@@ -1,0 +1,31 @@
+# Style for the engine sources. CI enforces this with:
+#   clang-format --dry-run --Werror src/*.c src/*.h
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++11
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+# `All` keeps the many one-line accessors (file_of, piece_on, square_bb, ...)
+# compact. `Inline` is a C++ notion and would explode each of them to three
+# lines, burying the interesting code.
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveMacros: Consecutive
+AlignEscapedNewlines: Left
+AlignTrailingComments: true
+
+BreakBeforeBraces: Attach
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1

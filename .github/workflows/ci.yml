@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Builds everywhere the engine is expected to run. Cross-platform breakage is
+  # cheap to fix immediately and expensive to fix months later, and OpenBench
+  # workers are overwhelmingly Linux even when development is on Windows.
+  build:
+    name: build ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        cc: [gcc, clang]
+        exclude:
+          # Apple ships clang as `gcc`; running both is testing the same thing.
+          - os: macos-latest
+            cc: gcc
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ARCH=popcnt (x86-64-v2), never `native`: CI runners vary, and a
+      # -march=native binary built on one runner may not even run on another.
+      # The Makefile ignores ARCH on non-x86, so macOS arm64 builds portably.
+      - name: Build
+        run: make ARCH=popcnt CC=${{ matrix.cc }}
+
+      - name: UCI handshake
+        run: |
+          out=$(printf 'uci\nisready\nquit\n' | ./chessengine)
+          echo "$out"
+          grep -q 'uciok'               <<< "$out" || { echo "::error::no uciok"; exit 1; }
+          grep -q 'readyok'             <<< "$out" || { echo "::error::no readyok"; exit 1; }
+          grep -q 'option name Hash'    <<< "$out" || { echo "::error::no Hash option"; exit 1; }
+          grep -q 'option name Threads' <<< "$out" || { echo "::error::no Threads option"; exit 1; }
+
+      # The OpenBench contract. Both properties are meaningful today even with
+      # the search unimplemented: the output SHAPE must parse, and repeated
+      # runs must agree.
+      - name: Bench format and determinism
+        run: |
+          n1=$(./chessengine bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
+          n2=$(./chessengine bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
+          echo "run 1: $n1 nodes / run 2: $n2 nodes"
+          [ -n "$n1" ] || { echo "::error::bench did not print '<nodes> nodes <nps> nps'"; exit 1; }
+          [ "$n1" = "$n2" ] || { echo "::error::bench is not deterministic ($n1 vs $n2)"; exit 1; }
+
+      - name: OpenBench EXE= contract
+        run: |
+          make ARCH=popcnt CC=${{ matrix.cc }} EXE=Engine-CITEST
+          ls Engine-CITEST* || { echo "::error::make EXE= produced no such binary"; exit 1; }
+
+  # Undefined behaviour in a chess engine shows up as a rare illegal move or a
+  # crash 40 moves into a tournament game. Catching it here is far cheaper.
+  sanitizers:
+    name: sanitizers (asan + ubsan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with sanitizers
+        run: make debug ARCH=popcnt
+
+      - name: Run bench under sanitizers
+        run: ./chessengine-debug bench 4
+
+      - name: Run perft suites under sanitizers
+        # TODO: remove continue-on-error once movegen and make/unmake exist.
+        # Until then the suites correctly report failure (zero nodes generated),
+        # and that is the honest signal - not something to paper over.
+        continue-on-error: true
+        run: |
+          ./chessengine-debug perft suite tests/perft/standard.epd 4
+          ./chessengine-debug perft suite tests/perft/tricky.epd
+
+  # Correctness gate for move generation. Currently advisory; becomes the most
+  # important job in this file the moment movegen lands.
+  perft:
+    name: perft correctness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make ARCH=popcnt
+
+      - name: Perft suites
+        # TODO: flip this to a hard failure once movegen is implemented.
+        continue-on-error: true
+        run: make perft
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: make format-check

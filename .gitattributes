@@ -1,0 +1,16 @@
+# Normalise line endings so the same source builds identically on every platform.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF so PowerShell and cmd never choke on them.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Test data is line-oriented text; keep it LF everywhere.
+*.epd text eol=lf
+*.pgn text eol=lf
+
+# Binary assets
+*.bin binary
+*.nnue binary
+*.zip binary

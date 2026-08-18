@@ -1,0 +1,44 @@
+# Build artifacts
+*.o
+*.d
+*.a
+*.exe
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.gcda
+*.gcno
+*.su
+/chessengine
+/chessengine-*
+/Engine-*
+/build/
+/obj/
+
+# Profile-guided optimisation data
+*.profraw
+*.profdata
+pgo/
+
+# External tooling, books, opponent engines, match output.
+# Everything here is fetched by tools/setup.ps1 and must never be committed.
+/external/
+
+# Match/test output that may land outside external/ by accident
+*.pgn
+*.epd.zip
+*.log
+config.json
+fastchess.config.json
+lookup.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+compile_commands.json
+.cache/
