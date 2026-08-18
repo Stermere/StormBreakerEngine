@@ -2,10 +2,11 @@
 
 A UCI chess engine written in C, built for competitive strength.
 
-This repository is currently **scaffolding**: the build system, protocol layer,
-testing harness and CI are complete and verified. Move generation, search and
-evaluation are documented stubs — that is the engine, and it is what gets
-written next.
+The engine plays legal chess. Move generation is verified exact against the
+published perft suites, and the search is the deliberate minimum: negamax with
+alpha-beta, iterative deepening, quiescence and MVV-LVA ordering over a
+material-only evaluation. That combination is the **baseline** — every change
+from here is measured against it with SPRT rather than argued for.
 
 ---
 
@@ -21,13 +22,19 @@ written next.
 | Perft harness + test suites | complete |
 | Bench harness | complete |
 | SPRT / gauntlet tooling, GUI integration, CI | complete |
-| **Move generation** | **TODO** |
-| **Make / unmake move** | **TODO** |
-| **Search** | **TODO** |
-| **Evaluation** | **TODO** |
+| Move generation (perft-exact, magic/PEXT sliders) | complete |
+| Make / unmake move | complete |
+| Time management | complete |
+| Search: iterative deepening, alpha-beta, quiescence | baseline |
+| Evaluation: material only | baseline |
+| **Transposition table probe / store** | **TODO** |
+| **Killers, history, null move, LMR** | **TODO** |
+| **Piece-square tables and beyond** | **TODO** |
+| **Remaining optimizations and performance upticks** | **TODO** |
+| **NNUE experiments and training pipeline. NN informed search** | **TODO** |
 
-`make openbench-check` passes today, so the engine can be registered with a
-distributed testing cluster before it can play a legal move.
+`make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
+so the engine can be registered with a distributed testing cluster.
 
 ---
 

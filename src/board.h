@@ -31,8 +31,12 @@ typedef struct {
     int halfmoveClock;
     Piece captured;
 
-    /* TODO(movegen): cache checkers/pinned/check-squares here once movegen
-     * lands. Recomputing them per node is a measurable Elo loss. */
+    /* Derived state is cached rather than recomputed: movegen needs `checkers`
+     * at every node and `pinned` for every legality test, and both cost a
+     * handful of slider lookups. Restoring them on undo is a memcpy-cheap way
+     * to avoid paying for them twice. */
+    Bitboard checkers;
+    Bitboard pinned;
 } Undo;
 
 typedef struct {
@@ -49,6 +53,12 @@ typedef struct {
     int fullmoveNumber;
 
     Key key;
+
+    /* Enemy pieces currently giving check to `sideToMove`, and the pieces of
+     * `sideToMove` that are pinned against their own king. Maintained by
+     * do_move/undo_move; see the note on Undo above. */
+    Bitboard checkers;
+    Bitboard pinned;
 
     /* Plies played from the root of the *game*, used to index `history` and to
      * detect repetitions across the whole game rather than just the search. */
@@ -70,6 +80,11 @@ static inline Bitboard pieces_bb(const Position *pos, Color c, PieceType pt) {
     return pos->byColor[c] & pos->byType[pt];
 }
 
+/* Both piece types at once - sliders are almost always wanted in pairs. */
+static inline Bitboard pieces2_bb(const Position *pos, Color c, PieceType a, PieceType b) {
+    return pos->byColor[c] & (pos->byType[a] | pos->byType[b]);
+}
+
 static inline Square king_square(const Position *pos, Color c) {
     return lsb(pieces_bb(pos, c, KING));
 }
@@ -77,6 +92,12 @@ static inline Square king_square(const Position *pos, Color c) {
 static inline int piece_count(const Position *pos, Color c, PieceType pt) {
     return pos->pieceCount[make_piece(c, pt)];
 }
+
+/* Bitboard of enemy pieces giving check to `pos->sideToMove`. */
+static inline Bitboard board_checkers(const Position *pos) { return pos->checkers; }
+
+/* Pieces of `pos->sideToMove` pinned against their own king. */
+static inline Bitboard board_pinned(const Position *pos) { return pos->pinned; }
 
 /* ------------------------------------------------------- board mutation -- */
 
@@ -112,40 +133,40 @@ void board_print(const Position *pos);
 /* ---------------------------------------------------------- move making -- */
 
 /*
- * TODO(engine): the four functions below are the heart of make/unmake and are
- * intentionally unimplemented. Implement do_move/undo_move first, then run
- * `make perft` - the suite in tests/perft/ will find essentially every bug in
- * move generation and move making before it can cost you Elo.
+ * Plays / retracts `m`, which must be legal in `pos`.
  *
- * Requirements when you implement them:
- *   - update byType, byColor, board and pieceCount together (never one alone)
- *   - update `key` incrementally, and assert(key == board_compute_key(pos))
- *     in debug builds
- *   - push the pre-move Undo onto history[gamePly] before mutating anything
- *   - handle: captures, double pawn pushes (setting epSquare), en passant,
- *     castling (king and rook), promotions, and the halfmove clock reset
+ * do_move pushes the irreversible state onto history[gamePly] before mutating
+ * anything, so undo_move restores it verbatim rather than trying to derive it.
+ * Both maintain the Zobrist key incrementally; debug builds assert it against
+ * board_compute_key().
+ *
+ * undo_move must be passed the SAME move that was given to do_move.
  */
 void board_do_move(Position *pos, Move m);
 void board_undo_move(Position *pos, Move m);
 
-/* Null move: pass the turn. Used by null-move pruning in the search. */
+/* Null move: pass the turn. Used by null-move pruning in the search. Only
+ * legal when the side to move is not in check. */
 void board_do_null_move(Position *pos);
 void board_undo_null_move(Position *pos);
 
 /* ----------------------------------------------------------- predicates -- */
 
-/* TODO(engine): needed by movegen and search. */
-
-/* Bitboard of enemy pieces giving check to `pos->sideToMove`. */
-Bitboard board_checkers(const Position *pos);
+/* Every piece of either colour attacking `s`, given `occupied`. Passing an
+ * explicit occupancy is what lets callers reason about x-rays: remove a piece
+ * from `occupied` and the attackers behind it appear. */
+Bitboard board_attackers_to(const Position *pos, Square s, Bitboard occupied);
 
 /* True if `s` is attacked by any piece of colour `by`, given `occupied`.
- * Passing an explicit occupancy lets the caller test x-rays and pins. */
+ * Cheaper than board_attackers_to when only the yes/no answer is needed. */
 bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occupied);
 
-/* True if the position is drawn by the fifty-move rule, threefold repetition,
- * or insufficient material. */
-bool board_is_draw(const Position *pos);
+/* True if the position is drawn by the fifty-move rule, repetition, or
+ * insufficient material. `ply` is the distance from the search root: a single
+ * repetition inside the search is already a draw for search purposes, whereas
+ * repeating a position that occurred before the root needs the full threefold
+ * count. Pass 0 outside the search. */
+bool board_is_draw(const Position *pos, int ply);
 
 /* Validates that all representations agree. Debug builds only - call it from
  * asserts inside do_move/undo_move while bringing move making up. */

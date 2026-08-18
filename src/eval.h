@@ -15,10 +15,21 @@
 void eval_init(void);
 
 /*
- * TODO(engine): implement.
+ * Centipawn piece values, indexed by PieceType.
+ *
+ * Shared with the search, which orders captures by them, so ordering and
+ * evaluation can never disagree about what a piece is worth. The king is zero:
+ * it is never captured, and giving it a value would corrupt every exchange
+ * calculation it appears in.
+ */
+extern const Value PieceValues[PIECE_TYPE_NB];
+
+/*
+ * Currently step 1 of the progression below. Every step after this one is a
+ * behavioural change and needs its own SPRT - see docs/TESTING.md.
  *
  * A pragmatic progression, SPRT-testing each step (see docs/TESTING.md):
- *   1. material only                        - gets you a playing engine
+ *   1. material only                        - DONE: gets you a playing engine
  *   2. piece-square tables, tapered between midgame and endgame
  *   3. pawn structure, mobility, king safety
  *   4. tune the weights on real game data (Texel tuning / gradient descent)

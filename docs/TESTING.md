@@ -173,6 +173,6 @@ This repository already satisfies the compliance requirements:
 - runs an ASan/UBSan build
 - checks `clang-format`
 
-The perft and sanitizer-perft jobs are marked `continue-on-error` **only**
-because move generation does not exist yet. Remove those two lines the moment
-it does — they are the most valuable jobs in the file.
+The perft and sanitizer-perft jobs are hard failures. They are the most
+valuable jobs in the file: a wrong count means the engine plays or accepts
+illegal moves, and nothing measured after that point means anything.

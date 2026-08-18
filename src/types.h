@@ -112,6 +112,9 @@ static inline Square flip_rank(Square s) { return (Square)(s ^ 56); }
 /* Rank as seen by `c`, so relative_rank(BLACK, SQ_A7) == RANK_2. */
 static inline Rank relative_rank(Color c, Square s) { return (Rank)((s >> 3) ^ (c * 7)); }
 
+/* Square delta of a single pawn push for `c`: north for white, south for black. */
+static inline int pawn_push(Color c) { return c == WHITE ? 8 : -8; }
+
 /* -------------------------------------------------------------- castling -- */
 
 /* Bit flags so a position's whole castling state fits in 4 bits. */

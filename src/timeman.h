@@ -23,14 +23,16 @@ typedef struct {
 } TimeManager;
 
 /*
- * TODO(engine): implement.
+ * Computes the budget for one move.
  *
- * A workable starting point for `movestogo == 0` (sudden death + increment):
- *     optimum = remaining / 20 + increment * 3 / 4
- *     maximum = min(remaining * 0.8, optimum * 5)
- * Then refine: spend longer when the best move keeps changing between
- * iterations, less when the score is stable, and always keep `Move Overhead`
- * in reserve for network and GUI latency.
+ * The current policy is the workable starting point and nothing more: divide
+ * the remaining clock by an assumed twenty moves left, bank three quarters of
+ * the increment, and cap the whole thing well short of flag fall. `Move
+ * Overhead` is held back for GUI and network latency.
+ *
+ * TODO(engine): refine it - spend longer when the best move keeps changing
+ * between iterations and less when the score is stable. Time management is
+ * worth real Elo and is confined to this module, so it SPRTs cleanly.
  */
 void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly);
 

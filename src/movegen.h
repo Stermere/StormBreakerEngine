@@ -20,9 +20,6 @@ typedef enum {
 } GenType;
 
 /*
- * TODO(engine): implement. This is the first thing to write, and `make perft`
- * is how you prove it correct.
- *
  * Generates PSEUDO-LEGAL moves: moves that respect piece movement rules but
  * may leave the mover's own king in check. Filtering those out with
  * movegen_is_legal() lazily - only for moves the search actually tries - is
@@ -30,6 +27,11 @@ typedef enum {
  * most generated moves are pruned before they are ever played.
  *
  * Returns the number of moves written to `list`, which must hold MAX_MOVES.
+ * Only the `m` field is written: `score` belongs to whoever orders the list.
+ *
+ * GEN_EVASIONS requires the side to move to actually be in check, and is both
+ * narrower and faster than filtering GEN_ALL. GEN_CAPTURES and GEN_QUIETS
+ * partition GEN_ALL exactly - no move appears in both, and none is missed.
  */
 int movegen_generate(const Position *pos, GenType type, ScoredMove *list);
 

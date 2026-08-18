@@ -1,16 +1,15 @@
 /*
- * board.c - position setup, FEN I/O and hashing.
- *
- * The move-making half of this module is deliberately left as TODO stubs; see
- * the contract documented in board.h.
+ * board.c - position setup, FEN I/O, hashing and move making.
  */
 #include "board.h"
 
+#include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "bitboard.h"
+#include "movegen.h"
 #include "zobrist.h"
 
 static const char PieceChars[PIECE_NB] = {[W_PAWN] = 'P', [W_KNIGHT] = 'N', [W_BISHOP] = 'B',
@@ -84,6 +83,72 @@ Key board_compute_key(const Position *pos) {
         k ^= ZobristSideToMove;
 
     return k;
+}
+
+/* ========================================================================== *
+ *  Attack and pin queries
+ * ========================================================================== */
+
+Bitboard board_attackers_to(const Position *pos, Square s, Bitboard occupied) {
+    /* pawn_attacks(BLACK, s) is the set of squares a WHITE pawn would have to
+     * stand on to attack s - the relation is symmetric, so the colours look
+     * inverted here on purpose. */
+    return (pawn_attacks(BLACK, s) & pieces_bb(pos, WHITE, PAWN)) |
+           (pawn_attacks(WHITE, s) & pieces_bb(pos, BLACK, PAWN)) |
+           (knight_attacks(s) & pos->byType[KNIGHT]) | (king_attacks(s) & pos->byType[KING]) |
+           (bishop_attacks(s, occupied) & (pos->byType[BISHOP] | pos->byType[QUEEN])) |
+           (rook_attacks(s, occupied) & (pos->byType[ROOK] | pos->byType[QUEEN]));
+}
+
+bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occupied) {
+    const Color them = (Color)(by ^ 1);
+
+    /* Cheapest and likeliest first: the leaper lookups are single loads, the
+     * two slider lookups are the only real work in this function. */
+    if (pawn_attacks(them, s) & pieces_bb(pos, by, PAWN))
+        return true;
+    if (knight_attacks(s) & pieces_bb(pos, by, KNIGHT))
+        return true;
+    if (king_attacks(s) & pieces_bb(pos, by, KING))
+        return true;
+    if (bishop_attacks(s, occupied) & pieces2_bb(pos, by, BISHOP, QUEEN))
+        return true;
+    return (rook_attacks(s, occupied) & pieces2_bb(pos, by, ROOK, QUEEN)) != 0;
+}
+
+/* Pieces of `us` that are the sole blocker between their own king and an enemy
+ * slider. Moving one off the pinning line exposes the king, which is precisely
+ * the test movegen_is_legal has to make. */
+static Bitboard compute_pinned(const Position *pos, Color us, Square ksq) {
+    const Color them   = (Color)(us ^ 1);
+    const Bitboard occ = occupied_bb(pos);
+    Bitboard pinned    = BB_EMPTY;
+
+    /* Only sliders that would attack the king on an EMPTY board can pin, so
+     * the per-slider work below runs a handful of times, not sixteen. */
+    Bitboard snipers = (rook_attacks(ksq, BB_EMPTY) & pieces2_bb(pos, them, ROOK, QUEEN)) |
+                       (bishop_attacks(ksq, BB_EMPTY) & pieces2_bb(pos, them, BISHOP, QUEEN));
+
+    while (snipers) {
+        const Square sniper  = pop_lsb(&snipers);
+        const Bitboard block = SquaresBetween[ksq][sniper] & occ;
+
+        /* bb_at_most_one() is also true for an empty set, which would be a
+         * check rather than a pin - hence the explicit non-empty test. */
+        if (block && bb_at_most_one(block))
+            pinned |= block & color_bb(pos, us);
+    }
+    return pinned;
+}
+
+/* Refreshes the cached derived state for whoever is to move. Must be called
+ * after every change to the board. */
+static void set_check_info(Position *pos) {
+    const Color us   = pos->sideToMove;
+    const Square ksq = king_square(pos, us);
+
+    pos->checkers = board_attackers_to(pos, ksq, occupied_bb(pos)) & color_bb(pos, (Color)(us ^ 1));
+    pos->pinned   = compute_pinned(pos, us, ksq);
 }
 
 bool board_set_fen(Position *pos, const char *fen) {
@@ -183,6 +248,14 @@ bool board_set_fen(Position *pos, const char *fen) {
     p.chess960 = pos->chess960; /* preserve the UCI option across position changes */
     p.gamePly  = 0;
     p.key      = board_compute_key(&p);
+    set_check_info(&p);
+
+    /* The side that just moved may not have left its own king en prise. Such a
+     * diagram is unreachable by legal play, and accepting it would let the
+     * search "win" by capturing a king. */
+    if (board_square_attacked(&p, king_square(&p, (Color)(p.sideToMove ^ 1)), p.sideToMove,
+                              occupied_bb(&p)))
+        return false;
 
     *pos = p;
     return true;
@@ -289,50 +362,296 @@ bool board_is_consistent(const Position *pos) {
 }
 
 /* ========================================================================== *
- *  TODO(engine): move making. See the contract in board.h.
- *  Everything below is a placeholder so the module links and the UCI layer,
- *  build system and CI can be exercised today.
+ *  Move making
  * ========================================================================== */
 
+/*
+ * Castling rights lost when a piece leaves or arrives on a square. A single
+ * table handles both halves of the rule at once: the king or rook moving away,
+ * and the rook being captured where it stands.
+ *
+ * Standard chess only - board_set_fen rejects Shredder-FEN, so the king and
+ * rook home squares are fixed. Chess960 will need this built per position.
+ */
+static const uint8_t CastlingLoss[SQUARE_NB] = {
+    [SQ_A1] = WHITE_OOO, [SQ_E1] = WHITE_ANY, [SQ_H1] = WHITE_OO,
+    [SQ_A8] = BLACK_OOO, [SQ_E8] = BLACK_ANY, [SQ_H8] = BLACK_OO,
+};
+
+/* Where the king and rook end up. `rookFrom` doubles as the move's destination
+ * square, because castling is encoded king-captures-own-rook. */
+static inline void castling_targets(Square kingFrom, Square rookFrom, Square *kingTo,
+                                    Square *rookTo) {
+    const bool kingside = rookFrom > kingFrom;
+    *kingTo             = make_square(kingside ? FILE_G : FILE_C, rank_of(kingFrom));
+    *rookTo             = make_square(kingside ? FILE_F : FILE_D, rank_of(kingFrom));
+}
+
 void board_do_move(Position *pos, Move m) {
-    (void)pos;
-    (void)m;
-    /* TODO(engine): implement make-move. Start here, then `make perft`. */
+    assert(is_ok_move(m));
+    assert(pos->gamePly < MAX_GAME_PLY);
+
+    const Color us    = pos->sideToMove;
+    const Color them  = (Color)(us ^ 1);
+    const Square from = from_sq(m);
+    const Square to   = to_sq(m);
+    const MoveType mt = type_of_move(m);
+    const Piece pc    = piece_on(pos, from);
+
+    assert(pc != NO_PIECE && color_of(pc) == us);
+
+    Undo *const u    = &pos->history[pos->gamePly++];
+    u->key           = pos->key;
+    u->castling      = pos->castling;
+    u->epSquare      = pos->epSquare;
+    u->halfmoveClock = pos->halfmoveClock;
+    u->checkers      = pos->checkers;
+    u->pinned        = pos->pinned;
+
+    Key k = pos->key ^ ZobristSideToMove;
+
+    /* The en passant right expires after exactly one ply, whatever happens. */
+    if (pos->epSquare != SQ_NONE) {
+        k ^= ZobristEnPassant[file_of(pos->epSquare)];
+        pos->epSquare = SQ_NONE;
+    }
+
+    ++pos->halfmoveClock;
+
+    if (mt == MT_CASTLING) {
+        Square kingTo, rookTo;
+        castling_targets(from, to, &kingTo, &rookTo);
+        const Piece rook = make_piece(us, ROOK);
+
+        assert(piece_on(pos, to) == rook);
+
+        /* Both pieces come off before either goes down: in Chess960 a king's
+         * destination can be the rook's origin and vice versa, so any
+         * move-then-move ordering would clobber a square. */
+        board_remove_piece(pos, from);
+        board_remove_piece(pos, to);
+        board_put_piece(pos, pc, kingTo);
+        board_put_piece(pos, rook, rookTo);
+
+        k ^= ZobristPiece[pc][from] ^ ZobristPiece[pc][kingTo] ^ ZobristPiece[rook][to] ^
+             ZobristPiece[rook][rookTo];
+
+        u->captured = NO_PIECE;
+    } else {
+        const Piece captured = mt == MT_EN_PASSANT ? make_piece(them, PAWN) : piece_on(pos, to);
+        u->captured          = captured;
+
+        if (captured != NO_PIECE) {
+            /* En passant takes the pawn that double-pushed, which sits beside
+             * the capturing pawn rather than on its destination square. */
+            const Square capsq = mt == MT_EN_PASSANT ? (Square)(to - pawn_push(us)) : to;
+
+            assert(piece_on(pos, capsq) == captured);
+            assert(type_of(captured) != KING);
+
+            board_remove_piece(pos, capsq);
+            k ^= ZobristPiece[captured][capsq];
+            pos->halfmoveClock = 0;
+        }
+
+        if (mt == MT_PROMOTION) {
+            const Piece promoted = make_piece(us, promotion_type(m));
+            board_remove_piece(pos, from);
+            board_put_piece(pos, promoted, to);
+            k ^= ZobristPiece[pc][from] ^ ZobristPiece[promoted][to];
+        } else {
+            board_move_piece(pos, from, to);
+            k ^= ZobristPiece[pc][from] ^ ZobristPiece[pc][to];
+        }
+
+        if (type_of(pc) == PAWN) {
+            pos->halfmoveClock = 0;
+
+            /* A double push is the only move that creates an ep target, and
+             * the only one whose origin and destination differ by two ranks. */
+            if ((from ^ to) == 16) {
+                pos->epSquare = (Square)((from + to) / 2);
+                k ^= ZobristEnPassant[file_of(pos->epSquare)];
+            }
+        }
+    }
+
+    const uint8_t lost = (uint8_t)(CastlingLoss[from] | CastlingLoss[to]);
+    if (pos->castling & lost) {
+        k ^= ZobristCastling[pos->castling];
+        pos->castling = (CastlingRights)(pos->castling & ~lost);
+        k ^= ZobristCastling[pos->castling];
+    }
+
+    pos->key        = k;
+    pos->sideToMove = them;
+    if (us == BLACK)
+        ++pos->fullmoveNumber;
+
+    set_check_info(pos);
+
+    assert(pos->key == board_compute_key(pos));
+    assert(board_is_consistent(pos));
 }
 
 void board_undo_move(Position *pos, Move m) {
-    (void)pos;
-    (void)m;
-    /* TODO(engine): implement unmake-move. */
+    assert(is_ok_move(m));
+    assert(pos->gamePly > 0);
+
+    const Color us    = (Color)(pos->sideToMove ^ 1); /* the side that made the move */
+    const Square from = from_sq(m);
+    const Square to   = to_sq(m);
+    const MoveType mt = type_of_move(m);
+
+    const Undo *const u = &pos->history[--pos->gamePly];
+
+    if (mt == MT_CASTLING) {
+        Square kingTo, rookTo;
+        castling_targets(from, to, &kingTo, &rookTo);
+
+        board_remove_piece(pos, kingTo);
+        board_remove_piece(pos, rookTo);
+        board_put_piece(pos, make_piece(us, KING), from);
+        board_put_piece(pos, make_piece(us, ROOK), to);
+    } else {
+        if (mt == MT_PROMOTION) {
+            board_remove_piece(pos, to);
+            board_put_piece(pos, make_piece(us, PAWN), from);
+        } else {
+            board_move_piece(pos, to, from);
+        }
+
+        if (u->captured != NO_PIECE) {
+            const Square capsq = mt == MT_EN_PASSANT ? (Square)(to - pawn_push(us)) : to;
+            board_put_piece(pos, u->captured, capsq);
+        }
+    }
+
+    /* Irreversible state is restored verbatim rather than derived: that is the
+     * whole reason it was pushed in the first place. */
+    pos->key           = u->key;
+    pos->castling      = u->castling;
+    pos->epSquare      = u->epSquare;
+    pos->halfmoveClock = u->halfmoveClock;
+    pos->checkers      = u->checkers;
+    pos->pinned        = u->pinned;
+    pos->sideToMove    = us;
+    if (us == BLACK)
+        --pos->fullmoveNumber;
+
+    assert(board_is_consistent(pos));
 }
 
 void board_do_null_move(Position *pos) {
-    (void)pos;
-    /* TODO(engine): needed by null-move pruning. */
+    assert(pos->checkers == BB_EMPTY);
+    assert(pos->gamePly < MAX_GAME_PLY);
+
+    Undo *const u    = &pos->history[pos->gamePly++];
+    u->key           = pos->key;
+    u->castling      = pos->castling;
+    u->epSquare      = pos->epSquare;
+    u->halfmoveClock = pos->halfmoveClock;
+    u->captured      = NO_PIECE;
+    u->checkers      = pos->checkers;
+    u->pinned        = pos->pinned;
+
+    Key k = pos->key ^ ZobristSideToMove;
+    if (pos->epSquare != SQ_NONE) {
+        k ^= ZobristEnPassant[file_of(pos->epSquare)];
+        pos->epSquare = SQ_NONE;
+    }
+
+    pos->key        = k;
+    pos->sideToMove = (Color)(pos->sideToMove ^ 1);
+    ++pos->halfmoveClock;
+
+    /* The board did not change, but the pins did - they are relative to the
+     * king of whoever is now to move. Checkers stay empty: passing cannot give
+     * check, and a null move is only legal when not already in check. */
+    set_check_info(pos);
+
+    assert(pos->key == board_compute_key(pos));
 }
 
 void board_undo_null_move(Position *pos) {
-    (void)pos;
-    /* TODO(engine): needed by null-move pruning. */
+    assert(pos->gamePly > 0);
+
+    const Undo *const u = &pos->history[--pos->gamePly];
+
+    pos->key           = u->key;
+    pos->castling      = u->castling;
+    pos->epSquare      = u->epSquare;
+    pos->halfmoveClock = u->halfmoveClock;
+    pos->checkers      = u->checkers;
+    pos->pinned        = u->pinned;
+    pos->sideToMove    = (Color)(pos->sideToMove ^ 1);
 }
 
-Bitboard board_checkers(const Position *pos) {
-    (void)pos;
-    /* TODO(engine): pieces of !sideToMove attacking king_square(pos, sideToMove). */
-    return BB_EMPTY;
-}
+/* ========================================================================== *
+ *  Draw detection
+ * ========================================================================== */
 
-bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occupied) {
-    (void)pos;
-    (void)s;
-    (void)by;
-    (void)occupied;
-    /* TODO(engine): pawn/knight/king lookups, then bishop_attacks/rook_attacks. */
+/* Material from which no mate exists at all, so no amount of search can find
+ * one. Deliberately conservative: king and two knights is NOT included,
+ * because mate is possible there with cooperation - that ending is drawn by
+ * the fifty-move count, not by this rule.  */
+static bool insufficient_material(const Position *pos) {
+    if (pos->byType[PAWN] | pos->byType[ROOK] | pos->byType[QUEEN])
+        return false;
+
+    const Bitboard minors = pos->byType[KNIGHT] | pos->byType[BISHOP];
+
+    if (bb_at_most_one(minors))
+        return true; /* K v K, and K plus one minor v K */
+
+    /* One bishop each, both on the same colour complex: neither can ever
+     * attack the other's squares, so no mating net exists. */
+    if (piece_count(pos, WHITE, BISHOP) == 1 && piece_count(pos, BLACK, BISHOP) == 1 &&
+        minors == pos->byType[BISHOP])
+        return (minors & BB_LIGHT_SQUARES) == minors || (minors & BB_DARK_SQUARES) == minors;
+
     return false;
 }
 
-bool board_is_draw(const Position *pos) {
-    (void)pos;
-    /* TODO(engine): fifty-move rule, threefold repetition, insufficient material. */
+/*
+ * `ply` is the distance from the search root.
+ *
+ * A position repeated INSIDE the search is scored as a draw on the FIRST
+ * repetition: the side to move has demonstrably forced the cycle once and can
+ * force it again, so making it prove the point a second time only costs
+ * search. A position repeated from the game history before the root still
+ * needs the full threefold count, because the opponent had a chance to
+ * deviate and did not.
+ */
+static bool is_repetition(const Position *pos, int ply) {
+    /* Nothing before the last irreversible move can repeat, and coming back
+     * round to the same position takes at least four plies. */
+    const int back = pos->halfmoveClock < pos->gamePly ? pos->halfmoveClock : pos->gamePly;
+    int seen       = 0;
+
+    for (int i = 4; i <= back; i += 2) { /* only every second ply has us to move */
+        if (pos->history[pos->gamePly - i].key != pos->key)
+            continue;
+        if (++seen + (ply > i ? 1 : 0) >= 2)
+            return true;
+    }
     return false;
+}
+
+bool board_is_draw(const Position *pos, int ply) {
+    if (pos->halfmoveClock > 99) {
+        /* Checkmate outranks the fifty-move rule, so the position is only
+         * drawn if the side to move actually has a legal reply. */
+        if (pos->checkers == BB_EMPTY)
+            return true;
+
+        ScoredMove moves[MAX_MOVES];
+        const int count = movegen_generate(pos, GEN_EVASIONS, moves);
+        for (int i = 0; i < count; ++i)
+            if (movegen_is_legal(pos, moves[i].m))
+                return true;
+        return false;
+    }
+
+    return insufficient_material(pos) || is_repetition(pos, ply);
 }

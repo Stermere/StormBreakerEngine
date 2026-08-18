@@ -100,19 +100,64 @@ static inline bool aligned(Square a, Square b, Square c) {
 /*
  * Sliding attacks from `s` given `occupied`.
  *
- * PERFORMANCE NOTE: this is the correct-but-slow classical ray walk. It is
- * fine for perft bring-up and for anything outside the search, but it is far
- * too slow for a competitive search - expect a large Elo gain from replacing
- * it with magic bitboards (or PEXT when USE_PEXT is defined).
+ * These are the hottest lookups in the engine, so they are table-driven and
+ * inline rather than a ray walk. Two interchangeable indexing schemes share
+ * the same table:
  *
- * TODO(perf): implement magic/PEXT sliding attacks behind this same signature.
+ *   - PEXT (USE_PEXT): the CPU extracts the relevant occupancy bits directly.
+ *     Fastest where the instruction is fast - Intel Haswell onwards and AMD
+ *     Zen 3 onwards. It is microcoded and very slow on Zen 1/2, which is why
+ *     the Makefile only defines USE_PEXT for the arch profiles where it wins.
+ *
+ *   - Magic multiplication: a perfect hash of the relevant occupancy bits,
+ *     found once at startup. Portable, and within a few percent of PEXT.
+ *
+ * Both index the same attack table, so switching schemes cannot change any
+ * result - only the speed of getting it.
  */
-Bitboard bishop_attacks(Square s, Bitboard occupied);
-Bitboard rook_attacks(Square s, Bitboard occupied);
-Bitboard queen_attacks(Square s, Bitboard occupied);
+typedef struct {
+    Bitboard *attacks; /* slice of the shared table for this square */
+    Bitboard mask;     /* occupancy bits that actually block this square */
+    uint64_t magic;    /* unused under USE_PEXT */
+    unsigned shift;    /* unused under USE_PEXT */
+} Magic;
+
+extern Magic BishopMagics[SQUARE_NB];
+extern Magic RookMagics[SQUARE_NB];
+
+static inline unsigned magic_index(const Magic *m, Bitboard occupied) {
+#ifdef USE_PEXT
+    return (unsigned)pext(occupied, m->mask);
+#else
+    return (unsigned)(((occupied & m->mask) * m->magic) >> m->shift);
+#endif
+}
+
+static inline Bitboard bishop_attacks(Square s, Bitboard occupied) {
+    const Magic *const m = &BishopMagics[s];
+    return m->attacks[magic_index(m, occupied)];
+}
+
+static inline Bitboard rook_attacks(Square s, Bitboard occupied) {
+    const Magic *const m = &RookMagics[s];
+    return m->attacks[magic_index(m, occupied)];
+}
+
+static inline Bitboard queen_attacks(Square s, Bitboard occupied) {
+    return bishop_attacks(s, occupied) | rook_attacks(s, occupied);
+}
 
 /* Attacks for any piece type. `occupied` is ignored for leapers. */
-Bitboard attacks_bb(PieceType pt, Square s, Bitboard occupied);
+static inline Bitboard attacks_bb(PieceType pt, Square s, Bitboard occupied) {
+    switch (pt) {
+    case KNIGHT: return KnightAttacks[s];
+    case BISHOP: return bishop_attacks(s, occupied);
+    case ROOK: return rook_attacks(s, occupied);
+    case QUEEN: return queen_attacks(s, occupied);
+    case KING: return KingAttacks[s];
+    default: return BB_EMPTY; /* pawns are directional: use pawn_attacks() */
+    }
+}
 
 /* Debug helper: dump a bitboard as an 8x8 grid to stdout. */
 void bb_print(Bitboard b);

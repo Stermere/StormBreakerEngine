@@ -7,17 +7,17 @@ main.c        startup, initialisation order, argv dispatch
   |
   +-- uci.c        protocol: parses commands, owns the root Position
   |     |
-  |     +-- search.c     search driver + worker thread   [TODO: the search]
+  |     +-- search.c     search driver + worker thread
   |     |     |
-  |     |     +-- movegen.c   move generation            [TODO]
-  |     |     +-- eval.c      static evaluation          [TODO]
+  |     |     +-- movegen.c   move generation
+  |     |     +-- eval.c      static evaluation          [material only]
   |     |     +-- tt.c        transposition table        [TODO: probe/store]
-  |     |     +-- timeman.c   clock allocation           [TODO: policy]
+  |     |     +-- timeman.c   clock allocation
   |     |
   |     +-- perft.c     movegen correctness testing
   |     +-- bench.c     deterministic node-count benchmark
   |
-  +-- board.c      position state, FEN I/O, hashing      [TODO: make/unmake]
+  +-- board.c      position state, FEN I/O, hashing, make/unmake
         |
         +-- bitboard.c   attack tables
         +-- zobrist.c    fixed-seed hash keys

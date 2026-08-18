@@ -48,9 +48,8 @@ jobs:
           grep -q 'option name Hash'    <<< "$out" || { echo "::error::no Hash option"; exit 1; }
           grep -q 'option name Threads' <<< "$out" || { echo "::error::no Threads option"; exit 1; }
 
-      # The OpenBench contract. Both properties are meaningful today even with
-      # the search unimplemented: the output SHAPE must parse, and repeated
-      # runs must agree.
+      # The OpenBench contract: the output SHAPE must parse, and repeated runs
+      # must agree on the node count.
       - name: Bench format and determinism
         run: |
           n1=$(./chessengine bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
@@ -79,16 +78,13 @@ jobs:
         run: ./chessengine-debug bench 4
 
       - name: Run perft suites under sanitizers
-        # TODO: remove continue-on-error once movegen and make/unmake exist.
-        # Until then the suites correctly report failure (zero nodes generated),
-        # and that is the honest signal - not something to paper over.
-        continue-on-error: true
         run: |
           ./chessengine-debug perft suite tests/perft/standard.epd 4
           ./chessengine-debug perft suite tests/perft/tricky.epd
 
-  # Correctness gate for move generation. Currently advisory; becomes the most
-  # important job in this file the moment movegen lands.
+  # The correctness gate for move generation, and the most important job in this
+  # file: a wrong perft count means the engine plays or accepts illegal moves,
+  # which forfeits tournament games and makes every Elo measurement noise.
   perft:
     name: perft correctness
     runs-on: ubuntu-latest
@@ -99,8 +95,6 @@ jobs:
         run: make ARCH=popcnt
 
       - name: Perft suites
-        # TODO: flip this to a hard failure once movegen is implemented.
-        continue-on-error: true
         run: make perft
 
   format:

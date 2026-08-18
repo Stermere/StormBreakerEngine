@@ -251,20 +251,18 @@ static void cmd_position(char *args) {
     if (!token_is(tok, "moves"))
         return;
 
-    static bool warned = false;
     while ((tok = next_token(&cursor)) != NULL) {
         const Move m = move_from_str(&Pos, tok);
+
+        /* An unresolvable move means the GUI and the engine disagree about the
+         * position. Stopping here leaves the board at the last state both
+         * agreed on, which is far safer than guessing. */
         if (m == MOVE_NONE) {
-            /* TODO(engine): this fires for every move until movegen and
-             * make/unmake exist, because no move can be resolved yet. */
-            if (!warned) {
-                printf("info string cannot apply moves: move generation is not "
-                       "implemented yet\n");
-                fflush(stdout);
-                warned = true;
-            }
+            printf("info string illegal move in position command: %s\n", tok);
+            fflush(stdout);
             return;
         }
+
         board_do_move(&Pos, m);
     }
 }

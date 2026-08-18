@@ -5,6 +5,17 @@
 
 #include <stdlib.h>
 
+/*
+ * Search workers get an explicit, generous stack.
+ *
+ * Each search frame carries a MAX_MOVES move list, so a line that runs to
+ * MAX_PLY needs on the order of half a megabyte - more under a sanitizer.
+ * The Win32 default (1 MB, from the PE header) is uncomfortably close to
+ * that, and some POSIX libcs default lower still. This is reserved address
+ * space, committed only as it is touched, so asking for more costs nothing.
+ */
+#define THREAD_STACK_BYTES (8u * 1024u * 1024u)
+
 #if defined(_WIN32)
 
 /* Win32 thread entry points must return DWORD and use the stdcall ABI, so the
@@ -31,7 +42,7 @@ bool thread_create(ThreadHandle *handle, ThreadEntry fn, void *arg) {
     start->fn  = fn;
     start->arg = arg;
 
-    *handle = CreateThread(NULL, 0, thread_trampoline, start, 0, NULL);
+    *handle = CreateThread(NULL, THREAD_STACK_BYTES, thread_trampoline, start, 0, NULL);
     if (!*handle) {
         HeapFree(GetProcessHeap(), 0, start);
         return false;
@@ -89,7 +100,14 @@ bool thread_create(ThreadHandle *handle, ThreadEntry fn, void *arg) {
     start->fn  = fn;
     start->arg = arg;
 
-    if (pthread_create(handle, NULL, thread_trampoline, start) != 0) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, THREAD_STACK_BYTES);
+
+    const int rc = pthread_create(handle, &attr, thread_trampoline, start);
+    pthread_attr_destroy(&attr);
+
+    if (rc != 0) {
         free(start);
         return false;
     }
