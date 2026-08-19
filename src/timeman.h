@@ -25,15 +25,30 @@ typedef struct {
 /*
  * Computes the budget for one move.
  *
- * The current policy is the workable starting point and nothing more: divide
- * the remaining clock by an assumed twenty moves left, bank three quarters of
- * the increment, and cap the whole thing well short of flag fall. `Move
- * Overhead` is held back for GUI and network latency.
+ * Divide the remaining clock by an assumed twenty moves left, bank three
+ * quarters of the increment, scale by where the game is, and cap the whole
+ * thing well short of flag fall. `Move Overhead` is held back for GUI and
+ * network latency.
  *
- * TODO(engine): refine it - spend longer when the best move keeps changing
- * between iterations and less when the score is stable. Time management is
- * worth real Elo and is confined to this module, so it SPRTs cleanly.
+ * Every constant in here is a guess that has not been through an SPRT yet.
+ * Time management is worth real Elo and is confined to this module, so it
+ * tests cleanly - see docs/TESTING.md.
  */
 void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly);
+
+/*
+ * The optimum allocation, adjusted for how settled the search looks.
+ *
+ * `stability` is the number of consecutive completed iterations that agreed on
+ * the best move. A search whose best move keeps changing has not found the
+ * point of the position yet and is exactly where an extra iteration pays; one
+ * that has returned the same move six times running is not about to change its
+ * mind, and the time is worth more on a later move.
+ *
+ * This only ever moves the soft target. `maximum` is a hard ceiling and is
+ * enforced separately, so an unstable position cannot talk the search into
+ * flagging.
+ */
+int64_t timeman_optimum(const TimeManager *tm, int stability);
 
 #endif /* TIMEMAN_H */

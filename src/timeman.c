@@ -46,10 +46,63 @@ int64_t time_ms(void) {
 
 static int64_t clamp64(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly) {
-    (void)gamePly; /* TODO(engine): spend more in the opening/middlegame than in
-                    * a simplified endgame. Worth an SPRT of its own. */
+/*
+ * How much of the nominal allocation to spend, in percent, as a function of
+ * how far into the game we are.
+ *
+ * The shape is deliberate. The first few moves are near-book and the position
+ * is the one every game shares, so thinking hard there buys the least. The
+ * middlegame is where games are decided and where an extra ply changes the
+ * move, so it gets the most. Deep into the game the position is simplified,
+ * the branching factor has collapsed, and the search reaches a useful depth
+ * far sooner - so the same quality of move costs less time, and what is saved
+ * is better banked against the scramble at the end.
+ *
+ * Indexed by gamePly / 16, i.e. roughly every eight full moves.
+ */
+static const int PhasePercent[] = {85, 100, 110, 110, 105, 100, 95, 90, 85, 80};
 
+#define PHASE_BUCKETS ((int)(sizeof(PhasePercent) / sizeof(PhasePercent[0])))
+
+static int phase_percent(int gamePly) {
+    int bucket = gamePly / 16;
+
+    if (bucket < 0)
+        bucket = 0;
+    else if (bucket >= PHASE_BUCKETS)
+        bucket = PHASE_BUCKETS - 1;
+
+    return PhasePercent[bucket];
+}
+
+/*
+ * Percent of the optimum to spend, by how many iterations running the best
+ * move has survived. Falls off quickly and then flattens: the difference
+ * between "changed last iteration" and "stable for two" is real information,
+ * the difference between stable for eight and stable for twelve is not.
+ */
+static const int StabilityPercent[] = {170, 130, 110, 100, 92, 86, 82, 80};
+
+#define STABILITY_BUCKETS ((int)(sizeof(StabilityPercent) / sizeof(StabilityPercent[0])))
+
+int64_t timeman_optimum(const TimeManager *tm, int stability) {
+    /* No clock at all - `go depth`, `go nodes`, `go infinite`, bench. Scaling
+     * a sentinel would overflow, and there is nothing here to scale. */
+    if (tm->optimum >= INT64_MAX / 256)
+        return tm->optimum;
+
+    if (stability < 0)
+        stability = 0;
+    else if (stability >= STABILITY_BUCKETS)
+        stability = STABILITY_BUCKETS - 1;
+
+    const int64_t scaled = tm->optimum * StabilityPercent[stability] / 100;
+
+    /* The soft target may never cross the hard ceiling. */
+    return scaled < tm->maximum ? scaled : tm->maximum;
+}
+
+void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly) {
     /* A fixed movetime is an instruction, not a budget: honour it exactly,
      * less the overhead reserved for GUI and network latency. */
     if (limits->movetime > 0) {
@@ -81,9 +134,14 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
         limits->movestogo > 0
             ? (limits->movestogo < MOVESTOGO_CAP ? limits->movestogo : MOVESTOGO_CAP)
             : 20;
-    const int64_t optimum = remaining / moves + inc * 3 / 4;
+    const int64_t nominal = remaining / moves + inc * 3 / 4;
+    const int64_t optimum = nominal * phase_percent(gamePly) / 100;
     const int64_t ceiling = remaining * MAX_CLOCK_FRACTION_NUM / MAX_CLOCK_FRACTION_DEN;
-    const int64_t maximum = optimum * 5 < ceiling ? optimum * 5 : ceiling;
+
+    /* The ceiling is computed off the nominal allocation rather than the
+     * phase-scaled one, so the phase curve moves the target without also
+     * moving the hard limit that protects the clock. */
+    const int64_t maximum = nominal * 5 < ceiling ? nominal * 5 : ceiling;
 
     /* Both are clamped into [1, remaining]: an allocation larger than the
      * clock is how engines lose on time in won positions. */

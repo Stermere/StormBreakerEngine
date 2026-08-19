@@ -10,8 +10,8 @@ main.c        startup, initialisation order, argv dispatch
   |     +-- search.c     search driver + worker thread
   |     |     |
   |     |     +-- movegen.c   move generation
-  |     |     +-- eval.c      static evaluation          [material only]
-  |     |     +-- tt.c        transposition table        [TODO: probe/store]
+  |     |     +-- eval.c      static evaluation          [material + PSTs]
+  |     |     +-- tt.c        transposition table
   |     |     +-- timeman.c   clock allocation
   |     |
   |     +-- perft.c     movegen correctness testing
@@ -112,17 +112,30 @@ reset on `ucinewgame`, or a game's result depends on which games preceded it.
 
 ## Known performance work
 
-These are correct-but-slow placeholders, deliberately left simple so the engine
-can be brought up and verified first:
+The bring-up placeholders are all gone. Sliding attacks go through magic
+bitboards (or PEXT where `USE_PEXT` is defined — it is behind its own flag
+because it is microcoded and very slow on AMD Zen 1/2); ray-walking survives
+only as the reference `slide()` that the magic tables are *built* from and
+verified against. Check and pin information is cached in `Undo` rather than
+recomputed. En passant is folded into the hash only when a pawn can actually
+capture, so positions that differ by an unusable ep right share an entry.
 
-- **Sliding attacks** (`bitboard.c`) walk rays one square at a time. Correct and
-  fine for perft, far too slow for a competitive search. Replace with magic
-  bitboards, or PEXT where `USE_PEXT` is defined — but note PEXT is microcoded
-  and very slow on AMD Zen 1/2, which is why it is behind its own flag.
-- **En passant hashing** (`board.c`) folds in the ep file whenever one exists.
-  It should only do so when an enemy pawn can actually capture, otherwise
-  transposition entries that ought to be shared get split.
-- **Check detection** is recomputed rather than cached in `Undo`.
+What is left is structural rather than incremental:
+
+- **The search is single-threaded.** `Threads` is advertised as `min 1 max 1`
+  and rejects anything else. Lazy SMP is the standard answer and needs the
+  ordering tables, which are currently file-scope, moved into a per-thread
+  block first.
+- **Move generation is not staged.** Every node generates its whole move list
+  and scores all of it, including at nodes where the transposition move cuts
+  immediately. A staged picker — table move, then captures, then quiets,
+  generated only when reached — avoids that work.
+- **No correction history.** Nothing feeds the difference between the static
+  evaluation and the searched score back into later static evaluations.
+- **Chess960 is representation-only.** Moves are encoded
+  king-captures-own-rook so the format is ready, but move generation hard-codes
+  standard castling geometry and `board_set_fen` rejects Shredder-FEN.
+  `UCI_Chess960` currently changes only how castling is spelled to the GUI.
 
 ---
 

@@ -13,7 +13,12 @@
  *
  * Castling is encoded king-captures-own-rook (origin = king, destination =
  * rook). That looks odd but it is the only encoding that stays unambiguous in
- * Chess960, which the engine supports via the UCI_Chess960 option.
+ * Chess960, so the representation is ready for it.
+ *
+ * The RULES are not: move generation hard-codes standard castling geometry and
+ * board_set_fen rejects Shredder-FEN. UCI_Chess960 currently switches how
+ * castling is SPELLED to the GUI and nothing more. See the TODO(chess960) in
+ * board.c for what is still missing.
  */
 #ifndef MOVE_H
 #define MOVE_H

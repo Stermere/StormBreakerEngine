@@ -4,9 +4,13 @@ Guidance for Claude Code when working in this repository.
 
 ## What this is
 
-A UCI chess engine in **C** (C17), built for competitive strength. The
-scaffolding is complete and verified; move generation, make/unmake, search and
-evaluation are documented TODO stubs.
+A UCI chess engine in **C** (C17), built for competitive strength.
+
+Scaffolding, move generation, make/unmake, search and evaluation are all
+complete and verified. The search is a PVS with a transposition table, null
+move, LMR, singular extensions, SEE pruning and history heuristics; the
+evaluation is material plus tapered piece-square tables. What remains is
+tuning, Lazy SMP, and eventually NNUE — see the status table in README.md.
 
 ## Build and test
 
@@ -56,7 +60,9 @@ is worse than a bug — it makes every subsequent result untrustworthy.
 
 ## Testing discipline
 
-Read [docs/TESTING.md](docs/TESTING.md). The short version:
+Read [docs/TESTING.md](docs/TESTING.md) for the method and
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) for what has already been measured —
+record every new result there. The short version:
 
 - **Correctness changes** (movegen, make/unmake): must pass `make perft`
   exactly. Not "close" — exactly.

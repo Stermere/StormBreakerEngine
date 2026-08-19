@@ -4,8 +4,6 @@
  * A shared, lossy cache of previously searched positions. It is the single
  * highest-value data structure in the engine: the same position is reached by
  * many move orders, and reusing the earlier result collapses the search tree.
- *
- * Allocation and lifetime are implemented; probe/store are TODO.
  */
 #ifndef TT_H
 #define TT_H
@@ -39,6 +37,14 @@ typedef struct {
     uint8_t padding[6];
 } TTEntry;
 
+/* Field accessors. The packing of `genBound` is an implementation detail; go
+ * through these so it can change without touching the search. */
+static inline Move tt_entry_move(const TTEntry *e) { return (Move)e->move; }
+static inline Value tt_entry_value(const TTEntry *e) { return (Value)e->value; }
+static inline Value tt_entry_eval(const TTEntry *e) { return (Value)e->eval; }
+static inline Depth tt_entry_depth(const TTEntry *e) { return (Depth)e->depth; }
+static inline Bound tt_entry_bound(const TTEntry *e) { return (Bound)(e->genBound & 3); }
+
 /* Allocates (or reallocates) the table to `mb` megabytes and clears it.
  * Driven by the Hash UCI option. Returns false if allocation failed. */
 bool tt_resize(size_t mb);
@@ -61,17 +67,31 @@ int tt_hashfull(void);
 size_t tt_size_mb(void);
 
 /*
- * TODO(engine): implement probe and store.
+ * Looks `key` up. On a hit, copies the entry into `out` and refreshes its
+ * generation so a live entry is not evicted by a merely deeper one.
  *
- * Two details that are easy to get wrong and expensive to debug:
- *   - MATE SCORES must be stored relative to the current ply and converted
- *     back on probe. A mate score is "mate in N from here"; storing it
- *     absolutely makes the engine announce mates it cannot deliver.
- *   - Always validate a probed move with movegen_is_pseudo_legal() before
- *     playing it. key16 is only 16 bits, so collisions are routine.
+ * TWO THINGS THE CALLER MUST DO, both of which are silent corruption if
+ * skipped:
+ *
+ *   - Run the raw `value` through tt_value_from_tt() with the current ply.
+ *     Mate scores are stored as "mate in N from this node"; using one at a
+ *     different distance from the root makes the engine announce - and play
+ *     for - mates it cannot deliver.
+ *
+ *   - Validate tt_entry_move() with movegen_is_pseudo_legal() before playing
+ *     it. key16 is 16 bits, so collisions are routine rather than exotic, and
+ *     the move that comes back may belong to an entirely different position.
  */
 bool tt_probe(Key key, TTEntry *out);
+
+/* Stores a result. `value` is absolute (as the search sees it); `ply` is used
+ * to make mate scores relative on the way in. Pass VALUE_NONE for `eval` when
+ * no static evaluation was computed at this node. */
 void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, int ply);
+
+/* Converts a probed score back to one that is meaningful at `ply`. The inverse
+ * of what tt_store does on the way in. */
+Value tt_value_from_tt(Value v, int ply);
 
 /* Hints the CPU to start loading this key's cluster. Called just after
  * do_move, well before the probe, to hide the memory latency. */

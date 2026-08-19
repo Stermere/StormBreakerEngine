@@ -25,12 +25,12 @@ void eval_init(void);
 extern const Value PieceValues[PIECE_TYPE_NB];
 
 /*
- * Currently step 1 of the progression below. Every step after this one is a
+ * Currently step 2 of the progression below. Every step after this one is a
  * behavioural change and needs its own SPRT - see docs/TESTING.md.
  *
  * A pragmatic progression, SPRT-testing each step (see docs/TESTING.md):
  *   1. material only                        - DONE: gets you a playing engine
- *   2. piece-square tables, tapered between midgame and endgame
+ *   2. piece-square tables, tapered between midgame and endgame  - DONE
  *   3. pawn structure, mobility, king safety
  *   4. tune the weights on real game data (Texel tuning / gradient descent)
  *   5. replace the lot with an NNUE network once the search is strong

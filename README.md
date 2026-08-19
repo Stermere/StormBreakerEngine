@@ -3,10 +3,12 @@
 A UCI chess engine written in C, built for competitive strength.
 
 The engine plays legal chess. Move generation is verified exact against the
-published perft suites, and the search is the deliberate minimum: negamax with
-alpha-beta, iterative deepening, quiescence and MVV-LVA ordering over a
-material-only evaluation. That combination is the **baseline** — every change
-from here is measured against it with SPRT rather than argued for.
+published perft suites, and the search is a principal variation search with the
+standard modern apparatus: transposition table, null move, late move
+reductions, singular extensions, SEE-based pruning and a set of history
+heuristics, over a tapered material-and-piece-square evaluation.
+
+Every change from here is measured with SPRT rather than argued for.
 
 ---
 
@@ -25,13 +27,21 @@ from here is measured against it with SPRT rather than argued for.
 | Move generation (perft-exact, magic/PEXT sliders) | complete |
 | Make / unmake move | complete |
 | Time management | complete |
-| Search: iterative deepening, alpha-beta, quiescence | baseline |
-| Evaluation: material only | baseline |
-| **Transposition table probe / store** | **TODO** |
-| **Killers, history, null move, LMR** | **TODO** |
-| **Piece-square tables and beyond** | **TODO** |
-| **Remaining optimizations and performance upticks** | **TODO** |
+| Search: iterative deepening, alpha-beta, quiescence | complete |
+| Transposition table probe / store | complete |
+| Killers, history, counter-moves, null move, LMR, PVS | complete |
+| Aspiration windows, IIR, reverse futility, LMP, futility | complete |
+| Razoring, SEE pruning, quiescence delta pruning | complete |
+| Singular extensions, multi-cut, negative extensions | complete |
+| Capture history, multi-ply continuation history | complete |
+| Time management: phase curve + best-move stability | complete |
+| Evaluation: material + tapered piece-square tables | complete |
+| **Pawn structure, mobility, king safety** | **TODO** |
+| **Evaluation tuning on real game data** | **TODO** |
+| **Lazy SMP (`Threads` is capped at 1), staged move generation** | **TODO** |
+| **Correction history** | **TODO** |
 | **NNUE experiments and training pipeline. NN informed search** | **TODO** |
+| **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
 so the engine can be registered with a distributed testing cluster.
@@ -70,9 +80,8 @@ pwsh tools\gui.ps1 -App both
 so the GUI never runs a stale binary. It starts the app detached — your terminal
 stays usable.
 
-> Until move generation exists the engine connects and handshakes correctly,
-> then replies `bestmove 0000`. That is the expected behaviour, not a
-> misconfiguration.
+`bestmove 0000` means the engine found no legal move — checkmate, stalemate, or
+a `go searchmoves` list with nothing legal in it. Anywhere else it is a bug.
 
 ### Command-line matches
 
@@ -125,21 +134,29 @@ external/           gitignored: books, opponent engines, baselines, PGNs
 
 ---
 
-## Where to start building
+## Where to go next
 
-The intended order, because each step is verifiable before the next:
+Steps 1–5 of the original bring-up order (movegen, make/unmake, perft, eval,
+search) are done. **Every change from here is measured with
+`tools/sprt.ps1`** — read [docs/TESTING.md](docs/TESTING.md) first, because the
+testing methodology is what separates an engine that improves from one that
+drifts.
 
-1. **`src/movegen.c`** — pseudo-legal move generation.
-2. **`board_do_move` / `board_undo_move`** in `src/board.c`.
-3. **`make perft`** until every position in `tests/perft/` matches exactly.
-   Do not proceed while a single count is wrong.
-4. **`src/eval.c`** — material only, to begin with.
-5. **`src/search.c`** — negamax, then quiescence, then the transposition table,
-   then move ordering.
-6. From here on, **every change is measured with `tools/sprt.ps1`**.
+The open work, roughly in order of Elo per unit of effort:
 
-Read [docs/TESTING.md](docs/TESTING.md) before step 6 — the testing
-methodology is what separates an engine that improves from one that drifts.
+1. **Search parameter tuning.** Every margin in `search.c` is a plausible
+   first guess, not a measured optimum — the singular margin, the SEE
+   thresholds, the razoring and futility curves, the LMR formula. These are
+   the cheapest Elo left, and each one SPRTs independently.
+2. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
+   are file-scope and must move into a per-thread block first.
+3. **Staged move generation**, so a node that cuts on the table move never
+   generates or scores the rest of the list.
+4. **Evaluation** — pawn structure, mobility, king safety, then tuning.
+   Worth doing well enough to generate good self-play data, and no further:
+   an NNUE will beat anything hand-written here.
+5. **NNUE**, trained on self-play data. Generating it in-house keeps the
+   network clear of other engines' licensing.
 
 ---
 
@@ -147,6 +164,7 @@ methodology is what separates an engine that improves from one that drifts.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the modules fit together
 - [docs/TESTING.md](docs/TESTING.md) — perft, bench, SPRT, OpenBench
+- [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) — every measured change and what it scored
 - [docs/UCI.md](docs/UCI.md) — supported commands and options
 
 ---

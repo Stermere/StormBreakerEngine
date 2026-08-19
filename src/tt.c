@@ -1,11 +1,9 @@
 /*
  * tt.c - transposition table storage.
- *
- * Allocation, clearing and statistics are implemented so the Hash UCI option
- * is honest from day one. probe/store are TODO - see tt.h.
  */
 #include "tt.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,6 +20,80 @@ static TTCluster *Table;
 static size_t ClusterCount;
 static size_t SizeMb;
 static uint8_t Generation;
+
+/* Generation lives in the top 6 bits of genBound, so it advances in steps of 4
+ * and wraps after 64 searches. Ages are computed modulo that cycle. */
+#define GENERATION_DELTA 4
+#define GENERATION_MASK  0xFCu
+
+/* ------------------------------------------------------------- indexing -- */
+
+/* High 64 bits of a 64x64 multiply. */
+static inline uint64_t mul_hi64(uint64_t a, uint64_t b) {
+#if defined(__SIZEOF_INT128__)
+    return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) >> 64);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    return __umulh(a, b);
+#else
+    const uint64_t aLo = (uint32_t)a, aHi = a >> 32;
+    const uint64_t bLo = (uint32_t)b, bHi = b >> 32;
+    const uint64_t mid = aHi * bLo + ((aLo * bLo) >> 32);
+    return aHi * bHi + (mid >> 32) + ((aLo * bHi + (uint32_t)mid) >> 32);
+#endif
+}
+
+/*
+ * Maps a key onto a cluster.
+ *
+ * `key % ClusterCount` would be the obvious spelling and is a 64-bit hardware
+ * division - tens of cycles, on the critical path of every node. The
+ * multiply-shift below computes the same mapping for the cost of one multiply,
+ * and unlike a power-of-two mask it does not force the table to round down to
+ * the next power of two, which would discard up to half of whatever the user
+ * set Hash to.
+ *
+ * The key is shifted left by 16 first because key_verifier() stores the top 16
+ * bits: without the shift, the cluster index and the verification bits would
+ * be drawn from the same part of the key, and two positions landing in one
+ * cluster would be far more likely to also appear identical.
+ */
+static inline size_t cluster_index(Key key) {
+    return (size_t)mul_hi64(key << 16, (uint64_t)ClusterCount);
+}
+
+static inline uint16_t key_verifier(Key key) { return (uint16_t)(key >> 48); }
+
+/* --------------------------------------------------------- mate scores -- */
+
+/*
+ * A mate score means "mate in N plies from HERE", so it is only meaningful
+ * relative to the node that produced it. The same position reached at a
+ * different distance from the root carries a different absolute score, and
+ * storing the absolute one makes the engine announce - and play for - mates
+ * that are one transposition away from evaporating. Convert on the way in,
+ * convert back on the way out.
+ */
+static Value value_to_tt(Value v, int ply) {
+    if (v == VALUE_NONE)
+        return VALUE_NONE;
+    if (v >= VALUE_MATE_IN_MAX_PLY)
+        return v + ply;
+    if (v <= VALUE_MATED_IN_MAX_PLY)
+        return v - ply;
+    return v;
+}
+
+Value tt_value_from_tt(Value v, int ply) {
+    if (v == VALUE_NONE)
+        return VALUE_NONE;
+    if (v >= VALUE_MATE_IN_MAX_PLY)
+        return v - ply;
+    if (v <= VALUE_MATED_IN_MAX_PLY)
+        return v + ply;
+    return v;
+}
+
+/* ------------------------------------------------------------- lifetime -- */
 
 bool tt_resize(size_t mb) {
     if (mb == 0)
@@ -55,7 +127,7 @@ void tt_clear(void) {
     Generation = 0;
 }
 
-void tt_new_search(void) { Generation += 4; /* low 2 bits belong to Bound */ }
+void tt_new_search(void) { Generation += GENERATION_DELTA; /* low 2 bits belong to Bound */ }
 
 size_t tt_size_mb(void) { return SizeMb; }
 
@@ -75,32 +147,102 @@ int tt_hashfull(void) {
     return used;
 }
 
-/* ---------------------------------------------------------------- TODO --- */
+/* -------------------------------------------------------- probe / store -- */
 
 bool tt_probe(Key key, TTEntry *out) {
-    (void)key;
-    (void)out;
-    /* TODO(engine): index with `key % ClusterCount`, scan the cluster for a
-     * matching key16, and convert mate scores back to absolute. */
+    if (!Table)
+        return false;
+
+    TTCluster *const cluster = &Table[cluster_index(key)];
+    const uint16_t key16     = key_verifier(key);
+
+    for (int i = 0; i < TT_CLUSTER_SIZE; ++i) {
+        TTEntry *const e = &cluster->entry[i];
+
+        if (e->key16 == key16 && (e->genBound & 3) != BOUND_NONE) {
+            /* Refresh: an entry the search keeps hitting is worth more than
+             * its depth suggests, so drag it forward to the current
+             * generation and out of the replacement policy sights. */
+            e->genBound = (uint8_t)(Generation | (e->genBound & 3));
+            *out        = *e;
+            return true;
+        }
+    }
     return false;
 }
 
+/* How many searches ago this entry was written, modulo the generation cycle. */
+static inline int entry_age(const TTEntry *e) {
+    return (int)((uint8_t)(Generation - (e->genBound & GENERATION_MASK)) / GENERATION_DELTA);
+}
+
+/*
+ * Replacement priority: depth, discounted by age.
+ *
+ * Depth alone would let a deep entry from three searches ago - so, about a
+ * game position that has since been left behind - squat in the table
+ * indefinitely. Charging eight plies per generation means a stale entry has to
+ * be substantially deeper to survive, while an entry from the current search
+ * is displaced only by something genuinely better.
+ */
+static inline int replace_priority(const TTEntry *e) { return (int)e->depth - 8 * entry_age(e); }
+
 void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, int ply) {
-    (void)key;
-    (void)m;
-    (void)value;
-    (void)eval;
-    (void)depth;
-    (void)bound;
-    (void)ply;
-    /* TODO(engine): depth-preferred replacement, biased against stale
-     * generations. Make mate scores ply-relative before storing. */
+    if (!Table)
+        return;
+
+    assert(bound != BOUND_NONE);
+    assert(depth >= 0);
+
+    TTCluster *const cluster = &Table[cluster_index(key)];
+    const uint16_t key16     = key_verifier(key);
+
+    TTEntry *replace = &cluster->entry[0];
+
+    for (int i = 0; i < TT_CLUSTER_SIZE; ++i) {
+        TTEntry *const e = &cluster->entry[i];
+
+        /* Its own slot, or an empty one: nothing to weigh up. */
+        if (e->key16 == key16 || (e->genBound & 3) == BOUND_NONE) {
+            replace = e;
+            break;
+        }
+        if (replace_priority(e) < replace_priority(replace))
+            replace = e;
+    }
+
+    const bool sameSlot = replace->key16 == key16;
+
+    /* A node that failed low has no best move to report. Rather than erase the
+     * move a previous - possibly deeper - search found here, keep it: it is
+     * still the best guess anything has made about this position. */
+    if (!sameSlot || m != MOVE_NONE)
+        replace->move = (uint16_t)m;
+
+    /*
+     * Overwrite when the slot is not already ours, when the new result is
+     * exact, or when the new search is not meaningfully shallower. The
+     * four-ply slack matters: without it, re-searching a position at a reduced
+     * depth never refreshes the entry, so its generation goes stale while it
+     * is still in active use and the replacement policy starts evicting
+     * exactly the entries the search is relying on.
+     */
+    if (!sameSlot || bound == BOUND_EXACT || (Depth)replace->depth < depth + 4) {
+        const Value stored = value_to_tt(value, ply);
+        assert(stored >= INT16_MIN && stored <= INT16_MAX);
+
+        replace->key16    = key16;
+        replace->value    = (int16_t)stored;
+        replace->eval     = (int16_t)eval;
+        replace->depth    = (uint8_t)(depth > 255 ? 255 : depth);
+        replace->genBound = (uint8_t)(Generation | (unsigned)bound);
+    }
 }
 
 void tt_prefetch(Key key) {
     (void)key;
 #if defined(__GNUC__)
     if (Table && ClusterCount)
-        __builtin_prefetch(&Table[(size_t)key % ClusterCount]);
+        __builtin_prefetch(&Table[cluster_index(key)]);
 #endif
 }

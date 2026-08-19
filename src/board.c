@@ -12,10 +12,10 @@
 #include "movegen.h"
 #include "zobrist.h"
 
-static const char PieceChars[PIECE_NB] = {[W_PAWN] = 'P', [W_KNIGHT] = 'N', [W_BISHOP] = 'B',
-                                          [W_ROOK] = 'R', [W_QUEEN] = 'Q',  [W_KING] = 'K',
-                                          [B_PAWN] = 'p', [B_KNIGHT] = 'n', [B_BISHOP] = 'b',
-                                          [B_ROOK] = 'r', [B_QUEEN] = 'q',  [B_KING] = 'k'};
+static const char PieceChars[PIECE_NB] = {
+    [W_PAWN] = 'P',   [W_KNIGHT] = 'N', [W_BISHOP] = 'B', [W_ROOK] = 'R',
+    [W_QUEEN] = 'Q',  [W_KING] = 'K',   [B_PAWN] = 'p',   [B_KNIGHT] = 'n',
+    [B_BISHOP] = 'b', [B_ROOK] = 'r',   [B_QUEEN] = 'q',  [B_KING] = 'k'};
 
 static Piece piece_from_char(char c) {
     switch (c) {
@@ -62,6 +62,30 @@ void board_move_piece(Position *pos, Square from, Square to) {
     pos->board[to]   = pc;
 }
 
+/*
+ * Could `capturer` actually take en passant on `ep`?
+ *
+ * The en passant file belongs in the hash only when the right can be
+ * exercised. Folding it in regardless splits the transposition table: the same
+ * position reached with a double push ahead of it hashes differently from the
+ * one reached without, so neither entry can answer for the other, and every
+ * such pair costs an entry and a re-search to buy a right that does not exist.
+ *
+ * A pawn of `capturer` can take on `ep` exactly when it stands on a square
+ * that a pawn of the opposite colour standing on `ep` would attack - pawn
+ * attacks reverse under a colour flip, which is what makes the one lookup
+ * enough.
+ *
+ * Pseudo-legal on purpose: a pin can still forbid the capture. What matters is
+ * that the incremental update in do_move and this function ask exactly the
+ * same question, since the key's correctness is the agreement between them. A
+ * sharper test would have to be sharper in both places and would buy very
+ * little.
+ */
+static bool ep_capturable(const Position *pos, Color capturer, Square ep) {
+    return (pawn_attacks((Color)(capturer ^ 1), ep) & pieces_bb(pos, capturer, PAWN)) != BB_EMPTY;
+}
+
 Key board_compute_key(const Position *pos) {
     Key k = 0;
 
@@ -73,10 +97,7 @@ Key board_compute_key(const Position *pos) {
 
     k ^= ZobristCastling[pos->castling];
 
-    /* TODO(perf): only fold in the en passant file when an enemy pawn can
-     * actually capture. Hashing an irrelevant ep square splits transposition
-     * table entries that ought to be shared. */
-    if (pos->epSquare != SQ_NONE)
+    if (pos->epSquare != SQ_NONE && ep_capturable(pos, pos->sideToMove, pos->epSquare))
         k ^= ZobristEnPassant[file_of(pos->epSquare)];
 
     if (pos->sideToMove == BLACK)
@@ -213,9 +234,22 @@ bool board_set_fen(Position *pos, const char *fen) {
             case 'k': p.castling |= BLACK_OO; break;
             case 'q': p.castling |= BLACK_OOO; break;
             default:
-                /* TODO(chess960): Shredder-FEN spells rights as the rook's
-                 * file (A-H/a-h). Accept those and record the rook files once
-                 * castling move generation understands arbitrary rook starts. */
+                /*
+                 * TODO(chess960): Shredder-FEN spells rights as the rook's
+                 * file (A-H/a-h) instead of KQkq. Rejecting them is the honest
+                 * answer for now, because accepting them would produce a
+                 * position this engine cannot legally play.
+                 *
+                 * Supporting Chess960 is three changes, in this order:
+                 *   1. store the castling rook's origin square per right on
+                 *      Position, parsed from either FEN spelling;
+                 *   2. build the CastlingSpec table in movegen.c per position
+                 *      from those squares, rather than from the fixed
+                 *      standard-chess geometry it hard-codes today;
+                 *   3. derive castling_targets() in this file the same way.
+                 * The move encoding is already king-captures-own-rook, so
+                 * nothing above movegen has to change.
+                 */
                 return false;
             }
         }
@@ -410,9 +444,12 @@ void board_do_move(Position *pos, Move m) {
 
     Key k = pos->key ^ ZobristSideToMove;
 
-    /* The en passant right expires after exactly one ply, whatever happens. */
+    /* The en passant right expires after exactly one ply, whatever happens.
+     * Only unhash it if it was hashed: `us` is the side that could have taken,
+     * which is the side ep_capturable() was asked about when it went in. */
     if (pos->epSquare != SQ_NONE) {
-        k ^= ZobristEnPassant[file_of(pos->epSquare)];
+        if (ep_capturable(pos, us, pos->epSquare))
+            k ^= ZobristEnPassant[file_of(pos->epSquare)];
         pos->epSquare = SQ_NONE;
     }
 
@@ -471,7 +508,13 @@ void board_do_move(Position *pos, Move m) {
              * the only one whose origin and destination differ by two ranks. */
             if ((from ^ to) == 16) {
                 pos->epSquare = (Square)((from + to) / 2);
-                k ^= ZobristEnPassant[file_of(pos->epSquare)];
+
+                /* Recorded either way - the FEN has to show it - but hashed
+                 * only when `them` can actually answer it. A double push that
+                 * no pawn is standing next to leaves the position identical to
+                 * one reached any other way, and the key should say so. */
+                if (ep_capturable(pos, them, pos->epSquare))
+                    k ^= ZobristEnPassant[file_of(pos->epSquare)];
             }
         }
     }
@@ -557,7 +600,8 @@ void board_do_null_move(Position *pos) {
 
     Key k = pos->key ^ ZobristSideToMove;
     if (pos->epSquare != SQ_NONE) {
-        k ^= ZobristEnPassant[file_of(pos->epSquare)];
+        if (ep_capturable(pos, pos->sideToMove, pos->epSquare))
+            k ^= ZobristEnPassant[file_of(pos->epSquare)];
         pos->epSquare = SQ_NONE;
     }
 
