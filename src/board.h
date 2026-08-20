@@ -16,8 +16,17 @@
 #include "move.h"
 #include "types.h"
 
-/* Long enough for any realistic game plus a full search from its end. */
-#define MAX_GAME_PLY 1024
+/*
+ * Long enough for any realistic game plus a full search from its end.
+ *
+ * do_move pushes one Undo per ply and never checks the bound outside an
+ * assert, so this has to cover the worst case rather than the typical one:
+ * the longest game ever played competitively ran 269 moves (538 plies), and a
+ * search from that position can add MAX_PLY more. 1024 did not clear that -
+ * 538 + 246 overruns it - and the overrun is a silent write past the end of
+ * Position. Doubling costs 40 KB in a struct that is copied once per search.
+ */
+#define MAX_GAME_PLY 2048
 
 #define FEN_STARTPOS "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 

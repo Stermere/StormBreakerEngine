@@ -32,9 +32,11 @@ void uci_print_bestmove(Move best, Move ponder);
 
 /* ------------------------------------------------------------- options --- */
 
-/* Live values of the UCI options, read by the search and evaluation. */
-bool uci_chess960(void);
+/* Live values of the UCI options, read by the search and evaluation.
+ *
+ * Only the options something outside uci.c actually consults are exported.
+ * UCI_Chess960 is read by move_to_str() inside uci.c and stamped onto the
+ * Position, so it needs no accessor here. */
 int uci_move_overhead(void);
-int uci_multipv(void);
 
 #endif /* UCI_H */

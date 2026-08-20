@@ -172,6 +172,68 @@ static void set_check_info(Position *pos) {
     pos->pinned   = compute_pinned(pos, us, ksq);
 }
 
+/*
+ * The castling rights the diagram can actually support.
+ *
+ * A FEN is free to claim rights the pieces do not back, and GUIs send such
+ * positions - an edited board, a truncated game, a position pasted by hand.
+ * Trusting the claim is not a cosmetic error: gen_castling() consults
+ * `castling` and nothing else, so an unbacked right emits a castling move,
+ * and board_do_move then removes a piece from an empty square and puts a rook
+ * down where none stood. The engine invents material out of nothing and every
+ * search below that node is scoring a position that cannot exist.
+ *
+ * Standard chess only, matching the rest of this file - see the
+ * TODO(chess960) in the castling field parser.
+ */
+static CastlingRights supported_castling(const Position *p) {
+    CastlingRights rights = NO_CASTLING;
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Rank home = c == WHITE ? RANK_1 : RANK_8;
+
+        /* No king at home, no castling of either kind. */
+        if (piece_on(p, make_square(FILE_E, home)) != make_piece(c, KING))
+            continue;
+
+        const Piece rook = make_piece(c, ROOK);
+
+        if (piece_on(p, make_square(FILE_H, home)) == rook)
+            rights |= c == WHITE ? WHITE_OO : BLACK_OO;
+        if (piece_on(p, make_square(FILE_A, home)) == rook)
+            rights |= c == WHITE ? WHITE_OOO : BLACK_OOO;
+    }
+    return rights;
+}
+
+/*
+ * Whether an en passant target describes a double push that really happened.
+ *
+ * Same class of problem as the castling rights above, and the same
+ * consequence. gen_pawn_moves() emits an en passant capture whenever a pawn
+ * stands beside the target square, without checking that there is anything to
+ * capture; do_move then removes the "captured" pawn from a square that may be
+ * empty, which decrements pieceCount[NO_PIECE] and folds a pawn that was never
+ * there into the Zobrist key. The key then disagrees with
+ * board_compute_key(), which poisons every transposition table entry the
+ * search writes from that position onwards.
+ *
+ * The target sits on the sixth rank from the mover's side whichever colour is
+ * to move, so one expression covers both.
+ */
+static bool ep_target_is_real(const Position *p, Square ep) {
+    const Color us      = p->sideToMove;
+    const int up        = pawn_push(us);
+    const Square pawnSq = (Square)(ep - up); /* where the double-pushed pawn sits */
+    const Square fromSq = (Square)(ep + up); /* where it started */
+
+    if (relative_rank(us, ep) != RANK_6)
+        return false;
+
+    return piece_on(p, pawnSq) == make_piece((Color)(us ^ 1), PAWN) && is_empty(p, ep) &&
+           is_empty(p, fromSq);
+}
+
 bool board_set_fen(Position *pos, const char *fen) {
     /* Parse into scratch so a malformed FEN from a GUI leaves `pos` intact. */
     Position p;
@@ -278,6 +340,22 @@ bool board_set_fen(Position *pos, const char *fen) {
     /* --- sanity: exactly one king each, or nothing downstream is meaningful --- */
     if (p.pieceCount[W_KING] != 1 || p.pieceCount[B_KING] != 1)
         return false;
+
+    /*
+     * Discard castling rights and an en passant target the diagram does not
+     * back, rather than rejecting the whole FEN.
+     *
+     * Dropping is deliberate where the placement parser rejects. A wrong piece
+     * layout means the sender and the engine disagree about the position and
+     * there is nothing safe to do with it; a stale castling right or en
+     * passant square is routine output from position editors and PGN tools,
+     * and the position they describe is perfectly playable once the
+     * unsupportable claim is removed. Both must happen before the key is
+     * computed - they are part of what it hashes.
+     */
+    p.castling &= supported_castling(&p);
+    if (p.epSquare != SQ_NONE && !ep_target_is_real(&p, p.epSquare))
+        p.epSquare = SQ_NONE;
 
     p.chess960 = pos->chess960; /* preserve the UCI option across position changes */
     p.gamePly  = 0;

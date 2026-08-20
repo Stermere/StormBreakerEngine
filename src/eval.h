@@ -15,28 +15,32 @@
 void eval_init(void);
 
 /*
- * Centipawn piece values, indexed by PieceType.
+ * Centipawn exchange values, indexed by PieceType.
  *
- * Shared with the search, which orders captures by them, so ordering and
- * evaluation can never disagree about what a piece is worth. The king is zero:
- * it is never captured, and giving it a value would corrupt every exchange
- * calculation it appears in.
+ * Used by the search to order captures and to run static exchange evaluation.
+ * These are fixed textbook numbers and are deliberately NOT the tuned
+ * Material[] weights the evaluation itself uses - see the note at the top of
+ * eval.c. The king is zero: it is never captured, and giving it a value would
+ * corrupt every exchange calculation it appears in.
  */
 extern const Value PieceValues[PIECE_TYPE_NB];
 
 /*
- * Currently step 2 of the progression below. Every step after this one is a
- * behavioural change and needs its own SPRT - see docs/TESTING.md.
+ * The progression this evaluation has followed (see docs/TESTING.md; every
+ * step after the first is a behavioural change needing its own SPRT):
  *
- * A pragmatic progression, SPRT-testing each step (see docs/TESTING.md):
  *   1. material only                        - DONE: gets you a playing engine
  *   2. piece-square tables, tapered between midgame and endgame  - DONE
- *   3. pawn structure, mobility, king safety
- *   4. tune the weights on real game data (Texel tuning / gradient descent)
+ *   3. pawn structure, mobility, king safety, threats            - DONE
+ *   4. weights fitted to real game data (logistic regression on
+ *      win/draw/loss labels)                                     - DONE
  *   5. replace the lot with an NNUE network once the search is strong
  *
  * Steps 1-4 are worth several hundred Elo and teach you what the search
  * actually needs. Do not jump straight to step 5.
+ *
+ * Every weight lives in evalparams.c and is enumerated by evalparams.h, which
+ * is what lets `make tuner` refit all of them. docs/TUNING.md is the procedure.
  */
 Value eval_evaluate(const Position *pos);
 

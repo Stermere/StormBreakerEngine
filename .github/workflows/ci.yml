@@ -63,6 +63,13 @@ jobs:
           make ARCH=popcnt CC=${{ matrix.cc }} EXE=Engine-CITEST
           ls Engine-CITEST* || { echo "::error::make EXE= produced no such binary"; exit 1; }
 
+      # `make tuner` recompiles every engine source with -DTUNE, which switches
+      # on the parameter trace in eval.c. Nothing else builds that configuration,
+      # so without this step an eval change can break the fitter and not be
+      # noticed until someone tries to retune months later.
+      - name: Tuner builds
+        run: make tuner ARCH=popcnt CC=${{ matrix.cc }}
+
   # Undefined behaviour in a chess engine shows up as a rare illegal move or a
   # crash 40 moves into a tournament game. Catching it here is far cheaper.
   sanitizers:

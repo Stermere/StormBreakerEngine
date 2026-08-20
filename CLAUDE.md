@@ -8,9 +8,12 @@ A UCI chess engine in **C** (C17), built for competitive strength.
 
 Scaffolding, move generation, make/unmake, search and evaluation are all
 complete and verified. The search is a PVS with a transposition table, null
-move, LMR, singular extensions, SEE pruning and history heuristics; the
-evaluation is material plus tapered piece-square tables. What remains is
-tuning, Lazy SMP, and eventually NNUE — see the status table in README.md.
+move, LMR, singular extensions, SEE pruning and history heuristics. The
+evaluation is a 13,684-parameter linear model — material, piece-square tables,
+king-relative placement, mobility, pawn structure, king safety and threats —
+fitted to 22.6M positions from human games by `tools/tuner.c`. What remains is
+ablating that batch, Lazy SMP, and eventually NNUE — see the status table in
+README.md.
 
 ## Build and test
 
@@ -22,6 +25,7 @@ make bench              # deterministic node-count benchmark
 make perft              # movegen correctness suite
 make openbench-check    # verify OpenBench compliance
 make format             # apply .clang-format
+make tuner              # build the evaluation fitter (docs/TUNING.md)
 ```
 
 On Windows, `make` is MSYS2's (`C:\msys64\usr\bin\make.exe`) and the compiler is
@@ -57,6 +61,18 @@ is worse than a bug — it makes every subsequent result untrustworthy.
 7. **`search_clear()` must reset everything that carries between searches** —
    transposition table, history, killers. Otherwise results depend on what was
    searched before, and reproducibility is gone.
+
+8. **Every evaluation weight goes through `TERM()` in `eval.c`, and every
+   table is registered once in `EVAL_PARAM_TABLES`.** That macro emits the
+   score contribution and the tuner's gradient coefficient from the same
+   expression. A term that adds to a score by hand is invisible to the tuner,
+   which then optimises a model that is not the one being run — and nothing
+   crashes, the engine just quietly gets worse while the fit reports success.
+
+9. **The evaluation must stay linear in its weights.** The tuner is plain
+   gradient descent on a dot product. A term whose *weight* changes which
+   *coefficients* get produced (a threshold on the running score, a lazy exit)
+   silently breaks that assumption.
 
 ## Testing discipline
 
@@ -95,7 +111,8 @@ correct response is to implement movegen, not to relax the check.
 | `src/` | engine sources |
 | `tests/perft/` | correctness suites (EPD) |
 | `tools/` | setup, GUI launch/registration, SPRT, gauntlet (PowerShell) |
-| `docs/` | architecture, testing, UCI reference |
-| `external/` | **gitignored** — books, opponents, baselines, PGNs |
+| `tools/tuner.c` | the evaluation fitter; **not** part of the engine binary |
+| `docs/` | architecture, testing, tuning, UCI reference |
+| `external/` | **gitignored** — books, opponents, baselines, PGNs, training data |
 
 Never commit anything under `external/`, and never commit binaries or PGNs.

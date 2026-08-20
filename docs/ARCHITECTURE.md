@@ -10,7 +10,8 @@ main.c        startup, initialisation order, argv dispatch
   |     +-- search.c     search driver + worker thread
   |     |     |
   |     |     +-- movegen.c   move generation
-  |     |     +-- eval.c      static evaluation          [material + PSTs]
+  |     |     +-- eval.c      static evaluation
+  |     |     |     +-- evalparams.c  the 6842 tunable weights
   |     |     +-- tt.c        transposition table
   |     |     +-- timeman.c   clock allocation
   |     |
@@ -25,11 +26,19 @@ main.c        startup, initialisation order, argv dispatch
 thread.c      portable Win32/pthreads shim
 types.h       squares, pieces, colours, values, CPU intrinsics
 move.h        16-bit packed move encoding
+
+tools/tuner.c   offline weight fitting; links everything above except main.c
 ```
 
 Dependencies point downward only. Nothing below `search.c` knows the UCI
 protocol exists, which is what lets perft and bench drive the same code the GUI
 does.
+
+`tools/tuner.c` is the one thing outside that tree. It is not part of the engine
+binary - `make tuner` builds it separately, with `-DTUNE` - but it links the
+same `eval.c`, which is the point: the weights it fits are fitted against the
+evaluation that will actually run, not a reimplementation of it. See
+[TUNING.md](TUNING.md).
 
 ---
 

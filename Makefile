@@ -137,7 +137,11 @@ debug:
 
 # Every binary a release would ship. `native` is deliberately excluded: it is
 # not portable and must never be published.
+#
+# The mkdir is not optional: the compiler is asked to write straight into
+# build/, and ld does not create the directory - it fails the link outright.
 release:
+	@mkdir -p build
 	@for arch in legacy popcnt avx2 bmi2 avx512; do \
 	    echo "==> $$arch"; \
 	    $(MAKE) --no-print-directory ARCH=$$arch EXE=build/$(EXE)-$$arch CC=$(CC) || exit 1; \
@@ -184,14 +188,30 @@ openbench-check:
 	@rm -f Engine-OBCHECK$(SUFFIX) .obuci.txt
 	@echo "PASS: engine is OpenBench compliant"
 
+# ------------------------------------------------------------------ tuner --
+# The evaluation fitter (tools/tuner.c). Links every engine source except
+# main.c - it supplies its own - and builds with -DTUNE, which switches on the
+# parameter trace eval.c emits. Deliberately NOT part of `all`: it is developer
+# tooling, it is not shipped, and the engine binary must not carry it.
+TUNER_SOURCES := $(filter-out src/main.c,$(SOURCES)) tools/tuner.c
+
+tuner: $(TUNER_SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) -DTUNE -Isrc $(TUNER_SOURCES) -o tuner$(SUFFIX) $(LDFLAGS)
+	@echo "built tuner$(SUFFIX) - see docs/TUNING.md"
+
+# tools/tuner.c is included: it is C in this repository's style, and leaving it
+# out of the check is how it stops being that.
+FORMAT_FILES := $(SOURCES) $(HEADERS) tools/tuner.c
+
 format:
-	clang-format -i $(SOURCES) $(HEADERS)
+	clang-format -i $(FORMAT_FILES)
 
 format-check:
-	clang-format --dry-run --Werror $(SOURCES) $(HEADERS)
+	clang-format --dry-run --Werror $(FORMAT_FILES)
 
 clean:
 	rm -f $(EXE) $(EXE).exe $(EXE)-debug $(EXE)-debug.exe Engine-* *.o *.d .ob*.txt
+	rm -f tuner tuner.exe
 	rm -rf build
 
 help:
@@ -202,5 +222,6 @@ help:
 	@echo "make perft-all          movegen correctness suite at full depth"
 	@echo "make release            build all distributable ARCHs into build/"
 	@echo "make openbench-check    verify OpenBench compliance"
+	@echo "make tuner              build the evaluation fitter (docs/TUNING.md)"
 	@echo "make format[-check]     apply / verify .clang-format"
 	@echo "make clean"

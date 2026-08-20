@@ -6,7 +6,13 @@ The engine plays legal chess. Move generation is verified exact against the
 published perft suites, and the search is a principal variation search with the
 standard modern apparatus: transposition table, null move, late move
 reductions, singular extensions, SEE-based pruning and a set of history
-heuristics, over a tapered material-and-piece-square evaluation.
+heuristics.
+
+The evaluation is a 13,684-parameter linear model — material, piece-square
+tables, placement conditioned on king position, mobility, pawn structure, king
+safety and threats — with every weight fitted by logistic regression to 22.6
+million quiet positions from 3.4 million human games. See
+[docs/TUNING.md](docs/TUNING.md).
 
 Every change from here is measured with SPRT rather than argued for.
 
@@ -36,8 +42,9 @@ Every change from here is measured with SPRT rather than argued for.
 | Capture history, multi-ply continuation history | complete |
 | Time management: phase curve + best-move stability | complete |
 | Evaluation: material + tapered piece-square tables | complete |
-| **Pawn structure, mobility, king safety** | **TODO** |
-| **Evaluation tuning on real game data** | **TODO** |
+| Evaluation: pawn structure, mobility, king safety, threats | complete |
+| Evaluation: king-relative placement (factorised HalfKA, 6144 weights) | complete |
+| Evaluation tuning on real game data (`make tuner`) | complete |
 | **Lazy SMP (`Threads` is capped at 1), staged move generation** | **TODO** |
 | **Correction history** | **TODO** |
 | **NNUE experiments and training pipeline. NN informed search** | **TODO** |
@@ -55,6 +62,7 @@ make                     # build for this machine
 make bench               # deterministic node-count benchmark
 make perft               # move generation correctness suite
 make openbench-check     # verify OpenBench compliance
+make tuner               # build the evaluation fitter
 make help                # all targets
 ```
 
@@ -144,18 +152,26 @@ drifts.
 
 The open work, roughly in order of Elo per unit of effort:
 
-1. **Search parameter tuning.** Every margin in `search.c` is a plausible
+1. **Ablate the evaluation batch.** E10 went in as one feature and gained
+   +270 Elo, which establishes the batch and attributes nothing. The
+   king-relative tables, the tuning itself, and king safety each want their
+   own measurement — see the table at the end of
+   [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
+2. **Search parameter tuning.** Every margin in `search.c` is a plausible
    first guess, not a measured optimum — the singular margin, the SEE
-   thresholds, the razoring and futility curves, the LMR formula. These are
-   the cheapest Elo left, and each one SPRTs independently.
-2. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
+   thresholds, the razoring and futility curves, the LMR formula. Each one
+   SPRTs independently.
+3. **A pawn hash table.** The evaluation costs 20% of the old nps. Most of
+   that is pawn structure, recomputed every node for a structure that rarely
+   changes. This is a *pure speedup*: the bench node count must come back
+   unchanged, which is what makes it provable without an SPRT.
+4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
    are file-scope and must move into a per-thread block first.
-3. **Staged move generation**, so a node that cuts on the table move never
+5. **Staged move generation**, so a node that cuts on the table move never
    generates or scores the rest of the list.
-4. **Evaluation** — pawn structure, mobility, king safety, then tuning.
-   Worth doing well enough to generate good self-play data, and no further:
-   an NNUE will beat anything hand-written here.
-5. **NNUE**, trained on self-play data. Generating it in-house keeps the
+6. **NNUE.** The tuner's feature extraction is already the network's input
+   layer: the king-relative tables are a factorised HalfKA set, so the same
+   code produces the same features. Generating the data in-house keeps the
    network clear of other engines' licensing.
 
 ---
@@ -164,6 +180,7 @@ The open work, roughly in order of Elo per unit of effort:
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the modules fit together
 - [docs/TESTING.md](docs/TESTING.md) — perft, bench, SPRT, OpenBench
+- [docs/TUNING.md](docs/TUNING.md) — fitting the evaluation to real games
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) — every measured change and what it scored
 - [docs/UCI.md](docs/UCI.md) — supported commands and options
 

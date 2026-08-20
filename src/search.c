@@ -1707,8 +1707,12 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
 
         prevScore = value;
         best      = iterationBest;
-        if (PvLength[0] > 1)
-            *ponderMove = PvTable[0][1];
+
+        /* Cleared, not left alone, when this iteration has no second PV move:
+         * the stale entry belongs to a line the search has since abandoned, and
+         * pondering on a move that no longer follows `best` wastes the whole
+         * ponder search and desynchronises the GUI on ponderhit. */
+        *ponderMove = PvLength[0] > 1 ? PvTable[0][1] : MOVE_NONE;
 
         print_iteration(depth, value, elapsed_ms());
         sort_root_moves(roots, rootCount);

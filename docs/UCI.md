@@ -41,14 +41,19 @@ Stockfish's, so the two can be diffed directly.
 |---|---|---|---|---|
 | `Hash` | spin | 16 | 1–65536 | transposition table size in MB |
 | `Threads` | spin | 1 | 1–1 | pinned to 1 until the search is parallel |
-| `Ponder` | check | false | | |
-| `MultiPV` | spin | 1 | 1–256 | |
+| `Ponder` | check | false | | the GUI drives pondering with `go ponder` |
 | `Move Overhead` | spin | 10 | 0–5000 | ms reserved for GUI/network latency |
 | `UCI_Chess960` | check | false | | switches castling move notation |
 
 `Hash` and `Threads` are mandatory for OpenBench compliance. `Threads` honestly
 advertises `max 1` rather than accepting a value it cannot deliver — a test
 client that believes an engine is multi-threaded will schedule games wrongly.
+
+`MultiPV` is deliberately **not** advertised. The search reports one line, and
+an option that is accepted and then ignored is the same trap as an inflated
+`Threads` range: a GUI asking for four lines would silently get one, and an
+analysis session would draw conclusions from a list that was never computed.
+It returns when the search can actually produce it.
 
 ---
 

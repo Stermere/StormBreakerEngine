@@ -148,9 +148,10 @@ if ($Smoke) {
 if (-not $Book) { $Book = Get-Book }
 $bookArgs = @()
 if ($Book -and (Test-Path $Book)) {
-    # order=random with a per-run seed, and -repeat so both engines get each
-    # opening from both colours. Without -repeat, colour luck becomes noise
-    # that the SPRT has to spend extra games averaging away.
+    # -repeat gives both engines each opening from both colours. Without it,
+    # colour luck becomes noise the SPRT has to spend extra games averaging
+    # away. No seed is pinned, so fastchess picks the opening order afresh per
+    # run and two runs of the same patch do not play the same games.
     $bookArgs = @('-openings', "file=$((Resolve-Path $Book).Path)", 'format=epd', 'order=random')
 } else {
     Write-Warn2 'No opening book found - games will start from the initial position.'

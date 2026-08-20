@@ -183,3 +183,129 @@ free.
 **Action:** removed. A version with a margin loose enough to fire before LMP
 does is a legitimate future experiment, but it is a different change and needs
 its own test.
+
+---
+
+### E10 — The evaluation: new terms, and weights fitted to human games
+
+**Date** 2026-08-19 · **Baseline** `eval-base` (commit 1ad1c42) · **Bench** 254099 -> 287826
+
+The largest single change the engine has had, and deliberately tested as one
+feature rather than as a dozen. Everything below shipped together:
+
+- **New terms.** Pawn structure (isolated, doubled, backward, connected,
+  phalanx, passed by rank with blocked/defended/king-distance variants,
+  candidate passers), mobility per piece type, king safety (pawn shelter and
+  storm, king-ring attacker count and weight, safe checks, king on an open
+  file), threats by pawn/minor/rook/king, hanging and restricted squares,
+  bishop pair, bad bishop, outposts, rook on open and semi-open files, tempo.
+- **King-relative placement.** 6144 weights: piece placement conditioned on
+  which of 8 buckets each king stands in, for the own king and the enemy king
+  separately. A deliberately NNUE-shaped feature set (factorised HalfKA), so
+  the extraction transfers to the network's input layer later.
+- **All 13,684 weights fitted** to 22,578,820 quiet positions drawn from
+  3,360,336 human games (12 months of the Lichess Elite database, CC0),
+  labelled with the result of the game they came from. See
+  [TUNING.md](TUNING.md).
+
+| | STC | LTC |
+|---|---|---|
+| TC / bounds | 8+0.08, [0, 5] normalized | 40+0.4, [0.5, 4.5] normalized |
+| **Result** | **H1** — LLR 2.94 at 372 games | **H1** — LLR 2.96 at 428 games |
+| Elo | **+269.69 ± 42.72** | **+327.16 ± 43.28** |
+| nElo | +327.54 ± 35.31 | +430.03 ± 32.92 |
+| Record | 294W / 52L / 26D, 82.53% | 359W / 44L / 25D, 86.80% |
+| Ptnml | [3, 2, 45, 22, 114] | [0, 2, 43, 21, 148] |
+
+**The gain is larger at LTC than at STC** (+327 vs +270), which is the
+direction that matters. An evaluation change that only helps at shallow depth
+is usually an artefact — it is scoring positions the search would have resolved
+anyway. Growing with depth means the opposite: the search is being pointed
+somewhere better, and it has further to run once pointed. It also fits the
+mechanism, since a king-safety blindness gets more punishing the deeper the
+opponent can see.
+
+**Why it is this large.** The baseline evaluation was material and piece-square
+tables and nothing else — it had no notion of king safety whatsoever. 750 of
+the 800 games ended in mate. An engine that cannot see its own king being
+surrounded loses to one that can, and it loses by getting mated, which is
+exactly the shape of this result. Do not read +270 as evidence that the terms
+are individually well tuned; read it as evidence of how much was missing.
+
+Verified against the obvious artefact: every one of the 800 games across both
+time controls terminated normally — 750 by mate, 50 by a draw rule. Zero time
+forfeits, zero crashes, zero illegal moves. Both binaries were built
+`ARCH=native` from the same compiler with the same hash and thread settings.
+
+**Cost.** The evaluation is about five times the work it was: nps fell from
+1,568,512 to 1,256,882 on the bench, a 20% loss, which is worth roughly -20
+Elo on its own. The terms paid for that many times over, but the figure is
+worth keeping in view — a future pawn hash table would recover most of it as a
+pure speedup, provable by an unchanged bench node count.
+
+**What this does NOT establish.** Ten-plus changes went in at once, exactly as
+in E1, and for the same reason: the harness had to exist before any of it could
+be measured at all. The batch is worth keeping. Nothing here attributes any of
+the gain to any individual term, and with an effect this large it is entirely
+possible some component is neutral or negative and is being carried by the
+rest. The ablations worth running, in rough order of how much is riding on an
+untested assumption:
+
+| Ablation | Question it answers |
+|---|---|
+| King-relative tables zeroed | Are the 6144 capacity weights earning their cache pressure, or is the classical tier doing all the work? |
+| Untuned weights, terms only | How much of +270 is the terms and how much is the fitting? |
+| Self-play data instead of human | The label-source argument in TUNING.md, measured rather than argued |
+| King safety removed | Almost certainly the largest single component; worth sizing |
+
+The self-play arm already exists: `external/games/*.pgn` extracts to 205,734
+positions and fits with the same command.
+
+**A caution about the fitted numbers.** `Material[]` came out at pawn 43,
+rook 386/677, which looks broken and is not. Material is collinear with the
+three placement tables — the tuner can move value between them because only
+their sum appears in a score. Measured end to end, by deleting a piece from
+real positions and diffing the evaluation, the engine prices a pawn at 107 and
+a rook at 550. Read the sums, never the individual tables.
+
+---
+
+
+## Absolute strength
+
+Every Elo figure above is relative to another build in `externalaselines`,
+none of which is itself rated. This anchors them. `toolsating.ps1` plays a
+ladder of Stockfish `UCI_Elo` rungs and fits one rating by inverse-variance
+weighting.
+
+**2026-08-19**, after E10, at STC 8+0.08, 100 games per rung:
+
+| SF rung | W-L-D | score | implied rating |
+|---|---|---|---|
+| 2600 | 70-20-10 | 75.0% | 2791 ± 79 |
+| 2800 | 38-41-21 | 48.5% | 2790 ± 68 |
+| 3000 | 20-63-17 | 28.5% | 2840 ± 75 |
+| 3190 | 8-74-18 | 17.0% | 2915 ± 91 |
+
+**Combined: 2826 ± 38.**
+
+Read the 2600 and 2800 rungs, not the combined figure. Those two bracket the
+50% point, so they need the least extrapolation — and they agree to within one
+Elo (2791 and 2790) from positions 400 nominal points apart, which is about as
+strong an internal consistency check as this method offers. The drift upward at
+3000 and 3190 is `UCI_Elo` compressing near full strength, not the engine
+outperforming there.
+
+**The honest number is ~2790 at blitz, ±100 or so.** The ±38 is statistical
+only and badly understates the real uncertainty: `UCI_Elo` is Stockfish's own
+calibration rather than the CCRL scale, a strength-limited engine makes
+occasional deliberate errors instead of being uniformly weaker, and ratings are
+time-control specific. Do not quote it as a rating; use it to decide whether a
+milestone has been passed.
+
+Verification that the ladder engages at all, rather than silently running a
+full-strength Stockfish in every seat: SF-1320 lost 0-22 to SF-2600, and the
+score above falls monotonically as the rung rises. `UCI_Elo` is ignored unless
+`UCI_LimitStrength` is also set, and setting one without the other fails
+silently - which is exactly the mistake that would make an engine look 400
+points weaker than it is.

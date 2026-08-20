@@ -1,209 +1,114 @@
 /*
  * eval.c - static position evaluation.
  *
- * Material plus piece-square tables, tapered between a midgame and an endgame
- * set. That is step 2 of the roadmap in eval.h.
+ * Material, piece placement (both unconditional and conditioned on king
+ * position), mobility, pawn structure, king safety and threats, every term
+ * tapered between a midgame and an endgame weight. That is steps 3 and 4 of
+ * the roadmap in eval.h.
  *
- * The tapering is the part that is easy to underrate. A single set of tables
- * cannot be right for both phases, because the same square means opposite
- * things at different points in the game: a king on g1 behind three pawns is
- * exactly where it belongs on move 20 and a liability on move 60, and a pawn
- * on the seventh is nearly a queen in an endgame and a weakness in a
- * middlegame. Interpolating between two sets by how much material is left
- * gives a score that moves continuously as pieces come off, instead of one
- * that jumps the moment some threshold is crossed.
+ * The tapering is the part that is easy to underrate. A single set of weights
+ * cannot be right for both phases, because the same fact means opposite things
+ * at different points in the game: a king on g1 behind three pawns is exactly
+ * where it belongs on move 20 and a liability on move 60, and a pawn on the
+ * seventh is nearly a queen in an endgame and a weakness in a middlegame.
+ * Interpolating by how much material is left gives a score that moves
+ * continuously as pieces come off, instead of one that jumps the moment some
+ * threshold is crossed.
+ *
+ * NOT ONE NUMBER IN THIS FILE IS A LITERAL. Every weight lives in a table in
+ * evalparams.c and is applied through TERM(), which adds the weight to the
+ * running score and records the coefficient for the tuner in the same
+ * expression. That is what makes the evaluation fittable: the tuner never has
+ * to model what this file does, it just reads out what this file did.
  */
 #include "eval.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "bitboard.h"
+#include "evalparams.h"
 
 /*
- * Deliberately the plain textbook values rather than anything tuned. A tuned
- * set is a behavioural change and belongs behind its own SPRT; starting from
- * the obvious numbers keeps that measurement honest.
+ * Static exchange values, used by the search to order captures and to prune.
+ *
+ * These are deliberately NOT the tuned Material[] table below. SEE needs
+ * values that are stable, ordered and non-negative, because it walks an
+ * exchange sequence and a table where a bishop outranks a rook produces
+ * nonsense. Tuned material weights carry no such guarantee - the tuner is free
+ * to move value between Material[] and the placement tables, since only their
+ * sum is observable in a score. Keeping the exchange table fixed means tuning
+ * the evaluation can never silently change how the search orders moves.
  */
 const Value PieceValues[PIECE_TYPE_NB] = {
     [NO_PIECE_TYPE] = 0, [PAWN] = 100,  [KNIGHT] = 320, [BISHOP] = 330,
     [ROOK] = 500,        [QUEEN] = 900, [KING] = 0,
 };
 
+/* ------------------------------------------------------------- utilities -- */
+
+/* A running white-relative score, midgame and endgame accumulated together. */
+typedef struct {
+    int mg, eg;
+} Score;
+
 /*
- * Endgame material values. PieceValues above doubles as the midgame set, which
- * keeps it honest as the exchange table the search orders captures with - the
- * two can never disagree about what a piece is worth in a middlegame trade.
+ * Apply one weight. `table` must be a bare table name so PARAM_OFF_##table
+ * resolves; `coeff` is signed - positive for white, negative for black - which
+ * is what keeps the whole evaluation white-relative until the very last line.
  *
- * Pawns are worth more here because they promote, and the pieces that stop
- * them gain a little with them. Every one of these numbers is a guess until it
- * is tuned; the point of step 4 of the roadmap is to replace them with numbers
- * fitted to real games.
+ * The trace entry is derived from the same index and coefficient as the score,
+ * so the tuner's gradient and the evaluation's arithmetic cannot disagree.
+ * This macro is the only sanctioned way to add anything to a score.
  */
-static const Value EgPieceValues[PIECE_TYPE_NB] = {
-    [NO_PIECE_TYPE] = 0, [PAWN] = 120,  [KNIGHT] = 320, [BISHOP] = 340,
-    [ROOK] = 550,        [QUEEN] = 980, [KING] = 0,
-};
+#define TERM(sc, table, index, coeff)          \
+    do {                                       \
+        const int i_ = (index);                \
+        const int c_ = (coeff);                \
+        (sc)->mg += c_ * (table)[i_].mg;       \
+        (sc)->eg += c_ * (table)[i_].eg;       \
+        TRACE_ADD(PARAM_OFF_##table + i_, c_); \
+    } while (0)
+
+/* +1 for white, -1 for black: the sign every term is applied with. */
+#define SIGN(c) ((c) == WHITE ? 1 : -1)
+
+static inline int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static inline int abs_int(int v) { return v < 0 ? -v : v; }
+
+/* Chebyshev distance - the number of king moves between two squares. */
+static inline int square_distance(Square a, Square b) {
+    const int df = abs_int((int)file_of(a) - (int)file_of(b));
+    const int dr = abs_int((int)rank_of(a) - (int)rank_of(b));
+    return df > dr ? df : dr;
+}
+
+/* The square as its owner sees it: black's board is flipped so both colours
+ * read the same tables. */
+static inline Square relative_square(Color c, Square s) { return c == WHITE ? s : flip_rank(s); }
+
+/* The piece of `b` nearest to `c`'s own back rank. Undefined for empty `b`. */
+static inline Square frontmost(Color c, Bitboard b) { return c == WHITE ? lsb(b) : msb(b); }
+
+/* --------------------------------------------------------- derived masks -- */
+
+/* Filled by eval_init(). All are pure functions of the geometry, so they cost
+ * nothing at runtime and keep the term code readable. */
+static Bitboard AdjacentFiles[8];
+static Bitboard ForwardRanks[COLOR_NB][8]; /* strictly ahead of this rank */
+static Bitboard ForwardFile[COLOR_NB][SQUARE_NB];
+static Bitboard PassedPawnSpan[COLOR_NB][SQUARE_NB];
+static Bitboard PawnAttackSpan[COLOR_NB][SQUARE_NB];
+
+/* --------------------------------------------------------- game phase ----- */
 
 /*
- * Piece-square tables, written from white's point of view with RANK 8 ON THE
- * FIRST LINE so they read like a chessboard. eval_init() flips them into board
- * order, so what you see here is what white sees looking up the board.
- */
-/* clang-format off */
-static const Value PstMg[PIECE_TYPE_NB][SQUARE_NB] = {
-    [PAWN] = {
-          0,   0,   0,   0,   0,   0,   0,   0,
-         50,  50,  50,  50,  50,  50,  50,  50,
-         10,  10,  20,  30,  30,  20,  10,  10,
-          5,   5,  10,  25,  25,  10,   5,   5,
-          0,   0,   0,  20,  20,   0,   0,   0,
-          5,  -5, -10,   0,   0, -10,  -5,   5,
-          5,  10,  10, -20, -20,  10,  10,   5,
-          0,   0,   0,   0,   0,   0,   0,   0,
-    },
-    [KNIGHT] = {
-        -50, -40, -30, -30, -30, -30, -40, -50,
-        -40, -20,   0,   0,   0,   0, -20, -40,
-        -30,   0,  10,  15,  15,  10,   0, -30,
-        -30,   5,  15,  20,  20,  15,   5, -30,
-        -30,   0,  15,  20,  20,  15,   0, -30,
-        -30,   5,  10,  15,  15,  10,   5, -30,
-        -40, -20,   0,   5,   5,   0, -20, -40,
-        -50, -40, -30, -30, -30, -30, -40, -50,
-    },
-    [BISHOP] = {
-        -20, -10, -10, -10, -10, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,  10,  10,   5,   0, -10,
-        -10,   5,   5,  10,  10,   5,   5, -10,
-        -10,   0,  10,  10,  10,  10,   0, -10,
-        -10,  10,  10,  10,  10,  10,  10, -10,
-        -10,   5,   0,   0,   0,   0,   5, -10,
-        -20, -10, -10, -10, -10, -10, -10, -20,
-    },
-    [ROOK] = {
-          0,   0,   0,   0,   0,   0,   0,   0,
-          5,  10,  10,  10,  10,  10,  10,   5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-          0,   0,   0,   5,   5,   0,   0,   0,
-    },
-    [QUEEN] = {
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,   5,   5,   5,   0, -10,
-         -5,   0,   5,   5,   5,   5,   0,  -5,
-          0,   0,   5,   5,   5,   5,   0,  -5,
-        -10,   5,   5,   5,   5,   5,   0, -10,
-        -10,   0,   5,   0,   0,   0,   0, -10,
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-    },
-    /* The midgame king wants a corner behind unmoved pawns, and the table says
-     * so bluntly: the centre is worth half a pawn less than g1. */
-    [KING] = {
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -20, -30, -30, -40, -40, -30, -30, -20,
-        -10, -20, -20, -20, -20, -20, -20, -10,
-         20,  20,   0,   0,   0,   0,  20,  20,
-         20,  30,  10,   0,   0,  10,  30,  20,
-    },
-};
-
-static const Value PstEg[PIECE_TYPE_NB][SQUARE_NB] = {
-    /* Endgame pawns are scored almost purely by how close they are to
-     * promoting, which is what makes the engine push them instead of shuffling
-     * pieces while its passer sits on the fourth rank. */
-    [PAWN] = {
-          0,   0,   0,   0,   0,   0,   0,   0,
-         80,  80,  80,  80,  80,  80,  80,  80,
-         50,  50,  50,  50,  50,  50,  50,  50,
-         30,  30,  30,  30,  30,  30,  30,  30,
-         15,  15,  15,  15,  15,  15,  15,  15,
-          5,   5,   5,   5,   5,   5,   5,   5,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-    },
-    [KNIGHT] = {
-        -40, -30, -20, -20, -20, -20, -30, -40,
-        -30, -15,   0,   0,   0,   0, -15, -30,
-        -20,   0,  10,  15,  15,  10,   0, -20,
-        -20,   5,  15,  20,  20,  15,   5, -20,
-        -20,   0,  15,  20,  20,  15,   0, -20,
-        -20,   5,  10,  15,  15,  10,   5, -20,
-        -30, -15,   0,   5,   5,   0, -15, -30,
-        -40, -30, -20, -20, -20, -20, -30, -40,
-    },
-    [BISHOP] = {
-        -15, -10, -10, -10, -10, -10, -10, -15,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,  10,  10,   5,   0, -10,
-        -10,   5,   5,  10,  10,   5,   5, -10,
-        -10,   0,  10,  10,  10,  10,   0, -10,
-        -10,   5,   5,  10,  10,   5,   5, -10,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -15, -10, -10, -10, -10, -10, -10, -15,
-    },
-    /* No central-file preference left: in an endgame a rook belongs behind a
-     * passed pawn or on the seventh, and neither is a property of the file. */
-    [ROOK] = {
-          0,   0,   0,   0,   0,   0,   0,   0,
-         10,  10,  10,  10,  10,  10,  10,  10,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-    },
-    [QUEEN] = {
-        -10,  -5,  -5,  -5,  -5,  -5,  -5, -10,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   5,   5,   5,   5,   0,  -5,
-         -5,   0,   5,  10,  10,   5,   0,  -5,
-         -5,   0,   5,  10,  10,   5,   0,  -5,
-         -5,   0,   5,   5,   5,   5,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-        -10,  -5,  -5,  -5,  -5,  -5,  -5, -10,
-    },
-    /* And the endgame king wants the exact opposite of the midgame one: the
-     * centre, where it supports pawns and cuts the enemy king off. Sitting on
-     * g1 in a pawn endgame loses games that a centralised king draws. */
-    [KING] = {
-        -50, -40, -30, -20, -20, -30, -40, -50,
-        -30, -20, -10,   0,   0, -10, -20, -30,
-        -30, -10,  20,  30,  30,  20, -10, -30,
-        -30, -10,  30,  40,  40,  30, -10, -30,
-        -30, -10,  30,  40,  40,  30, -10, -30,
-        -30, -10,  20,  30,  30,  20, -10, -30,
-        -30, -30,   0,   0,   0,   0, -30, -30,
-        -50, -30, -30, -30, -30, -30, -30, -50,
-    },
-};
-/* clang-format on */
-
-/*
- * Material plus square value, per piece code and square, ready to sum. Built
- * by eval_init() so the hot loop is two array reads and two adds per piece
- * rather than a piece-type switch and a colour-dependent square flip.
+ * 24 with all the pieces on, 0 once only kings and pawns remain.
  *
- * Black entries are negated and vertically mirrored, so both colours are
- * accumulated into one running white-relative total with no branch.
- */
-static Value PsqMg[PIECE_NB][SQUARE_NB];
-static Value PsqEg[PIECE_NB][SQUARE_NB];
-
-/*
- * Game phase: 24 with all the pieces on, 0 once only kings and pawns remain.
- *
- * Pawns deliberately contribute nothing. Phase is meant to measure how much
- * material is left to attack WITH, and a position with every pawn and no piece
- * is an endgame however many pawns are on the board.
+ * Pawns deliberately contribute nothing. Phase measures how much material is
+ * left to attack WITH, and a position with every pawn and no piece is an
+ * endgame however many pawns are on the board.
  */
 #define PHASE_MAX 24
 
@@ -225,93 +130,481 @@ static int game_phase(const Position *pos) {
     return phase > PHASE_MAX ? PHASE_MAX : phase;
 }
 
+/* --------------------------------------------------------- shared state --- */
+
+/*
+ * Everything computed once and used by several terms. Attack maps are the bulk
+ * of it: mobility, king safety and threats all want to know which squares each
+ * side covers, and computing that three times would triple the cost of the
+ * most expensive part of the evaluation.
+ */
+typedef struct {
+    Square ksq[COLOR_NB];
+    Bitboard kingRing[COLOR_NB];
+    Bitboard mobilityArea[COLOR_NB];
+
+    Bitboard attackedBy[COLOR_NB][PIECE_TYPE_NB];
+    Bitboard attackedAll[COLOR_NB];
+    Bitboard attackedBy2[COLOR_NB]; /* covered at least twice */
+
+    /* Filled while scoring pieces, consumed by the king safety terms. */
+    int kingAttackerCount[COLOR_NB]; /* enemy pieces bearing on this king's ring */
+    int kingRingAttacks[COLOR_NB];   /* ring squares the enemy covers */
+} EvalInfo;
+
+/* ------------------------------------------------- king-relative indexing -- */
+
+/*
+ * Fold the 64 king squares onto 8 buckets.
+ *
+ * The king square is first normalised (rank-flipped for black, file-mirrored
+ * when it sits on the kingside), which leaves 32 distinct squares; pairing
+ * files and ranks halves each axis again. Eight is a compromise: more buckets
+ * describe the king's influence more precisely, but each one only sees an
+ * eighth of the training positions, and a bucket the tuner cannot fill is
+ * worse than no bucket at all.
+ */
+static inline int king_bucket(Square normalisedKing) {
+    return (int)(rank_of(normalisedKing) >> 1) * 2 + (int)(file_of(normalisedKing) >> 1);
+}
+
+/* Mirror across the d/e file boundary. */
+static inline Square mirror_file(Square s) { return (Square)(s ^ 7); }
+
+/*
+ * Score one piece's placement relative to a king.
+ *
+ * `kingSq` and `pieceSq` arrive already rank-normalised for the piece's owner.
+ * Mirroring is driven by the KING, not the piece: the whole point is to
+ * describe where the piece stands with respect to that king, so both squares
+ * must be folded the same way or the table would be indexed inconsistently.
+ */
+#define TERM_PSQK(sc, table, kingSq, pieceSq, pt, coeff)             \
+    do {                                                             \
+        Square k_ = (kingSq), p_ = (pieceSq);                        \
+        if (file_of(k_) >= FILE_E) {                                 \
+            k_ = mirror_file(k_);                                    \
+            p_ = mirror_file(p_);                                    \
+        }                                                            \
+        TERM(sc, table, PSQK_IDX(king_bucket(k_), (pt), p_), coeff); \
+    } while (0)
+
+/* ------------------------------------------------------------ init -------- */
+
 void eval_init(void) {
-    for (PieceType pt = PAWN; pt <= KING; ++pt) {
+    for (File f = FILE_A; f <= FILE_H; ++f)
+        AdjacentFiles[f] = (f > FILE_A ? file_bb((File)(f - 1)) : BB_EMPTY) |
+                           (f < FILE_H ? file_bb((File)(f + 1)) : BB_EMPTY);
+
+    for (Rank r = RANK_1; r <= RANK_8; ++r) {
+        Bitboard above = BB_EMPTY;
+        for (Rank q = (Rank)(r + 1); q <= RANK_8; ++q)
+            above |= rank_bb(q);
+
+        ForwardRanks[WHITE][r] = above;
+        ForwardRanks[BLACK][r] = ~above & ~rank_bb(r);
+    }
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
         for (Square s = SQ_A1; s <= SQ_H8; ++s) {
-            /* The literals are laid out rank 8 first, so the table index for a
-             * board square is that square mirrored vertically - which is
-             * exactly flip_rank(). */
-            const Square t = flip_rank(s);
+            const Bitboard ahead = ForwardRanks[c][rank_of(s)];
 
-            const Value mg = PieceValues[pt] + PstMg[pt][t];
-            const Value eg = EgPieceValues[pt] + PstEg[pt][t];
-
-            PsqMg[make_piece(WHITE, pt)][s] = mg;
-            PsqEg[make_piece(WHITE, pt)][s] = eg;
-
-            /* Black gets the same value at the mirrored square, negated: the
-             * whole evaluation is accumulated white-relative and flipped once
-             * at the end. */
-            PsqMg[make_piece(BLACK, pt)][t] = -mg;
-            PsqEg[make_piece(BLACK, pt)][t] = -eg;
+            ForwardFile[c][s]    = ahead & file_bb(file_of(s));
+            PawnAttackSpan[c][s] = ahead & AdjacentFiles[file_of(s)];
+            PassedPawnSpan[c][s] = ForwardFile[c][s] | PawnAttackSpan[c][s];
         }
     }
 }
 
-Value eval_evaluate(const Position *pos) {
-    int mg = 0;
-    int eg = 0;
+/* Set up the attack maps every later term reads. */
+static void eval_init_info(const Position *pos, EvalInfo *ei) {
+    memset(ei, 0, sizeof(*ei));
 
-    Bitboard occupied = occupied_bb(pos);
-    while (occupied) {
-        const Square s = pop_lsb(&occupied);
-        const Piece pc = piece_on(pos, s);
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Bitboard pawns = pieces_bb(pos, c, PAWN);
 
-        mg += PsqMg[pc][s];
-        eg += PsqEg[pc][s];
+        ei->ksq[c] = king_square(pos, c);
+
+        ei->attackedBy[c][PAWN] = c == WHITE ? shift_north_east(pawns) | shift_north_west(pawns)
+                                             : shift_south_east(pawns) | shift_south_west(pawns);
+        ei->attackedBy[c][KING] = king_attacks(ei->ksq[c]);
+
+        ei->attackedBy2[c] = ei->attackedBy[c][PAWN] & ei->attackedBy[c][KING];
+        ei->attackedAll[c] = ei->attackedBy[c][PAWN] | ei->attackedBy[c][KING];
     }
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Color them = (Color)(c ^ 1);
+
+        /* The ring is the king's eight neighbours, pulled back onto the board
+         * when the king is on an edge - otherwise a king on h1 would have a
+         * three-square ring and look far safer than it is. */
+        Bitboard ring = king_attacks(ei->ksq[c]);
+        if (file_of(ei->ksq[c]) == FILE_A)
+            ring |= shift_east(ring);
+        else if (file_of(ei->ksq[c]) == FILE_H)
+            ring |= shift_west(ring);
+        if (rank_of(ei->ksq[c]) == RANK_1)
+            ring |= shift_north(ring);
+        else if (rank_of(ei->ksq[c]) == RANK_8)
+            ring |= shift_south(ring);
+        ei->kingRing[c] = ring | square_bb(ei->ksq[c]);
+
+        /* Where a piece could actually go: not onto our own men, and not onto
+         * a square an enemy pawn covers, because standing there loses material
+         * however many squares it nominally attacks. */
+        ei->mobilityArea[c] = ~(color_bb(pos, c) | ei->attackedBy[them][PAWN]);
+    }
+}
+
+/* ---------------------------------------------------------- placement ----- */
+
+/*
+ * Material and the three placement tables, in one pass over the occupancy.
+ *
+ * The king-relative lookups are what the parameter budget is mostly spent on;
+ * see the note in evalparams.h for why they are worth their cost.
+ */
+static void eval_placement(const Position *pos, const EvalInfo *ei, Score *sc) {
+    Bitboard occupied = occupied_bb(pos);
+
+    while (occupied) {
+        const Square s     = pop_lsb(&occupied);
+        const Piece pc     = piece_on(pos, s);
+        const Color c      = color_of(pc);
+        const PieceType pt = type_of(pc);
+        const int sign     = SIGN(c);
+
+        /* Everything below is read from the owner's point of view. */
+        const Square rs = relative_square(c, s);
+        const Square ok = relative_square(c, ei->ksq[c]);
+        const Square ek = relative_square(c, ei->ksq[c ^ 1]);
+
+        TERM(sc, Material, pt, sign);
+
+        switch (pt) {
+        case PAWN: TERM(sc, PsqPawn, rs, sign); break;
+        case KNIGHT: TERM(sc, PsqKnight, rs, sign); break;
+        case BISHOP: TERM(sc, PsqBishop, rs, sign); break;
+        case ROOK: TERM(sc, PsqRook, rs, sign); break;
+        case QUEEN: TERM(sc, PsqQueen, rs, sign); break;
+        default: TERM(sc, PsqKing, rs, sign); break;
+        }
+
+        TERM_PSQK(sc, PsqOwnKing, ok, rs, pt, sign);
+        TERM_PSQK(sc, PsqEnemyKing, ek, rs, pt, sign);
+    }
+}
+
+/* -------------------------------------------------------------- pawns ----- */
+
+static void eval_pawns(const Position *pos, const EvalInfo *ei, Score *sc) {
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Color them      = (Color)(c ^ 1);
+        const int sign        = SIGN(c);
+        const Bitboard ours   = pieces_bb(pos, c, PAWN);
+        const Bitboard theirs = pieces_bb(pos, them, PAWN);
+        const int push        = pawn_push(c);
+
+        Bitboard b = ours;
+        while (b) {
+            const Square s = pop_lsb(&b);
+            const File f   = file_of(s);
+            const int r    = (int)relative_rank(c, s);
+
+            const Bitboard neighbours = ours & AdjacentFiles[f];
+            const Bitboard phalanx    = neighbours & rank_bb(rank_of(s));
+            const Bitboard support    = ours & pawn_attacks(them, s);
+            const Bitboard stoppers   = theirs & PassedPawnSpan[c][s];
+            const Bitboard opposed    = theirs & ForwardFile[c][s];
+            const Bitboard lever      = theirs & pawn_attacks(c, s);
+
+            /* A pawn on the last rank cannot exist, so the stop square is
+             * always on the board. */
+            const Square stop        = (Square)(s + push);
+            const Bitboard leverPush = theirs & pawn_attacks(c, stop);
+            const bool doubled       = (ours & square_bb((Square)(s - push))) != 0;
+
+            if (!neighbours)
+                TERM(sc, PawnIsolated, (int)f, sign);
+            if (doubled)
+                TERM(sc, PawnDoubled, (int)f, sign);
+
+            /* Backward: every friendly pawn on an adjacent file is already
+             * further up the board, so none can ever support this one's
+             * advance, and the square in front is covered by an enemy pawn. */
+            if (!(neighbours & ~ForwardRanks[c][rank_of(s)]) && leverPush)
+                TERM(sc, PawnBackward, (int)f, sign);
+
+            if (support)
+                TERM(sc, PawnConnected, r, sign);
+            if (phalanx)
+                TERM(sc, PawnPhalanx, r, sign);
+
+            if (!stoppers) {
+                TERM(sc, PawnPassed, r, sign);
+
+                if (!is_empty(pos, stop))
+                    TERM(sc, PawnPassedBlocked, r, sign);
+                if (support)
+                    TERM(sc, PawnPassedDefended, r, sign);
+
+                /* Both kings' races against the pawn. Only the endgame half of
+                 * these weights can be non-zero and mean anything. */
+                TERM(sc, PawnPassedOwnKing, clamp_int(square_distance(ei->ksq[c], stop), 0, 7),
+                     sign);
+                TERM(sc, PawnPassedEnemyKing, clamp_int(square_distance(ei->ksq[them], stop), 0, 7),
+                     sign);
+            } else if (!opposed && popcount(support) >= popcount(lever) &&
+                       popcount(phalanx) >= popcount(leverPush)) {
+                /* Not passed, but nothing blocks its own file and it wins every
+                 * pawn exchange on the way up - a passer in waiting. */
+                TERM(sc, PawnCandidate, r, sign);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------- pieces ----- */
+
+/*
+ * Mobility, outposts, rook files and bishop quality - and, as a side effect,
+ * the attack maps and king-ring pressure counts the king safety terms need.
+ */
+static void eval_pieces(const Position *pos, EvalInfo *ei, Score *sc) {
+    const Bitboard occ = occupied_bb(pos);
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Color them      = (Color)(c ^ 1);
+        const int sign        = SIGN(c);
+        const Bitboard ours   = pieces_bb(pos, c, PAWN);
+        const Bitboard theirs = pieces_bb(pos, them, PAWN);
+
+        for (PieceType pt = KNIGHT; pt <= QUEEN; ++pt) {
+            Bitboard b = pieces_bb(pos, c, pt);
+
+            while (b) {
+                const Square s     = pop_lsb(&b);
+                const Bitboard atk = attacks_bb(pt, s, occ);
+                const int mobility = popcount(atk & ei->mobilityArea[c]);
+
+                ei->attackedBy2[c] |= ei->attackedAll[c] & atk;
+                ei->attackedBy[c][pt] |= atk;
+                ei->attackedAll[c] |= atk;
+
+                switch (pt) {
+                case KNIGHT: TERM(sc, MobilityKnight, clamp_int(mobility, 0, 8), sign); break;
+                case BISHOP: TERM(sc, MobilityBishop, clamp_int(mobility, 0, 13), sign); break;
+                case ROOK: TERM(sc, MobilityRook, clamp_int(mobility, 0, 14), sign); break;
+                default: TERM(sc, MobilityQueen, clamp_int(mobility, 0, 27), sign); break;
+                }
+
+                /* Pressure on the enemy king, banked for eval_king(). */
+                if (atk & ei->kingRing[them]) {
+                    ei->kingAttackerCount[them]++;
+                    ei->kingRingAttacks[them] += popcount(atk & ei->kingRing[them]);
+                    /* A penalty on the king's owner, hence SIGN(them). */
+                    TERM(sc, KingAttackWeight, pt, SIGN(them));
+                }
+
+                if (pt == KNIGHT || pt == BISHOP) {
+                    /* An outpost is a square in enemy territory that no enemy
+                     * pawn can ever attack - which is what makes it permanent
+                     * and therefore worth something. */
+                    const int rr = (int)relative_rank(c, s);
+                    if (rr >= RANK_4 && rr <= RANK_6 && !(PawnAttackSpan[c][s] & theirs)) {
+                        const int supported = (ours & pawn_attacks(them, s)) != 0;
+                        if (pt == KNIGHT)
+                            TERM(sc, KnightOutpost, supported, sign);
+                        else
+                            TERM(sc, BishopOutpost, supported, sign);
+                    }
+
+                    if (pt == BISHOP) {
+                        const Bitboard sameColour =
+                            (square_bb(s) & BB_LIGHT_SQUARES) ? BB_LIGHT_SQUARES : BB_DARK_SQUARES;
+                        TERM(sc, BishopBadPawns, clamp_int(popcount(ours & sameColour), 0, 8),
+                             sign);
+                    }
+                } else if (pt == ROOK) {
+                    const Bitboard fileMask = file_bb(file_of(s));
+                    if (!(fileMask & ours))
+                        TERM(sc, RookOpenFile, (fileMask & theirs) ? 0 : 1, sign);
+                    if (relative_rank(c, s) == RANK_7)
+                        TERM(sc, RookOnSeventh, 0, sign);
+                }
+            }
+        }
+
+        if (piece_count(pos, c, BISHOP) >= 2)
+            TERM(sc, BishopPair, 0, sign);
+    }
+}
+
+/* -------------------------------------------------------- king safety ----- */
+
+static void eval_king(const Position *pos, const EvalInfo *ei, Score *sc) {
+    const Bitboard occ = occupied_bb(pos);
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Color them      = (Color)(c ^ 1);
+        const int sign        = SIGN(c); /* every term here penalises c */
+        const Square ksq      = ei->ksq[c];
+        const Bitboard ours   = pieces_bb(pos, c, PAWN);
+        const Bitboard theirs = pieces_bb(pos, them, PAWN);
+
+        /* Squares at or in front of the king, from its own point of view: a
+         * pawn behind the king shelters nothing. */
+        const Bitboard inFront = ForwardRanks[c][rank_of(ksq)] | rank_bb(rank_of(ksq));
+
+        /* Shelter and storm over the king's file and its two neighbours. The
+         * king file is clamped away from the edge so the three-file window
+         * always fits on the board. */
+        const File kf = (File)clamp_int((int)file_of(ksq), FILE_B, FILE_G);
+        for (File f = (File)(kf - 1); f <= (File)(kf + 1); ++f) {
+            const int edge      = f < FILE_E ? (int)f : 7 - (int)f;
+            const Bitboard mine = ours & file_bb(f) & inFront;
+            const Bitboard his  = theirs & file_bb(f) & inFront;
+
+            TERM(sc, KingShelter, edge * 8 + (mine ? (int)relative_rank(c, frontmost(c, mine)) : 0),
+                 sign);
+            TERM(sc, KingStorm, edge * 8 + (his ? (int)relative_rank(c, frontmost(c, his)) : 0),
+                 sign);
+        }
+
+        {
+            const Bitboard kingFile = file_bb(file_of(ksq));
+            TERM(sc, KingOnOpenFile, (kingFile & ours) ? 0 : ((kingFile & theirs) ? 1 : 2), sign);
+        }
+
+        TERM(sc, KingAttackers, clamp_int(ei->kingAttackerCount[c], 0, 7), sign);
+        TERM(sc, KingRingAttacks, clamp_int(ei->kingRingAttacks[c], 0, 15), sign);
+
+        /*
+         * Checks the checking piece survives. A check we can simply capture is
+         * not a threat, so the square has to be one the enemy can occupy and
+         * we do not cover.
+         */
+        const Bitboard safe = ~color_bb(pos, them) & ~ei->attackedAll[c];
+
+        if (knight_attacks(ksq) & ei->attackedBy[them][KNIGHT] & safe)
+            TERM(sc, KingSafeCheck, KNIGHT, sign);
+        if (bishop_attacks(ksq, occ) & ei->attackedBy[them][BISHOP] & safe)
+            TERM(sc, KingSafeCheck, BISHOP, sign);
+        if (rook_attacks(ksq, occ) & ei->attackedBy[them][ROOK] & safe)
+            TERM(sc, KingSafeCheck, ROOK, sign);
+        if (queen_attacks(ksq, occ) & ei->attackedBy[them][QUEEN] & safe)
+            TERM(sc, KingSafeCheck, QUEEN, sign);
+    }
+}
+
+/* ------------------------------------------------------------ threats ----- */
+
+static void eval_threats(const Position *pos, const EvalInfo *ei, Score *sc) {
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Color them   = (Color)(c ^ 1);
+        const int sign     = SIGN(c);
+        const Bitboard win = color_bb(pos, them);
+
+        /* Attacked by us and defended by nothing at all. */
+        const Bitboard weak = win & ei->attackedAll[c] & ~ei->attackedAll[them];
+        /* Non-pawns are what a pawn or minor threat is actually worth winning. */
+        const Bitboard nonPawn = win & ~pieces_bb(pos, them, PAWN);
+
+        Bitboard b = nonPawn & ei->attackedBy[c][PAWN];
+        while (b)
+            TERM(sc, ThreatByPawn, type_of(piece_on(pos, pop_lsb(&b))), sign);
+
+        b = nonPawn & (ei->attackedBy[c][KNIGHT] | ei->attackedBy[c][BISHOP]);
+        while (b)
+            TERM(sc, ThreatByMinor, type_of(piece_on(pos, pop_lsb(&b))), sign);
+
+        b = weak & ei->attackedBy[c][ROOK];
+        while (b)
+            TERM(sc, ThreatByRook, type_of(piece_on(pos, pop_lsb(&b))), sign);
+
+        b = weak & ei->attackedBy[c][KING];
+        while (b)
+            TERM(sc, ThreatByKing, type_of(piece_on(pos, pop_lsb(&b))), sign);
+
+        if (weak)
+            TERM(sc, Hanging, 0, sign * popcount(weak));
+
+        /* Squares the enemy covers that we contest and they do not hold
+         * firmly. Space they cannot actually use. */
+        const Bitboard strong     = ei->attackedBy[them][PAWN] | ei->attackedBy2[them];
+        const Bitboard restricted = ei->attackedAll[them] & ei->attackedAll[c] & ~strong;
+        if (restricted)
+            TERM(sc, Restricted, 0, sign * popcount(restricted));
+    }
+}
+
+/* ---------------------------------------------------------- entry point --- */
+
+Value eval_evaluate(const Position *pos) {
+    EvalInfo ei;
+    Score sc = {0, 0};
+
+    eval_init_info(pos, &ei);
+    eval_placement(pos, &ei, &sc);
+    eval_pawns(pos, &ei, &sc);
+    eval_pieces(pos, &ei, &sc);
+    eval_king(pos, &ei, &sc);
+    eval_threats(pos, &ei, &sc);
+
+    TERM(&sc, Tempo, 0, SIGN(pos->sideToMove));
 
     /* Interpolate. With everything on the board this is purely the midgame
      * score; with nothing but kings and pawns, purely the endgame one. */
     const int phase   = game_phase(pos);
-    const Value score = (Value)((mg * phase + eg * (PHASE_MAX - phase)) / PHASE_MAX);
+    const Value score = (Value)((sc.mg * phase + sc.eg * (PHASE_MAX - phase)) / PHASE_MAX);
 
     /* Scores are side-to-move-relative so the search can stay plain negamax. */
     return pos->sideToMove == WHITE ? score : -score;
 }
 
+/* ------------------------------------------------------------- tracing ---- */
+
 void eval_trace(const Position *pos) {
-    static const char *const Names[PIECE_TYPE_NB] = {
-        [PAWN] = "Pawn", [KNIGHT] = "Knight", [BISHOP] = "Bishop",
-        [ROOK] = "Rook", [QUEEN] = "Queen",   [KING] = "King",
-    };
+    static const char *const Names[] = {"Material + placement", "Pawn structure", "Pieces",
+                                        "King safety",          "Threats",        "Tempo"};
+    EvalInfo ei;
+    Score parts[6];
+
+    memset(parts, 0, sizeof(parts));
+    eval_init_info(pos, &ei);
+
+    /* Same helpers, same order, separate accumulators - so the breakdown is
+     * guaranteed to sum to what eval_evaluate() would have returned. */
+    eval_placement(pos, &ei, &parts[0]);
+    eval_pawns(pos, &ei, &parts[1]);
+    eval_pieces(pos, &ei, &parts[2]);
+    eval_king(pos, &ei, &parts[3]);
+    eval_threats(pos, &ei, &parts[4]);
+    TERM(&parts[5], Tempo, 0, SIGN(pos->sideToMove));
 
     const int phase = game_phase(pos);
-    int totalMg     = 0;
-    int totalEg     = 0;
+    Score total     = {0, 0};
 
-    printf("           count(w/b)   midgame   endgame\n");
-    printf("           ----------   -------   -------\n");
+    printf("                          midgame   endgame   tapered\n");
+    printf("                          -------   -------   -------\n");
 
-    for (PieceType pt = PAWN; pt <= KING; ++pt) {
-        int mg = 0;
-        int eg = 0;
+    for (int i = 0; i < 6; ++i) {
+        total.mg += parts[i].mg;
+        total.eg += parts[i].eg;
 
-        for (Color c = WHITE; c <= BLACK; ++c) {
-            Bitboard b = pieces_bb(pos, c, pt);
-            while (b) {
-                const Square s = pop_lsb(&b);
-                mg += PsqMg[make_piece(c, pt)][s];
-                eg += PsqEg[make_piece(c, pt)][s];
-            }
-        }
-
-        totalMg += mg;
-        totalEg += eg;
-
-        printf("%-9s     %2d/%-2d     %+7.2f   %+7.2f\n", Names[pt], piece_count(pos, WHITE, pt),
-               piece_count(pos, BLACK, pt), (double)mg / 100.0, (double)eg / 100.0);
+        const int tapered = (parts[i].mg * phase + parts[i].eg * (PHASE_MAX - phase)) / PHASE_MAX;
+        printf("%-22s   %+7.2f   %+7.2f   %+7.2f\n", Names[i], (double)parts[i].mg / 100.0,
+               (double)parts[i].eg / 100.0, (double)tapered / 100.0);
     }
 
-    printf("           ----------   -------   -------\n");
-    printf("%-9s                %+7.2f   %+7.2f\n", "Total", (double)totalMg / 100.0,
-           (double)totalEg / 100.0);
+    const int tapered = (total.mg * phase + total.eg * (PHASE_MAX - phase)) / PHASE_MAX;
 
-    const int tapered = (totalMg * phase + totalEg * (PHASE_MAX - phase)) / PHASE_MAX;
+    printf("                          -------   -------   -------\n");
+    printf("%-22s   %+7.2f   %+7.2f   %+7.2f\n", "Total (white)", (double)total.mg / 100.0,
+           (double)total.eg / 100.0, (double)tapered / 100.0);
 
     printf("\nPhase: %d/%d (%d%% midgame)\n", phase, PHASE_MAX, phase * 100 / PHASE_MAX);
-    printf("Tapered (white side):      %+.2f\n", (double)tapered / 100.0);
     printf("Evaluation (side to move): %+.2f\n",
            (double)(pos->sideToMove == WHITE ? tapered : -tapered) / 100.0);
-    printf("\nNOTE: material and piece-square tables only - see the roadmap in eval.h.\n");
 }

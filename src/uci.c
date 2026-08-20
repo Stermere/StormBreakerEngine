@@ -35,15 +35,10 @@ static Position Pos;
 /* ------------------------------------------------------------- options --- */
 
 static int OptHash         = 16;
-static int OptThreads      = 1;
-static bool OptPonder      = false;
-static int OptMultiPV      = 1;
 static int OptMoveOverhead = 10;
 static bool OptChess960    = false;
 
-bool uci_chess960(void) { return OptChess960; }
 int uci_move_overhead(void) { return OptMoveOverhead; }
-int uci_multipv(void) { return OptMultiPV; }
 
 /* ------------------------------------------------------------ tokenising -- */
 
@@ -161,7 +156,6 @@ static void cmd_uci(void) {
     printf("option name Hash type spin default 16 min 1 max 65536\n");
     printf("option name Threads type spin default 1 min 1 max 1\n");
     printf("option name Ponder type check default false\n");
-    printf("option name MultiPV type spin default 1 min 1 max 256\n");
     printf("option name Move Overhead type spin default 10 min 0 max 5000\n");
     printf("option name UCI_Chess960 type check default false\n");
     printf("uciok\n");
@@ -194,16 +188,13 @@ static void cmd_setoption(char *args) {
         if (!tt_resize((size_t)OptHash))
             printf("info string failed to allocate %d MB hash\n", OptHash);
     } else if (strcmp(name, "Threads") == 0 && value) {
-        OptThreads = atoi(value);
-        if (OptThreads != 1)
-            printf("info string only 1 thread is supported; ignoring Threads=%d\n", OptThreads);
-        OptThreads = 1;
+        const int threads = atoi(value);
+        if (threads != 1)
+            printf("info string only 1 thread is supported; ignoring Threads=%d\n", threads);
     } else if (strcmp(name, "Ponder") == 0 && value) {
-        OptPonder = strcmp(value, "true") == 0;
-    } else if (strcmp(name, "MultiPV") == 0 && value) {
-        OptMultiPV = atoi(value);
-        if (OptMultiPV < 1)
-            OptMultiPV = 1;
+        /* Accepted and ignored on purpose. The option exists so that a GUI
+         * will send `go ponder`, and it is that command the search acts on -
+         * there is no separate state for this flag to hold. */
     } else if (strcmp(name, "Move Overhead") == 0 && value) {
         OptMoveOverhead = atoi(value);
     } else if (strcmp(name, "UCI_Chess960") == 0 && value) {
@@ -252,6 +243,16 @@ static void cmd_position(char *args) {
         return;
 
     while ((tok = next_token(&cursor)) != NULL) {
+        /* The search pushes up to MAX_PLY more Undo records onto the same
+         * array, so the game itself has to stop short of the end by that much.
+         * MAX_GAME_PLY is sized so no real game reaches this; saying so and
+         * stopping still beats writing past the end of Position if one does. */
+        if (Pos.gamePly + MAX_PLY >= MAX_GAME_PLY) {
+            printf("info string game too long for the move history; ignoring the rest\n");
+            fflush(stdout);
+            return;
+        }
+
         const Move m = move_from_str(&Pos, tok);
 
         /* An unresolvable move means the GUI and the engine disagree about the
