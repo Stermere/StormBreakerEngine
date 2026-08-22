@@ -50,6 +50,7 @@
 #endif
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -100,6 +101,23 @@ enum { MAX_WORKERS = 64, PATH_CAP = 1024 };
 
 static void die(const char *msg) {
     fprintf(stderr, "datagen: %s\n", msg);
+    exit(1);
+}
+
+/* die(), for the messages that have to name the file and the numbers. A
+ * failure that says which shard and how many bytes is a fix; "bad shard" is an
+ * afternoon. */
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static void
+dief(const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "datagen: ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
     exit(1);
 }
 
@@ -816,6 +834,228 @@ static void shard_close(ShardWriter *w, const Manifest *m) {
     if (w->pol)
         fclose(w->pol);
     manifest_write(w->recPath, m, w->count, w->bySource, w->pol != NULL);
+
+    /* Unconditional, so that "a manifest exists" and "a checkpoint exists" can
+     * never both be true: the first means the shard is finished, the second
+     * that it is not. remove() on a shard that was never checkpointed fails
+     * harmlessly. */
+    char resumePath[PATH_CAP];
+    replace_ext(resumePath, sizeof(resumePath), w->recPath, ".resume");
+    remove(resumePath);
+}
+
+/* ========================================================================== *
+ *  Resuming an interrupted run
+ * ========================================================================== */
+
+/*
+ * Labelling 22.6M positions at 10,000 nodes is a five-hour run, and without
+ * this a machine that reboots four hours in has produced nothing: shard_open()
+ * opens with "wb", so the obvious response - run the same command again -
+ * starts from the first line.
+ *
+ * The checkpoint is a file of its own rather than a field in the manifest, for
+ * two reasons. The manifest is JSON, and reading it back would need a parser
+ * this file does not have. And the manifest already MEANS something: it is
+ * written once, at the end, and its presence is what makes a shard
+ * trustworthy. A `.resume` file present means precisely the opposite, so the
+ * two are never consulted together and never disagree.
+ *
+ * What makes this safe is that the checkpoint is a LOWER bound. The shard on
+ * disk may hold more records than the checkpoint claims - the process died
+ * between a write and the next checkpoint - so resuming TRUNCATES back to the
+ * recorded count and re-labels from the recorded line. Records are never
+ * appended after a point the checkpoint did not cover, which is what stops a
+ * resumed shard from holding a torn record or a duplicated one.
+ */
+
+/* The most re-labelling an interruption can cost, against one flush and a
+ * 64-byte write per interval. */
+#define CHECKPOINT_SECONDS 30.0
+
+#define RESUME_MAGIC   "CKRESUME"
+#define RESUME_VERSION 1
+#define RESUME_BYTES                                        \
+    64 /* fixed, and written in one fwrite, so a checkpoint \
+          is never half-updated */
+
+#if defined(_WIN32)
+#include <io.h>
+#define truncate_file(f, n) _chsize_s(_fileno(f), (__int64)(n))
+#else
+#include <unistd.h>
+#define truncate_file(f, n) ftruncate(fileno(f), (off_t)(n))
+#endif
+
+static bool file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    fclose(f);
+    return true;
+}
+
+/* The checkpoint, or false when there is none. A checkpoint that exists and
+ * cannot be read is fatal rather than ignored: carrying on would append to a
+ * shard whose contents are unknown, and silently produce duplicates. */
+static bool resume_read(const char *path, uint64_t *records, long *nextLine) {
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+
+    char buf[RESUME_BYTES + 1];
+    const size_t got = fread(buf, 1, RESUME_BYTES, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    char magic[16];
+    int version;
+    unsigned long long count;
+    long line;
+    if (got < 16 || sscanf(buf, "%15s %d %llu %ld", magic, &version, &count, &line) != 4 ||
+        strcmp(magic, RESUME_MAGIC) != 0 || version != RESUME_VERSION)
+        dief("%s is not a readable checkpoint. Delete it to start this shard over, or "
+             "keep it and report it - it should never happen.",
+             path);
+
+    *records  = (uint64_t)count;
+    *nextLine = line;
+    return true;
+}
+
+static void resume_write(const char *path, uint64_t records, long nextLine) {
+    char buf[RESUME_BYTES];
+    memset(buf, ' ', sizeof(buf));
+    const int n = snprintf(buf, sizeof(buf), "%s %d %llu %ld", RESUME_MAGIC, RESUME_VERSION,
+                           (unsigned long long)records, nextLine);
+    if (n < 0 || (size_t)n >= sizeof(buf))
+        dief("checkpoint does not fit in %d bytes", RESUME_BYTES);
+    buf[n]                = '\n';
+    buf[RESUME_BYTES - 1] = '\n';
+
+    FILE *f = xfopen(path, "wb");
+    if (fwrite(buf, 1, sizeof(buf), f) != sizeof(buf))
+        dief("short write on %s", path);
+    fclose(f);
+}
+
+/*
+ * Restores what the in-memory writer state would have been: the per-source
+ * counts the manifest reports, and - when dedup is on - the key set.
+ *
+ * Rebuilding the key set rather than starting it empty is what makes a resumed
+ * shard byte-identical to an uninterrupted one. Without it the second half of
+ * the run cannot see the first half's positions, and the shard quietly holds
+ * duplicates that no test looks for.
+ */
+static void shard_rescan(ShardWriter *w, KeySet *seen) {
+    if (fseek64(w->rec, 0, SEEK_SET) != 0)
+        dief("cannot rewind %s to rescan it", w->recPath);
+
+    uint8_t buf[REC_BYTES];
+    for (uint64_t i = 0; i < w->count; ++i) {
+        if (fread(buf, 1, REC_BYTES, w->rec) != REC_BYTES)
+            dief("%s ended after %llu of %llu records while rescanning", w->recPath,
+                 (unsigned long long)i, (unsigned long long)w->count);
+
+        Record r;
+        record_decode(buf, &r);
+        ++w->bySource[record_source(&r)];
+
+        if (seen) {
+            char fen[FEN_MAX_LEN];
+            Position p;
+            if (record_to_fen(&r, fen) && board_set_fen(&p, fen))
+                keyset_insert(seen, p.key);
+        }
+    }
+}
+
+typedef enum {
+    SHARD_FRESH,    /* nothing on disk; opened truncating */
+    SHARD_RESUMED,  /* opened at a checkpoint, *resumeFrom is where to pick up */
+    SHARD_COMPLETE, /* a finished shard is already there; nothing opened */
+} ShardOpen;
+
+/*
+ * shard_open(), plus the three states a shard can already be in. `seen` may be
+ * NULL when dedup is off.
+ */
+static ShardOpen shard_open_resumable(ShardWriter *w, const char *path, bool policy,
+                                      long *resumeFrom, KeySet *seen) {
+    memset(w, 0, sizeof(*w));
+    if (strlen(path) >= sizeof(w->recPath))
+        die("output path too long");
+    strcpy(w->recPath, path);
+    ensure_parent_dir(path);
+    *resumeFrom = 0;
+
+    char resumePath[PATH_CAP], manifestPath[PATH_CAP], polPath[PATH_CAP];
+    replace_ext(resumePath, sizeof(resumePath), path, ".resume");
+    replace_ext(manifestPath, sizeof(manifestPath), path, ".json");
+    replace_ext(polPath, sizeof(polPath), path, ".pol");
+
+    uint64_t records = 0;
+    long nextLine    = 0;
+    if (!resume_read(resumePath, &records, &nextLine)) {
+        if (file_exists(manifestPath))
+            return SHARD_COMPLETE;
+        w->rec = xfopen(path, "wb");
+        if (policy)
+            w->pol = xfopen(polPath, "wb");
+        return SHARD_FRESH;
+    }
+
+    /* "r+b", not "ab": the file has to be truncated back to the checkpoint
+     * before anything is appended, and append mode cannot be positioned. */
+    w->rec      = xfopen(path, "r+b");
+    w->count    = records;
+    *resumeFrom = nextLine;
+
+    if (fseek64(w->rec, 0, SEEK_END) != 0)
+        dief("cannot seek %s", path);
+    const long long onDisk = ftell64(w->rec);
+    const long long want   = (long long)records * REC_BYTES;
+    if (onDisk < want)
+        dief("%s holds %lld bytes but its checkpoint claims %llu records (%lld bytes). The "
+             "shard and the checkpoint are not from the same run; delete both and start over.",
+             path, onDisk, (unsigned long long)records, want);
+    if (truncate_file(w->rec, want) != 0)
+        dief("cannot truncate %s to %lld bytes", path, want);
+
+    if (policy) {
+        w->pol = xfopen(polPath, "r+b");
+        if (fseek64(w->pol, 0, SEEK_END) != 0)
+            dief("cannot seek %s", polPath);
+        const long long polWant = (long long)records * POL_BYTES;
+        if (ftell64(w->pol) < polWant)
+            dief("%s is shorter than its %llu records need", polPath, (unsigned long long)records);
+        if (truncate_file(w->pol, polWant) != 0)
+            dief("cannot truncate %s to %lld bytes", polPath, polWant);
+    }
+
+    shard_rescan(w, seen);
+
+    if (fseek64(w->rec, want, SEEK_SET) != 0)
+        dief("cannot seek %s to its checkpoint", path);
+    if (w->pol && fseek64(w->pol, (long long)records * POL_BYTES, SEEK_SET) != 0)
+        dief("cannot seek %s to its checkpoint", polPath);
+
+    return SHARD_RESUMED;
+}
+
+/* Makes everything written so far durable, then records how far the INPUT got.
+ * The flush has to come first: a checkpoint ahead of the data it describes is
+ * the one ordering that cannot be recovered from. */
+static void shard_checkpoint(ShardWriter *w, long nextLine) {
+    if (fflush(w->rec) != 0)
+        dief("cannot flush %s", w->recPath);
+    if (w->pol && fflush(w->pol) != 0)
+        die("cannot flush the policy sidecar");
+
+    char resumePath[PATH_CAP];
+    replace_ext(resumePath, sizeof(resumePath), w->recPath, ".resume");
+    resume_write(resumePath, w->count, nextLine);
 }
 
 /* ========================================================================== *
@@ -1522,6 +1762,7 @@ typedef struct {
     bool dedup;
     int dedupBits;
     bool policy;
+    bool resume;
 } LabelOpts;
 
 /*
@@ -1560,17 +1801,37 @@ static int label_worker(int index, int workers, void *ctx) {
 
     tt_resize((size_t)o->hashMb);
 
-    ShardWriter writer;
-    shard_open(&writer, path, o->policy);
-
+    /* The key set comes first: a resumed shard replays its own records into it,
+     * so that the second half of a run can see the first half's positions. */
     KeySet seen;
     if (o->dedup)
         keyset_init(&seen, o->dedupBits);
 
-    const double start = now_seconds();
-    double lastReport  = start;
-    long eligible      = 0; /* lines that passed -skip and -stride, all workers */
-    uint64_t labelled  = 0;
+    ShardWriter writer;
+    long resumeFrom = 0;
+
+    if (o->resume) {
+        const ShardOpen state =
+            shard_open_resumable(&writer, path, o->policy, &resumeFrom, o->dedup ? &seen : NULL);
+        if (state == SHARD_COMPLETE) {
+            if (!Quiet)
+                fprintf(stdout, "[w%02d] %s is already complete\n", index, path);
+            if (o->dedup)
+                keyset_free(&seen);
+            return 0;
+        }
+        if (state == SHARD_RESUMED && !Quiet)
+            fprintf(stdout, "[w%02d] resuming %s at %llu records, line %ld\n", index, path,
+                    (unsigned long long)writer.count, resumeFrom);
+    } else {
+        shard_open(&writer, path, o->policy);
+    }
+
+    const double start    = now_seconds();
+    double lastReport     = start;
+    double lastCheckpoint = start;
+    long eligible         = 0; /* lines that passed -skip and -stride, all workers */
+    uint64_t labelled     = 0;
 
     char line[512];
     for (int f = 0; f < o->inputCount && (o->max <= 0 || (long)writer.count < o->max); ++f) {
@@ -1594,6 +1855,25 @@ static int label_worker(int index, int workers, void *ctx) {
              * worker count reads the same lines in the same order. */
             if (((ordinal - o->skip) / (o->stride > 1 ? o->stride : 1)) % workers != index)
                 continue;
+
+            /* Applied AFTER the worker split, never before: the split is
+             * `(ordinal - skip) / stride % workers`, so anything that shifted
+             * the ordinals would hand this worker a different set of lines
+             * than the run being resumed gave it. */
+            if (ordinal < resumeFrom)
+                continue;
+
+            /* This line is ours and not yet done, so everything before it is.
+             * Checkpointing here rather than after a successful write also
+             * covers a long run of lines the filters all rejected - the
+             * filters run AFTER the search, so replaying them is not free. */
+            if (o->resume) {
+                const double now = now_seconds();
+                if (now - lastCheckpoint > CHECKPOINT_SECONDS) {
+                    shard_checkpoint(&writer, ordinal);
+                    lastCheckpoint = now;
+                }
+            }
 
             Position p;
             SearchResult res;
@@ -1693,6 +1973,14 @@ static void usage_label(void) {
            "  -nodedup           keep positions already seen in this shard.\n"
            "  -dedupbits N       initial log2 size of the dedup table.    (22)\n"
            "  -nopolicy          do not write the .pol sidecar.\n"
+           "  -resume            checkpoint every 30s, and pick up where an interrupted\n"
+           "                     run of the SAME command stopped. Without it a rerun\n"
+           "                     truncates the shard and starts from the first line,\n"
+           "                     which on a five-hour labelling run is the whole run.\n"
+           "                     A shard that already finished is left alone, so the\n"
+           "                     command is safe to repeat until it says complete.\n"
+           "                     Keep -threads the same: workers split the input by\n"
+           "                     line, so a different count reads different lines.\n"
            "  -quiet             progress lines off.\n");
 }
 
@@ -1745,6 +2033,8 @@ static int cmd_label(int argc, char **argv) {
             o.dedup = false;
         else if (!strcmp(argv[i], "-nopolicy"))
             o.policy = false;
+        else if (!strcmp(argv[i], "-resume"))
+            o.resume = true;
         else if (!strcmp(argv[i], "-quiet"))
             Quiet = true;
         else if (argv[i][0] == '-') {

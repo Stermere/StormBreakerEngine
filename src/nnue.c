@@ -23,6 +23,47 @@
 #include "eval.h"
 
 /*
+ * ----------------------------------------------------------------------------
+ * THE SHAPE OF THE HOT PATH
+ * ----------------------------------------------------------------------------
+ * An evaluation is, almost entirely, two sums of at most 32 rows of `hidden`
+ * int16 weights. At 1024 wide that is 65,536 int16 additions per call, and
+ * everything below exists to make them cheap:
+ *
+ *   * The accumulator is int16, not int32. It halves the bytes moved, and it
+ *     is what lets sixteen lanes fit in one AVX2 register instead of eight.
+ *     Nothing wraps, and that is not hoped for: tools/export_net.py refuses to
+ *     write a net whose bias plus 32 rows could leave int16, using a bound
+ *     that holds over EVERY legal position rather than over a sample.
+ *   * One activation and one feature set are implemented, so there is no
+ *     branch per unit and none per piece.
+ *   * AVX2 where the compiler says it is available, plain C otherwise. The two
+ *     must produce IDENTICAL integers - not similar - and `make nnue-test`
+ *     checks whichever one was built. Integer addition is associative, so the
+ *     different summation orders agree exactly; the only way they could differ
+ *     is an intermediate that overflows in one and not the other, which is why
+ *     the flush below is a proof rather than a guess.
+ */
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define NNUE_AVX2 1
+
+/*
+ * How many AVX2 int32 lanes of SCReLU may accumulate before being widened into
+ * int64.
+ *
+ * One _mm256_madd_epi16 result is two products of (v * w) * v, and the load
+ * checks bound |v * w| by int16 and v by QA, so a lane holds at most
+ * 2 * 32767 * 255 = 16,711,170. Sixty-four of those is 1.07e9, comfortably
+ * inside int32's 2.15e9; a hundred and thirty would not be. The flush costs
+ * one horizontal add per 64 vectors, which is nothing, and it makes the bound
+ * independent of the hidden width - so a wider net stays correct rather than
+ * staying correct up to 2048.
+ */
+#define NNUE_SCRELU_FLUSH 64
+#endif
+
+/*
  * The exporter packs this header with an explicit struct format string rather
  * than a C compiler, so its size is a contract rather than an implementation
  * detail. A field added without care - one that makes the compiler insert
@@ -52,7 +93,7 @@ _Static_assert(sizeof(NnueHeader) == 96, "NnueHeader must stay 96 bytes; see HEA
 /* ------------------------------------------------------------- sha-256 ---- */
 
 /*
- * A net is 6 MB of gitignored data and the bench node count depends on which
+ * A net is 50 MB of gitignored data and the bench node count depends on which
  * one is embedded, so a build has to be able to say which net it carries.
  * FIPS 180-4, about ninety lines, no dependency - which is the point, since
  * the engine links against nothing but libc.
@@ -217,6 +258,19 @@ typedef struct {
 
 static Net Loaded;
 
+/*
+ * How many king slots a feature set folds the board onto, or 0 if this build
+ * has never heard of it. The count is the feature set's shape, so the loader
+ * derives the expected feature count from it rather than trusting the file to
+ * be self-consistent about both.
+ */
+static uint32_t nnue_king_slots(uint32_t featureSet) {
+    switch (featureSet) {
+    case NNUE_FEATURES_HALFKA_32SQ: return 32;
+    default: return 0; /* including the retired 8-bucket tag */
+    }
+}
+
 /* Bytes the payload must occupy for this header to be self-consistent. */
 static uint64_t nnue_payload_bytes(const NnueHeader *h) {
     return (uint64_t)h->features * h->hidden * sizeof(int16_t) +
@@ -230,7 +284,9 @@ static uint64_t nnue_payload_bytes(const NnueHeader *h) {
  * almost always someone mid-upgrade, and "hidden width 1024, this build holds
  * at most 512" is a fix; "bad net file" is a morning.
  */
-static bool nnue_validate(const NnueHeader *h, size_t bytes, const char *what) {
+static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *what) {
+    const NnueHeader *const h = (const NnueHeader *)(const void *)blob;
+
 #define REJECT(...)                       \
     do {                                  \
         printf("info string %s: ", what); \
@@ -252,30 +308,41 @@ static bool nnue_validate(const NnueHeader *h, size_t bytes, const char *what) {
                "tools/export_net.py",
                h->formatVersion, NNUE_FORMAT_VERSION);
 
-    if (h->featureSet != NNUE_FEATURES_HALFKA_8BUCKET)
-        REJECT("feature set %u is not implemented - add its case to nnue_feature_index() "
+    const uint32_t slots = nnue_king_slots(h->featureSet);
+    if (slots == 0)
+        REJECT("feature set %u is not implemented (this build runs %u, halfka-32sq) - add "
+               "its king slot count to nnue_king_slots() and its case to nnue_perspective() "
                "in src/nnue.c",
-               h->featureSet);
+               h->featureSet, (unsigned)NNUE_FEATURES_HALFKA_32SQ);
 
-    if (h->activation != NNUE_ACT_CRELU)
-        REJECT("activation %u is not implemented - add its case to nnue_output() in "
-               "src/nnue.c",
-               h->activation);
+    if (h->activation != NNUE_ACT_SCRELU)
+        REJECT("activation %u is not implemented (this build runs %u, screlu) - add its "
+               "case to nnue_output() in src/nnue.c",
+               h->activation, (unsigned)NNUE_ACT_SCRELU);
 
     /* The feature set's tag defines its own shape, so a file that disagrees was
      * written by an exporter with a different idea of what the tag means. */
-    if (h->features != 8u * 12u * 64u)
-        REJECT("feature set %u is %u features, not %u", h->featureSet, 8u * 12u * 64u, h->features);
+    if (h->features != slots * 12u * 64u)
+        REJECT("feature set %u is %u features, not %u", h->featureSet, slots * 12u * 64u,
+               h->features);
 
     if (h->hidden == 0 || h->hidden > NNUE_MAX_HIDDEN)
         REJECT("hidden width %u, this build holds at most %u - raise NNUE_MAX_HIDDEN in "
                "src/nnue.h and rebuild",
                h->hidden, (unsigned)NNUE_MAX_HIDDEN);
 
-    if (h->outputBuckets != 1)
-        REJECT("%u output buckets - bucketed output is not implemented in nnue_output() "
-               "in src/nnue.c",
-               h->outputBuckets);
+    if (h->hidden % NNUE_WIDTH_MULTIPLE != 0)
+        REJECT("hidden width %u is not a multiple of %u, which the vectorised accumulator "
+               "requires - retrain at a width that is",
+               h->hidden, (unsigned)NNUE_WIDTH_MULTIPLE);
+
+    /* Buckets are indexed (pieceCount - 2) / (32 / buckets), which only covers
+     * every row when the count divides 32. A file that says otherwise would
+     * evaluate some piece counts out of a bucket that was never trained. */
+    if (h->outputBuckets == 0 || h->outputBuckets > NNUE_MAX_OUTPUT_BUCKETS ||
+        32u % h->outputBuckets != 0)
+        REJECT("%u output buckets - must be a divisor of 32, at most %u", h->outputBuckets,
+               (unsigned)NNUE_MAX_OUTPUT_BUCKETS);
 
     if (h->qa == 0 || h->qb == 0 || h->scale == 0)
         REJECT("degenerate quantisation (qa %u, qb %u, scale %d)", h->qa, h->qb, h->scale);
@@ -288,6 +355,15 @@ static bool nnue_validate(const NnueHeader *h, size_t bytes, const char *what) {
     if ((uint64_t)bytes != sizeof(NnueHeader) + need)
         REJECT("file is %zu bytes, header describes %llu", bytes,
                (unsigned long long)(sizeof(NnueHeader) + need));
+
+        /*
+         * Not checked here: that the weights keep the int16 accumulator and the
+         * int16 SCReLU product in range. tools/export_net.py refuses to WRITE a
+         * net that does not, with bounds that hold over every legal position, and
+         * it is the only thing that writes one. Re-deriving a looser bound at load
+         * would cost a pass over 50 MB and could only reject a net the exporter
+         * already blessed.
+         */
 
 #undef REJECT
     return true;
@@ -347,7 +423,7 @@ bool nnue_load_file(const char *path) {
     const size_t got = fread(blob, 1, (size_t)size, f);
     fclose(f);
 
-    if (got != (size_t)size || !nnue_validate((const NnueHeader *)(const void *)blob, got, path)) {
+    if (got != (size_t)size || !nnue_validate(blob, got, path)) {
         free(blob);
         return false;
     }
@@ -362,8 +438,7 @@ void nnue_init(void) {
 
 #ifdef NNUE_EVALFILE
     const size_t bytes = (size_t)(nnueEmbeddedEnd - nnueEmbeddedStart);
-    if (!nnue_validate((const NnueHeader *)(const void *)nnueEmbeddedStart, bytes,
-                       "embedded net")) {
+    if (!nnue_validate(nnueEmbeddedStart, bytes, "embedded net")) {
         printf("info string the embedded net is unusable; rebuild with a valid EVALFILE\n");
         fflush(stdout);
         exit(1);
@@ -380,14 +455,12 @@ void nnue_init(void) {
 /* ------------------------------------------------------------ features ---- */
 
 /*
- * The 64 king squares folded onto 8 buckets - eval.c's king_bucket(), spelled
- * out again on purpose. Sharing it would tie the net's indexing to the
- * classical evaluation's, and the whole point of NnueFeatureSet is that the
- * net's can move on - 32 mirrored king squares is the planned next step -
- * while the classical evaluation's stays where the tuner fitted it.
+ * The mirrored king square: file 0-3 after the mirror, so 32 slots. The net
+ * indexes this directly rather than a bucketing of it, which is what lets it
+ * distinguish a king on g1 from one on h1.
  */
-static inline int nnue_king_bucket(Square normalisedKing) {
-    return (int)(rank_of(normalisedKing) >> 1) * 2 + (int)(file_of(normalisedKing) >> 1);
+static inline int nnue_king_square(Square normalisedKing) {
+    return (int)rank_of(normalisedKing) * 4 + (int)file_of(normalisedKing);
 }
 
 /*
@@ -399,7 +472,7 @@ static inline int nnue_king_bucket(Square normalisedKing) {
 typedef struct {
     Color side;
     bool mirror;
-    int bucket;
+    int slot;
 } Perspective;
 
 static Perspective nnue_perspective(const Position *pos, Color side) {
@@ -413,14 +486,14 @@ static Perspective nnue_perspective(const Position *pos, Color side) {
     p.mirror = file_of(king) >= FILE_E;
     if (p.mirror)
         king = (Square)(king ^ 7);
-    p.bucket = nnue_king_bucket(king);
+    p.slot = nnue_king_square(king);
     return p;
 }
 
 /*
- * UPGRADE POINT: the index function IS the feature set. A new NnueFeatureSet
- * tag gets its own version of this, accepted in nnue_validate() and selected
- * here.
+ * UPGRADE POINT: the index function IS the feature set. A feature set that is
+ * not "king slot x 12 planes x 64 squares" - a piece-type-dependent offset, a
+ * factorised set - gets its own version here, selected on the tag.
  */
 static inline int nnue_feature_index(const Perspective *p, Square sq, Piece pc) {
     Square s = (p->side == BLACK) ? flip_rank(sq) : sq;
@@ -430,63 +503,161 @@ static inline int nnue_feature_index(const Perspective *p, Square sq, Piece pc) 
     /* Planes 0-5 are the perspective's own pieces, 6-11 the enemy's, each in
      * PAWN..KING order. PieceType starts at 1, the planes at 0. */
     const int plane = (color_of(pc) == p->side ? 0 : 6) + (int)type_of(pc) - 1;
-    return p->bucket * (12 * 64) + plane * 64 + (int)s;
+    return p->slot * (12 * 64) + plane * 64 + (int)s;
 }
 
 /*
  * One perspective's accumulator, from scratch.
  *
- * int32 rather than int16, deliberately. The stored weights are int16 and a
- * future incremental accumulator will be too - that is what SIMD wants - but
- * summing in int32 here means this function cannot silently wrap where numpy
- * would not, and a wrap the exact-match test did not happen to cover would
- * surface as a rare blunder in a game instead. tools/export_net.py refuses to
- * export a net whose accumulator could leave int16 range, which is what makes
- * the narrower future version safe.
+ * This is the evaluation. At 1024 wide it is 32 rows of 1024 int16 additions,
+ * and everything else in this file is rounding error beside it. int16 rather
+ * than int32 because it halves the traffic and doubles the lanes; the exporter
+ * proves it cannot wrap.
  */
-static void nnue_accumulate(const Position *pos, const Perspective *p, int32_t *acc) {
+static void nnue_accumulate(const Position *pos, const Perspective *p, int16_t *acc) {
     const uint32_t hidden = Loaded.hdr.hidden;
 
-    for (uint32_t j = 0; j < hidden; ++j)
-        acc[j] = Loaded.ftBias[j];
+    /*
+     * The rows are resolved first, in one pass over the occupancy, and only
+     * then summed. That unblocks the address arithmetic from the adds, and it
+     * makes the NEXT row known while the current one is being added, which is
+     * what the prefetch below needs.
+     *
+     * The table is 50 MB and a row is 2 KB, so an evaluation streams ~128 KB
+     * of weights whose layout it did not choose. The prefetch measured about
+     * 4% of bench nps here - small, but it is two lines and it went the same
+     * way on every run. Anything much larger has to come from not recomputing
+     * the accumulator at all, which is what an incremental update is for.
+     */
+    const int16_t *rows[32];
+    int count = 0;
 
     Bitboard occupied = occupied_bb(pos);
     while (occupied) {
-        const Square s           = pop_lsb(&occupied);
-        const int feature        = nnue_feature_index(p, s, piece_on(pos, s));
-        const int16_t *const row = Loaded.ftWeight + (size_t)feature * hidden;
+        const Square s    = pop_lsb(&occupied);
+        const int feature = nnue_feature_index(p, s, piece_on(pos, s));
+        rows[count++]     = Loaded.ftWeight + (size_t)feature * hidden;
+    }
 
+    memcpy(acc, Loaded.ftBias, hidden * sizeof(int16_t));
+
+    for (int i = 0; i < count; ++i) {
+        const int16_t *const row = rows[i];
+        if (i + 1 < count)
+            __builtin_prefetch(rows[i + 1]);
+
+#ifdef NNUE_AVX2
+        for (uint32_t j = 0; j < hidden; j += 16) {
+            const __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(acc + j));
+            const __m256i r = _mm256_loadu_si256((const __m256i *)(const void *)(row + j));
+            _mm256_storeu_si256((__m256i *)(void *)(acc + j), _mm256_add_epi16(a, r));
+        }
+#else
         for (uint32_t j = 0; j < hidden; ++j)
-            acc[j] += row[j];
+            acc[j] = (int16_t)(acc[j] + row[j]);
+#endif
     }
 }
 
 /* --------------------------------------------------------------- output --- */
 
 /*
+ * Which output row a position reads: piece count, folded onto the buckets the
+ * net was trained with. The same expression as output_bucket() in
+ * trainer/nnue/format.py, and both kings are always on the board, so the count
+ * is 2..32 and the index cannot leave the table.
+ */
+static inline int nnue_output_bucket(const Position *pos) {
+    const uint32_t buckets = Loaded.hdr.outputBuckets;
+    if (buckets == 1)
+        return 0;
+    return (popcount(occupied_bb(pos)) - 2) / (int)(32u / buckets);
+}
+
+#ifdef NNUE_AVX2
+/* Eight int32 lanes into an int64. Called once per NNUE_SCRELU_FLUSH vectors,
+ * so the store round-trip is free and the clarity is worth having. */
+static inline int64_t nnue_hsum_epi32(__m256i v) {
+    int32_t lanes[8];
+    _mm256_storeu_si256((__m256i *)(void *)lanes, v);
+
+    int64_t sum = 0;
+    for (int i = 0; i < 8; ++i)
+        sum += lanes[i];
+    return sum;
+}
+
+/* SCReLU against one half of the output row, accumulated the way the bound at
+ * the top of this file describes. */
+static inline int64_t nnue_screlu_half(const int16_t *acc, const int16_t *w, uint32_t hidden,
+                                       int32_t qa) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i top  = _mm256_set1_epi16((short)qa);
+
+    int64_t total    = 0;
+    __m256i lanes    = zero;
+    uint32_t pending = 0;
+
+    for (uint32_t j = 0; j < hidden; j += 16) {
+        const __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(acc + j));
+        const __m256i v = _mm256_min_epi16(_mm256_max_epi16(a, zero), top);
+        const __m256i k = _mm256_loadu_si256((const __m256i *)(const void *)(w + j));
+
+        /* v * w stays in int16 - the exporter refuses a net where it would not
+         * - and madd then widens (v * w) * v into int32 pairs. */
+        lanes = _mm256_add_epi32(lanes, _mm256_madd_epi16(_mm256_mullo_epi16(v, k), v));
+
+        if (++pending == NNUE_SCRELU_FLUSH) {
+            total += nnue_hsum_epi32(lanes);
+            lanes   = zero;
+            pending = 0;
+        }
+    }
+    return total + nnue_hsum_epi32(lanes);
+}
+#endif
+
+/*
  * The side to move always reads its own accumulator first. Getting this
  * backwards produces a net that plays reasonably, hates its own position, and
  * trains to a loss curve that looks completely normal.
  *
- * UPGRADE POINT: NNUE_ACT_SCRELU squares the clamped activation here, which is
- * why it needs wider intermediates than clipped ReLU does.
+ * SCReLU's rescale is the part with a wrong answer that looks right: the
+ * squared activation carries QA^2 where the bias carries QA, so the sum is
+ * divided by QA - truncating toward zero, which is what C's / does - BEFORE
+ * the bias is added. tools/export_net.py spells out the same order in numpy,
+ * where // would floor instead, and `make nnue-test` is what proves the two
+ * agree on the negatives.
+ *
+ * UPGRADE POINT: a new NnueActivation gets a branch here and a case in the
+ * exporter's forward().
  */
-static int32_t nnue_output(const int32_t *own, const int32_t *other) {
+static int32_t nnue_output(const int16_t *own, const int16_t *other, int bucket) {
     const uint32_t hidden  = Loaded.hdr.hidden;
     const int32_t qa       = (int32_t)Loaded.hdr.qa;
-    const int16_t *const w = Loaded.outWeight;
+    const int16_t *const w = Loaded.outWeight + (size_t)bucket * 2u * hidden;
+    const int32_t bias     = Loaded.outBias[bucket];
 
-    int32_t sum = Loaded.outBias[0];
+#ifdef NNUE_AVX2
+    const int64_t sum =
+        nnue_screlu_half(own, w, hidden, qa) + nnue_screlu_half(other, w + hidden, hidden, qa);
+#else
+    /* int64 because a term reaches QA^2 * 32767 and there are 2 * hidden of
+     * them. The vector path above cannot use int64 lanes and does not need to;
+     * both orders sum the same integers, so both give the same answer. */
+    int64_t sum = 0;
 
     for (uint32_t j = 0; j < hidden; ++j) {
         const int32_t x = own[j] < 0 ? 0 : (own[j] > qa ? qa : own[j]);
-        sum += x * (int32_t)w[j];
+        sum += (int64_t)(x * x) * (int64_t)w[j];
     }
     for (uint32_t j = 0; j < hidden; ++j) {
         const int32_t x = other[j] < 0 ? 0 : (other[j] > qa ? qa : other[j]);
-        sum += x * (int32_t)w[hidden + j];
+        sum += (int64_t)(x * x) * (int64_t)w[hidden + j];
     }
-    return sum;
+#endif
+
+    return (int32_t)(sum / qa) + bias;
 }
 
 /*
@@ -513,7 +684,10 @@ static Value nnue_centipawns(int32_t raw) {
 /* The raw integer output, shared by the evaluation and the verifier so the
  * gate tests the arithmetic the engine actually runs. */
 static int32_t nnue_raw(const Position *pos) {
-    int32_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
+    /* Aligned so the vector loads and stores land on cache-line boundaries.
+     * 8 KB of stack at the maximum width, which is fine at every depth the
+     * search reaches. */
+    _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
 
     for (Color c = WHITE; c <= BLACK; ++c) {
         const Perspective p = nnue_perspective(pos, c);
@@ -521,7 +695,7 @@ static int32_t nnue_raw(const Position *pos) {
     }
 
     const Color stm = pos->sideToMove;
-    return nnue_output(acc[stm], acc[stm ^ 1]);
+    return nnue_output(acc[stm], acc[stm ^ 1], nnue_output_bucket(pos));
 }
 
 Value nnue_evaluate(const Position *pos) { return nnue_centipawns(nnue_raw(pos)); }
@@ -546,9 +720,18 @@ void nnue_print_info(void) {
     memcpy(tag, h->tag, NNUE_TAG_LEN);
     tag[NNUE_TAG_LEN] = '\0';
 
-    printf("info string net %.12s  %u->%ux2->%u  qa %u qb %u scale %d  tag %s  from %s\n",
-           Loaded.hash, h->features, h->hidden, h->outputBuckets, h->qa, h->qb, h->scale, tag,
-           Loaded.source);
+    /* Which inference path this binary took, as well as which net it carries:
+     * an nps that cannot be attributed to a build is as useless as a node
+     * count that cannot be attributed to a net. */
+    printf("info string net %.12s  %u->%ux2->%u  screlu halfka-32sq %s  qa %u qb %u "
+           "scale %d  tag %s  from %s\n",
+           Loaded.hash, h->features, h->hidden, h->outputBuckets,
+#ifdef NNUE_AVX2
+           "avx2",
+#else
+           "scalar",
+#endif
+           h->qa, h->qb, h->scale, tag, Loaded.source);
     fflush(stdout);
 }
 

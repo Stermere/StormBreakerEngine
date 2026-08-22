@@ -6,6 +6,10 @@ import pytest
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "trainer"))
+# tools/ too: export_net.py is the quantised reference, and tests/test_export.py
+# checks it here rather than waiting for `make nnue-test` to need a compiler, a
+# checkpoint and a 50 MB net file to say the same thing.
+sys.path.insert(0, os.path.join(REPO, "tools"))
 
 
 def pytest_addoption(parser):

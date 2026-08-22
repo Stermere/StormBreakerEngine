@@ -1,6 +1,21 @@
 /*
  * thread.c - Win32 / pthreads implementations of the thread.h shim.
  */
+
+/*
+ * -std=c17 sets __STRICT_ANSI__, and glibc reads that as "declare ISO C and
+ * nothing else" - which hides every POSIX declaration this file needs. The
+ * request has to come before the first header, because feature test macros are
+ * only consulted the first time one is included.
+ *
+ * Darwin is excluded deliberately: there _POSIX_C_SOURCE *subtracts* from the
+ * default visibility instead of adding to it, and would take the BSD-only
+ * _SC_NPROCESSORS_ONLN used below with it.
+ */
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "thread.h"
 
 #include <stdlib.h>
@@ -76,6 +91,7 @@ void cond_broadcast(CondVar *cv) { WakeAllConditionVariable(cv); }
 
 #else /* POSIX */
 
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -121,7 +137,14 @@ int thread_hardware_concurrency(void) {
     return n > 0 ? (int)n : 1;
 }
 
-void thread_sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+/* nanosleep() rather than usleep(): POSIX.1-2008 removed the latter, so asking
+ * for that level above is precisely what makes it unavailable. */
+void thread_sleep_ms(int ms) {
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
 
 void mutex_init(Mutex *m) { pthread_mutex_init(m, NULL); }
 void mutex_destroy(Mutex *m) { pthread_mutex_destroy(m); }

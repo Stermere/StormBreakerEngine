@@ -111,6 +111,7 @@ def test_unpack_shapes_and_bounds(shard_path):
 
     assert set(np.unique(fields["stm"])) <= {0, 1}
     assert fields["wdl"].max() <= 3
+    assert counts.min() >= 2 and counts.max() <= MAX_PIECES
 
 
 def test_unpack_matches_per_record_packing(shard_path):

@@ -44,18 +44,22 @@ cd trainer
 #    Tree sampling is ON by default (-tree 1): roughly half the records come
 #    from inside the search trees rather than from the game line. `-tree 0`
 #    turns it off, `-tree 2` doubles it. See `datagen selfplay -help`.
-.\datagen.exe selfplay -o external\data\shard%02d.cnn -games 20000 -nodes 10000 -threads 14
+.\datagen.exe selfplay -o external\data\shard%02d.cnn -games 20000 -nodes 100000 -threads 14
 
 # 2. label games that already exist. `tuner extract` turns PGNs into quiet
 #    FENs carrying the game result; `datagen label` searches each one.
+#    -resume makes the command safe to repeat: it checkpoints every 30s and
+#    picks up where an interrupted run stopped, instead of starting the whole
+#    multi-hour pass again. Note that -threads 14 writes human00.cnn ..
+#    human13.cnn, not human.cnn - shards concatenate, and step 4 globs them.
 .\tuner.exe extract external\training\*.pgn -o external\training\human.epd
 .\datagen.exe label external\training\human.epd -o external\data\human.cnn `
-    -source human -nodes 10000 -threads 14
+    -source human -nodes 100000 -threads 14 -resume
 
 # 3. prove the data before training on it. -relabel re-searches from scratch,
 #    so it needs the SAME -nodes the shard was written with - every record
 #    looks wrong otherwise. The shard's .json says which.
-.\datagen.exe verify external\data\shard00.cnn -relabel 500 -nodes 10000
+.\datagen.exe verify external\data\shard00.cnn -relabel 500 -nodes 100000
 .\datagen.exe stats  external\data\shard00.cnn
 
 # 4. shuffle on disk, across every shard of every source.
@@ -223,19 +227,43 @@ Three things to read off it, in decreasing order of how certain they are:
 ## What the network is
 
 ```
-feature transformer   6144 -> 512, shared weights, one accumulator per side
-concatenate           [stm accumulator ; non-stm accumulator] -> 1024
-activation            clipped ReLU, [0, 1]
-output                1024 -> 1
+feature transformer   24576 -> H, shared weights, one accumulator per side
+concatenate           [stm accumulator ; non-stm accumulator] -> 2H
+activation            SCReLU, clamp(x, 0, 1)^2
+output                2H -> B, the row selected by piece count
 ```
 
-The feature set is `(king bucket, piece, square)` per perspective over both
-colours' pieces: 8 × 12 × 64 = 6144. It reuses the classical evaluation's
-normalisation verbatim — rank-flip for the perspective's owner, file-mirror
-when that king sits on the kingside, then `king_bucket()` from
-[../src/eval.c](../src/eval.c). That is the payoff for having built the linear
-model as a factorised HalfKA: the feature extraction already existed and was
-already the thing the tuner fits.
+The feature set is `(32 mirrored king squares, piece, square)` over both
+colours' pieces, and the activation is SCReLU. Neither is a flag: `src/nnue.c`
+implements one of each and rejects anything else by name. Only the shape is a
+choice, and both halves of it are header fields the engine reads out of the net
+file, so changing either is a retrain and an export with no C change:
+
+| Flag | Values | Default |
+|---|---|---|
+| `--hidden` | a multiple of 16, up to 2048 | 1024 |
+| `--output-buckets` | any divisor of 32 | 8 |
+
+24576 feature rows is a lot to fit. On a few million positions most rows are
+seen a handful of times, and `--hidden 512` is what to trade down first.
+
+The normalisation is the classical evaluation's, verbatim — rank-flip for the
+perspective's owner, file-mirror when that king sits on the kingside — after
+which a king stands on one of exactly 32 squares. That reuse is the payoff for
+having built the linear model as a factorised HalfKA: the feature extraction
+already existed and was already the thing the tuner fits.
+
+The checkpoint records its own shape, so `make nnue-export` is never told what
+it is holding. A checkpoint without an `arch` field predates this network and
+is **refused**, not guessed at — it was trained on a different feature set with
+a different activation, and there is nothing in the file that says which.
+
+**Weights are clipped after every step**, to the range the engine's integer
+arithmetic can represent (`WEIGHT_CLIP` in `nnue/format.py`). That is not
+regularisation: the engine's SCReLU multiplies the clamped activation by the
+weight as int16, and the export refuses a net that would wrap.
+`--no-weight-clip` turns it off, which is useful for measuring what it costs
+and for nothing else.
 
 ### Units, and why they are fixed here
 
@@ -272,7 +300,9 @@ be lived with. Record what each one scored in
 | `--sources 0 1` | train on self-play line + tree samples only |
 | `--workers 8` | the loader, not the model, is usually the bottleneck |
 | `--batch-size 32768` | bigger batches keep the 3070 busier |
-| `--hidden 1024` | wider; measure the 512 one first |
+| `--hidden 512` | narrower and faster; what a small dataset wants |
+| `--output-buckets 1` | one output row for every phase |
+| `--no-weight-clip` | measure what the clip costs; the export will then refuse the net |
 | `--device cpu` | force CPU, e.g. to reproduce a CI failure |
 
 Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.

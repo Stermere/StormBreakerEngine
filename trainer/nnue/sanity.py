@@ -36,6 +36,13 @@ Then read the material rows. A position a piece down should score roughly a
 piece, with the right sign. Only ``flip`` is exact; everything else is a
 judgement call, and the number to react to is one with the wrong sign or the
 wrong order of magnitude.
+
+The table deliberately spans piece counts from 32 down to 2, so on a net with
+output buckets it reads several different output rows. Early in training that
+shows up as neighbouring rows disagreeing more than the positions warrant -
+each bucket has seen a fraction of the data. It settles; a row that stays wrong
+after the loss has flattened is a bucket that has no data, which
+``datagen stats`` will confirm in one run.
 """
 
 from __future__ import annotations
@@ -45,7 +52,7 @@ import argparse
 import torch
 
 from .format import pack_fens, unpack
-from .model import NNUE
+from .model import NNUE, from_checkpoint
 
 # FEN, description, and the rough centipawn score a working net should give.
 SANITY_POSITIONS = [
@@ -100,17 +107,20 @@ def null_fen(fen: str) -> str:
 
 @torch.no_grad()
 def score_fens(model: NNUE, fens, device=None) -> list:
-    """Centipawn scores, side-to-move relative, one per FEN."""
+    """Centipawn scores, side-to-move relative, one per FEN.
+
+    """
     device = device or next(model.parameters()).device
     fields = unpack(pack_fens(fens))
 
     white = torch.from_numpy(fields["white"]).to(device)
     black = torch.from_numpy(fields["black"]).to(device)
     stm = torch.from_numpy(fields["stm"]).float().unsqueeze(1).to(device)
+    pieces = torch.from_numpy(fields["piece_count"]).to(device)
 
     was_training = model.training
     model.eval()
-    scores = model.evaluate_cp(white, black, stm).cpu().tolist()
+    scores = model.evaluate_cp(white, black, stm, pieces).cpu().tolist()
     model.train(was_training)
     return scores
 
@@ -153,8 +163,8 @@ def main() -> None:
     args = parser.parse_args()
 
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = NNUE(hidden=state.get("hidden", 512))
-    model.load_state_dict(state["model"])
+    model = from_checkpoint(state)
+    print(f"net: {model.describe()}")
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)

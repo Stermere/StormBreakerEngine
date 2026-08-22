@@ -48,6 +48,7 @@ Every change from here is measured with SPRT rather than argued for.
 | NNUE data generation, record format, shuffler (`make datagen`) | complete |
 | NNUE trainer: features, dataset, model, training loop (`trainer/`) | complete |
 | NNUE export + C inference, bit-exact against the reference (`make nnue-test`) | complete |
+| NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
 | **Lazy SMP (`Threads` is capped at 1), staged move generation** | **TODO** |
 | **Correction history** | **TODO** |
 | **NNUE integration: incremental accumulator, re-tuned margins, SPRT** | **TODO** |
@@ -212,11 +213,13 @@ The open work, roughly in order of Elo per unit of effort:
    are file-scope and must move into a per-thread block first.
 5. **Staged move generation**, so a node that cuts on the table move never
    generates or scores the rest of the list.
-6. **NNUE.** Tasks 1 and 2 of [docs/NNUE.md](docs/NNUE.md) are built and
-   their gates pass: `tools/datagen.c` generates and labels positions with the
-   search in the working tree, and `trainer/` fits the network to them. Next is
-   Task 3, the exporter and `src/nnue.c`, whose acceptance criterion is exact
-   integer equality with the quantised Python reference — not "close".
+6. **NNUE.** Tasks 1-3 of [docs/NNUE.md](docs/NNUE.md) are built and their
+   gates pass: `tools/datagen.c` generates and labels positions with the search
+   in the working tree, `trainer/` fits a 24576 -> 1024x2 -> 8 SCReLU network to
+   them, and `src/nnue.c` reproduces the quantised reference to the integer on
+   10,000 positions — the acceptance criterion is exact equality, not "close".
+   Next is Task 4: the incremental accumulator, which is most of the remaining
+   speed, then re-tuned margins and an SPRT before the default can change.
    Generating the data in-house is what keeps the network clear of other
    engines' licensing.
 

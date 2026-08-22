@@ -12,6 +12,15 @@ only the second of those two will tell you.
 Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5-15 epochs.
 If it is much worse than that the bottleneck is the loader, not the model - try
 --workers and a larger --batch-size before touching anything else.
+
+The architecture is SCReLU over 32 mirrored king squares, and the only two
+things left to choose are shape: --hidden and --output-buckets. Both are header
+fields the engine reads out of the net file, so changing either is a retrain
+and an export, with no C change and no flag to keep in sync.
+
+24576 feature rows is a lot to fit. A few million positions leave most rows
+seen a handful of times, and the width is what to trade down first - --hidden
+512 trains and exports exactly the same way.
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ import torch
 
 from . import sanity
 from .dataset import make_loader, to_device
+from .format import DEFAULT_OUTPUT_BUCKETS
 from .model import DEFAULT_HIDDEN, NNUE, blended_target, loss_fn
 
 # The evaluation's sigmoid scale, in centipawns. Keeping it equal to the value
@@ -41,7 +51,8 @@ def evaluate(model, loader, device, sigmoid_k, lam, limit=None) -> float:
             if limit and i >= limit:
                 break
             batch = to_device(batch, device)
-            prediction = model(batch["white"], batch["black"], batch["stm"])
+            prediction = model(batch["white"], batch["black"], batch["stm"],
+                               batch["piece_count"])
             target = blended_target(batch["score"], batch["wdl"], lam, sigmoid_k)
             n = prediction.numel()
             total += loss_fn(prediction, target, sigmoid_k).item() * n
@@ -55,6 +66,9 @@ def train(args) -> None:
     print(f"device: {device}"
           f"{' (' + torch.cuda.get_device_name(0) + ')' if device.type == 'cuda' else ''}")
 
+    model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets).to(device)
+    print(f"net:    {model.describe()}")
+
     train_loader = make_loader(args.train, args.batch_size, args.workers, shuffle=True,
                                sources=args.sources)
     val_loader = (make_loader(args.val, args.batch_size, max(args.workers // 2, 0),
@@ -64,8 +78,6 @@ def train(args) -> None:
           f"in {len(train_loader)} batches of {args.batch_size}")
     if val_loader:
         print(f"val:   {val_loader.dataset.records:,} records")
-
-    model = NNUE(hidden=args.hidden).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=args.lr_gamma)
@@ -88,13 +100,20 @@ def train(args) -> None:
                 break
             batch = to_device(batch, device)
 
-            prediction = model(batch["white"], batch["black"], batch["stm"])
+            prediction = model(batch["white"], batch["black"], batch["stm"],
+                               batch["piece_count"])
             target = blended_target(batch["score"], batch["wdl"], lam, args.sigmoid_k)
             loss = loss_fn(prediction, target, args.sigmoid_k)
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
             optimiser.step()
+
+            # After the step, every step. This is what makes the exported net
+            # representable rather than merely hopefully-representable: see
+            # WEIGHT_CLIP in format.py for the bound and why it is that number.
+            if not args.no_weight_clip:
+                model.clip_weights()
 
             n = prediction.numel()
             running += loss.item() * n
@@ -124,6 +143,11 @@ def train(args) -> None:
 
         checkpoint = {
             "model": model.state_dict(),
+            # Self-describing on purpose: the exporter reads the architecture
+            # out of the checkpoint rather than being told it again on the
+            # command line, so there is no pair of flags to keep in sync and no
+            # way to export a net under the wrong shape.
+            "arch": model.arch,
             "hidden": args.hidden,
             "epoch": epoch,
             "sigmoid_k": args.sigmoid_k,
@@ -150,7 +174,14 @@ def parse_args(argv=None):
 
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16384)
-    parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN)
+    parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN,
+                        help="hidden width per perspective; a multiple of 16")
+    parser.add_argument("--output-buckets", type=int, default=DEFAULT_OUTPUT_BUCKETS,
+                        help="output rows, selected by piece count; must divide 32")
+    parser.add_argument("--no-weight-clip", action="store_true",
+                        help="do not hold weights inside the quantised range. The export "
+                             "will then refuse nets it cannot represent, which is the "
+                             "point: this flag is for measuring what the clip costs")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr-gamma", type=float, default=0.8, help="LR decay per epoch")
     parser.add_argument("--weight-decay", type=float, default=0.0)

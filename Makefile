@@ -160,12 +160,33 @@ HEADERS := $(wildcard src/*.h)
 #  rewritten only when they change, and named as a prerequisite. $(file ...) is
 #  used rather than a shell so this works with or without a POSIX shell on
 #  PATH, which the top-level build otherwise does not need.
-FLAGSTAMP := .buildflags
-BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS)
+#
+#  $(file ...) needs GNU make 4.0, and macOS still ships 3.81, where it is
+#  not a function at all - it parses as a reference to an undefined variable
+#  and expands to nothing, without a word of warning. The stamp is then never
+#  written and the build dies on a prerequisite that has no rule, so old make
+#  gets a shell instead. That branch never runs on Windows, whose make is
+#  MSYS2's 4.x, so the no-shell guarantee above still holds where it matters.
+FLAGSTAMP   := .buildflags
+BUILDID     := $(CC) $(CFLAGS) $(LDFLAGS)
+HAS_FILE_FN := $(filter file,$(.FEATURES))
+
+ifeq ($(HAS_FILE_FN),)
+PREVBUILD := $(strip $(shell cat $(FLAGSTAMP) 2>/dev/null))
+else
 PREVBUILD := $(strip $(if $(wildcard $(FLAGSTAMP)),$(file < $(FLAGSTAMP))))
+endif
 
 ifneq ($(strip $(BUILDID)),$(PREVBUILD))
+ifeq ($(HAS_FILE_FN),)
+# Handed over through the environment rather than pasted into the command:
+# EVAL=nnue puts -DNNUE_EVALFILE='"..."' in the flags, and those quotes would
+# not survive being expanded into a shell word.
+export BUILDID
+STAMP_WRITE := $(shell printf '%s\n' "$$BUILDID" > $(FLAGSTAMP))
+else
 $(file > $(FLAGSTAMP),$(BUILDID))
+endif
 endif
 
 # ----------------------------------------------------------------- targets --

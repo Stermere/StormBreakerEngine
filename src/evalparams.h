@@ -65,9 +65,18 @@ typedef struct {
  */
 #define KING_BUCKET_NB 8
 
-/* [bucket][piece type][square], piece types PAWN..KING packed into 0..5. */
+/*
+ * [bucket][piece type][square], piece types PAWN..KING packed into 0..5.
+ *
+ * Held off clang-format: version 15 and 16+ disagree about whether the `*` and
+ * `-` inside PSQK_IDX are binary operators or a pointer and a sign, and each
+ * rewrites the other's output, so neither spelling is a fixed point of both.
+ * PSQK_SIZE is inside the region only to keep the two aligned as a pair.
+ */
+/* clang-format off */
 #define PSQK_SIZE           (KING_BUCKET_NB * 6 * SQUARE_NB)
 #define PSQK_IDX(b, pt, sq) ((((b)*6 + ((pt)-PAWN)) * SQUARE_NB) + (sq))
+/* clang-format on */
 
 /* ---------------------------------------------------------- the registry -- */
 
@@ -143,7 +152,9 @@ EVAL_PARAM_TABLES(X)
  * PARAM_LAST_<name> pins its last one, the next table's offset lands exactly
  * where it should with no arithmetic left to get wrong. PARAM_NB is the total.
  */
+/* clang-format off */ /* see PSQK_IDX above: the `-1` is disputed the same way */
 #define X(name, len, cols) PARAM_OFF_##name, PARAM_LAST_##name = PARAM_OFF_##name + (len)-1,
+/* clang-format on */
 enum { EVAL_PARAM_TABLES(X) PARAM_NB };
 #undef X
 

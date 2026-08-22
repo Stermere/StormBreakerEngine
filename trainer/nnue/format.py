@@ -55,32 +55,117 @@ SOURCE_NAMES = ("selfplay", "tree", "human", "engine", "book", "other")
 
 # ---------------------------------------------------------------- features --
 #
-# (king bucket, piece, square) per perspective, over both colours' pieces:
-# 8 buckets x 12 pieces x 64 squares = 6144. This is the evaluation's existing
-# normalisation, verbatim - rank-flip for the perspective's owner, file-mirror
-# when that king sits on the kingside, then the king bucket from eval.c - which
-# is the payoff for having built the linear model as a factorised HalfKA.
+# (king slot, piece, square) per perspective, over both colours' pieces:
 #
-# Index 6144 is a padding slot. A position has at most 32 pieces, so a batch is
-# a dense (B, 32) index matrix; records with fewer pieces pad with an entry
-# whose embedding is pinned to zero.
+#     32 mirrored king squares x 12 planes x 64 squares = 24576
+#
+# The normalisation is the classical evaluation's, verbatim - rank-flip for the
+# perspective's owner, file-mirror when that king sits on the kingside - so a
+# mirrored king stands on one of 32 squares, and the net indexes that square
+# directly. Reusing the normalisation is the payoff for having built the linear
+# model as a factorised HalfKA: the extraction already existed and was already
+# the thing the tuner fits.
+#
+# Indexing the square rather than a bucketing of it is what lets the net say
+# "this knight is good with the king on g1 and bad with it on h1". It costs
+# feature rows, and rows are what a large dataset is for.
+#
+# A position has at most 32 pieces, so a batch is a dense (B, 32) index matrix;
+# records with fewer pieces pad with an entry whose embedding is pinned to zero.
 
-KING_BUCKETS = 8
+KING_SQUARES = 32
 PIECE_PLANES = 12
-NUM_FEATURES = KING_BUCKETS * PIECE_PLANES * 64  # 6144
-PAD_INDEX = NUM_FEATURES
+SQUARES = 64
 MAX_PIECES = 32
 
-# Centipawns per unit of network output. Fixed by the quantisation Task 3 will
-# use: eval_cp = raw * SCALE / (QA * QB) with SCALE = 400, so a float model
-# output of 1.0 is 400 centipawns. Keeping the two definitions equal here is
-# what lets the exporter be a pure re-scaling rather than a re-interpretation.
-NET_TO_CP = 400.0
+NUM_FEATURES = KING_SQUARES * PIECE_PLANES * SQUARES  # 24576
+PAD_INDEX = NUM_FEATURES
+
+# NnueFeatureSet and NnueActivation in src/nnue.h. One of each is implemented,
+# and the loader rejects anything else by name.
+FEATURE_SET_TAG = 1
+FEATURE_SET_NAME = "halfka-32sq"
+ACTIVATION_TAG = 1
+ACTIVATION_NAME = "screlu"
 
 
-def king_bucket(normalised_king: np.ndarray) -> np.ndarray:
-    """eval.c's ``king_bucket``: fold 64 king squares onto 8."""
-    return ((normalised_king >> 3) >> 1) * 2 + ((normalised_king & 7) >> 1)
+def king_index(normalised_king):
+    """The king slot for an already-normalised king square.
+
+    ``normalised_king`` has been rank-flipped for black and file-mirrored, so
+    its file is 0-3 and there are exactly 32 squares it can be on. Spelled out
+    again in ``nnue_king_square()`` in src/nnue.c, deliberately: the net's
+    indexing is free to move on while the classical evaluation's stays where
+    the tuner fitted it.
+    """
+    return (normalised_king >> 3) * 4 + (normalised_king & 7)
+
+
+# ---------------------------------------------------------- output buckets --
+#
+# One output layer per phase, selected by piece count. A single output has to
+# answer for a 32-piece opening and a 5-piece endgame with one row of weights,
+# and the two want opposite things from the same accumulator; separating them
+# is most of what output buckets buy.
+#
+# Piece count is the phase proxy because it is free - the engine has the
+# popcount in hand - and because selection then costs one index rather than a
+# branch per unit. Both kings are always on, so the count is 2..32 and the
+# index is (count - 2) // (32 // buckets), which needs the count to divide 32.
+
+DEFAULT_OUTPUT_BUCKETS = 8
+
+
+def check_output_buckets(buckets: int) -> int:
+    if buckets < 1 or 32 % buckets:
+        raise ValueError(f"output buckets must be a divisor of 32, got {buckets}")
+    return buckets
+
+
+def output_bucket(piece_count, buckets: int):
+    """Which output row a position reads.
+
+    Works on ints, numpy arrays and torch tensors alike, which is the point:
+    src/nnue.c, the numpy reference and the trainer have to agree on this to
+    the last position, and three spellings of it is three chances to disagree.
+    """
+    check_output_buckets(buckets)
+    return (piece_count - 2) // (32 // buckets)
+
+
+# ------------------------------------------------------------ quantisation --
+#
+# These live here, beside the features, rather than in the exporter, because
+# the TRAINER needs them too: weights are clipped during training to the range
+# that keeps the engine's integer arithmetic in bounds, and a clip computed
+# from a different QB than the exporter quantises with is a clip that does not
+# clip.
+#
+#     eval_cp = raw * SCALE / (QA * QB)
+#
+# so a float model output of 1.0 is SCALE centipawns. That is what pins the
+# float model's units to the quantised ones and makes the exporter a pure
+# re-scaling rather than a re-interpretation.
+
+QA = 255
+QB = 64
+SCALE = 400
+NET_TO_CP = float(SCALE)
+
+# The bound weight clipping enforces, in float units.
+#
+# The OUTPUT weights are the binding constraint, and not because of anything
+# the scalar C code does - it sums SCReLU terms in int64. A SIMD SCReLU
+# multiplies the clamped activation by the weight as int16 (`v * w`, then a
+# widening madd), so `QA * max|w_int|` has to fit int16: 255 * 127 = 32385
+# against 32767.
+#
+# Clipping the feature transformer to the same bound is a bonus rather than a
+# requirement, and it makes the int16 accumulator safe by construction: 32
+# pieces plus the bias is at most 33 * QA * 1.984 = 16.7k, well inside int16,
+# so the exporter's accumulator bound check becomes a formality instead of a
+# coin toss decided by how training happened to go.
+WEIGHT_CLIP = 127.0 / QB
 
 
 # ------------------------------------------------------------ unpacking -----
@@ -146,13 +231,13 @@ def unpack(records: np.ndarray) -> dict:
         king_n = ksq ^ 56 if perspective == 1 else ksq
         mirror = (king_n & 7) >= 4
         king_n = np.where(mirror, king_n ^ 7, king_n)
-        bucket = king_bucket(king_n)
+        king_slot = king_index(king_n)
 
         sq_n = squares ^ 56 if perspective == 1 else squares
         sq_n = np.where(mirror[rows], sq_n ^ 7, sq_n)
 
         plane = np.where(colour == perspective, 0, 6) + ptype
-        feature = bucket[rows] * (PIECE_PLANES * 64) + plane * 64 + sq_n
+        feature = king_slot[rows] * (PIECE_PLANES * SQUARES) + plane * SQUARES + sq_n
 
         idx = np.full((batch, MAX_PIECES), PAD_INDEX, dtype=np.int64)
         idx[rows, slot] = feature

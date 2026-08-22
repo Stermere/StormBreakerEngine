@@ -1,8 +1,8 @@
 """Invariants of the feature extraction.
 
 The normalisation - rank-flip for the perspective's owner, file-mirror when
-that king is on the kingside, then the king bucket - has two symmetries that
-must hold exactly. Both catch the classic bugs:
+that king is on the kingside, then the mirrored king square - has two
+symmetries that must hold exactly. Both catch the classic bugs:
 
   * a position and its file-mirror produce the same features. A mirror applied
     to the king but not the pieces, or with the wrong comparison, breaks this.
@@ -14,7 +14,17 @@ must hold exactly. Both catch the classic bugs:
 import numpy as np
 import pytest
 
-from nnue.format import MAX_PIECES, NUM_FEATURES, PAD_INDEX, pack_fens, unpack
+from nnue.format import (
+    KING_SQUARES,
+    MAX_PIECES,
+    NUM_FEATURES,
+    PAD_INDEX,
+    PIECE_PLANES,
+    SQUARES,
+    king_index,
+    pack_fens,
+    unpack,
+)
 from nnue.sanity import flip_fen
 
 # Deliberately without castling rights or en passant squares: the point here is
@@ -91,17 +101,17 @@ def test_start_position_is_symmetric():
 
 
 def test_feature_index_decomposes_as_documented():
-    """bucket * 768 + plane * 64 + square, with own pieces on planes 0-5."""
+    """slot * 768 + plane * 64 + square, with own pieces on planes 0-5."""
     (bare,) = feature_sets(["4k3/8/8/8/8/8/8/4K3 w - - 0 1"])
 
     # Two kings, so two features per perspective: our king on plane 5, theirs
     # on plane 11.
     assert len(bare["white"]) == 2
-    planes = sorted((f % 768) // 64 for f in bare["white"])
+    planes = sorted((f % (PIECE_PLANES * SQUARES)) // SQUARES for f in bare["white"])
     assert planes == [5, 11]
 
     # Both kings are on the e-file, which mirrors, so both perspectives land in
-    # the same bucket and the two perspectives are identical here.
+    # the same slot and the two perspectives are identical here.
     assert bare["white"] == bare["black"]
 
 
@@ -113,6 +123,19 @@ def test_every_piece_gets_exactly_one_feature():
         assert np.array_equal(active, counts)
         assert fields[key].shape[1] == MAX_PIECES
         assert fields[key][fields[key] != PAD_INDEX].max() < NUM_FEATURES
+
+
+def test_a_mirrored_king_reaches_exactly_thirty_two_slots():
+    """The feature count is 32 x 12 x 64, and the 32 is a claim about geometry:
+    after the file-mirror a king stands on files 0-3 and nowhere else. If it
+    could reach a fifth file the table would be indexed out of range; if it
+    reached fewer, a quarter of the net would be dead weight."""
+    squares = np.arange(64)
+    reachable = (squares & 7) < 4
+    slots = king_index(squares[reachable])
+
+    assert sorted(slots.tolist()) == list(range(KING_SQUARES))
+    assert NUM_FEATURES == KING_SQUARES * PIECE_PLANES * SQUARES
 
 
 def test_side_to_move_bit():

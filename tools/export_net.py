@@ -24,13 +24,16 @@ consulting torch. If both sides called the same code the test would prove only
 that the code equals itself. The point is that two people writing the same
 specification in two languages disagree exactly where the specification is
 ambiguous, and every place they disagree here - the truncating division, the
-clamp bounds, the perspective order - is a place the engine could have been
-silently wrong.
+clamp bounds, the perspective order, WHERE THE SCReLU RESCALE HAPPENS - is a
+place the engine could have been silently wrong.
 
-UPGRADING THE NETWORK. Everything architectural is read out of the checkpoint
-and written into the header, so a wider retrain needs no change here and none
-in the engine. A new activation or feature set needs a case in both this file
-and src/nnue.c, and the enums in src/nnue.h say where.
+UPGRADING THE NETWORK. The shape - width and output buckets - is read out of
+the checkpoint and written into the header, so a wider or differently-bucketed
+retrain needs no change here and none in the engine. The feature set and the
+activation are not parameters: one of each is implemented, here and in
+src/nnue.c, and a new one needs a case in both plus a new enum value in
+src/nnue.h. A checkpoint that disagrees is refused rather than exported under a
+tag it does not match.
 """
 
 from __future__ import annotations
@@ -47,23 +50,30 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trainer"))
 
 from nnue.format import (  # noqa: E402
+    ACTIVATION_TAG,
+    FEATURE_SET_NAME,
+    FEATURE_SET_TAG,
     MAX_PIECES,
-    NET_TO_CP,
     NUM_FEATURES,
     PAD_INDEX,
+    QA,
+    QB,
+    SCALE,
+    output_bucket,
     pack_fens,
     read_shard,
     record_to_fen,
     unpack,
 )
+from nnue.model import arch_from_checkpoint  # noqa: E402
 
 # ------------------------------------------------------------------ format --
 
 MAGIC = b"CKNNUE\0\0"
-FORMAT_VERSION = 1
-
-FEATURES_HALFKA_8BUCKET = 1
-ACT_CRELU = 0
+# Must equal NNUE_FORMAT_VERSION in src/nnue.h. 2 is the single-architecture
+# format: every v1 net fails on the version rather than being read with tags
+# that have since been renumbered.
+FORMAT_VERSION = 2
 
 # 8 bytes magic, eight u32, one i32 (scale), one u32 (payload), 32-byte tag,
 # 16 reserved. Must stay identical to NnueHeader in src/nnue.h, which carries a
@@ -72,12 +82,12 @@ HEADER_FMT = "<8s8IiI32s16s"
 HEADER_BYTES = 96
 assert struct.calcsize(HEADER_FMT) == HEADER_BYTES
 
-# Defaults from docs/NNUE.md. SCALE is not free to choose here: the trainer's
-# NET_TO_CP already fixed it, so that a target computed by the trainer means
-# what a target computed by tools/tuner.c means.
-DEFAULT_QA = 255
-DEFAULT_QB = 64
-DEFAULT_SCALE = int(NET_TO_CP)
+# Defaults from nnue/format.py, which is also where the TRAINER reads them:
+# weight clipping during training is computed from these, and a clip fitted to
+# a different QB than the export quantises with is a clip that does not clip.
+DEFAULT_QA = QA
+DEFAULT_QB = QB
+DEFAULT_SCALE = SCALE
 
 # Paired with NNUE_EVAL_LIMIT in src/nnue.c. Engine policy rather than a
 # property of the net, which is why it is not a header field - a static
@@ -85,6 +95,9 @@ DEFAULT_SCALE = int(NET_TO_CP)
 # mates that do not exist. The export prints the largest |cp| it actually saw,
 # so it is visible when a net starts creeping toward the clamp.
 EVAL_LIMIT = 20000
+
+INT16_MAX = 32767
+INT32_MAX = 2**31 - 1
 
 
 def trunc_div(num: np.ndarray, den: int) -> np.ndarray:
@@ -94,6 +107,9 @@ def trunc_div(num: np.ndarray, den: int) -> np.ndarray:
     evaluation would be one centipawn low, which is to say about half the test
     vectors would fail and the engine would be marginally wrong forever if the
     test had been written with a tolerance.
+
+    SCReLU divides twice - once to undo the squared accumulator scale, once for
+    centipawns - so the rule matters in two places rather than one.
     """
     return np.sign(num) * (np.abs(num) // den)
 
@@ -101,82 +117,123 @@ def trunc_div(num: np.ndarray, den: int) -> np.ndarray:
 # ------------------------------------------------------------ quantisation --
 
 
-def quantise(state: dict, qa: int, qb: int) -> dict:
+def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
     """Round the float weights onto the integer grid the engine reads.
 
     Rounding is half-to-even (``np.rint``). Which rule is used does not affect
     the C/Python equivalence - only Python ever rounds, the engine just reads
     the stored integers - but it is the sort of thing worth pinning rather than
     inheriting.
+
+    Everything comes back int32. The values all fit int16; int32 is the working
+    type so that a later product does not silently wrap in numpy the way it
+    would in an int16 array.
     """
+    buckets = arch["output_buckets"]
+
     ft_w = state["ft.weight"].detach().cpu().numpy().astype(np.float64)
     ft_b = state["ft_bias"].detach().cpu().numpy().astype(np.float64)
-    out_w = state["out.weight"].detach().cpu().numpy().astype(np.float64).reshape(-1)
-    out_b = float(state["out.bias"].detach().cpu().numpy().reshape(-1)[0])
+    out_w = state["out.weight"].detach().cpu().numpy().astype(np.float64)
+    out_b = state["out.bias"].detach().cpu().numpy().astype(np.float64).reshape(-1)
 
     # The padding row exists only so a batch can be a dense (B, 32) matrix. It
     # is pinned to zero in training and is not part of the model.
-    assert ft_w.shape[0] == NUM_FEATURES + 1, f"unexpected feature rows {ft_w.shape[0]}"
-    assert np.all(ft_w[PAD_INDEX] == 0.0), "the padding embedding drifted off zero in training"
+    if ft_w.shape[0] != NUM_FEATURES + 1:
+        raise SystemExit(
+            f"checkpoint has {ft_w.shape[0]} feature rows, this build's feature set has "
+            f"{NUM_FEATURES} + 1 padding. It was written by a different model."
+        )
+    assert np.all(ft_w[PAD_INDEX] == 0.0), \
+        "the padding embedding drifted off zero in training"
     ft_w = ft_w[:NUM_FEATURES]
 
+    hidden = int(ft_w.shape[1])
+    if out_w.shape != (buckets, 2 * hidden) or out_b.shape != (buckets,):
+        raise SystemExit(
+            f"output layer is {out_w.shape}/{out_b.shape}, expected "
+            f"{(buckets, 2 * hidden)}/{(buckets,)} for {buckets} output buckets"
+        )
+
     return {
-        "ft_w": np.rint(ft_w * qa).astype(np.int64),
-        "ft_b": np.rint(ft_b * qa).astype(np.int64),
-        "out_w": np.rint(out_w * qb).astype(np.int64),
-        "out_b": int(np.rint(out_b * qa * qb)),
-        "hidden": int(ft_w.shape[1]),
+        "ft_w": np.rint(ft_w * qa).astype(np.int32),
+        "ft_b": np.rint(ft_b * qa).astype(np.int32),
+        "out_w": np.rint(out_w * qb).astype(np.int32),
+        "out_b": np.rint(out_b * qa * qb).astype(np.int32),
+        "hidden": hidden,
+        "buckets": buckets,
     }
 
 
 def check_ranges(q: dict, qa: int) -> dict:
     """Refuse to export a net whose arithmetic could overflow the engine's.
 
-    Three bounds, and the middle one is the one that matters:
+    Every bound here is SOUND over all legal positions - derived from the
+    weights and from "a position has at most 32 pieces" - rather than measured
+    over the ten thousand positions the gate happens to cover. A bound that
+    holds on a sample and not in general produces a net that passes every test
+    and blunders once a tournament.
 
     ``int16`` weights
         A stored weight that does not fit is simply a broken file.
 
     ``int16`` accumulator
-        src/nnue.c sums the accumulator in int32 today, so nothing overflows
-        there - but the stored accumulator is int16, and the incremental
-        version that Task 4 needs will sum in int16 because that is what SIMD
-        wants. A position has at most 32 pieces, so bias plus the 32 largest
-        positive weights in a column is a SOUND upper bound over every legal
-        position, not a sample. Checking it now is what makes the narrower
-        future version safe without re-deriving anything.
+        src/nnue.c sums the accumulator in int16, because that is what puts
+        sixteen lanes in an AVX2 register and halves the bytes moved - and the
+        accumulator is the evaluation. Nothing there checks for overflow, so
+        this is the check. Bias plus the 32 largest positive weights in a
+        column bounds it over every legal position, not over a sample.
+
+    ``int16`` activation product
+        The engine's SCReLU forms ``v * w`` as int16 before widening, so
+        ``QA * max|w|`` must fit int16. This is the one bound the engine cannot
+        recover from at runtime - the multiply simply wraps, the net scores
+        plausibly, and it loses Elo silently. Training clips the weights to
+        keep it true; --no-weight-clip is what makes it fail.
 
     ``int32`` output
-        255 times the sum of the absolute output weights, which likewise bounds
-        every possible input rather than the ones we happened to test.
+        The raw output is returned as int32 by both implementations.
     """
     limits = {}
 
-    for name, arr in (("ft_w", q["ft_w"]), ("ft_b", q["ft_b"]), ("out_w", q["out_w"])):
-        peak = int(np.abs(arr).max())
-        if peak > 32767:
+    for name in ("ft_w", "ft_b", "out_w", "out_b"):
+        peak = int(np.abs(q[name]).max())
+        limits[f"{name}_peak"] = peak
+        if name != "out_b" and peak > INT16_MAX:
             raise SystemExit(
                 f"{name} quantises to {peak}, which does not fit int16. The net is "
                 f"unusable at this QA/QB; retrain with weight clipping or lower the scale."
             )
-        limits[f"{name}_peak"] = peak
 
-    # Sound bound over all legal positions: 32 pieces, so 32 rows contribute.
     ft_w, ft_b = q["ft_w"], q["ft_b"]
     top = np.sort(ft_w, axis=0)
-    hi = ft_b + np.clip(top[-MAX_PIECES:], 0, None).sum(axis=0)
-    lo = ft_b + np.clip(top[:MAX_PIECES], None, 0).sum(axis=0)
+    hi = ft_b + np.clip(top[-MAX_PIECES:], 0, None).sum(axis=0, dtype=np.int64)
+    lo = ft_b + np.clip(top[:MAX_PIECES], None, 0).sum(axis=0, dtype=np.int64)
     worst = int(max(np.abs(hi).max(), np.abs(lo).max()))
     limits["accumulator_bound"] = worst
-    if worst > 32767:
+    if worst > INT16_MAX:
         raise SystemExit(
             f"the accumulator can reach {worst}, past int16. An incremental accumulator "
             f"would wrap. Retrain with a smaller QA or with weight clipping."
         )
 
-    out_bound = int(abs(q["out_b"]) + qa * int(np.abs(q["out_w"]).sum()))
+    activation_product = qa * limits["out_w_peak"]
+    limits["activation_product_bound"] = activation_product
+    if activation_product > INT16_MAX:
+        raise SystemExit(
+            f"QA * max|out_w| is {activation_product}, past int16. The engine's SCReLU "
+            f"multiplies the clamped activation by the weight as int16, so this net would "
+            f"wrap in play. Retrain with weight clipping - the bound is "
+            f"{INT16_MAX // qa} quantised units, {INT16_MAX // qa / q['qb']:.3f} in float, "
+            f"which is WEIGHT_CLIP in trainer/nnue/format.py - or lower QA."
+        )
+
+    # |raw| over every possible activation vector. SCReLU's extra factor of QA
+    # is divided back out before the bias is added, so the bound is QA * the
+    # weight sum, exactly as it would be without the square.
+    per_bucket = np.abs(q["out_w"]).sum(axis=1, dtype=np.int64)
+    out_bound = int((np.abs(q["out_b"]) + qa * per_bucket).max())
     limits["output_bound"] = out_bound
-    if out_bound > 2**31 - 1:
+    if out_bound > INT32_MAX:
         raise SystemExit(f"the output sum can reach {out_bound}, past int32.")
 
     return limits
@@ -185,19 +242,33 @@ def check_ranges(q: dict, qa: int) -> dict:
 # --------------------------------------------------------- reference model --
 
 
-def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 512) -> tuple:
+def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 256) -> tuple:
     """The quantised forward pass, in integers, exactly as src/nnue.c runs it.
 
-    Chunked because ``ft_w[idx]`` materialises (B, 32, hidden): at ten thousand
-    positions and 512 wide that is 650 MB, and there is no reason to pay it.
+    Chunked because ``table[idx]`` materialises (B, 32, hidden): at ten thousand
+    positions and 1024 wide that is 2.6 GB, and there is no reason to pay it.
+
+    The SCReLU rescale is the subtle part. The activation is ``v^2`` where
+    ``v <= QA``, so a term is at QA^2 * QB while the bias is at QA * QB. The sum
+    is therefore divided by QA - truncating, toward zero - BEFORE the bias is
+    added, and src/nnue.c does the same in the same order. Adding the bias
+    first, or flooring instead of truncating, changes about half the vectors by
+    one and nothing else.
+
+    This sums in int64 and the engine's AVX2 path sums int32 lanes, flushing
+    often enough that they cannot overflow. Integer addition is associative, so
+    the two orders agree exactly - which is what `make nnue-test` asserts, on
+    whichever path the binary was built with.
     """
-    hidden = q["hidden"]
+    hidden, buckets = q["hidden"], q["buckets"]
     white, black, stm = fields["white"], fields["black"], fields["stm"]
     n = len(stm)
 
-    # Row PAD_INDEX was dropped from the exported weights, so pad has to map to
+    bucket = np.asarray(output_bucket(fields["piece_count"], buckets), dtype=np.int64)
+
+    # Row pad_index was dropped from the exported weights, so pad has to map to
     # an explicit zero rather than to a row that no longer exists.
-    table = np.concatenate([q["ft_w"], np.zeros((1, hidden), dtype=np.int64)], axis=0)
+    table = np.concatenate([q["ft_w"], np.zeros((1, hidden), dtype=np.int32)], axis=0)
 
     raw = np.empty(n, dtype=np.int64)
 
@@ -205,8 +276,8 @@ def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 51
         stop = min(start + chunk, n)
         idx_w, idx_b = white[start:stop], black[start:stop]
 
-        acc_w = q["ft_b"] + table[idx_w].sum(axis=1)
-        acc_b = q["ft_b"] + table[idx_b].sum(axis=1)
+        acc_w = q["ft_b"] + table[idx_w].sum(axis=1, dtype=np.int64)
+        acc_b = q["ft_b"] + table[idx_b].sum(axis=1, dtype=np.int64)
 
         # The side to move always reads its own accumulator first. Getting this
         # backwards gives a net that plays reasonably and hates its position.
@@ -215,7 +286,13 @@ def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 51
         other = np.where(black_moves, acc_w, acc_b)
 
         x = np.concatenate([np.clip(own, 0, qa), np.clip(other, 0, qa)], axis=1)
-        raw[start:stop] = q["out_b"] + (x * q["out_w"]).sum(axis=1)
+        w = q["out_w"][bucket[start:stop]].astype(np.int64)
+        b = q["out_b"][bucket[start:stop]].astype(np.int64)
+
+        raw[start:stop] = trunc_div((x * x * w).sum(axis=1), qa) + b
+
+    if np.abs(raw).max(initial=0) > INT32_MAX:
+        raise SystemExit("a test position overflowed int32; the bound check is wrong")
 
     cp = np.clip(trunc_div(raw * scale, qa * qb), -EVAL_LIMIT, EVAL_LIMIT)
     return raw, cp
@@ -224,8 +301,9 @@ def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 51
 # ------------------------------------------------------------- positions ----
 
 # Used when neither a shard nor a FEN file is available. Small, but it still
-# covers both perspectives, both mirror halves, every piece type and an empty
-# board - which is most of what the feature extraction can get wrong.
+# covers both perspectives, both mirror halves, every piece type, several
+# output buckets and an empty board - which is most of what the feature
+# extraction and the bucket selection can get wrong.
 FALLBACK_FENS = [
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
@@ -272,27 +350,29 @@ def collect_fens(args) -> list:
 
 
 def write_net(path: str, q: dict, args, tag: str) -> bytes:
-    hidden = q["hidden"]
+    hidden, buckets = q["hidden"], q["buckets"]
+
     payload = b"".join(
         [
             q["ft_w"].astype(np.int16).tobytes(order="C"),
             q["ft_b"].astype(np.int16).tobytes(order="C"),
             q["out_w"].astype(np.int16).tobytes(order="C"),
-            np.int32(q["out_b"]).tobytes(),
+            q["out_b"].astype(np.int32).tobytes(order="C"),
         ]
     )
-    expect = NUM_FEATURES * hidden * 2 + hidden * 2 + 2 * hidden * 2 + 4
+    expect = (NUM_FEATURES * hidden * 2 + hidden * 2
+              + buckets * 2 * hidden * 2 + buckets * 4)
     assert len(payload) == expect, (len(payload), expect)
 
     header = struct.pack(
         HEADER_FMT,
         MAGIC,
         FORMAT_VERSION,
-        FEATURES_HALFKA_8BUCKET,
-        ACT_CRELU,
+        FEATURE_SET_TAG,
+        ACTIVATION_TAG,
         NUM_FEATURES,
         hidden,
-        1,  # output buckets
+        buckets,
         args.qa,
         args.qb,
         args.scale,
@@ -334,8 +414,9 @@ def main() -> None:
     import torch
 
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model_state = state["model"]
-    q = quantise(model_state, args.qa, args.qb)
+    arch = arch_from_checkpoint(state)
+    q = quantise(state["model"], arch, args.qa, args.qb)
+    q["qb"] = args.qb
 
     if q["hidden"] != int(state.get("hidden", q["hidden"])):
         raise SystemExit("checkpoint's hidden field disagrees with its own weights")
@@ -349,11 +430,13 @@ def main() -> None:
         f.write(f"{digest}  {os.path.basename(out)}\n")
 
     print(f"wrote {out}  ({len(blob):,} bytes)")
-    print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2 -> 1, crelu, 8 king buckets")
+    print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2 -> {q['buckets']}, "
+          f"screlu, {FEATURE_SET_NAME}")
     print(f"  quant     qa {args.qa}  qb {args.qb}  scale {args.scale}")
     print(f"  peaks     ft_w {limits['ft_w_peak']}  ft_b {limits['ft_b_peak']}  "
-          f"out_w {limits['out_w_peak']}  (int16 holds 32767)")
+          f"out_w {limits['out_w_peak']}  (int16 holds {INT16_MAX})")
     print(f"  bounds    accumulator |x| <= {limits['accumulator_bound']} (int16), "
+          f"activation product <= {limits['activation_product_bound']} (int16), "
           f"output |x| <= {limits['output_bound']} (int32)")
     print(f"  sha256    {digest}")
 
@@ -372,16 +455,18 @@ def main() -> None:
     # How far the quantised net drifted from the float one it came from. Not a
     # gate - the gate is C against these vectors - but a quantisation that has
     # gone badly wrong shows up here first, and in units anyone can judge.
+    # SCReLU drifts more than a linear activation would for the same weights:
+    # squaring a rounded activation squares its rounding error too.
     with torch.no_grad():
-        from nnue.model import NNUE
+        from nnue.model import from_checkpoint
 
-        model = NNUE(hidden=q["hidden"])
-        model.load_state_dict(model_state)
+        model = from_checkpoint(state)
         model.eval()
         float_cp = model.evaluate_cp(
             torch.from_numpy(fields["white"]),
             torch.from_numpy(fields["black"]),
             torch.from_numpy(fields["stm"]).float().unsqueeze(1),
+            torch.from_numpy(fields["piece_count"]),
         ).numpy()
 
     drift = np.abs(float_cp - cp)
@@ -397,9 +482,9 @@ def main() -> None:
         "format_version": FORMAT_VERSION,
         "features": NUM_FEATURES,
         "hidden": q["hidden"],
-        "output_buckets": 1,
-        "activation": "crelu",
-        "feature_set": "halfka-8bucket",
+        "output_buckets": q["buckets"],
+        "activation": "screlu",
+        "feature_set": FEATURE_SET_NAME,
         "qa": args.qa,
         "qb": args.qb,
         "scale": args.scale,

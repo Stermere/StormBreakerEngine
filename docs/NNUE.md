@@ -70,7 +70,7 @@ the engine in the working tree.
 
 ```
 datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16
-datagen label    external/training/human.epd -o external/data/human.cnn -nodes 10000
+datagen label    external/training/human.epd -o external/data/human.cnn -nodes 10000 -resume
 ```
 
 Two subcommands because there are two jobs: generate positions by playing, and
@@ -248,12 +248,27 @@ make datagen-test      # the gate above, on a few games. Seconds.
 
 ```
 datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16
-datagen label <in.epd>... -o out.cnn -source human -nodes 10000
+datagen label <in.epd>... -o out.cnn -source human -nodes 10000 -resume
 datagen shuffle <in.cnn>... -o train.cnn -seed 1
 datagen verify <shard.cnn>... -relabel 500     # the gate; exits non-zero on failure
 datagen stats <shard.cnn>...                   # the histograms to eyeball
 datagen dump <shard.cnn> -n 20 [-pol]          # records as text
 ```
+
+**Labelling runs are long, so `label` takes `-resume`.** It checkpoints every
+30 seconds - a flush, plus a 64-byte `.resume` file beside the shard - and on a
+rerun truncates back to that checkpoint and carries on from the input line it
+recorded. Without it a rerun opens the shard `"wb"` and starts from the first
+line, which on 22.6M positions is five hours.
+
+The checkpoint is a lower bound, never an upper one: a shard may hold more
+records than the checkpoint claims and never fewer, so resuming discards the
+uncheckpointed tail rather than trusting it. The dedup key set is rebuilt by
+replaying the records already written, so a resumed shard is byte-identical to
+one that nothing interrupted - without that, the second half of a run cannot
+see the first half's positions and the shard quietly holds duplicates. A
+finished shard is left alone, so the command is safe to repeat until it says
+complete; keep `-threads` the same, since workers split the input by line.
 
 **`datagen <subcommand> -help` is the option reference.** Every flag, with its
 default, in the same order the parser reads them; the list below only covers
@@ -352,32 +367,88 @@ not subject to the C style rules. `requirements.txt` pinned.
 > the trainer runs on. GPU here is an RTX 3070, 8 GB — comfortable for the
 > architecture below.
 
-### Architecture, v1
+### Architecture
 
 ```
-feature transformer   6144 -> 512, shared weights, one accumulator per perspective
-concatenate           [stm accumulator ; non-stm accumulator]  -> 1024
-activation            clipped ReLU, [0, 1] in float / [0, 255] in int
-output                1024 -> 1
+feature transformer   24576 -> H, shared weights, one accumulator per perspective
+concatenate           [stm accumulator ; non-stm accumulator]  -> 2H
+activation            SCReLU, clamp(x, 0, 1)^2 float / clamp(x, 0, QA)^2 int
+output                2H -> B, the row selected by piece count
 ```
 
-The feature set is `(king bucket, piece, square)` per perspective, over **both
-colours' pieces** — 8 × 12 × 64 = 6144. It reuses the evaluation's existing
-normalisation verbatim: rank-flip for the perspective's owner, file-mirror when
-that king sits on the kingside, then `king_bucket()` in
-[../src/eval.c](../src/eval.c#L167). This is the payoff for having built the
-linear model as a factorised HalfKA: the feature extraction already exists, is
-already tested, and is already the thing the tuner fits.
+**One architecture.** The feature set is `(32 mirrored king squares, piece,
+square)` over both colours' pieces — 32 × 12 × 64 = 24576 — and the activation
+is SCReLU. Neither is a flag. The inference path in `src/nnue.c` is written for
+them: no branch per unit, no branch per piece, and the accumulator in int16
+because that is what puts sixteen lanes in an AVX2 register.
 
-Deliberately conservative choices for v1, each with a known upgrade behind an
-SPRT:
+Only the *shape* is a choice, and shape is a header field the engine reads out
+of the net file:
 
-| v1 | Upgrade later | Why not now |
+| Flag | Values | Default |
 |---|---|---|
-| Clipped ReLU | Squared clipped ReLU | SCReLU is worth Elo but needs int32 intermediates; get bit-exactness working first |
-| One output | Output buckets by piece count | Another factor of N in export and test surface |
-| 512 wide | 1024+ | Wider is better and slower; measure the first one first |
-| 8 king buckets | 32 mirrored king squares | 8 reuses existing code exactly; more buckets need more data |
+| `--hidden` | any multiple of 16, up to `NNUE_MAX_HIDDEN` (2048) | 1024 |
+| `--output-buckets` | any divisor of 32 | 8 |
+
+The normalisation is the classical evaluation's, verbatim: rank-flip for the
+perspective's owner, file-mirror when that king sits on the kingside. A
+mirrored king then stands on one of exactly 32 squares, and the net indexes
+that square. This is the payoff for having built the linear model as a
+factorised HalfKA — the feature extraction already exists, is already tested,
+and is already the thing the tuner fits.
+
+What each part is for, and what it costs:
+
+| Choice | What it buys | What it costs |
+|---|---|---|
+| SCReLU | A non-piecewise-linear unit: one unit says "more of this matters more", where clipped ReLU needs two and a bias | Range. The squared activation carries QA², so the output sum is rescaled by QA and the weights are clipped to keep the int16 multiply in bounds |
+| Output buckets | Stops one row of weights answering for both a 32-piece opening and a 5-piece endgame | Data per bucket — eight buckets means each row sees an eighth of the dataset |
+| 1024 wide | Capacity | Accumulator work, which is the evaluation |
+| 32 king squares | "Good with the king on g1, bad on h1", which a bucket holding both cannot say | 24576 feature rows to fit, and a 50 MB net |
+
+The last row is what a large dataset is for. With a few million positions most
+of those rows are seen a handful of times; `--hidden 512` is the first thing to
+trade down, not the feature set, which is not tradeable.
+
+**Nothing supports the v1 architecture.** `NNUE_FORMAT_VERSION` is 2, the tags
+were renumbered, and a v1 net or a v1 checkpoint is refused by name rather than
+read as something it is not. There are no nets outside this repository, so
+there was nothing to keep compatible with.
+
+### Making the inference fast
+
+The evaluation is two sums of at most 32 rows of `hidden` int16 weights — at
+1024 wide, 65,536 int16 additions and ~128 KB of weights streamed per call.
+Everything in the hot path serves that:
+
+- **int16 accumulator.** Half the bytes moved, and sixteen lanes per AVX2
+  register instead of eight. Nothing wraps, and that is proved rather than
+  hoped: `tools/export_net.py` refuses to write a net whose bias plus 32 rows
+  could leave int16, with a bound that holds over every legal position.
+- **AVX2** where the compiler reports it, plain C otherwise, chosen on
+  `__AVX2__` so `ARCH=popcnt` still builds and still runs. The two must produce
+  **identical integers**, which is why the SCReLU lanes are flushed into int64
+  every 64 vectors: integer addition is associative, so the only way two
+  summation orders can disagree is an intermediate that overflows in one.
+  `make nnue-test` checks whichever path was built.
+- **Rows resolved before they are summed**, so the address arithmetic does not
+  block the adds and the next row can be prefetched. Worth about 4%.
+
+Measured on the 42-position bench, one net, node count identical across all
+three (257482 — a pure speedup, per [TESTING.md](TESTING.md)):
+
+| Build | nps |
+|---|---|
+| scalar, int32 accumulator | 292k |
+| AVX2, int16 accumulator | ~487k |
+| AVX2 + rows resolved + prefetch | ~547k (median of 6) |
+| classical evaluation, for scale | ~1.2M |
+
+**The remaining gap is not arithmetic, it is the from-scratch accumulator.**
+Every node pays for two full 24576 → 1024 sums, and the way not to pay is to
+not recompute: an incremental accumulator updates the handful of features a
+move actually changed. That is Task 4's first job, it needs make/unmake hooks
+in the search, and it is worth several times what everything above was.
 
 ### The label
 
@@ -500,13 +571,22 @@ output bias                           int32, scale QA * QB
 eval_cp = (activations . w_out + b_out) * SCALE / (QA * QB)     SCALE = 400
 ```
 
+**SCReLU rescales.** `clamp(x, 0, QA)^2` carries QA² where the bias carries QA,
+so the weighted sum is divided by QA — truncating toward zero, C's `/` —
+**before** the bias is added, and only then does the line above apply. Getting
+that divide wrong is a net that is 255× too confident; getting its *position*
+wrong is a net that is off by one everywhere, which is precisely the failure
+`make nnue-test` exists to catch and a tolerance would have hidden. The engine
+forms `v * w` as int16 before widening, so the exporter refuses any net whose
+`QA * max|w_out|` would not fit — and the trainer clips the weights so it does.
+
 `SCALE` puts the output in the same centipawn units the search's margins assume.
 It is a free parameter worth one experiment on its own, because it sets how the
 net's opinions interact with every threshold in `search.c`.
 
 ### The net file, and the repository's no-binaries rule
 
-The net is ~6 MB (6144 × 512 × int16), which the repository policy says must
+The net is 50 MB at 24576 × 1024 × int16, which the repository policy says must
 not be committed. It also must be present at build time for the bench to be
 deterministic and for OpenBench to build a self-contained binary.
 
@@ -569,17 +649,37 @@ compiled beside it. What that buys:
 | Change | What it costs |
 |---|---|
 | Retrain the same architecture on better data | re-export, rebuild |
-| Retrain **wider** (512 → 1024 → …) | re-export, rebuild — no C change, up to `NNUE_MAX_HIDDEN` |
+| Retrain **wider** (1024 → 1536 → …) | re-export, rebuild — no C change, up to `NNUE_MAX_HIDDEN`, width a multiple of 16 |
+| Retrain with more or fewer **output buckets** | re-export, rebuild — no C change |
 | Change QA / QB / SCALE | `--qa/--qb/--scale` on the exporter, rebuild |
-| **SCReLU** instead of clipped ReLU | a case in `nnue_output()` and one in the exporter's `forward()`; the tag already exists |
-| **Output buckets** | a case in `nnue_output()`, and the header field already exists |
-| **32 mirrored king squares** instead of 8 buckets | a case in `nnue_feature_index()` and a new `NnueFeatureSet` tag |
-| Change the file layout | bump `NNUE_FORMAT_VERSION`; every stale net then fails loudly instead of being misread |
+| A **new** activation | a branch in `nnue_output()`, a case in the exporter's `forward()`, a new `NnueActivation` value |
+| A **new** feature set | a slot count in `nnue_king_slots()` and a case in `nnue_perspective()`, plus a new `NnueFeatureSet` value. An indexing that is not "king slot × 12 planes × 64 squares" also needs `nnue_feature_index()` |
+| Change the file layout, or what a tag means | bump `NNUE_FORMAT_VERSION`; every stale net then fails loudly instead of being misread |
 
-The three places that need a new `case` are marked `UPGRADE POINT` in
-`src/nnue.c`. Every rejection names the field and both values, because a net
-that fails to load is almost always someone mid-upgrade: *"hidden width 1024,
-this build holds at most 512"* is a fix, *"bad net file"* is a morning.
+The places that need a new `case` are marked `UPGRADE POINT` in `src/nnue.c`.
+Every rejection names the field and both values, because a net that fails to
+load is almost always someone mid-upgrade: *"hidden width 4096, this build
+holds at most 2048"* is a fix, *"bad net file"* is a morning. What that looks
+like, on nets with one header field each corrupted:
+
+```
+format version 1, this build reads 2 - re-export with the current tools/export_net.py
+feature set 7 is not implemented (this build runs 1, halfka-32sq) - add its king slot
+                                 count to nnue_king_slots() and its case to
+                                 nnue_perspective() in src/nnue.c
+activation 5 is not implemented (this build runs 1, screlu) - add its case to
+                                nnue_output() in src/nnue.c
+3 output buckets - must be a divisor of 32, at most 32
+hidden width 9999, this build holds at most 2048 - raise NNUE_MAX_HIDDEN in src/nnue.h
+hidden width 100 is not a multiple of 16, which the vectorised accumulator requires
+```
+
+and from the trainer, on a checkpoint rather than a net:
+
+```
+this checkpoint carries no 'arch' field, so it predates the current network and
+describes a model this build cannot run. Retrain: ...
+```
 
 ### What came out differently from the sketch
 
@@ -623,7 +723,9 @@ the first 12 hex digits in its header.
 
 ### What the first export looked like
 
-`net.pt`, epoch 10, 6144 → 512×2 → 1:
+`net.pt`, epoch 10, 6144 → 512×2 → 1, crelu — the v1 architecture, kept here
+because the numbers are the ones the equivalence gate was first proved against.
+Neither that net nor that checkpoint loads any more:
 
 | | |
 |---|---|

@@ -16,15 +16,22 @@
  * and feature-set identifiers - and the loader believes the file rather than a
  * constant compiled beside it. The practical consequence:
  *
- *   * Retraining WIDER (512 -> 1024 -> ...) is a drop-in. Export, point
- *     EVALFILE at it, rebuild. No C changes, up to NNUE_MAX_HIDDEN.
+ *   * Retraining WIDER (1024 -> 1536 -> ...) is a drop-in. Export, point
+ *     EVALFILE at it, rebuild. No C changes, up to NNUE_MAX_HIDDEN, provided
+ *     the width is a multiple of NNUE_WIDTH_MULTIPLE.
+ *   * Retraining with more or fewer OUTPUT BUCKETS is a drop-in, up to
+ *     NNUE_MAX_OUTPUT_BUCKETS.
  *   * Retraining the same architecture on better data is a drop-in.
- *   * Changing the ACTIVATION or the FEATURE SET needs C code, because those
- *     are arithmetic rather than shape. Both are enum-tagged in the header
- *     (NnueActivation, NnueFeatureSet), the loader rejects a tag it was not
- *     built to handle by name, and the switch statements that need a new case
- *     are marked `UPGRADE POINT` in nnue.c. Add the case, bump the enum, and
- *     the exporter writes the new tag straight out of the checkpoint.
+ *   * The ACTIVATION and the FEATURE SET are NOT choices. One of each is
+ *     implemented - SCReLU over 32 mirrored king squares - because the
+ *     inference path is written for it: no branch per unit, no branch per
+ *     piece. Both are still enum-tagged in this header, and the loader rejects
+ *     a tag it was not built for BY NAME, which is what makes a stale net a
+ *     one-line fix instead of a morning.
+ *   * A NEW activation or feature set needs C code, because those are
+ *     arithmetic rather than shape. The places that need one are marked
+ *     `UPGRADE POINT` in nnue.c. Add it, extend the enum with a NEW number,
+ *     and the exporter writes the tag straight out of the checkpoint.
  *   * Changing the RECORD or FILE layout bumps NNUE_FORMAT_VERSION, which
  *     makes every stale net fail loudly at load instead of being misread.
  *
@@ -54,9 +61,16 @@
  */
 #define NNUE_MAX_HIDDEN 2048
 
-/* Bumped whenever the on-disk layout changes shape. A net written by an older
- * exporter must fail loudly rather than be misread as the new layout. */
-#define NNUE_FORMAT_VERSION 1u
+/*
+ * Bumped whenever the on-disk layout or the meaning of a tag changes. A net
+ * written by an older exporter must fail loudly rather than be misread.
+ *
+ * 2: one architecture. SCReLU over 32 mirrored king squares, output buckets by
+ *    piece count. The v1 tags were renumbered rather than retired, which is
+ *    exactly what a version bump licenses - every v1 net fails on the version
+ *    before anything can read a tag as the wrong thing.
+ */
+#define NNUE_FORMAT_VERSION 2u
 
 #define NNUE_MAGIC     "CKNNUE\0\0" /* 8 bytes, NUL-padded, never NUL-terminated */
 #define NNUE_MAGIC_LEN 8u
@@ -65,29 +79,47 @@
 /*
  * How the accumulator is squashed before the output layer.
  *
- * UPGRADE POINT: SCReLU is worth Elo and is the first planned change, but it
- * needs int32 intermediates in the output sum. Add the case in nnue_output().
+ * SCReLU squares the clamped activation, so a term carries QA^2 rather than QA
+ * and the output sum is divided by QA before the bias is added.
  */
 typedef enum {
-    NNUE_ACT_CRELU  = 0, /* clamp(x, 0, QA) */
-    NNUE_ACT_SCRELU = 1  /* clamp(x, 0, QA)^2 - NOT IMPLEMENTED */
+    NNUE_ACT_SCRELU = 1 /* clamp(x, 0, QA)^2, rescaled by QA */
 } NnueActivation;
 
 /*
- * Which (king, piece, square) indexing the net was trained with.
+ * Which (king, piece, square) indexing the net was trained with. A mirrored
+ * king stands on one of 32 squares, and the net indexes that square directly.
  *
- * UPGRADE POINT: v1 folds the 64 king squares onto 8 buckets, reusing the
- * classical evaluation's normalisation. Moving to 32 mirrored king squares is
- * a different index function, not a different shape, so it gets a new tag and
- * a new case in nnue_feature_index().
+ * UPGRADE POINT: an indexing that is not "king slot x 12 planes x 64 squares"
+ * needs its own case in nnue_feature_index() as well as a slot count.
  *
- * Deliberately NOT shared with eval.c's king_bucket(), even though v1 computes
- * the same thing: the whole point of the tag is that the net's indexing can
- * move on while the classical evaluation's stays put.
+ * Deliberately NOT shared with eval.c's king_bucket(): the point of the tag is
+ * that the net's indexing can move on while the classical evaluation's stays
+ * where the tuner fitted it.
  */
 typedef enum {
-    NNUE_FEATURES_HALFKA_8BUCKET = 1 /* 8 king buckets x 12 planes x 64 squares */
+    NNUE_FEATURES_HALFKA_32SQ = 1 /* 32 king squares x 12 planes x 64 squares = 24576 */
 } NnueFeatureSet;
+
+/*
+ * The hidden width must be a multiple of this.
+ *
+ * The accumulator and the output layer are both walked 16 int16 lanes at a
+ * time on AVX2, and a remainder loop is code that runs on no net anyone would
+ * train - every width worth using is a multiple of 64 already. So the loader
+ * requires it rather than handling it, and says so by name.
+ */
+#define NNUE_WIDTH_MULTIPLE 16
+
+/*
+ * Ceiling on output buckets, which are selected by piece count.
+ *
+ * A bucket count must divide 32 so that (pieceCount - 2) / (32 / buckets)
+ * covers every row: 32 is the most buckets that can differ, one per piece
+ * count. The bound is here rather than in nnue.c because it is a property of
+ * the file format - a header claiming more is malformed, not unsupported.
+ */
+#define NNUE_MAX_OUTPUT_BUCKETS 32
 
 /*
  * The file header. Little-endian, fixed 96 bytes, immediately followed by the
@@ -109,9 +141,9 @@ typedef struct {
     uint32_t formatVersion;
     uint32_t featureSet;    /* NnueFeatureSet */
     uint32_t activation;    /* NnueActivation */
-    uint32_t features;      /* 6144 for v1 */
-    uint32_t hidden;        /* 512 for v1 */
-    uint32_t outputBuckets; /* 1 for v1 */
+    uint32_t features;      /* 6144 or 24576, per featureSet */
+    uint32_t hidden;        /* per-perspective width */
+    uint32_t outputBuckets; /* selected by piece count; divides 32 */
     uint32_t qa;            /* accumulator scale, 255 */
     uint32_t qb;            /* output weight scale, 64 */
     int32_t scale;          /* centipawns per unit of float output, 400 */

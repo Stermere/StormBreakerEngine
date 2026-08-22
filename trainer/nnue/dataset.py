@@ -87,6 +87,11 @@ class ShardBatches(Dataset):
             "stm": torch.from_numpy(fields["stm"]).float().unsqueeze(1),
             "score": torch.from_numpy(fields["score"]).float(),
             "wdl": torch.from_numpy(fields["wdl"]),
+            # Carried for the output bucket. The bucket index itself is not
+            # computed here: how many buckets there are is a property of the
+            # model, and a loader that baked it in would have to be rebuilt to
+            # change it.
+            "piece_count": torch.from_numpy(fields["piece_count"]),
         }
 
 
