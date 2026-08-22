@@ -23,6 +23,7 @@
 #include "bitboard.h"
 #include "eval.h"
 #include "movegen.h"
+#include "nnue.h"
 #include "perft.h"
 #include "search.h"
 #include "timeman.h"
@@ -158,6 +159,12 @@ static void cmd_uci(void) {
     printf("option name Ponder type check default false\n");
     printf("option name Move Overhead type spin default 10 min 0 max 5000\n");
     printf("option name UCI_Chess960 type check default false\n");
+#ifdef EVAL_NNUE
+    /* The net is embedded, so the default is not a path. Setting this swaps
+     * the evaluation without a rebuild, which is what makes a candidate net
+     * cheap to try before it is worth embedding. */
+    printf("option name EvalFile type string default <internal>\n");
+#endif
     printf("uciok\n");
     fflush(stdout);
 }
@@ -197,6 +204,15 @@ static void cmd_setoption(char *args) {
          * there is no separate state for this flag to hold. */
     } else if (strcmp(name, "Move Overhead") == 0 && value) {
         OptMoveOverhead = atoi(value);
+#ifdef EVAL_NNUE
+    } else if (strcmp(name, "EvalFile") == 0 && value) {
+        if (strcmp(value, "<internal>") == 0)
+            printf("info string EvalFile: keeping the embedded net\n");
+        else if (nnue_load_file(value))
+            nnue_print_info();
+            /* A failed load leaves the previous net in place and says why: a typo
+             * in a GUI config must not leave the engine with no evaluation. */
+#endif
     } else if (strcmp(name, "UCI_Chess960") == 0 && value) {
         OptChess960  = strcmp(value, "true") == 0;
         Pos.chess960 = OptChess960;
@@ -342,6 +358,34 @@ static void cmd_perft(char *args) {
     fflush(stdout);
 }
 
+#ifdef EVAL_NNUE
+/*
+ * `nnue verify <file>` is the Task 3 acceptance gate. It runs the shipped
+ * inference vectors through the net and compares the output to the expected values.
+ */
+static void cmd_nnue(char *args) {
+    char *cursor = args;
+    char *tok    = next_token(&cursor);
+
+    if (token_is(tok, "verify")) {
+        char *path = next_token(&cursor);
+        if (!path) {
+            printf("usage: nnue verify <vectors file>\n");
+            ExitCode = 1;
+        } else if (nnue_verify_vectors(path) != 0) {
+            ExitCode = 1;
+        }
+    } else if (token_is(tok, "eval")) {
+        printf("nnue eval: %d cp\n", (int)nnue_evaluate(&Pos));
+    } else if (!tok) {
+        nnue_print_info();
+    } else {
+        printf("usage: nnue [verify <file> | eval]\n");
+    }
+    fflush(stdout);
+}
+#endif
+
 /* ---------------------------------------------------------- dispatcher --- */
 
 bool uci_execute(const char *line) {
@@ -406,8 +450,14 @@ bool uci_execute(const char *line) {
         board_print(&Pos);
         fflush(stdout);
     } else if (strcmp(cmd, "eval") == 0) {
+        /* Always the classical breakdown: it is the only evaluation with terms
+         * to name. An NNUE build answers `nnue eval` as well. */
         eval_trace(&Pos);
         fflush(stdout);
+#ifdef EVAL_NNUE
+    } else if (strcmp(cmd, "nnue") == 0) {
+        cmd_nnue(cursor);
+#endif
     } else {
         printf("info string unknown command '%s'\n", cmd);
         fflush(stdout);

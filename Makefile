@@ -12,6 +12,8 @@
 #    make                 optimised build for THIS machine (-march=native)
 #    make ARCH=avx2       portable build for a CPU class (see ARCH table below)
 #    make avx2            shorthand for the above
+#    make EVAL=nnue       build with the network instead of the classical eval
+#    make EVAL=classical  the hand-written evaluation (the default)
 #    make debug           unoptimised + assertions (+ sanitizers on POSIX)
 #    make bench           build, then run the deterministic node-count benchmark
 #    make perft           build, then run the perft correctness suite
@@ -25,6 +27,23 @@
 
 EXE  ?= chessengine
 ARCH ?= native
+
+# --------------------------------------------------------------- evaluation --
+#  Which evaluation gets linked. Exactly one is compiled in - there is no
+#  runtime switch, because an evaluation that tested a flag at every node
+#  would pay for the flexibility in the only currency that matters.
+#
+#    classical  the tuned 13,684-parameter linear model in src/eval.c
+#    nnue       the network in src/nnue.c, embedded from EVALFILE
+#
+#  Both build the same engine otherwise, and `make EVAL=classical` is
+#  byte-for-byte the engine that existed before the network did. The default
+#  stays classical until an NNUE build has passed its own SPRT (docs/NNUE.md,
+#  Task 4) - the switch exists so the two can be compared, and a default
+#  flipped ahead of the measurement is how an untested change ships.
+EVAL     ?= classical
+EVALFILE ?= external/nets/net.nnue
+NET      ?= external/nets/net.pt
 
 # `CC ?= gcc` would NOT work here: make predefines CC as `cc`, so the variable
 # is already set and ?= does nothing. Overriding only when the value is still
@@ -104,7 +123,25 @@ CSTD     := -std=c17
 WARNINGS := -Wall -Wextra -Wshadow -Wcast-qual -Wstrict-prototypes \
             -Wmissing-prototypes -Wpointer-arith -Wwrite-strings
 OPTIMISE := -O3 -funroll-loops -fno-math-errno -fomit-frame-pointer
-DEFINES  := -DNDEBUG $(ARCHDEFS)
+# EVAL_NNUE switches the evaluation; NNUE_EVALFILE is the path .incbin embeds,
+# resolved relative to the directory make was run from - which is where the
+# assembler looks too. Kept in their own variable so `make tuner` can filter
+# them back out: the tuner fits the classical model and must never link the
+# network over the top of it.
+NNUEDEFS :=
+ifeq ($(EVAL),nnue)
+    NNUEDEFS := -DEVAL_NNUE -DNNUE_EVALFILE='"$(EVALFILE)"'
+    EVALDEP  := $(EVALFILE)
+    ifeq ($(wildcard $(EVALFILE)),)
+        $(error EVAL=nnue needs a net at '$(EVALFILE)'. Export one with 'make \
+nnue-export', or point EVALFILE somewhere else. Note that the path must not \
+contain spaces - it is embedded as an assembler string.)
+    endif
+else ifneq ($(EVAL),classical)
+    $(error Unknown EVAL '$(EVAL)'. Valid: classical nnue)
+endif
+
+DEFINES  := -DNDEBUG $(ARCHDEFS) $(NNUEDEFS)
 
 CFLAGS ?=
 CFLAGS := $(CSTD) $(WARNINGS) $(OPTIMISE) $(ARCHFLAGS) $(DEFINES) $(CFLAGS)
@@ -112,13 +149,34 @@ CFLAGS := $(CSTD) $(WARNINGS) $(OPTIMISE) $(ARCHFLAGS) $(DEFINES) $(CFLAGS)
 SOURCES := $(wildcard src/*.c)
 HEADERS := $(wildcard src/*.h)
 
+# ------------------------------------------------------------ rebuilding --
+#  `make EVAL=nnue` and `make EVAL=classical` build the same file name from
+#  the same sources, and so do `make` and `make ARCH=popcnt`. Left alone, make
+#  compares timestamps, finds nothing newer, and hands back the binary built
+#  with the OTHER flags - so an ablation sweep silently re-benches the previous
+#  build and reports that the flag made no difference.
+#
+#  The fix is a stamp file holding the flags the current binary was built with,
+#  rewritten only when they change, and named as a prerequisite. $(file ...) is
+#  used rather than a shell so this works with or without a POSIX shell on
+#  PATH, which the top-level build otherwise does not need.
+FLAGSTAMP := .buildflags
+BUILDID   := $(CC) $(CFLAGS) $(LDFLAGS)
+PREVBUILD := $(strip $(if $(wildcard $(FLAGSTAMP)),$(file < $(FLAGSTAMP))))
+
+ifneq ($(strip $(BUILDID)),$(PREVBUILD))
+$(file > $(FLAGSTAMP),$(BUILDID))
+endif
+
 # ----------------------------------------------------------------- targets --
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
-        bench perft perft-all openbench-check format format-check clean help
+        bench perft perft-all openbench-check format format-check clean help \
+        tuner datagen datagen-test trainer-setup trainer-test \
+        nnue nnue-export nnue-test nnue-info
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES) $(HEADERS)
+$(TARGET): $(SOURCES) $(HEADERS) $(EVALDEP) $(FLAGSTAMP)
 	$(CC) $(CFLAGS) $(SOURCES) -o $(TARGET) $(LDFLAGS)
 
 native avx512 bmi2 avx2 popcnt legacy:
@@ -126,7 +184,8 @@ native avx512 bmi2 avx2 popcnt legacy:
 
 # Assertions on, optimiser off. Sanitizers are POSIX-only: MinGW GCC ships no
 # ASan runtime, so on Windows this is a plain assert+debuginfo build.
-debug: CFLAGS := $(CSTD) $(WARNINGS) -O1 -g3 -fno-omit-frame-pointer $(ARCHFLAGS) $(ARCHDEFS)
+debug: CFLAGS := $(CSTD) $(WARNINGS) -O1 -g3 -fno-omit-frame-pointer $(ARCHFLAGS) \
+                 $(ARCHDEFS) $(NNUEDEFS)
 ifneq ($(OS),Windows_NT)
 debug: CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all
 debug: LDFLAGS += -fsanitize=address,undefined
@@ -195,13 +254,104 @@ openbench-check:
 # tooling, it is not shipped, and the engine binary must not carry it.
 TUNER_SOURCES := $(filter-out src/main.c,$(SOURCES)) tools/tuner.c
 
+# The NNUE defines are filtered out rather than merely not added: `make tuner
+# EVAL=nnue` would otherwise link the network over eval_evaluate and fit a
+# model that is not the one being measured. tools/tuner.c calls
+# eval_classical() by name for the same reason.
 tuner: $(TUNER_SOURCES) $(HEADERS)
-	$(CC) $(CFLAGS) -DTUNE -Isrc $(TUNER_SOURCES) -o tuner$(SUFFIX) $(LDFLAGS)
+	$(CC) $(filter-out $(NNUEDEFS),$(CFLAGS)) -DTUNE -Isrc $(TUNER_SOURCES) \
+	    -o tuner$(SUFFIX) $(LDFLAGS)
 	@echo "built tuner$(SUFFIX) - see docs/TUNING.md"
 
-# tools/tuner.c is included: it is C in this repository's style, and leaving it
-# out of the check is how it stops being that.
-FORMAT_FILES := $(SOURCES) $(HEADERS) tools/tuner.c
+# ---------------------------------------------------------------- datagen --
+# The NNUE training-data generator (tools/datagen.c). Links the engine exactly
+# as the tuner does, so a label is produced by the search in the working tree.
+#
+# -DDATAGEN switches on the node visitor in search.c that the tree sampler
+# needs. It is a compile-time hook on purpose: the shipped engine carries
+# neither the hook nor the branch that tests it, so the bench node count is
+# identical either way. Never build the engine itself with it.
+#
+# GIT_COMMIT is stamped into every shard's .json sidecar. A dataset that cannot
+# be attributed to a specific engine build cannot be compared to another one.
+DATAGEN_SOURCES := $(filter-out src/main.c,$(SOURCES)) tools/datagen.c
+GIT_COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY       := $(shell git status --porcelain 2>/dev/null | head -1)
+ifneq ($(GIT_DIRTY),)
+    GIT_COMMIT := $(GIT_COMMIT)-dirty
+endif
+
+# Deliberately honours EVAL: `make datagen EVAL=nnue` is how the pipeline
+# bootstraps, since net n+1 trains on labels from searches that used net n.
+datagen: $(DATAGEN_SOURCES) $(HEADERS) $(EVALDEP) $(FLAGSTAMP)
+	$(CC) $(CFLAGS) -DDATAGEN -DDATAGEN_COMMIT='"$(GIT_COMMIT)"' -Isrc \
+	    $(DATAGEN_SOURCES) -o datagen$(SUFFIX) $(LDFLAGS)
+	@echo "built datagen$(SUFFIX) - see docs/NNUE.md"
+
+# The Task 1 acceptance gate, small enough to run on every change: generate a
+# handful of games, prove every record round-trips to identical bytes, and
+# prove a label re-searched from scratch reproduces the score it was stored
+# with. A failure here means the dataset cannot be trusted, which is worse than
+# a crash, because nothing downstream will notice.
+DATAGEN_TEST_DIR := external/datagen-test
+
+datagen-test: datagen
+	@rm -rf $(DATAGEN_TEST_DIR)
+	@mkdir -p $(DATAGEN_TEST_DIR)
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/shard%02d.cnn \
+	    -games 6 -nodes 2000 -threads 2 -seed 7 -quiet
+	./datagen$(SUFFIX) shuffle $(DATAGEN_TEST_DIR)/shard00.cnn \
+	    $(DATAGEN_TEST_DIR)/shard01.cnn -o $(DATAGEN_TEST_DIR)/all.cnn -seed 7 -quiet
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/all.cnn -relabel 32 -nodes 2000
+	./datagen$(SUFFIX) stats $(DATAGEN_TEST_DIR)/all.cnn | head -12
+	@echo "PASS: datagen round-trips and its labels reproduce"
+
+# ---------------------------------------------------------------- trainer --
+# PyTorch, its own virtualenv, not part of the C build and not subject to the C
+# style rules. See trainer/README.md.
+ifeq ($(OS),Windows_NT)
+    PYTHON ?= trainer/.venv/Scripts/python.exe
+else
+    PYTHON ?= trainer/.venv/bin/python
+endif
+
+trainer-setup:
+	powershell -ExecutionPolicy Bypass -File tools/trainer-setup.ps1
+
+trainer-test: datagen-test
+	$(PYTHON) -m pytest trainer/tests -q --shard $(DATAGEN_TEST_DIR)/all.cnn
+
+# ------------------------------------------------------------------- nnue --
+# Quantise a trained checkpoint into the file the engine embeds, plus the
+# test vectors and the SHA-256 sidecar. Needs the trainer's venv (torch reads
+# the checkpoint); the engine itself needs none of it.
+nnue-export:
+	$(PYTHON) tools/export_net.py $(NET) -o $(EVALFILE)
+
+# The engine, built with the network. A separate name from the classical
+# binary on purpose: comparing the two is the entire point, and that is hard
+# to do when the second build overwrites the first.
+nnue:
+	@$(MAKE) --no-print-directory EVAL=nnue EXE=$(EXE)-nnue ARCH=$(ARCH) CC=$(CC)
+
+# The Task 3 acceptance gate: export, then require the C inference to
+# reproduce the quantised Python reference EXACTLY on every vector. Exact,
+# not close - see the note at the top of tools/export_net.py. A mismatch
+# exits non-zero, so this works as a CI gate.
+nnue-test:
+	@$(MAKE) --no-print-directory nnue-export
+	@$(MAKE) --no-print-directory nnue
+	./$(EXE)-nnue$(SUFFIX) nnue verify $(EVALFILE).vectors
+
+# Which net a build is actually carrying, by hash. `make bench EVAL=nnue`
+# prints the same hash in its header.
+nnue-info: nnue
+	@./$(EXE)-nnue$(SUFFIX) nnue
+
+# tools/tuner.c and tools/datagen.c are included: they are C in this
+# repository's style, and leaving them out of the check is how they stop being
+# that.
+FORMAT_FILES := $(SOURCES) $(HEADERS) tools/tuner.c tools/datagen.c
 
 format:
 	clang-format -i $(FORMAT_FILES)
@@ -211,11 +361,13 @@ format-check:
 
 clean:
 	rm -f $(EXE) $(EXE).exe $(EXE)-debug $(EXE)-debug.exe Engine-* *.o *.d .ob*.txt
-	rm -f tuner tuner.exe
+	rm -f tuner tuner.exe datagen datagen.exe
+	rm -f $(EXE)-nnue $(EXE)-nnue.exe $(FLAGSTAMP)
 	rm -rf build
 
 help:
 	@echo "make [ARCH=native|avx512|bmi2|avx2|popcnt|legacy]  optimised build"
+	@echo "make [EVAL=classical|nnue]                        pick the evaluation"
 	@echo "make debug              assertions (+ sanitizers on POSIX)"
 	@echo "make bench              deterministic node-count benchmark"
 	@echo "make perft              movegen correctness suite (fast, depth-capped)"
@@ -223,5 +375,13 @@ help:
 	@echo "make release            build all distributable ARCHs into build/"
 	@echo "make openbench-check    verify OpenBench compliance"
 	@echo "make tuner              build the evaluation fitter (docs/TUNING.md)"
+	@echo "make datagen            build the NNUE data generator (docs/NNUE.md)"
+	@echo "make datagen-test       datagen round-trip + label reproducibility gate"
+	@echo "make trainer-setup      create trainer/.venv and install PyTorch"
+	@echo "make trainer-test       run the trainer's test suite"
+	@echo "make nnue-export        quantise NET into EVALFILE (+ test vectors)"
+	@echo "make nnue               build the engine with the network evaluation"
+	@echo "make nnue-test          C inference == quantised Python reference"
+	@echo "make nnue-info          which net a build is carrying, by hash"
 	@echo "make format[-check]     apply / verify .clang-format"
 	@echo "make clean"

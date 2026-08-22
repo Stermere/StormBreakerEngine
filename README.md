@@ -45,9 +45,13 @@ Every change from here is measured with SPRT rather than argued for.
 | Evaluation: pawn structure, mobility, king safety, threats | complete |
 | Evaluation: king-relative placement (factorised HalfKA, 6144 weights) | complete |
 | Evaluation tuning on real game data (`make tuner`) | complete |
+| NNUE data generation, record format, shuffler (`make datagen`) | complete |
+| NNUE trainer: features, dataset, model, training loop (`trainer/`) | complete |
+| NNUE export + C inference, bit-exact against the reference (`make nnue-test`) | complete |
 | **Lazy SMP (`Threads` is capped at 1), staged move generation** | **TODO** |
 | **Correction history** | **TODO** |
-| **NNUE experiments and training pipeline. NN informed search** | **TODO** |
+| **NNUE integration: incremental accumulator, re-tuned margins, SPRT** | **TODO** |
+| **NN informed search (policy head for move ordering)** | **TODO** |
 | **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
@@ -63,6 +67,9 @@ make bench               # deterministic node-count benchmark
 make perft               # move generation correctness suite
 make openbench-check     # verify OpenBench compliance
 make tuner               # build the evaluation fitter
+make datagen             # build the NNUE training-data generator
+make datagen-test        # datagen round-trip + label reproducibility gate
+make nnue-test           # C network inference == the quantised reference
 make help                # all targets
 ```
 
@@ -72,6 +79,7 @@ First-time environment setup (Windows):
 pwsh tools\setup.ps1              # install fastchess, GUIs, Stockfish; fetch the book
 pwsh tools\register-engines.ps1   # register the engine with Cute Chess
 pwsh tools\sprt.ps1 -Smoke        # verify the match pipeline end to end
+pwsh tools\trainer-setup.ps1      # create trainer\.venv and install PyTorch
 ```
 
 ---
@@ -80,7 +88,7 @@ pwsh tools\sprt.ps1 -Smoke        # verify the match pipeline end to end
 
 ```powershell
 pwsh tools\gui.ps1                    # En Croissant (default)
-pwsh tools\gui.ps1 -App encroissant   # Cute Chess
+pwsh tools\gui.ps1 -App cutechess   # Cute Chess
 pwsh tools\gui.ps1 -App both
 ```
 
@@ -123,9 +131,42 @@ fast-chess -engine cmd=.\chessengine.exe name=dev `
 | `make release` | every distributable ARCH into `build/` |
 | `make debug` | assertions on, sanitizers on POSIX |
 | `make EXE=name` | name the output binary (OpenBench requirement) |
+| `make tuner` | the evaluation fitter ([docs/TUNING.md](docs/TUNING.md)) |
+| `make datagen` | the NNUE data generator ([docs/NNUE.md](docs/NNUE.md)) |
+| `make datagen-test` | datagen round-trip + label reproducibility gate |
+| `make trainer-setup` | create `trainer/.venv` and install PyTorch |
+| `make trainer-test` | the trainer's test suite |
+| `make EVAL=nnue` | build with the network instead of the classical evaluation |
+| `make nnue-export` | quantise `NET` into `EVALFILE` + test vectors |
+| `make nnue` | the engine with the network, as `chessengine-nnue` |
+| `make nnue-test` | C inference == the quantised Python reference, exactly |
+| `make nnue-info` | which net a build is carrying, by hash |
 
 On non-x86 targets (Apple Silicon, ARM) the arch profiles are ignored and a
 portable build is produced automatically.
+
+### Which evaluation gets built
+
+`EVAL` picks one, at compile time, and there is no runtime switch - an
+evaluation that tested a flag at every node would pay for the flexibility in
+the only currency that matters.
+
+```sh
+make                      # classical: the tuned 13,684-parameter linear model
+make EVAL=nnue            # the network, embedded from EVALFILE
+make EVAL=nnue EVALFILE=external/nets/candidate.nnue
+```
+
+The default is classical and stays classical until an NNUE build has passed
+its own SPRT ([docs/NNUE.md](docs/NNUE.md), Task 4). The switch exists so the
+two can be compared; a default flipped ahead of the measurement is how an
+untested change ships.
+
+A net is embedded with `.incbin`, so an NNUE binary is self-contained and its
+bench prints the net's SHA-256 in the header - a node count that cannot name
+its net is not a measurement. `setoption name EvalFile value <path>` swaps the
+net at runtime, which is how a candidate is tried before it is worth
+embedding.
 
 ---
 
@@ -135,6 +176,8 @@ portable build is produced automatically.
 src/                engine sources (flat, as in most strong engines)
 tests/perft/        move generation correctness suites (EPD)
 tools/              setup, GUI launch/registration, SPRT, gauntlet (PowerShell)
+                    plus tuner.c (evaluation fitter) and datagen.c (NNUE data)
+trainer/            the NNUE trainer: PyTorch, its own venv, its own tests
 docs/               architecture, testing methodology, UCI reference
 external/           gitignored: books, opponent engines, baselines, PGNs
 .github/workflows/  CI
@@ -169,10 +212,13 @@ The open work, roughly in order of Elo per unit of effort:
    are file-scope and must move into a per-thread block first.
 5. **Staged move generation**, so a node that cuts on the table move never
    generates or scores the rest of the list.
-6. **NNUE.** The tuner's feature extraction is already the network's input
-   layer: the king-relative tables are a factorised HalfKA set, so the same
-   code produces the same features. Generating the data in-house keeps the
-   network clear of other engines' licensing.
+6. **NNUE.** Tasks 1 and 2 of [docs/NNUE.md](docs/NNUE.md) are built and
+   their gates pass: `tools/datagen.c` generates and labels positions with the
+   search in the working tree, and `trainer/` fits the network to them. Next is
+   Task 3, the exporter and `src/nnue.c`, whose acceptance criterion is exact
+   integer equality with the quantised Python reference — not "close".
+   Generating the data in-house is what keeps the network clear of other
+   engines' licensing.
 
 ---
 
@@ -181,6 +227,8 @@ The open work, roughly in order of Elo per unit of effort:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the modules fit together
 - [docs/TESTING.md](docs/TESTING.md) — perft, bench, SPRT, OpenBench
 - [docs/TUNING.md](docs/TUNING.md) — fitting the evaluation to real games
+- [docs/NNUE.md](docs/NNUE.md) — the network plan: data schema, trainer, export, search integration
+- [trainer/README.md](trainer/README.md) — running the trainer: setup, the pipeline, the sanity table
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) — every measured change and what it scored
 - [docs/UCI.md](docs/UCI.md) — supported commands and options
 

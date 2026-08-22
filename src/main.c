@@ -7,6 +7,7 @@
 #include "bitboard.h"
 #include "board.h"
 #include "eval.h"
+#include "nnue.h"
 #include "search.h"
 #include "tt.h"
 #include "uci.h"
@@ -30,6 +31,12 @@ int main(int argc, char **argv) {
     bb_init();
     zobrist_init();
     eval_init();
+#ifdef EVAL_NNUE
+    /* Before search_init(), and fatal on failure: an engine whose evaluation
+     * did not load has nothing useful to do, and finding that out at the first
+     * `go` rather than at startup wastes a match. */
+    nnue_init();
+#endif
     search_init();
     tt_resize(16);
 

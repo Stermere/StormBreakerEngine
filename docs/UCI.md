@@ -44,6 +44,14 @@ Stockfish's, so the two can be diffed directly.
 | `Ponder` | check | false | | the GUI drives pondering with `go ponder` |
 | `Move Overhead` | spin | 10 | 0–5000 | ms reserved for GUI/network latency |
 | `UCI_Chess960` | check | false | | switches castling move notation |
+| `EvalFile` | string | `<internal>` | | **`EVAL=nnue` builds only** — load a net from disk |
+
+`EvalFile` is advertised only by a build that has a network to replace. The net
+is embedded at compile time, so the default is not a path; setting one swaps the
+evaluation without a rebuild, which is how a candidate net is tried before it is
+worth embedding. A load that fails leaves the previous net in place and says why
+on an `info string` — a typo in a GUI config must not leave the engine with no
+evaluation at all. `<internal>` is accepted and means "keep the embedded one".
 
 `Hash` and `Threads` are mandatory for OpenBench compliance. `Threads` honestly
 advertises `max 1` rather than accepting a value it cannot deliver — a test
@@ -67,7 +75,15 @@ Useful during development; GUIs ignore them.
 | `perft <depth>` | per-move node breakdown for the current position |
 | `perft suite [path] [maxdepth]` | run an EPD perft suite |
 | `d` | print the board, FEN and Zobrist key |
-| `eval` | print the static evaluation breakdown |
+| `eval` | print the classical evaluation's term-by-term breakdown |
+| `nnue` | which net is loaded: architecture, quantisation, hash, source |
+| `nnue eval` | the network's score for the current position, in centipawns |
+| `nnue verify <file>` | check the exported test vectors; exits non-zero on any mismatch |
+
+The three `nnue` commands exist only in an `EVAL=nnue` build. `eval` always
+traces the *classical* model, in every build: it is the only evaluation with
+terms to name, and it stays in the tree as the reference the network is measured
+against.
 
 Every one of these also works as a command-line argument, dispatched through the
 exact same code path:

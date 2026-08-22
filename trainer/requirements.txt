@@ -1,0 +1,9 @@
+# torch is pinned: it is the one dependency whose version changes results, and
+# a loss curve that cannot be attributed to a specific build is not a
+# measurement. Install it from a CUDA index, not from PyPI - the PyPI wheel for
+# Windows is CPU-only. tools/trainer-setup.ps1 does this for you.
+torch==2.13.0
+
+# Floored rather than pinned: these do not touch the numbers.
+numpy>=2.1
+pytest>=8.0

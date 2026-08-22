@@ -77,7 +77,3 @@ if ($App -eq 'encroissant' -or $App -eq 'both') {
 }
 
 if ($launched -eq 0) { exit 1 }
-
-Write-Host ''
-Write-Host 'Note: the engine cannot play legal moves until movegen is implemented.' -ForegroundColor Yellow
-Write-Host 'It will connect and handshake correctly, then reply bestmove 0000.' -ForegroundColor Yellow

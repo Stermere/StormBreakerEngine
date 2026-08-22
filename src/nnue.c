@@ -1,0 +1,624 @@
+/*
+ * nnue.c - loading and evaluating the network.
+ *
+ * See nnue.h for the file format and for what it takes to upgrade the net.
+ * The whole file compiles to nothing unless EVAL_NNUE is defined, so a
+ * classical build carries none of it.
+ *
+ * The arithmetic here is the C half of a two-implementation contract: every
+ * number this file produces is also produced, independently, by
+ * tools/export_net.py in numpy, and `make nnue-test` requires the two to agree
+ * EXACTLY on ten thousand positions. That is the only reason to trust it. A
+ * quantisation that is subtly wrong loses about 30 Elo and looks completely
+ * healthy from every other angle.
+ */
+#include "nnue.h"
+
+#ifdef EVAL_NNUE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "eval.h"
+
+/*
+ * The exporter packs this header with an explicit struct format string rather
+ * than a C compiler, so its size is a contract rather than an implementation
+ * detail. A field added without care - one that makes the compiler insert
+ * padding - would silently shift every weight by a few bytes, and the failure
+ * would look like a net that trained badly rather than one that loaded wrong.
+ */
+_Static_assert(sizeof(NnueHeader) == 96, "NnueHeader must stay 96 bytes; see HEADER_FMT in "
+                                         "tools/export_net.py");
+
+/*
+ * Everything below assumes a little-endian host: the net file is
+ * little-endian and its weights are read in place rather than byte-swapped.
+ * Every target the engine builds for is little-endian in practice; a
+ * big-endian port would need a swap pass in nnue_adopt().
+ */
+
+/*
+ * Clamp on the returned score.
+ *
+ * Nothing structural stops a network from emitting an enormous number, and a
+ * static evaluation that wanders into mate territory makes the search report
+ * forced mates that do not exist. 20000 is far above any real evaluation and
+ * far below VALUE_MATE_IN_MAX_PLY even after the search adds its margins.
+ */
+#define NNUE_EVAL_LIMIT 20000
+
+/* ------------------------------------------------------------- sha-256 ---- */
+
+/*
+ * A net is 6 MB of gitignored data and the bench node count depends on which
+ * one is embedded, so a build has to be able to say which net it carries.
+ * FIPS 180-4, about ninety lines, no dependency - which is the point, since
+ * the engine links against nothing but libc.
+ */
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t bits;
+    uint8_t buf[64];
+    size_t used;
+} Sha256;
+
+/* clang-format off */
+static const uint32_t Sha256K[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u,
+    0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u,
+    0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u,
+    0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
+    0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au,
+    0x5b9cca4fu, 0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+/* clang-format on */
+
+static inline uint32_t sha_ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void sha256_block(Sha256 *sh, const uint8_t *p) {
+    uint32_t w[64];
+
+    for (int i = 0; i < 16; ++i)
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+
+    for (int i = 16; i < 64; ++i) {
+        const uint32_t s0 = sha_ror(w[i - 15], 7) ^ sha_ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        const uint32_t s1 = sha_ror(w[i - 2], 17) ^ sha_ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i]              = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = sh->state[0], b = sh->state[1], c = sh->state[2], d = sh->state[3];
+    uint32_t e = sh->state[4], f = sh->state[5], g = sh->state[6], h = sh->state[7];
+
+    for (int i = 0; i < 64; ++i) {
+        const uint32_t s1 = sha_ror(e, 6) ^ sha_ror(e, 11) ^ sha_ror(e, 25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t t1 = h + s1 + ch + Sha256K[i] + w[i];
+        const uint32_t s0 = sha_ror(a, 2) ^ sha_ror(a, 13) ^ sha_ror(a, 22);
+        const uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t t2 = s0 + mj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    sh->state[0] += a;
+    sh->state[1] += b;
+    sh->state[2] += c;
+    sh->state[3] += d;
+    sh->state[4] += e;
+    sh->state[5] += f;
+    sh->state[6] += g;
+    sh->state[7] += h;
+}
+
+/* Hex SHA-256 of `len` bytes into `out`, which needs 65 bytes. */
+static void sha256_hex(const void *data, size_t len, char *out) {
+    static const char Hex[] = "0123456789abcdef";
+
+    Sha256 sh;
+    sh.state[0] = 0x6a09e667u;
+    sh.state[1] = 0xbb67ae85u;
+    sh.state[2] = 0x3c6ef372u;
+    sh.state[3] = 0xa54ff53au;
+    sh.state[4] = 0x510e527fu;
+    sh.state[5] = 0x9b05688cu;
+    sh.state[6] = 0x1f83d9abu;
+    sh.state[7] = 0x5be0cd19u;
+    sh.bits     = (uint64_t)len * 8u;
+    sh.used     = 0;
+
+    const uint8_t *p = (const uint8_t *)data;
+    while (len >= 64) {
+        sha256_block(&sh, p);
+        p += 64;
+        len -= 64;
+    }
+    memcpy(sh.buf, p, len);
+    sh.used = len;
+
+    sh.buf[sh.used++] = 0x80;
+    if (sh.used > 56) {
+        memset(sh.buf + sh.used, 0, 64 - sh.used);
+        sha256_block(&sh, sh.buf);
+        sh.used = 0;
+    }
+    memset(sh.buf + sh.used, 0, 56 - sh.used);
+    for (int i = 0; i < 8; ++i)
+        sh.buf[56 + i] = (uint8_t)(sh.bits >> (56 - i * 8));
+    sha256_block(&sh, sh.buf);
+
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t byte     = (uint8_t)(sh.state[i] >> (24 - j * 8));
+            out[i * 8 + j * 2]     = Hex[byte >> 4];
+            out[i * 8 + j * 2 + 1] = Hex[byte & 15];
+        }
+    out[64] = '\0';
+}
+
+/* ----------------------------------------------------------- embedding ---- */
+
+/*
+ * The net is embedded with .incbin so the shipped binary is self-contained:
+ * OpenBench builds one file and runs it, and a bench node count has to be
+ * reproducible from the binary alone.
+ *
+ * NNUE_EVALFILE is a path relative to the directory make was run from, which
+ * is the assembler's working directory too.
+ */
+#ifdef NNUE_EVALFILE
+/* clang-format off */
+__asm__(".section .rodata\n"
+        ".balign 64\n"
+        ".globl nnueEmbeddedStart\n"
+        "nnueEmbeddedStart:\n"
+        ".incbin \"" NNUE_EVALFILE "\"\n"
+        ".globl nnueEmbeddedEnd\n"
+        "nnueEmbeddedEnd:\n"
+        ".balign 4\n"
+        ".text\n");
+/* clang-format on */
+extern const unsigned char nnueEmbeddedStart[];
+extern const unsigned char nnueEmbeddedEnd[];
+#endif
+
+/* ------------------------------------------------------------ the net ----- */
+
+typedef struct {
+    NnueHeader hdr;
+
+    /* Pointers into the payload, which is either the embedded blob - read in
+     * place, never copied - or `owned` below. */
+    const int16_t *ftWeight;  /* [features][hidden], feature-major */
+    const int16_t *ftBias;    /* [hidden] */
+    const int16_t *outWeight; /* [outputBuckets][2 * hidden] */
+    const int32_t *outBias;   /* [outputBuckets] */
+
+    unsigned char *owned; /* non-NULL only when the net came from a file */
+    char hash[65];
+    char source[512];
+    bool loaded;
+} Net;
+
+static Net Loaded;
+
+/* Bytes the payload must occupy for this header to be self-consistent. */
+static uint64_t nnue_payload_bytes(const NnueHeader *h) {
+    return (uint64_t)h->features * h->hidden * sizeof(int16_t) +
+           (uint64_t)h->hidden * sizeof(int16_t) +
+           (uint64_t)h->outputBuckets * 2u * h->hidden * sizeof(int16_t) +
+           (uint64_t)h->outputBuckets * sizeof(int32_t);
+}
+
+/*
+ * Every rejection names the field and both values. A net that fails to load is
+ * almost always someone mid-upgrade, and "hidden width 1024, this build holds
+ * at most 512" is a fix; "bad net file" is a morning.
+ */
+static bool nnue_validate(const NnueHeader *h, size_t bytes, const char *what) {
+#define REJECT(...)                       \
+    do {                                  \
+        printf("info string %s: ", what); \
+        printf(__VA_ARGS__);              \
+        printf("\n");                     \
+        fflush(stdout);                   \
+        return false;                     \
+    } while (0)
+
+    if (bytes < sizeof(NnueHeader))
+        REJECT("truncated - %zu bytes is smaller than the %zu-byte header", bytes,
+               sizeof(NnueHeader));
+
+    if (memcmp(h->magic, NNUE_MAGIC, NNUE_MAGIC_LEN) != 0)
+        REJECT("not a net file (bad magic)");
+
+    if (h->formatVersion != NNUE_FORMAT_VERSION)
+        REJECT("format version %u, this build reads %u - re-export with the current "
+               "tools/export_net.py",
+               h->formatVersion, NNUE_FORMAT_VERSION);
+
+    if (h->featureSet != NNUE_FEATURES_HALFKA_8BUCKET)
+        REJECT("feature set %u is not implemented - add its case to nnue_feature_index() "
+               "in src/nnue.c",
+               h->featureSet);
+
+    if (h->activation != NNUE_ACT_CRELU)
+        REJECT("activation %u is not implemented - add its case to nnue_output() in "
+               "src/nnue.c",
+               h->activation);
+
+    /* The feature set's tag defines its own shape, so a file that disagrees was
+     * written by an exporter with a different idea of what the tag means. */
+    if (h->features != 8u * 12u * 64u)
+        REJECT("feature set %u is %u features, not %u", h->featureSet, 8u * 12u * 64u, h->features);
+
+    if (h->hidden == 0 || h->hidden > NNUE_MAX_HIDDEN)
+        REJECT("hidden width %u, this build holds at most %u - raise NNUE_MAX_HIDDEN in "
+               "src/nnue.h and rebuild",
+               h->hidden, (unsigned)NNUE_MAX_HIDDEN);
+
+    if (h->outputBuckets != 1)
+        REJECT("%u output buckets - bucketed output is not implemented in nnue_output() "
+               "in src/nnue.c",
+               h->outputBuckets);
+
+    if (h->qa == 0 || h->qb == 0 || h->scale == 0)
+        REJECT("degenerate quantisation (qa %u, qb %u, scale %d)", h->qa, h->qb, h->scale);
+
+    const uint64_t need = nnue_payload_bytes(h);
+    if (h->payloadBytes != need)
+        REJECT("header claims %u payload bytes, its own shape needs %llu", h->payloadBytes,
+               (unsigned long long)need);
+
+    if ((uint64_t)bytes != sizeof(NnueHeader) + need)
+        REJECT("file is %zu bytes, header describes %llu", bytes,
+               (unsigned long long)(sizeof(NnueHeader) + need));
+
+#undef REJECT
+    return true;
+}
+
+/* Points the net at a validated blob and hashes it. `owned` is NULL for the
+ * embedded blob, which lives in rodata and must not be freed. */
+static void nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *owned,
+                       const char *source) {
+    if (Loaded.owned)
+        free(Loaded.owned);
+
+    memcpy(&Loaded.hdr, blob, sizeof(NnueHeader));
+    Loaded.owned = owned;
+
+    const int16_t *p = (const int16_t *)(const void *)(blob + sizeof(NnueHeader));
+    Loaded.ftWeight  = p;
+    p += (size_t)Loaded.hdr.features * Loaded.hdr.hidden;
+    Loaded.ftBias = p;
+    p += Loaded.hdr.hidden;
+    Loaded.outWeight = p;
+    p += (size_t)Loaded.hdr.outputBuckets * 2u * Loaded.hdr.hidden;
+    Loaded.outBias = (const int32_t *)(const void *)p;
+
+    sha256_hex(blob, bytes, Loaded.hash);
+    snprintf(Loaded.source, sizeof(Loaded.source), "%s", source);
+    Loaded.loaded = true;
+}
+
+bool nnue_load_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        printf("info string EvalFile: cannot open %s\n", path);
+        fflush(stdout);
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        printf("info string EvalFile: %s is empty\n", path);
+        fflush(stdout);
+        fclose(f);
+        return false;
+    }
+
+    unsigned char *blob = (unsigned char *)malloc((size_t)size);
+    if (!blob) {
+        printf("info string EvalFile: out of memory reading %s\n", path);
+        fflush(stdout);
+        fclose(f);
+        return false;
+    }
+
+    const size_t got = fread(blob, 1, (size_t)size, f);
+    fclose(f);
+
+    if (got != (size_t)size || !nnue_validate((const NnueHeader *)(const void *)blob, got, path)) {
+        free(blob);
+        return false;
+    }
+
+    nnue_adopt(blob, got, blob, path);
+    return true;
+}
+
+void nnue_init(void) {
+    if (Loaded.loaded)
+        return;
+
+#ifdef NNUE_EVALFILE
+    const size_t bytes = (size_t)(nnueEmbeddedEnd - nnueEmbeddedStart);
+    if (!nnue_validate((const NnueHeader *)(const void *)nnueEmbeddedStart, bytes,
+                       "embedded net")) {
+        printf("info string the embedded net is unusable; rebuild with a valid EVALFILE\n");
+        fflush(stdout);
+        exit(1);
+    }
+    nnue_adopt(nnueEmbeddedStart, bytes, NULL, NNUE_EVALFILE " (embedded)");
+#else
+    printf("info string this build embeds no net: rebuild with "
+           "'make EVAL=nnue EVALFILE=<path>'\n");
+    fflush(stdout);
+    exit(1);
+#endif
+}
+
+/* ------------------------------------------------------------ features ---- */
+
+/*
+ * The 64 king squares folded onto 8 buckets - eval.c's king_bucket(), spelled
+ * out again on purpose. Sharing it would tie the net's indexing to the
+ * classical evaluation's, and the whole point of NnueFeatureSet is that the
+ * net's can move on - 32 mirrored king squares is the planned next step -
+ * while the classical evaluation's stays where the tuner fitted it.
+ */
+static inline int nnue_king_bucket(Square normalisedKing) {
+    return (int)(rank_of(normalisedKing) >> 1) * 2 + (int)(file_of(normalisedKing) >> 1);
+}
+
+/*
+ * One perspective's view of the board: rank-flipped for black, file-mirrored
+ * when that side's king sits on the kingside. The mirror is driven by the KING
+ * and applied to every square, exactly as TERM_PSQK does in eval.c - fold the
+ * two differently and the table is indexed inconsistently.
+ */
+typedef struct {
+    Color side;
+    bool mirror;
+    int bucket;
+} Perspective;
+
+static Perspective nnue_perspective(const Position *pos, Color side) {
+    Perspective p;
+    Square king = king_square(pos, side);
+
+    if (side == BLACK)
+        king = flip_rank(king);
+
+    p.side   = side;
+    p.mirror = file_of(king) >= FILE_E;
+    if (p.mirror)
+        king = (Square)(king ^ 7);
+    p.bucket = nnue_king_bucket(king);
+    return p;
+}
+
+/*
+ * UPGRADE POINT: the index function IS the feature set. A new NnueFeatureSet
+ * tag gets its own version of this, accepted in nnue_validate() and selected
+ * here.
+ */
+static inline int nnue_feature_index(const Perspective *p, Square sq, Piece pc) {
+    Square s = (p->side == BLACK) ? flip_rank(sq) : sq;
+    if (p->mirror)
+        s = (Square)(s ^ 7);
+
+    /* Planes 0-5 are the perspective's own pieces, 6-11 the enemy's, each in
+     * PAWN..KING order. PieceType starts at 1, the planes at 0. */
+    const int plane = (color_of(pc) == p->side ? 0 : 6) + (int)type_of(pc) - 1;
+    return p->bucket * (12 * 64) + plane * 64 + (int)s;
+}
+
+/*
+ * One perspective's accumulator, from scratch.
+ *
+ * int32 rather than int16, deliberately. The stored weights are int16 and a
+ * future incremental accumulator will be too - that is what SIMD wants - but
+ * summing in int32 here means this function cannot silently wrap where numpy
+ * would not, and a wrap the exact-match test did not happen to cover would
+ * surface as a rare blunder in a game instead. tools/export_net.py refuses to
+ * export a net whose accumulator could leave int16 range, which is what makes
+ * the narrower future version safe.
+ */
+static void nnue_accumulate(const Position *pos, const Perspective *p, int32_t *acc) {
+    const uint32_t hidden = Loaded.hdr.hidden;
+
+    for (uint32_t j = 0; j < hidden; ++j)
+        acc[j] = Loaded.ftBias[j];
+
+    Bitboard occupied = occupied_bb(pos);
+    while (occupied) {
+        const Square s           = pop_lsb(&occupied);
+        const int feature        = nnue_feature_index(p, s, piece_on(pos, s));
+        const int16_t *const row = Loaded.ftWeight + (size_t)feature * hidden;
+
+        for (uint32_t j = 0; j < hidden; ++j)
+            acc[j] += row[j];
+    }
+}
+
+/* --------------------------------------------------------------- output --- */
+
+/*
+ * The side to move always reads its own accumulator first. Getting this
+ * backwards produces a net that plays reasonably, hates its own position, and
+ * trains to a loss curve that looks completely normal.
+ *
+ * UPGRADE POINT: NNUE_ACT_SCRELU squares the clamped activation here, which is
+ * why it needs wider intermediates than clipped ReLU does.
+ */
+static int32_t nnue_output(const int32_t *own, const int32_t *other) {
+    const uint32_t hidden  = Loaded.hdr.hidden;
+    const int32_t qa       = (int32_t)Loaded.hdr.qa;
+    const int16_t *const w = Loaded.outWeight;
+
+    int32_t sum = Loaded.outBias[0];
+
+    for (uint32_t j = 0; j < hidden; ++j) {
+        const int32_t x = own[j] < 0 ? 0 : (own[j] > qa ? qa : own[j]);
+        sum += x * (int32_t)w[j];
+    }
+    for (uint32_t j = 0; j < hidden; ++j) {
+        const int32_t x = other[j] < 0 ? 0 : (other[j] > qa ? qa : other[j]);
+        sum += x * (int32_t)w[hidden + j];
+    }
+    return sum;
+}
+
+/*
+ * Raw output to centipawns.
+ *
+ * int64 because raw reaches several million and SCALE is 400. The division
+ * TRUNCATES toward zero, which is plain C integer division and which
+ * tools/export_net.py reproduces explicitly: numpy's floor division rounds the
+ * other way for negatives, and that one asymmetry would fail about half the
+ * test vectors.
+ */
+static Value nnue_centipawns(int32_t raw) {
+    const int64_t num = (int64_t)raw * (int64_t)Loaded.hdr.scale;
+    const int64_t den = (int64_t)Loaded.hdr.qa * (int64_t)Loaded.hdr.qb;
+    const int64_t cp  = num / den;
+
+    if (cp > NNUE_EVAL_LIMIT)
+        return NNUE_EVAL_LIMIT;
+    if (cp < -NNUE_EVAL_LIMIT)
+        return -NNUE_EVAL_LIMIT;
+    return (Value)cp;
+}
+
+/* The raw integer output, shared by the evaluation and the verifier so the
+ * gate tests the arithmetic the engine actually runs. */
+static int32_t nnue_raw(const Position *pos) {
+    int32_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Perspective p = nnue_perspective(pos, c);
+        nnue_accumulate(pos, &p, acc[c]);
+    }
+
+    const Color stm = pos->sideToMove;
+    return nnue_output(acc[stm], acc[stm ^ 1]);
+}
+
+Value nnue_evaluate(const Position *pos) { return nnue_centipawns(nnue_raw(pos)); }
+
+/* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is
+ * not set, so which one the engine runs costs nothing at runtime. */
+Value eval_evaluate(const Position *pos) { return nnue_evaluate(pos); }
+
+/* ------------------------------------------------------------- reporting -- */
+
+const char *nnue_hash(void) { return Loaded.loaded ? Loaded.hash : "no-net"; }
+
+void nnue_print_info(void) {
+    if (!Loaded.loaded) {
+        printf("info string no net loaded\n");
+        fflush(stdout);
+        return;
+    }
+
+    const NnueHeader *h = &Loaded.hdr;
+    char tag[NNUE_TAG_LEN + 1];
+    memcpy(tag, h->tag, NNUE_TAG_LEN);
+    tag[NNUE_TAG_LEN] = '\0';
+
+    printf("info string net %.12s  %u->%ux2->%u  qa %u qb %u scale %d  tag %s  from %s\n",
+           Loaded.hash, h->features, h->hidden, h->outputBuckets, h->qa, h->qb, h->scale, tag,
+           Loaded.source);
+    fflush(stdout);
+}
+
+/* ---------------------------------------------------------- the gate ------ */
+
+int nnue_verify_vectors(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("nnue verify: cannot open %s\n", path);
+        printf("             write it with tools/export_net.py --vectors\n");
+        return 1;
+    }
+
+    char line[512];
+    long checked = 0, failed = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+
+        long expectedRaw, expectedCp;
+        int consumed = 0;
+        if (sscanf(line, "%ld %ld %n", &expectedRaw, &expectedCp, &consumed) != 2 || !consumed) {
+            printf("nnue verify: malformed line: %s", line);
+            ++failed;
+            continue;
+        }
+
+        char *const fen = line + consumed;
+        for (char *p = fen; *p; ++p)
+            if (*p == '\n' || *p == '\r') {
+                *p = '\0';
+                break;
+            }
+
+        Position pos;
+        memset(&pos, 0, sizeof(pos));
+        if (!board_set_fen(&pos, fen)) {
+            printf("nnue verify: unparseable FEN: %s\n", fen);
+            ++failed;
+            continue;
+        }
+
+        const int32_t raw = nnue_raw(&pos);
+        const Value cp    = nnue_centipawns(raw);
+
+        if ((long)raw != expectedRaw || (long)cp != expectedCp) {
+            /* Print the first handful and then stop counting out loud: a
+             * quantisation bug fails every line, and ten thousand of them
+             * buries the one worth reading. */
+            if (failed < 10)
+                printf("nnue verify: MISMATCH  raw %ld != %ld   cp %ld != %ld   %s\n", (long)raw,
+                       expectedRaw, (long)cp, expectedCp, fen);
+            ++failed;
+        }
+        ++checked;
+    }
+    fclose(f);
+
+    if (checked == 0) {
+        printf("FAIL: %s contained no test vectors\n", path);
+        return 1;
+    }
+    if (failed) {
+        printf("FAIL: %ld of %ld positions disagree with the Python reference\n", failed, checked);
+        return 1;
+    }
+
+    printf("PASS: %ld positions, C inference matches the quantised reference exactly\n", checked);
+    return 0;
+}
+
+#endif /* EVAL_NNUE */

@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "board.h"
+#include "nnue.h"
 #include "search.h"
 #include "timeman.h"
 #include "tt.h"
@@ -124,6 +125,14 @@ void bench_run(int depth) {
     printf("\n===========================\n");
     printf("Positions  : %d\n", BENCH_POSITION_COUNT);
     printf("Depth      : %d\n", depth);
+#ifdef EVAL_NNUE
+    /* The node count depends on which net is embedded, so a bench number
+     * that cannot name its net is not a measurement. This goes in the
+     * header and never on the last line, which invariant 2 owns. */
+    printf("Eval       : nnue %.12s\n", nnue_hash());
+#else
+    printf("Eval       : classical\n");
+#endif
     printf("Time       : %lldms\n", (long long)elapsed);
 
     /* THIS LINE IS THE CONTRACT. OpenBench parses exactly this shape; keep the

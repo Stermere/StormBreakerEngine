@@ -70,6 +70,14 @@ jobs:
       - name: Tuner builds
         run: make tuner ARCH=popcnt CC=${{ matrix.cc }}
 
+      # `make datagen` is a third configuration: every engine source rebuilt
+      # with -DDATAGEN, which switches on the tree-sampling hook in search.c.
+      # Nothing else compiles it, so without this step a search change can
+      # break data generation and go unnoticed until someone regenerates a
+      # hundred million positions.
+      - name: Datagen builds
+        run: make datagen ARCH=popcnt CC=${{ matrix.cc }}
+
   # Undefined behaviour in a chess engine shows up as a rare illegal move or a
   # crash 40 moves into a tournament game. Catching it here is far cheaper.
   sanitizers:
@@ -103,6 +111,35 @@ jobs:
 
       - name: Perft suites
         run: make perft
+
+  # The NNUE data pipeline's acceptance gate (docs/NNUE.md, Task 1) and the
+  # trainer's test suite. Both are seconds, and both guard failures that have
+  # no symptom: a record that does not round-trip, a label that does not
+  # reproduce, or a Python feature extractor that has drifted from the C one.
+  datagen:
+    name: datagen gate + trainer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # CPU torch: the trainer's tests never touch a GPU, and the CUDA wheel is
+      # 2.6 GB.
+      - name: Install the trainer
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy pytest
+
+      - name: Datagen round-trip and label reproducibility
+        run: make datagen-test ARCH=popcnt
+
+      # Not `make trainer-test`: that target drives the Windows venv layout.
+      - name: Trainer tests
+        run: python -m pytest trainer/tests -q --shard external/datagen-test/all.cnn
 
   format:
     name: clang-format

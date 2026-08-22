@@ -44,6 +44,16 @@ extern const Value PieceValues[PIECE_TYPE_NB];
  */
 Value eval_evaluate(const Position *pos);
 
+/*
+ * The hand-written evaluation above, by name.
+ *
+ * eval_evaluate() IS this in a classical build and is the network in an
+ * `EVAL=nnue` one, so anything that specifically wants the classical model -
+ * tools/tuner.c, which fits it, and `eval`, which traces it - must ask for it
+ * by this name or it will quietly measure whichever evaluation got linked.
+ */
+Value eval_classical(const Position *pos);
+
 /* Human-readable term-by-term breakdown - the UCI `eval` command. Invaluable
  * when a game is lost to an evaluation blind spot and you need to see why. */
 void eval_trace(const Position *pos);

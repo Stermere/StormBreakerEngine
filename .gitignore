@@ -16,6 +16,10 @@
 /build/
 /obj/
 
+# Records the flags the current binary was built with, so switching ARCH or
+# EVAL actually rebuilds instead of handing back the previous build.
+/.buildflags
+
 # Profile-guided optimisation data
 *.profraw
 *.profdata
@@ -24,6 +28,23 @@ pgo/
 # External tooling, books, opponent engines, match output.
 # Everything here is fetched by tools/setup.ps1 and must never be committed.
 /external/
+
+# NNUE training data and nets. Packed shards, their policy sidecars and their
+# manifests live under external/ (already ignored); these catch one written
+# somewhere else by accident. A shard is gigabytes and a net is ~6 MB - neither
+# belongs in git, and docs/NNUE.md says how a net is distributed instead.
+*.cnn
+*.pol
+*.pt
+*.nnue
+*.nnue.vectors
+*.nnue.sha256
+
+# The trainer's virtualenv. Recreate it with tools/trainer-setup.ps1.
+/trainer/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Match/test output that may land outside external/ by accident
 *.pgn

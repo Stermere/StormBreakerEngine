@@ -219,13 +219,13 @@ static Value quiesce(Position *pos, Value alpha, Value beta, int depth) {
     Value best         = -VALUE_INFINITE;
 
     if (!inCheck) {
-        best = eval_evaluate(pos);
+        best = eval_classical(pos);
         if (best >= beta || depth <= 0)
             return best;
         if (best > alpha)
             alpha = best;
     } else if (depth <= 0) {
-        return eval_evaluate(pos);
+        return eval_classical(pos);
     }
 
     ScoredMove list[MAX_MOVES];
@@ -258,7 +258,7 @@ static bool position_is_quiet(Extractor *ex) {
     if (board_checkers(ex->pos))
         return false;
 
-    const Value stat = eval_evaluate(ex->pos);
+    const Value stat = eval_classical(ex->pos);
     const Value q    = quiesce(ex->pos, -VALUE_INFINITE, VALUE_INFINITE, ex->opt.qsearchPly);
 
     if (q != stat)
@@ -772,7 +772,7 @@ static void load_worker(void *arg) {
         }
 
         EvalTraceDirtyCount = 0;
-        eval_evaluate(pos);
+        eval_classical(pos);
 
         Sample *s = &Samples[i];
         s->offset = (uint32_t)pool->len;

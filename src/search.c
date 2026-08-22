@@ -95,6 +95,16 @@ static SearchStack Stack[MAX_PLY];
  * check, say - cannot grow the tree without limit. */
 static Depth RootDepth;
 
+/* Score and depth of the last iteration that ran to completion, published for
+ * search_run_sync. The UCI path reads the same numbers off the `info` lines,
+ * which is why nothing but an offline tool ever needed them exposed. */
+static Value RootScore;
+static Depth CompletedDepth;
+
+/* Suppresses the `info` lines. Set only for the duration of a synchronous
+ * search: datagen runs millions of them and wants its own stdout. */
+static bool Silent;
+
 /* Deepest ply any line reached this iteration, quiescence included. Reported
  * as `info seldepth`, which is how a GUI tells a search that is genuinely
  * looking deep along forcing lines from one that is merely reporting a big
@@ -157,6 +167,16 @@ static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
+
+#ifdef DATAGEN
+static SearchNodeVisitor NodeVisitor;
+static void *NodeVisitorCtx;
+
+void search_set_node_visitor(SearchNodeVisitor fn, void *ctx) {
+    NodeVisitor    = fn;
+    NodeVisitorCtx = ctx;
+}
+#endif
 
 /* Nodes between clock checks. Fine enough that a search cannot overrun its
  * budget by more than a millisecond or two, coarse enough that the clock read
@@ -1476,6 +1496,19 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         tt_store(key, bestMove, best, staticEval, depth, bound, ply);
     }
 
+#ifdef DATAGEN
+    /* A singular verification is skipped on purpose: its move list was missing
+     * a move, so neither the position's value nor its best move is a fact
+     * about the position, and a sampler must not learn from one. */
+    if (NodeVisitor && !isExcluded) {
+        const SearchNodeInfo info = {depth, ply, inCheck, bestMove,
+                                     best >= beta  ? NODE_FAIL_HIGH
+                                     : raisedAlpha ? NODE_EXACT
+                                                   : NODE_FAIL_LOW};
+        NodeVisitor(pos, &info, NodeVisitorCtx);
+    }
+#endif
+
     return best;
 }
 
@@ -1623,6 +1656,9 @@ static void print_iteration(Depth depth, Value value, int64_t elapsed) {
 static Move iterative_deepening(Position *pos, Move *ponderMove) {
     *ponderMove = MOVE_NONE;
 
+    RootScore      = VALUE_NONE;
+    CompletedDepth = 0;
+
     timeman_init(&Timer, &Limits, pos->sideToMove, pos->gamePly);
     tt_new_search();
 
@@ -1705,8 +1741,10 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         stability = (prevBest != MOVE_NONE && iterationBest == prevBest) ? stability + 1 : 0;
         prevBest  = iterationBest;
 
-        prevScore = value;
-        best      = iterationBest;
+        prevScore      = value;
+        best           = iterationBest;
+        RootScore      = value;
+        CompletedDepth = depth;
 
         /* Cleared, not left alone, when this iteration has no second PV move:
          * the stale entry belongs to a line the search has since abandoned, and
@@ -1714,7 +1752,8 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
          * ponder search and desynchronises the GUI on ponderhit. */
         *ponderMove = PvLength[0] > 1 ? PvTable[0][1] : MOVE_NONE;
 
-        print_iteration(depth, value, elapsed_ms());
+        if (!Silent)
+            print_iteration(depth, value, elapsed_ms());
         sort_root_moves(roots, rootCount);
 
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)
@@ -1736,9 +1775,9 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
 
 /* ------------------------------------------------------------ lifecycle -- */
 
-static void worker_entry(void *arg) {
-    (void)arg;
-
+/* One search over RootPos under Limits, shared by the worker thread and by
+ * search_run_sync so the two can never drift apart. */
+static Move run_search(Move *ponderMove) {
     NodeCount = 0;
     SelDepth  = 0;
     atomic_store(&Nodes, 0);
@@ -1748,8 +1787,15 @@ static void worker_entry(void *arg) {
      * one depend on it. */
     memset(Stack, 0, sizeof(Stack));
 
-    Move ponderMove = MOVE_NONE;
-    Move best       = iterative_deepening(&RootPos, &ponderMove);
+    *ponderMove = MOVE_NONE;
+    return iterative_deepening(&RootPos, ponderMove);
+}
+
+static void worker_entry(void *arg) {
+    (void)arg;
+
+    Move ponderMove;
+    Move best = run_search(&ponderMove);
 
     /*
      * UCI forbids sending `bestmove` during a ponder or an infinite search:
@@ -1773,6 +1819,7 @@ void search_start(const Position *pos, const SearchLimits *limits) {
     atomic_store(&Pondering, limits->ponder);
     atomic_store(&ClockOrigin, limits->startTime);
     atomic_store(&Searching, true);
+    Silent = false;
 
     WorkerStarted = thread_create(&Worker, worker_entry, NULL);
     if (!WorkerStarted) {
@@ -1780,6 +1827,32 @@ void search_start(const Position *pos, const SearchLimits *limits) {
          * - it just cannot be interrupted - which beats not moving at all. */
         worker_entry(NULL);
     }
+}
+
+void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResult *out) {
+    search_wait(); /* never run two searches at once */
+
+    RootPos = *pos;
+    Limits  = *limits;
+
+    atomic_store(&StopFlag, false);
+    /* A synchronous ponder search would wait for a `stop` that no one is
+     * around to send, so the flag is dropped rather than honoured. */
+    atomic_store(&Pondering, false);
+    atomic_store(&ClockOrigin, limits->startTime);
+    atomic_store(&Searching, true);
+    Silent = true;
+
+    Move ponderMove;
+    const Move best = run_search(&ponderMove);
+
+    Silent = false;
+    atomic_store(&Searching, false);
+
+    out->best  = best;
+    out->score = RootScore;
+    out->depth = CompletedDepth;
+    out->nodes = NodeCount;
 }
 
 void search_stop(void) { atomic_store(&StopFlag, true); }

@@ -11,9 +11,14 @@ complete and verified. The search is a PVS with a transposition table, null
 move, LMR, singular extensions, SEE pruning and history heuristics. The
 evaluation is a 13,684-parameter linear model — material, piece-square tables,
 king-relative placement, mobility, pawn structure, king safety and threats —
-fitted to 22.6M positions from human games by `tools/tuner.c`. What remains is
-ablating that batch, Lazy SMP, and eventually NNUE — see the status table in
-README.md.
+fitted to 22.6M positions from human games by `tools/tuner.c`.
+
+A network exists alongside it: `trainer/` fits it, `tools/export_net.py`
+quantises it, and `src/nnue.c` runs it, bit-exactly against the Python
+reference. It is **not** the default evaluation — `make EVAL=nnue` builds it,
+`make` still builds the classical one, and it stays that way until the
+integration passes an SPRT (docs/NNUE.md, Task 4). What remains is ablating the
+eval batch, Lazy SMP, and NNUE Tasks 4-5 — see the status table in README.md.
 
 ## Build and test
 
@@ -26,7 +31,18 @@ make perft              # movegen correctness suite
 make openbench-check    # verify OpenBench compliance
 make format             # apply .clang-format
 make tuner              # build the evaluation fitter (docs/TUNING.md)
+
+make EVAL=nnue          # any build, with the network instead of eval.c
+make nnue-test          # C inference == the quantised reference, exactly
+make datagen-test       # datagen round-trips and its labels reproduce
+make trainer-test       # the trainer's pytest suite
 ```
+
+`EVAL` picks the evaluation at compile time; `classical` is the default and
+there is no runtime switch. Switching `EVAL` or `ARCH` rebuilds correctly - a
+`.buildflags` stamp is a prerequisite of every binary, because otherwise make
+sees the same sources and the same output name and hands back the binary built
+with the *other* flags.
 
 On Windows, `make` is MSYS2's (`C:\msys64\usr\bin\make.exe`) and the compiler is
 MSYS2 UCRT64 gcc. PowerShell needs those on PATH.
@@ -62,17 +78,28 @@ is worse than a bug — it makes every subsequent result untrustworthy.
    transposition table, history, killers. Otherwise results depend on what was
    searched before, and reproducibility is gone.
 
-8. **Every evaluation weight goes through `TERM()` in `eval.c`, and every
+8. **A net is described by its own file, and every rejection names the field.**
+   `src/nnue.c` reads the architecture out of the net's header rather than from
+   constants compiled beside it, so retraining wider is a drop-in. Anything the
+   loader cannot handle must fail loudly at load with the field and both values
+   - a net that is misread scores plausibly and loses Elo silently, which is the
+   worst failure mode in this repository. `make nnue-test` is the gate: the C
+   inference must match the quantised Python reference EXACTLY on 10,000
+   positions, never approximately.
+
+9. **Every evaluation weight goes through `TERM()` in `eval.c`, and every
    table is registered once in `EVAL_PARAM_TABLES`.** That macro emits the
    score contribution and the tuner's gradient coefficient from the same
    expression. A term that adds to a score by hand is invisible to the tuner,
    which then optimises a model that is not the one being run — and nothing
    crashes, the engine just quietly gets worse while the fit reports success.
 
-9. **The evaluation must stay linear in its weights.** The tuner is plain
-   gradient descent on a dot product. A term whose *weight* changes which
-   *coefficients* get produced (a threshold on the running score, a lazy exit)
-   silently breaks that assumption.
+10. **The classical evaluation must stay linear in its weights.** The tuner is
+    plain gradient descent on a dot product. A term whose *weight* changes which
+    *coefficients* get produced (a threshold on the running score, a lazy exit)
+    silently breaks that assumption. This governs `eval.c` only; the network is
+    nonlinear by design, and `eval_classical()` stays reachable by name in every
+    build precisely so the tuner keeps fitting the model it thinks it is.
 
 ## Testing discipline
 
@@ -112,6 +139,8 @@ correct response is to implement movegen, not to relax the check.
 | `tests/perft/` | correctness suites (EPD) |
 | `tools/` | setup, GUI launch/registration, SPRT, gauntlet (PowerShell) |
 | `tools/tuner.c` | the evaluation fitter; **not** part of the engine binary |
+| `tools/export_net.py` | quantises a checkpoint into `.nnue` + the equivalence vectors |
+| `trainer/` | PyTorch NNUE trainer, its own venv, not subject to the C style rules |
 | `docs/` | architecture, testing, tuning, UCI reference |
 | `external/` | **gitignored** — books, opponents, baselines, PGNs, training data |
 

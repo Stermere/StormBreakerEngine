@@ -541,7 +541,7 @@ static void eval_threats(const Position *pos, const EvalInfo *ei, Score *sc) {
 
 /* ---------------------------------------------------------- entry point --- */
 
-Value eval_evaluate(const Position *pos) {
+Value eval_classical(const Position *pos) {
     EvalInfo ei;
     Score sc = {0, 0};
 
@@ -562,6 +562,19 @@ Value eval_evaluate(const Position *pos) {
     /* Scores are side-to-move-relative so the search can stay plain negamax. */
     return pos->sideToMove == WHITE ? score : -score;
 }
+
+/*
+ * This build's evaluation.
+ *
+ * src/nnue.c defines the same symbol when EVAL_NNUE is set, so the engine
+ * carries exactly one evaluation and never tests a flag to find out which. The
+ * classical one stays reachable by name in every build: `eval` traces it,
+ * tools/tuner.c fits it, and it is the only reference for whether a net is
+ * actually an improvement.
+ */
+#ifndef EVAL_NNUE
+Value eval_evaluate(const Position *pos) { return eval_classical(pos); }
+#endif
 
 /* ------------------------------------------------------------- tracing ---- */
 
