@@ -14,7 +14,7 @@
     measure as neutral or worse.
 
 .PARAMETER Dev
-    Engine under test. Defaults to the freshly built .\chessengine.exe.
+    Engine under test. Defaults to the freshly built .\stormbreaker.exe.
 
 .PARAMETER Base
     Baseline to compare against. Defaults to the most recent snapshot in
@@ -36,7 +36,7 @@
     pwsh tools\sprt.ps1 -Smoke
     pwsh tools\sprt.ps1
     pwsh tools\sprt.ps1 -Tc LTC
-    pwsh tools\sprt.ps1 -Dev .\chessengine.exe -Base external\baselines\v0.1.exe
+    pwsh tools\sprt.ps1 -Dev .\stormbreaker.exe -Base external\baselines\v0.1.exe
 #>
 [CmdletBinding()]
 param(

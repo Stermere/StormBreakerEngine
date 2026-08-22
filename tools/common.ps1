@@ -76,7 +76,7 @@ function Get-Stockfish {
 
 # The freshly built engine.
 function Get-EngineBinary {
-    $exe = Join-Path $RepoRoot 'chessengine.exe'
+    $exe = Join-Path $RepoRoot 'stormbreaker.exe'
     if (Test-Path $exe) { return $exe }
     return $null
 }

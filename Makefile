@@ -25,7 +25,7 @@
 #  dependency on `mkdir -p`/shell builtins that MinGW make may not provide.
 # ============================================================================
 
-EXE  ?= chessengine
+EXE  ?= stormbreaker
 ARCH ?= native
 
 # --------------------------------------------------------------- evaluation --

@@ -1,4 +1,4 @@
-# ChessEngine
+# StormBreaker
 
 A UCI chess engine written in C, built for competitive strength.
 
@@ -113,7 +113,7 @@ pwsh tools\gauntlet.ps1         # vs a field of opponents
 A quick ad-hoc match (fastchess is on PATH as `fast-chess`):
 
 ```powershell
-fast-chess -engine cmd=.\chessengine.exe name=dev `
+fast-chess -engine cmd=.\stormbreaker.exe name=dev `
            -engine cmd=stockfish name=sf `
            -each tc=10+0.1 -rounds 2 -pgnout file=external\games\quick.pgn
 ```
@@ -138,7 +138,7 @@ fast-chess -engine cmd=.\chessengine.exe name=dev `
 | `make trainer-test` | the trainer's test suite |
 | `make EVAL=nnue` | build with the network instead of the classical evaluation |
 | `make nnue-export` | quantise `NET` into `EVALFILE` + test vectors |
-| `make nnue` | the engine with the network, as `chessengine-nnue` |
+| `make nnue` | the engine with the network, as `stormbreaker-nnue` |
 | `make nnue-test` | C inference == the quantised Python reference, exactly |
 | `make nnue-info` | which net a build is carrying, by hash |
 

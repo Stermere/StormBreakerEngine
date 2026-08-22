@@ -541,7 +541,7 @@ a position that matters.
 
 ```sh
 make nnue-export    # quantise NET into EVALFILE, + vectors + .sha256 + manifest
-make nnue           # the engine with the network, as chessengine-nnue
+make nnue           # the engine with the network, as stormbreaker-nnue
 make nnue-test      # export, build, and require exact equality on every vector
 make nnue-info      # which net a build is carrying, by hash
 ```

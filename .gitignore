@@ -10,8 +10,8 @@
 *.gcda
 *.gcno
 *.su
-/chessengine
-/chessengine-*
+/stormbreaker
+/stormbreaker-*
 /Engine-*
 /build/
 /obj/

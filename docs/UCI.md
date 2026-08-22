@@ -89,8 +89,8 @@ Every one of these also works as a command-line argument, dispatched through the
 exact same code path:
 
 ```sh
-./chessengine bench
-./chessengine perft suite tests/perft/standard.epd 4
+./stormbreaker bench
+./stormbreaker perft suite tests/perft/standard.epd 4
 ```
 
 ---
@@ -115,13 +115,13 @@ correctly today.
 Pipe commands in directly:
 
 ```sh
-printf 'uci\nisready\nd\nquit\n' | ./chessengine
+printf 'uci\nisready\nd\nquit\n' | ./stormbreaker
 ```
 
 On Windows PowerShell, prefer a file to avoid encoding surprises:
 
 ```powershell
-cmd /c "type test.txt | .\chessengine.exe"
+cmd /c "type test.txt | .\stormbreaker.exe"
 ```
 
 (The engine tolerates a UTF-8 BOM anyway, since PowerShell adds one when piping

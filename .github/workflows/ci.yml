@@ -41,7 +41,7 @@ jobs:
 
       - name: UCI handshake
         run: |
-          out=$(printf 'uci\nisready\nquit\n' | ./chessengine)
+          out=$(printf 'uci\nisready\nquit\n' | ./stormbreaker)
           echo "$out"
           grep -q 'uciok'               <<< "$out" || { echo "::error::no uciok"; exit 1; }
           grep -q 'readyok'             <<< "$out" || { echo "::error::no readyok"; exit 1; }
@@ -52,8 +52,8 @@ jobs:
       # must agree on the node count.
       - name: Bench format and determinism
         run: |
-          n1=$(./chessengine bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
-          n2=$(./chessengine bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
+          n1=$(./stormbreaker bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
+          n2=$(./stormbreaker bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
           echo "run 1: $n1 nodes / run 2: $n2 nodes"
           [ -n "$n1" ] || { echo "::error::bench did not print '<nodes> nodes <nps> nps'"; exit 1; }
           [ "$n1" = "$n2" ] || { echo "::error::bench is not deterministic ($n1 vs $n2)"; exit 1; }
@@ -90,12 +90,12 @@ jobs:
         run: make debug ARCH=popcnt
 
       - name: Run bench under sanitizers
-        run: ./chessengine-debug bench 4
+        run: ./stormbreaker-debug bench 4
 
       - name: Run perft suites under sanitizers
         run: |
-          ./chessengine-debug perft suite tests/perft/standard.epd 4
-          ./chessengine-debug perft suite tests/perft/tricky.epd
+          ./stormbreaker-debug perft suite tests/perft/standard.epd 4
+          ./stormbreaker-debug perft suite tests/perft/tricky.epd
 
   # The correctness gate for move generation, and the most important job in this
   # file: a wrong perft count means the engine plays or accepts illegal moves,

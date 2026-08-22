@@ -1,11 +1,11 @@
 # Standard perft positions - the six everyone benchmarks against.
 #
 # Format:  <fen> ;D<depth> <expected leaf nodes> ;D<depth> <count> ...
-# Run:     ./chessengine perft suite tests/perft/standard.epd [maxdepth]
+# Run:     ./stormbreaker perft suite tests/perft/standard.epd [maxdepth]
 #
 # The counts below are the published, universally agreed values. If your
 # movegen disagrees with ANY of them, it is wrong - do not rationalise it.
-# Use `./chessengine perft <depth>` after `position fen ...` to get a
+# Use `./stormbreaker perft <depth>` after `position fen ...` to get a
 # per-move breakdown, compare it against Stockfish's `go perft <depth>`,
 # and recurse into the first move whose count differs.
 #

@@ -54,7 +54,7 @@ if ($App -eq 'cutechess' -or $App -eq 'both') {
         Write-Section 'Cute Chess'
         Start-Process -FilePath $exe
         Write-Ok 'launched'
-        Write-Host '  Play a game:  Game -> New  ->  set one side to CPU / ChessEngine' -ForegroundColor Gray
+        Write-Host '  Play a game:  Game -> New  ->  set one side to CPU / StormBreaker' -ForegroundColor Gray
         Write-Host '  Tournament:   Tournament -> New' -ForegroundColor Gray
         $launched++
     } else {

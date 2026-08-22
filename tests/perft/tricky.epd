@@ -4,7 +4,7 @@
 # catch the mistakes that the six standard positions miss - and each of these
 # bugs, left in, means playing or accepting an illegal move in a real game.
 #
-# Run: ./chessengine perft suite tests/perft/tricky.epd
+# Run: ./stormbreaker perft suite tests/perft/tricky.epd
 #
 # When one fails, the comment above it tells you exactly which rule you broke.
 

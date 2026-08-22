@@ -16,11 +16,11 @@
 
 .EXAMPLE
     pwsh tools\register-engines.ps1
-    pwsh tools\register-engines.ps1 -Name ChessEngine-dev
+    pwsh tools\register-engines.ps1 -Name StormBreaker-dev
 #>
 [CmdletBinding()]
 param(
-    [string]$Name = 'ChessEngine',
+    [string]$Name = 'StormBreaker',
     [string]$Engine
 )
 

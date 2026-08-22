@@ -50,7 +50,7 @@ when one fails, the comment above it tells you what you broke.
 
 ```sh
 make bench
-./chessengine bench      # prints "<nodes> nodes <nps> nps"
+./stormbreaker bench      # prints "<nodes> nodes <nps> nps"
 ```
 
 Bench serves two purposes:
