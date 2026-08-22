@@ -12,6 +12,10 @@
 *.su
 /stormbreaker
 /stormbreaker-*
+# Unignored, this makes the tree dirty the moment it is built, and the next
+# make re-stamps DATAGEN_COMMIT as <commit>-dirty - so a fleet's shards record
+# a build that cannot be tied to a commit.
+/datagen
 /Engine-*
 /build/
 /obj/
@@ -63,3 +67,9 @@ lookup.json
 Thumbs.db
 compile_commands.json
 .cache/
+
+# The fleet's real configuration. job.env.template is committed; job.env is
+# yours - it names your Storage Box and your key, which are not the repo's
+# business and differ per machine.
+/tools/cloud/job.env
+secrets.txt
