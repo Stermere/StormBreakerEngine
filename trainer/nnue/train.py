@@ -188,7 +188,7 @@ def parse_args(argv=None):
 
     parser.add_argument("--lambda-start", type=float, default=0.9,
                         help="weight on the search score in epoch 1")
-    parser.add_argument("--lambda-end", type=float, default=0.7,
+    parser.add_argument("--lambda-end", type=float, default=0.9,
                         help="weight on the search score in the final epoch")
     parser.add_argument("--sigmoid-k", type=float, default=DEFAULT_SIGMOID_K,
                         help="centipawns per unit of the win-probability sigmoid")

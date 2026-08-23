@@ -308,7 +308,7 @@ bool board_set_fen(Position *pos, const char *fen) {
                  *   2. build the CastlingSpec table in movegen.c per position
                  *      from those squares, rather than from the fixed
                  *      standard-chess geometry it hard-codes today;
-                 *   3. derive castling_targets() in this file the same way.
+                 *   3. derive castling_targets() in board.h the same way.
                  * The move encoding is already king-captures-own-rook, so
                  * nothing above movegen has to change.
                  */
@@ -489,15 +489,6 @@ static const uint8_t CastlingLoss[SQUARE_NB] = {
     [SQ_A1] = WHITE_OOO, [SQ_E1] = WHITE_ANY, [SQ_H1] = WHITE_OO,
     [SQ_A8] = BLACK_OOO, [SQ_E8] = BLACK_ANY, [SQ_H8] = BLACK_OO,
 };
-
-/* Where the king and rook end up. `rookFrom` doubles as the move's destination
- * square, because castling is encoded king-captures-own-rook. */
-static inline void castling_targets(Square kingFrom, Square rookFrom, Square *kingTo,
-                                    Square *rookTo) {
-    const bool kingside = rookFrom > kingFrom;
-    *kingTo             = make_square(kingside ? FILE_G : FILE_C, rank_of(kingFrom));
-    *rookTo             = make_square(kingside ? FILE_F : FILE_D, rank_of(kingFrom));
-}
 
 void board_do_move(Position *pos, Move m) {
     assert(is_ok_move(m));

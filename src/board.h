@@ -142,6 +142,23 @@ void board_print(const Position *pos);
 /* ---------------------------------------------------------- move making -- */
 
 /*
+ * Where the king and rook end up when castling. `rookFrom` doubles as the
+ * move's destination square, because castling is encoded king-captures-own-rook.
+ *
+ * In the header rather than in board.c because the NNUE accumulator has to
+ * derive the same two squares to know which features a castle changes. Two
+ * copies of this would be two things to keep in step, and a copy that drifted
+ * would put the rook's feature on the wrong square - which scores plausibly
+ * and loses Elo silently.
+ */
+static inline void castling_targets(Square kingFrom, Square rookFrom, Square *kingTo,
+                                    Square *rookTo) {
+    const bool kingside = rookFrom > kingFrom;
+    *kingTo             = make_square(kingside ? FILE_G : FILE_C, rank_of(kingFrom));
+    *rookTo             = make_square(kingside ? FILE_F : FILE_D, rank_of(kingFrom));
+}
+
+/*
  * Plays / retracts `m`, which must be legal in `pos`.
  *
  * do_move pushes the irreversible state onto history[gamePly] before mutating

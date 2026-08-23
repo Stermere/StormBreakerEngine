@@ -14,6 +14,7 @@
 #    make avx2            shorthand for the above
 #    make EVAL=nnue       build with the network instead of the classical eval
 #    make EVAL=classical  the hand-written evaluation (the default)
+#    make TUNE_SEARCH=on  expose the search margins as UCI spin options
 #    make debug           unoptimised + assertions (+ sanitizers on POSIX)
 #    make bench           build, then run the deterministic node-count benchmark
 #    make perft           build, then run the perft correctness suite
@@ -141,7 +142,24 @@ else ifneq ($(EVAL),classical)
     $(error Unknown EVAL '$(EVAL)'. Valid: classical nnue)
 endif
 
-DEFINES  := -DNDEBUG $(ARCHDEFS) $(NNUEDEFS)
+# TUNE_SEARCH exposes every pruning margin in search.c as a UCI spin option, so
+# a parameter sweep sets them per game instead of rebuilding per candidate. Off
+# by default and free when off: TUNABLE() expands to an enum constant and the
+# compiler folds it exactly as it folded the #define it replaced.
+#
+# Spelled in full rather than as TUNE because -DTUNE already belongs to the
+# EVALUATION fitter below, where it switches on the parameter trace in eval.c.
+# One flag doing both jobs would mean `make tuner` silently shipped the search
+# options, and a tuning build silently carried the eval trace on its hot path.
+TUNE_SEARCH ?= off
+TUNEDEFS    :=
+ifeq ($(TUNE_SEARCH),on)
+    TUNEDEFS := -DTUNE_SEARCH
+else ifneq ($(TUNE_SEARCH),off)
+    $(error Unknown TUNE_SEARCH '$(TUNE_SEARCH)'. Valid: on off)
+endif
+
+DEFINES  := -DNDEBUG $(ARCHDEFS) $(NNUEDEFS) $(TUNEDEFS)
 
 CFLAGS ?=
 CFLAGS := $(CSTD) $(WARNINGS) $(OPTIMISE) $(ARCHFLAGS) $(DEFINES) $(CFLAGS)

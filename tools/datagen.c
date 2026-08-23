@@ -1,12 +1,13 @@
 /*
  * datagen.c - training data for the network. Not part of the engine binary.
  *
- * Six subcommands, which together are the whole pipeline from an empty
+ * Seven subcommands, which together are the whole pipeline from an empty
  * directory to a shard a trainer can memory-map:
  *
  *     datagen selfplay -o shard%02d.cnn -games N   play games, label positions
  *     datagen label <in.epd>... -o out.cnn         label positions that exist
  *     datagen shuffle <in.cnn>... -o out.cnn       on-disk shuffle
+ *     datagen filter <in.cnn>... -o out.cnn        keep/drop by source tag
  *     datagen verify <shard.cnn>...                the Task 1 acceptance gate
  *     datagen stats <shard.cnn>...                 histograms, to be eyeballed
  *     datagen dump <shard.cnn>                     records as text
@@ -1610,7 +1611,7 @@ static void usage_selfplay(void) {
            "  -hash MB           hash per worker.                         (8)\n"
            "  -seed N            base RNG seed; worker k derives its own.  (1)\n"
            "\n"
-           "tree sampling  (on by default - it is most of the dataset)\n"
+           "tree sampling  (off by default - it is most of the dataset)\n"
            "  -tree N            interior nodes reservoir-sampled per played move, 0 to\n"
            "                     switch tree sampling off entirely.       (1, max 8)\n"
            "  -treedepth N       remaining depth a node must still have to be eligible.\n"
@@ -1651,12 +1652,12 @@ static int cmd_selfplay(int argc, char **argv) {
     o.out             = NULL;
     o.games           = 100;
     o.nodes           = 10000;
-    o.hashMb          = 8;
+    o.hashMb          = 64;
     o.threads         = 1;
     o.seed            = 1;
     o.openingPlies    = 8;
     o.openingMaxScore = 800;
-    o.treeSamples     = 1;
+    o.treeSamples     = 0;
     o.treeMinDepth    = 4;
     o.maxPlies        = 400;
     o.winScore        = 2000;
@@ -2308,6 +2309,220 @@ static int cmd_shuffle(int argc, char **argv) {
 }
 
 /* ========================================================================== *
+ *  Subcommand: filter
+ *
+ *  Selects records by source tag. The tag exists so a mixture generated once
+ *  can be re-weighted without regenerating anything, and trainer/nnue already
+ *  does that at load time with --sources - so this subcommand buys nothing a
+ *  trainer flag does not, except the bytes. A shard that will never be trained
+ *  on with its tree nodes is cheaper to shrink once than to skip on every
+ *  epoch of every run.
+ *
+ *  The .pol sidecar is read in lockstep and written for the kept records only.
+ *  Dropping a record from one file but not the other is the one mistake in
+ *  here that leaves a shard of a plausible length which teaches the wrong move
+ *  for every position after the first drop, so the input sidecars are
+ *  length-checked before a byte is written.
+ * ========================================================================== */
+
+static void usage_filter(void) {
+    printf("datagen filter <in.cnn>... -o <out.cnn> [-keep NAME]... [-drop NAME]...\n"
+           "\n"
+           "Copies through only the records whose source tag survives the selection,\n"
+           "carrying the .pol sidecar with them. The sources are selfplay, tree, human,\n"
+           "engine, book and other.\n"
+           "\n"
+           "  -o <path>          output shard.                            (required)\n"
+           "  -keep NAME         keep only these sources; repeatable.\n"
+           "  -drop NAME         drop these sources; repeatable.\n"
+           "  -quiet             progress lines off.\n"
+           "\n"
+           "The first -keep makes the selection a whitelist; -drop subtracts from\n"
+           "whatever is selected at that point. With neither, every record is kept.\n"
+           "Either every input has a .pol or none may.\n");
+}
+
+static int cmd_filter(int argc, char **argv) {
+    if (wants_help(argc, argv)) {
+        usage_filter();
+        return 0;
+    }
+
+    const char *out = NULL;
+    char *inputs[256];
+    int inputCount = 0;
+    bool keep[SRC_NB];
+    bool whitelist = false;
+
+    for (int i = 0; i < SRC_NB; ++i)
+        keep[i] = true;
+
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "-o") && i + 1 < argc) {
+            out = argv[++i];
+        } else if ((!strcmp(argv[i], "-keep") || !strcmp(argv[i], "-drop")) && i + 1 < argc) {
+            const bool dropping = argv[i][1] == 'd';
+            SourceTag tag;
+            if (!source_from_name(argv[i + 1], &tag))
+                dief("unknown source '%s'", argv[i + 1]);
+            ++i;
+            if (!dropping && !whitelist) {
+                for (int s = 0; s < SRC_NB; ++s)
+                    keep[s] = false;
+                whitelist = true;
+            }
+            keep[tag] = !dropping;
+        } else if (!strcmp(argv[i], "-quiet")) {
+            Quiet = true;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "datagen: unknown filter option '%s'\n", argv[i]);
+            return 1;
+        } else if (inputCount < (int)(sizeof(inputs) / sizeof(inputs[0])))
+            inputs[inputCount++] = argv[i];
+        else
+            die("too many input shards");
+    }
+
+    if (!out || inputCount == 0)
+        die("usage: datagen filter <in.cnn>... -o <out.cnn> [-keep NAME] [-drop NAME]");
+
+    bool anyKept = false;
+    for (int i = 0; i < SRC_NB; ++i)
+        anyKept = anyKept || keep[i];
+    if (!anyKept)
+        die("the selection keeps no source at all");
+
+    /* shard_open() truncates, so an output that is also an input would be
+     * emptied before it is read. The shards this runs on are gigabytes. */
+    for (int i = 0; i < inputCount; ++i)
+        if (!strcmp(inputs[i], out))
+            dief("%s is both an input and the output", out);
+
+    /*
+     * All inputs must agree about whether a sidecar exists, and each one must
+     * be exactly four bytes per record. A short .pol means the pairing is
+     * already wrong going in, and copying it through would launder that into a
+     * file nothing downstream can tell is broken.
+     */
+    bool policy = true;
+    for (int i = 0; i < inputCount; ++i) {
+        char pol[PATH_CAP];
+        replace_ext(pol, sizeof(pol), inputs[i], ".pol");
+        FILE *f = fopen(pol, "rb");
+        if (f)
+            fclose(f);
+        else
+            policy = false;
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < inputCount; ++i) {
+        FILE *f = xfopen(inputs[i], "rb");
+        fseek64(f, 0, SEEK_END);
+        const long long size = (long long)ftell64(f);
+        fclose(f);
+        if (size % REC_BYTES)
+            dief("%s holds %lld bytes, not a multiple of the %d-byte record", inputs[i], size,
+                 REC_BYTES);
+        const long long records = size / REC_BYTES;
+
+        if (policy) {
+            char polPath[PATH_CAP];
+            replace_ext(polPath, sizeof(polPath), inputs[i], ".pol");
+            FILE *pf = xfopen(polPath, "rb");
+            fseek64(pf, 0, SEEK_END);
+            const long long polSize = (long long)ftell64(pf);
+            fclose(pf);
+            if (polSize != records * POL_BYTES)
+                dief("%s holds %lld bytes but its %lld records need %lld", polPath, polSize,
+                     records, records * POL_BYTES);
+        }
+        total += (uint64_t)records;
+    }
+
+    if (total == 0)
+        die("nothing to filter");
+
+    ShardWriter w;
+    shard_open(&w, out, policy);
+
+    uint64_t seen = 0;
+    uint64_t bySource[SRC_NB];
+    memset(bySource, 0, sizeof(bySource));
+    double lastReport = now_seconds();
+
+    for (int f = 0; f < inputCount; ++f) {
+        FILE *in  = xfopen(inputs[f], "rb");
+        FILE *pol = NULL;
+        if (policy) {
+            char polPath[PATH_CAP];
+            replace_ext(polPath, sizeof(polPath), inputs[f], ".pol");
+            pol = xfopen(polPath, "rb");
+        }
+
+        uint8_t buf[REC_BYTES];
+        while (fread(buf, 1, REC_BYTES, in) == REC_BYTES) {
+            Record rec;
+            record_decode(buf, &rec);
+
+            /* Read the sidecar for EVERY record, kept or not: it is positional,
+             * so a skipped read is exactly what desynchronises it. */
+            PolicyRecord p = {0, 0};
+            if (pol) {
+                uint8_t pbuf[POL_BYTES];
+                if (fread(pbuf, 1, POL_BYTES, pol) != POL_BYTES)
+                    dief("the policy sidecar of %s ran out before its shard did", inputs[f]);
+                policy_decode(pbuf, &p);
+            }
+
+            ++seen;
+            const SourceTag src = record_source(&rec);
+            if (src >= SRC_NB)
+                dief("%s holds a record with source tag %d", inputs[f], (int)src);
+            ++bySource[src];
+            if (keep[src])
+                shard_write(&w, &rec, &p);
+
+            const double now = now_seconds();
+            if (!Quiet && now - lastReport > 5.0) {
+                lastReport = now;
+                fprintf(stdout, "filter: %llu/%llu read, %llu kept (%.1f%%)\n",
+                        (unsigned long long)seen, (unsigned long long)total,
+                        (unsigned long long)w.count, 100.0 * (double)w.count / (double)seen);
+            }
+        }
+
+        fclose(in);
+        if (pol)
+            fclose(pol);
+    }
+
+    char joined[PATH_CAP];
+    joined[0] = '\0';
+    for (int i = 0; i < inputCount; ++i) {
+        if (strlen(joined) + strlen(inputs[i]) + 2 >= sizeof(joined))
+            break;
+        if (joined[0])
+            strcat(joined, " ");
+        strcat(joined, inputs[i]);
+    }
+
+    Manifest man;
+    memset(&man, 0, sizeof(man));
+    man.command = "filter";
+    man.inputs  = joined;
+    shard_close(&w, &man);
+
+    fprintf(stdout, "kept %llu of %llu records in %s\n", (unsigned long long)w.count,
+            (unsigned long long)seen, out);
+    for (int i = 0; i < SRC_NB; ++i)
+        if (bySource[i])
+            fprintf(stdout, "  %-10s %10llu  %s\n", SourceNames[i], (unsigned long long)bySource[i],
+                    keep[i] ? "kept" : "dropped");
+    return 0;
+}
+
+/* ========================================================================== *
  *  Subcommand: verify - the Task 1 acceptance gate
  *
  *  Two properties, and a shard that fails either is not usable:
@@ -2816,6 +3031,7 @@ static void usage(void) {
                     "  datagen label <in.epd>... -o <shard.cnn> [-source human] [-nodes N]\n"
                     "                            [-max N per worker] [-stride N] [-skip N]\n"
                     "  datagen shuffle <in.cnn>... -o <out.cnn> [-buckets K] [-seed S]\n"
+                    "  datagen filter <in.cnn>... -o <out.cnn> [-keep NAME] [-drop NAME]\n"
                     "  datagen verify <shard.cnn>... [-relabel N] [-nodes N]\n"
                     "  datagen stats <shard.cnn>...\n"
                     "  datagen dump <shard.cnn> [-n N] [-skip N] [-pol]\n"
@@ -2870,6 +3086,8 @@ int main(int argc, char **argv) {
         rc = cmd_label(argc - 2, argv + 2);
     else if (!strcmp(argv[1], "shuffle"))
         rc = cmd_shuffle(argc - 2, argv + 2);
+    else if (!strcmp(argv[1], "filter"))
+        rc = cmd_filter(argc - 2, argv + 2);
     else if (!strcmp(argv[1], "verify"))
         rc = cmd_verify(argc - 2, argv + 2);
     else if (!strcmp(argv[1], "stats"))

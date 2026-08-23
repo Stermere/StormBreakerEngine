@@ -270,11 +270,39 @@ a rook at 550. Read the sums, never the individual tables.
 
 ---
 
+### E11 — The network replaces the classical evaluation
+
+**Date** 2026-08-23 · **Baseline** `stormbreaker.exe`, classical (bench 287826) ·
+**Dev** `stormbreaker-nnue.exe`, net `848d2b21e0d0`, commit 74301a7 (bench 269601)
+
+Task 4 of [NNUE.md](NNUE.md): the network, called by the search, against the
+13,684-parameter linear model E10 fitted. The dev build carries the incremental
+accumulator, so the network is evaluated at roughly the speed of the classical
+one rather than at two thirds of it.
+
+| | STC |
+|---|---|
+| TC / bounds | 8+0.08, [0, 5] normalized |
+| **Result** | **H1** — LLR 2.95 at 390 games |
+| Elo | **+238.05 ± 35.48** |
+| nElo | +313.06 ± 34.48 |
+| Record | 272W / 40L / 78D, 79.74% |
+| Ptnml | [3, 7, 31, 63, 91] |
+| PGN | `external/games/20260823-161051-STC.pgn` |
+
+**Cost, and why it is nearly zero.** The from-scratch accumulator evaluated the
+net at 940k nps against the classical evaluation's 1184k — a 21% deficit paid
+at every node. The incremental accumulator (E12 below) removes almost all of
+it: 1133k nps, within 4% of classical, at an identical bench node count. The
+network is now approximately free relative to the evaluation it replaces, which
+is why this measures as eval quality rather than as a trade.
+---
+
 
 ## Absolute strength
 
-Every Elo figure above is relative to another build in `externalaselines`,
-none of which is itself rated. This anchors them. `toolsating.ps1` plays a
+Every Elo figure above is relative to another build in `external\baselines`,
+none of which is itself rated. This anchors them. `tools\rating.ps1` plays a
 ladder of Stockfish `UCI_Elo` rungs and fits one rating by inverse-variance
 weighting.
 

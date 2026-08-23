@@ -167,6 +167,7 @@ static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
+static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 #ifdef DATAGEN
 static SearchNodeVisitor NodeVisitor;
@@ -239,6 +240,7 @@ void search_clear(void) {
     memset(ContHist, 0, sizeof(ContHist));
     memset(CaptureHist, 0, sizeof(CaptureHist));
     memset(Stack, 0, sizeof(Stack));
+    eval_state_clear();
 }
 
 bool search_running(void) { return atomic_load(&Searching); }
@@ -312,9 +314,27 @@ static inline void count_node(void) {
  * for speed, and every one of them is wrong sometimes - which is exactly why
  * each arrived behind its own SPRT rather than on the argument that it looks
  * reasonable.
+ *
+ * They are also all wrong TOGETHER whenever the evaluation changes underneath
+ * them. Each was fitted against the classical model's scale and its noise
+ * profile, and the network shares neither; docs/NNUE.md Task 4 is explicit
+ * that re-fitting them is where a real part of the network's value is found.
+ *
+ * So the margins below are written with TUNABLE rather than #define. In a
+ * normal build that expands to an enum constant and the compiler folds it
+ * exactly as it folded the macro - the released engine is unchanged. Under
+ * `make TUNE_SEARCH=on` it expands to a variable and uci.c advertises each one as a
+ * spin option, so sweeping a candidate value costs a `setoption` instead of a
+ * rebuild, and a sweep can drive the whole set from one binary.
  */
-#define RFP_MARGIN 80 /* reverse futility: how far above beta is "safely won" */
-#define RFP_DEPTH  7
+#ifdef TUNE_SEARCH
+#define TUNABLE(name, def) int name = (def)
+#else
+#define TUNABLE(name, def) enum { name = (def) }
+#endif
+
+TUNABLE(RFP_MARGIN, 80); /* reverse futility: how far above beta is "safely won" */
+#define RFP_DEPTH 7
 
 #define LMP_DEPTH 8 /* deepest node that will discard its late quiet moves */
 
@@ -331,7 +351,7 @@ static inline void count_node(void) {
  * tree. The useful range is narrow and the whole curve is worth re-measuring
  * before anyone "corrects" this number upwards.
  */
-#define FUTILITY_MARGIN 40
+TUNABLE(FUTILITY_MARGIN, 40);
 
 /* Half-width of the first aspiration window, and the depth below which the
  * previous score is too unreliable to aim one at. */
@@ -348,8 +368,8 @@ static inline void count_node(void) {
  * certain no quiet move here recovers the deficit. Verified rather than
  * assumed - the qsearch actually runs, and only its result can prune.
  */
-#define RAZOR_MARGIN 240
-#define RAZOR_DEPTH  3
+TUNABLE(RAZOR_MARGIN, 240);
+#define RAZOR_DEPTH 3
 
 /*
  * SEE pruning thresholds, in centipawns per unit of depth.
@@ -360,10 +380,10 @@ static inline void count_node(void) {
  * compensation to demonstrate in the first place - the bar for keeping one
  * should rise much faster as depth falls.
  */
-#define SEE_CAPTURE_DEPTH  6
-#define SEE_CAPTURE_MARGIN 100
-#define SEE_QUIET_DEPTH    8
-#define SEE_QUIET_MARGIN   28
+#define SEE_CAPTURE_DEPTH 6
+TUNABLE(SEE_CAPTURE_MARGIN, 100);
+#define SEE_QUIET_DEPTH 8
+TUNABLE(SEE_QUIET_MARGIN, 28);
 
 /*
  * Delta pruning margin for quiescence.
@@ -373,7 +393,7 @@ static inline void count_node(void) {
  * outright is not going to raise it. The margin has to cover what the rest of
  * the sequence might swing, which is why it is a piece rather than a pawn.
  */
-#define DELTA_MARGIN 200
+TUNABLE(DELTA_MARGIN, 200);
 
 /*
  * Singular extension: the shallowest depth worth testing, and how far below
@@ -386,8 +406,61 @@ static inline void count_node(void) {
  * does not read as singular, and narrow enough that a genuinely forced line
  * still does.
  */
-#define SINGULAR_DEPTH  7
-#define SINGULAR_MARGIN 32
+#define SINGULAR_DEPTH 7
+TUNABLE(SINGULAR_MARGIN, 32);
+
+#ifdef TUNE_SEARCH
+/*
+ * The sweep's view of the margins above: a name to set them by and the range
+ * a sweep is allowed to explore.
+ *
+ * Written out by hand rather than generated from a macro list, because a list
+ * that generated both could not carry the comments above - and those comments
+ * are the whole reason someone choosing a range picks a sensible one instead
+ * of a symmetric guess around the default.
+ *
+ * The ranges are deliberately wider than any value that looks plausible now.
+ * A sweep that cannot leave the neighbourhood of the current value can only
+ * ever confirm it, and the point of re-fitting these against the network is
+ * that the neighbourhood itself may be wrong.
+ */
+static const struct {
+    const char *name;
+    int *value;
+    int min;
+    int max;
+} Tunables[] = {
+    {"RfpMargin", &RFP_MARGIN, 20, 250},
+    {"FutilityMargin", &FUTILITY_MARGIN, 10, 150},
+    {"RazorMargin", &RAZOR_MARGIN, 80, 600},
+    {"SeeCaptureMargin", &SEE_CAPTURE_MARGIN, 20, 300},
+    {"SeeQuietMargin", &SEE_QUIET_MARGIN, 5, 120},
+    {"DeltaMargin", &DELTA_MARGIN, 50, 600},
+    {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
+};
+
+int search_tunable_count(void) { return (int)(sizeof(Tunables) / sizeof(Tunables[0])); }
+
+void search_tunable_info(int i, const char **name, int *value, int *min, int *max) {
+    *name  = Tunables[i].name;
+    *value = *Tunables[i].value;
+    *min   = Tunables[i].min;
+    *max   = Tunables[i].max;
+}
+
+bool search_tunable_set(const char *name, int value) {
+    for (int i = 0; i < search_tunable_count(); ++i)
+        if (strcmp(name, Tunables[i].name) == 0) {
+            /* Clamped rather than rejected: a sweep that walks outside the
+             * range should stay at the edge and keep playing, not have one
+             * engine silently keep the previous value for the rest of a match
+             * while the other moved. */
+            *Tunables[i].value = iclamp(value, Tunables[i].min, Tunables[i].max);
+            return true;
+        }
+    return false;
+}
+#endif /* TUNE_SEARCH */
 
 /*
  * Divisors that convert a history score into plies of reduction, and capture
@@ -897,8 +970,10 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         Stack[ply].staticEval = staticEval;
 
         board_do_move(pos, m);
+        eval_state_push(pos, m);
         tt_prefetch(pos->key);
         const Value v = -qsearch(pos, -beta, -alpha, ply + 1);
+        eval_state_pop();
         board_undo_move(pos, m);
 
         if (search_stopped())
@@ -1130,8 +1205,10 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         Stack[ply].movedPiece = NO_PIECE;
 
         board_do_null_move(pos);
+        eval_state_push_null(pos);
         tt_prefetch(pos->key);
         const Value v = -negamax(pos, depth - r, -beta, -beta + 1, ply + 1, !cutNode);
+        eval_state_pop();
         board_undo_null_move(pos);
 
         if (search_stopped())
@@ -1342,6 +1419,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         Stack[ply].movedPiece = moved;
 
         board_do_move(pos, m);
+        eval_state_push(pos, m);
         tt_prefetch(pos->key);
 
         const bool givesCheck = board_checkers(pos) != BB_EMPTY;
@@ -1435,6 +1513,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         if (pvNode && (moveCount == 1 || (v > alpha && v < beta)))
             v = -negamax(pos, childDepth, -beta, -alpha, ply + 1, false);
 
+        eval_state_pop();
         board_undo_move(pos, m);
 
         if (search_stopped())
@@ -1578,6 +1657,7 @@ static Value search_root(Position *pos, ScoredMove *roots, int count, Depth dept
         Stack[0].staticEval = VALUE_NONE; /* no grandparent above the root */
 
         board_do_move(pos, m);
+        eval_state_push(pos, m);
         tt_prefetch(pos->key);
 
         /*
@@ -1599,6 +1679,7 @@ static Value search_root(Position *pos, ScoredMove *roots, int count, Depth dept
                 v = -negamax(pos, depth - 1, -beta, -alpha, 1, false);
         }
 
+        eval_state_pop();
         board_undo_move(pos, m);
 
         if (search_stopped())

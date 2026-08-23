@@ -113,16 +113,20 @@ generation ever needs to upload anything again.
 ## Running a generation
 
 ```powershell
-# 1. size the fleet from a measurement, not from an estimate
+# 1. publish the net, if EVAL=nnue. Idempotent, and `up` and `calibrate`
+#    both do it for you - this exists for when you want it done early.
+.\tools\cloud\fleet.ps1 push-net
+
+# 2. size the fleet from a measurement, not from an estimate
 .\tools\cloud\fleet.ps1 calibrate
 
-# 2. edit job.env: GEN, and BOXES from what calibrate reported
+# 3. edit job.env: GEN, and BOXES from what calibrate reported
 .\tools\cloud\fleet.ps1 up
 .\tools\cloud\fleet.ps1 status
 .\tools\cloud\fleet.ps1 logs 2
 
-# 3. when every unit has a done-marker
-.\tools\cloud\aggregate.ps1
+# 4. when every unit has a done-marker
+.\tools\cloud\aggregate.ps1 -Parallel 8
 .\tools\cloud\fleet.ps1 down     # billing is hourly - do not forget this
 ```
 

@@ -113,7 +113,7 @@ def king_index(normalised_king):
 # branch per unit. Both kings are always on, so the count is 2..32 and the
 # index is (count - 2) // (32 // buckets), which needs the count to divide 32.
 
-DEFAULT_OUTPUT_BUCKETS = 8
+DEFAULT_OUTPUT_BUCKETS = 4
 
 
 def check_output_buckets(buckets: int) -> int:

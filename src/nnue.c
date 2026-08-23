@@ -16,6 +16,7 @@
 
 #ifdef EVAL_NNUE
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -475,9 +476,15 @@ typedef struct {
     int slot;
 } Perspective;
 
-static Perspective nnue_perspective(const Position *pos, Color side) {
+/*
+ * Split from nnue_perspective() so the incremental update can ask what a
+ * perspective WOULD be with the king somewhere else. A king move that leaves
+ * both `slot` and `mirror` alone changes nothing about how this side indexes
+ * the board, and is therefore an ordinary two-feature delta rather than a
+ * refresh - which is most king moves, and worth the two lines to notice.
+ */
+static Perspective nnue_perspective_of(Color side, Square king) {
     Perspective p;
-    Square king = king_square(pos, side);
 
     if (side == BLACK)
         king = flip_rank(king);
@@ -488,6 +495,10 @@ static Perspective nnue_perspective(const Position *pos, Color side) {
         king = (Square)(king ^ 7);
     p.slot = nnue_king_square(king);
     return p;
+}
+
+static inline Perspective nnue_perspective(const Position *pos, Color side) {
+    return nnue_perspective_of(side, king_square(pos, side));
 }
 
 /*
@@ -700,9 +711,312 @@ static int32_t nnue_raw(const Position *pos) {
 
 Value nnue_evaluate(const Position *pos) { return nnue_centipawns(nnue_raw(pos)); }
 
+/* ------------------------------------------------- incremental updates ---- */
+
+/*
+ * The accumulator stack.
+ *
+ * A from-scratch accumulation is up to 32 rows per perspective - 64 KB of
+ * weights streamed per call at 512 wide - and it is essentially the entire
+ * cost of the network. A move changes at most two features per perspective,
+ * three when it captures and four when it castles, so carrying the accumulator
+ * across make/unmake replaces 64 rows with 4.
+ *
+ * Two properties make this safe rather than merely fast:
+ *
+ *   * Every level records the Zobrist key of the position it describes, and a
+ *     level whose key does not match the board rebuilds itself from the board.
+ *     A missing push, a stale root left over from the previous search, or an
+ *     `eval` typed at the UCI prompt therefore costs a recomputation - never a
+ *     wrong score. The residual risk is a Zobrist collision at one specific
+ *     stack level, which is the risk the transposition table already takes.
+ *   * Debug builds assert the incremental value against a full recomputation
+ *     at every evaluation. That one assertion covers the whole class of
+ *     incremental-update bugs, which is where NNUE integrations quietly go
+ *     wrong: the symptom is rare unreproducible blunders, and nothing in a
+ *     loss curve or a node count ever points at it.
+ *
+ * TODO(engine): Lazy SMP needs one stack per thread. It is file-scope for the
+ * same reason search.c's ordering tables are, and it moves when they do.
+ */
+typedef struct {
+    _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
+
+    /* Key of the position this level describes; 0 until it describes one. */
+    Key key;
+
+    /* Per perspective, because a king that changes slot or crosses the mirror
+     * line reindexes every feature ITS side sees and none of the other's. */
+    bool computed[COLOR_NB];
+} Accumulator;
+
+/* The search returns at ply >= MAX_PLY - 1 before making a move, so the
+ * deepest push is shallower than this; the slack is deliberate. */
+static Accumulator AccStack[MAX_PLY + 2];
+static int AccTop;
+
+/* One feature: a piece standing on a square. */
+typedef struct {
+    Piece pc;
+    Square sq;
+} NnueFeature;
+
+/*
+ * What a move changed, in features, plus which perspectives cannot express it
+ * as a delta at all. Two of each is the worst case and it is castling: two
+ * pieces leave two squares and arrive on two others.
+ */
+typedef struct {
+    NnueFeature added[2];
+    NnueFeature removed[2];
+    int addedCount;
+    int removedCount;
+    bool refresh[COLOR_NB];
+} NnueDelta;
+
+/* Whether `side` still indexes the board the same way after its king moves. */
+static inline bool nnue_king_reindexes(Color side, Square kingFrom, Square kingTo) {
+    const Perspective before = nnue_perspective_of(side, kingFrom);
+    const Perspective after  = nnue_perspective_of(side, kingTo);
+
+    /* Both fields, not just the slot: a king stepping d1-e1 keeps slot 3 and
+     * gains the mirror, which reindexes every square just as thoroughly. */
+    return before.slot != after.slot || before.mirror != after.mirror;
+}
+
+/*
+ * The features `m` changed, derived from the position AFTER it was played.
+ *
+ * After rather than before, because the level being pushed has to record the
+ * key of the position it describes and that key only exists once do_move has
+ * folded in the side to move, the castling rights and the en passant square.
+ * Everything the delta needs survives the move: the moving piece stands on
+ * `to`, the captured piece is on the Undo record do_move just pushed, and
+ * castling's two pieces are known from the mover's colour.
+ */
+static void nnue_delta(const Position *pos, Move m, NnueDelta *d) {
+    const Color us    = (Color)(pos->sideToMove ^ 1);
+    const Square from = from_sq(m);
+    const Square to   = to_sq(m);
+    const MoveType mt = type_of_move(m);
+
+    d->addedCount = d->removedCount = 0;
+    d->refresh[WHITE] = d->refresh[BLACK] = false;
+
+    if (mt == MT_CASTLING) {
+        Square kingTo, rookTo;
+        castling_targets(from, to, &kingTo, &rookTo);
+
+        const Piece king = make_piece(us, KING);
+        const Piece rook = make_piece(us, ROOK);
+
+        d->removed[d->removedCount++] = (NnueFeature){king, from};
+        d->removed[d->removedCount++] = (NnueFeature){rook, to};
+        d->added[d->addedCount++]     = (NnueFeature){king, kingTo};
+        d->added[d->addedCount++]     = (NnueFeature){rook, rookTo};
+
+        d->refresh[us] = nnue_king_reindexes(us, from, kingTo);
+        return;
+    }
+
+    /* do_move incremented gamePly, so the record it wrote is one below. */
+    const Piece captured = pos->history[pos->gamePly - 1].captured;
+    if (captured != NO_PIECE) {
+        /* En passant takes the pawn beside the destination, not on it, and the
+         * push direction belongs to the mover. */
+        const Square capsq            = mt == MT_EN_PASSANT ? (Square)(to - pawn_push(us)) : to;
+        d->removed[d->removedCount++] = (NnueFeature){captured, capsq};
+    }
+
+    /* A promotion vacates `from` as a pawn and occupies `to` as something
+     * else, which is the one move where the two features disagree. */
+    const Piece vacated  = mt == MT_PROMOTION ? make_piece(us, PAWN) : piece_on(pos, to);
+    const Piece occupied = piece_on(pos, to);
+
+    d->removed[d->removedCount++] = (NnueFeature){vacated, from};
+    d->added[d->addedCount++]     = (NnueFeature){occupied, to};
+
+    if (type_of(vacated) == KING)
+        d->refresh[us] = nnue_king_reindexes(us, from, to);
+}
+
+/*
+ * dst = src + the added rows - the removed rows, in one pass over the width.
+ *
+ * One pass because the accumulator IS the memory traffic: reading src, writing
+ * dst and touching each weight row once is the floor, and separate add and
+ * subtract passes would pay for dst repeatedly.
+ */
+static void nnue_apply_delta(const int16_t *src, int16_t *dst, const int16_t *const *add,
+                             int addCount, const int16_t *const *sub, int subCount,
+                             uint32_t hidden) {
+    /* The overwhelmingly common shape - a quiet move, one square vacated and
+     * one occupied - gets a body with no inner loop at all. */
+    if (addCount == 1 && subCount == 1) {
+        const int16_t *const a = add[0];
+        const int16_t *const b = sub[0];
+
+#ifdef NNUE_AVX2
+        for (uint32_t j = 0; j < hidden; j += 16) {
+            const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + j));
+            const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(a + j));
+            const __m256i y = _mm256_loadu_si256((const __m256i *)(const void *)(b + j));
+            _mm256_storeu_si256((__m256i *)(void *)(dst + j),
+                                _mm256_sub_epi16(_mm256_add_epi16(v, x), y));
+        }
+#else
+        for (uint32_t j = 0; j < hidden; ++j)
+            dst[j] = (int16_t)(src[j] + a[j] - b[j]);
+#endif
+        return;
+    }
+
+#ifdef NNUE_AVX2
+    for (uint32_t j = 0; j < hidden; j += 16) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + j));
+
+        for (int i = 0; i < addCount; ++i)
+            v = _mm256_add_epi16(v,
+                                 _mm256_loadu_si256((const __m256i *)(const void *)(add[i] + j)));
+        for (int i = 0; i < subCount; ++i)
+            v = _mm256_sub_epi16(v,
+                                 _mm256_loadu_si256((const __m256i *)(const void *)(sub[i] + j)));
+
+        _mm256_storeu_si256((__m256i *)(void *)(dst + j), v);
+    }
+#else
+    for (uint32_t j = 0; j < hidden; ++j) {
+        int32_t v = src[j];
+
+        for (int i = 0; i < addCount; ++i)
+            v += add[i][j];
+        for (int i = 0; i < subCount; ++i)
+            v -= sub[i][j];
+
+        dst[j] = (int16_t)v;
+    }
+#endif
+}
+
+void eval_state_clear(void) {
+    AccTop = 0;
+    memset(&AccStack[0], 0, sizeof(AccStack[0]));
+}
+
+void eval_state_push(const Position *pos, Move m) {
+    assert(AccTop + 1 < (int)(sizeof(AccStack) / sizeof(AccStack[0])));
+
+    const Accumulator *const parent = &AccStack[AccTop];
+    Accumulator *const child        = &AccStack[++AccTop];
+
+    /* The key the parent must be describing if its accumulator is to be worth
+     * carrying forward: do_move recorded the pre-move key on the Undo. */
+    const Key parentKey = pos->history[pos->gamePly - 1].key;
+
+    child->key = pos->key;
+
+    NnueDelta d;
+    nnue_delta(pos, m, &d);
+
+    const uint32_t hidden = Loaded.hdr.hidden;
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        /* Nothing to carry forward from a parent that was never computed or
+         * that describes some other position, and nothing a delta can say to a
+         * perspective that reindexed. Either way the level is left for the
+         * next evaluation to rebuild from the board. */
+        if (d.refresh[c] || !parent->computed[c] || parent->key != parentKey) {
+            child->computed[c] = false;
+            continue;
+        }
+
+        /* The perspective is read off the CURRENT board, which is legitimate
+         * precisely because this branch has established that `c` did not
+         * reindex - its slot and mirror are what they were before the move, so
+         * the same indices apply on both sides of it. */
+        const Perspective p = nnue_perspective(pos, c);
+
+        const int16_t *add[2];
+        const int16_t *sub[2];
+
+        for (int i = 0; i < d.addedCount; ++i)
+            add[i] = Loaded.ftWeight +
+                     (size_t)nnue_feature_index(&p, d.added[i].sq, d.added[i].pc) * hidden;
+        for (int i = 0; i < d.removedCount; ++i)
+            sub[i] = Loaded.ftWeight +
+                     (size_t)nnue_feature_index(&p, d.removed[i].sq, d.removed[i].pc) * hidden;
+
+        nnue_apply_delta(parent->acc[c], child->acc[c], add, d.addedCount, sub, d.removedCount,
+                         hidden);
+        child->computed[c] = true;
+    }
+}
+
+/*
+ * A null move moves no piece, so both accumulators are already right and only
+ * the key changed. The copy exists so the child level can carry that key:
+ * without a level of its own, every node under a null move would find a key
+ * mismatch and rebuild from scratch, which is the cost this section exists to
+ * avoid.
+ */
+void eval_state_push_null(const Position *pos) {
+    assert(AccTop + 1 < (int)(sizeof(AccStack) / sizeof(AccStack[0])));
+
+    const Accumulator *const parent = &AccStack[AccTop];
+    Accumulator *const child        = &AccStack[++AccTop];
+    const uint32_t hidden           = Loaded.hdr.hidden;
+
+    child->key = pos->key;
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        child->computed[c] = parent->computed[c];
+        if (parent->computed[c])
+            memcpy(child->acc[c], parent->acc[c], hidden * sizeof(int16_t));
+    }
+}
+
+void eval_state_pop(void) {
+    assert(AccTop > 0);
+    --AccTop;
+}
+
+/*
+ * The level describing the board, with any perspective that cannot be trusted
+ * rebuilt from it.
+ */
+static const Accumulator *nnue_current(const Position *pos) {
+    Accumulator *const a = &AccStack[AccTop];
+
+    if (a->key != pos->key) {
+        a->key             = pos->key;
+        a->computed[WHITE] = a->computed[BLACK] = false;
+    }
+
+    for (Color c = WHITE; c <= BLACK; ++c)
+        if (!a->computed[c]) {
+            const Perspective p = nnue_perspective(pos, c);
+            nnue_accumulate(pos, &p, a->acc[c]);
+            a->computed[c] = true;
+        }
+
+    return a;
+}
+
 /* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is
  * not set, so which one the engine runs costs nothing at runtime. */
-Value eval_evaluate(const Position *pos) { return nnue_evaluate(pos); }
+Value eval_evaluate(const Position *pos) {
+    const Accumulator *const a = nnue_current(pos);
+    const Color stm            = pos->sideToMove;
+
+    const int32_t raw = nnue_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos));
+
+    /* The gate on the entire incremental path. Cheap to state, expensive to
+     * omit: an accumulator that drifts produces a legal-looking evaluation and
+     * surfaces only as blunders nobody can reproduce. */
+    assert(raw == nnue_raw(pos) && "incremental accumulator disagrees with a full recomputation");
+
+    return nnue_centipawns(raw);
+}
 
 /* ------------------------------------------------------------- reporting -- */
 

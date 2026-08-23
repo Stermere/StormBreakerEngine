@@ -49,14 +49,35 @@ Every change from here is measured with SPRT rather than argued for.
 | NNUE trainer: features, dataset, model, training loop (`trainer/`) | complete |
 | NNUE export + C inference, bit-exact against the reference (`make nnue-test`) | complete |
 | NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
-| **Lazy SMP (`Threads` is capped at 1), staged move generation** | **TODO** |
+| NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
 | **Correction history** | **TODO** |
-| **NNUE integration: incremental accumulator, re-tuned margins, SPRT** | **TODO** |
+| **NNUE: re-tuned search margins, then the default switches** | **TODO** |
+| **Next data generation, labelled by the network rather than by `eval.c`** | **TODO** |
+| **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
+| **Staged movegen 1: try the TT move before generating anything** | **TODO** |
+| **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
+| **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
 | **NN informed search (policy head for move ordering)** | **TODO** |
 | **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
 so the engine can be registered with a distributed testing cluster.
+
+Staged move generation is listed after the NNUE integration deliberately: it is
+worth roughly 10% of search time (~5-9 Elo), and a more expensive evaluation
+shrinks that share, so it should be measured against the eval that ships. At
+bench depth 12, generation and ordering are ~25% of search cycles, 61% of
+generated moves are never picked, and 52% of generating nodes cut on the first
+move tried - 15% on the TT move, which need not generate at all.
+
+Steps 1 and 2 are **pure speedups gated on an unchanged bench node count, not an
+SPRT**. The ordering bands in `src/search.c` are strictly separated, so a staged
+picker can reproduce today's order exactly. Promotions are the one exception and
+straddle the bands three ways: a quiet underpromotion is generated as a quiet but
+scores in the winning-capture band, and an SEE-losing capturing promotion scores
+down into the quiet band. The tactical stage has to generate promotions and spill
+whatever scores below `SCORE_KILLER_1` into the quiet stage - otherwise the bench
+count moves and the step needs an SPRT after all.
 
 ---
 
@@ -138,6 +159,7 @@ fast-chess -engine cmd=.\stormbreaker.exe name=dev `
 | `make trainer-setup` | create `trainer/.venv` and install PyTorch |
 | `make trainer-test` | the trainer's test suite |
 | `make EVAL=nnue` | build with the network instead of the classical evaluation |
+| `make TUNE_SEARCH=on` | expose the pruning margins as UCI spin options, for a sweep |
 | `make nnue-export` | quantise `NET` into `EVALFILE` + test vectors |
 | `make nnue` | the engine with the network, as `stormbreaker-nnue` |
 | `make nnue-test` | C inference == the quantised Python reference, exactly |
@@ -189,39 +211,66 @@ external/           gitignored: books, opponent engines, baselines, PGNs
 ## Where to go next
 
 Steps 1–5 of the original bring-up order (movegen, make/unmake, perft, eval,
-search) are done. **Every change from here is measured with
+search) are done, and so is the network: it is measurably stronger than the
+tuned linear evaluation and the remaining work is about collecting the rest of
+what it is worth. **Every change from here is measured with
 `tools/sprt.ps1`** — read [docs/TESTING.md](docs/TESTING.md) first, because the
 testing methodology is what separates an engine that improves from one that
 drifts.
 
 The open work, roughly in order of Elo per unit of effort:
 
-1. **Ablate the evaluation batch.** E10 went in as one feature and gained
-   +270 Elo, which establishes the batch and attributes nothing. The
-   king-relative tables, the tuning itself, and king safety each want their
-   own measurement — see the table at the end of
-   [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
-2. **Search parameter tuning.** Every margin in `search.c` is a plausible
-   first guess, not a measured optimum — the singular margin, the SEE
-   thresholds, the razoring and futility curves, the LMR formula. Each one
-   SPRTs independently.
-3. **A pawn hash table.** The evaluation costs 20% of the old nps. Most of
-   that is pawn structure, recomputed every node for a structure that rarely
-   changes. This is a *pure speedup*: the bench node count must come back
-   unchanged, which is what makes it provable without an SPRT.
+1. **Re-tune the search margins against the network.** Every threshold in
+   `search.c` — `RFP_MARGIN`, `FUTILITY_MARGIN`, `RAZOR_MARGIN`, the two SEE
+   bands, `SINGULAR_MARGIN`, `DELTA_MARGIN`, the LMR formula — was fitted
+   against an evaluation with a particular scale and a particular noise
+   profile, and the network has neither. [docs/NNUE.md](docs/NNUE.md) Task 4
+   calls this out as where a meaningful fraction of the total NNUE gain
+   actually lives. Each SPRTs independently; `make TUNE_SEARCH=on` exposes
+   them as UCI spin options so a sweep needs no rebuild per candidate.
+2. **The next generation of training data, labelled by the network.** Every
+   label in `gen-001` came from a 10,000-node search using the *classical*
+   evaluation, because that was the only evaluation that existed when it was
+   generated. That teacher is now the weaker of the two. Re-labelling at the
+   same node count with `EVAL=nnue` costs nothing but machine time and raises
+   the ceiling on every net trained afterwards — which is the bootstrap loop
+   [docs/NNUE.md](docs/NNUE.md) is built around, and the single largest item
+   on this list. `gen-001` is also 100% `human`-sourced; the self-play arm is
+   configured in `tools/cloud/job.env` and has never been run.
+3. **Train longer and wider.** The shipped net stopped at epoch 3 with its
+   validation loss still falling monotonically, at 512 hidden units — half the
+   width the architecture was designed around. Both are free Elo in the sense
+   that neither needs an idea, only time. Widen *after* step 1, not before:
+   the accumulator refresh is the one cost that scales with width.
 4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
-   are file-scope and must move into a per-thread block first.
+   and the accumulator stack in `src/nnue.c` are file-scope and must move into
+   a per-thread block first. Worth nothing in a single-threaded SPRT and worth
+   a great deal to anyone actually playing the engine — and it makes every
+   future data generation run cheaper.
 5. **Staged move generation**, so a node that cuts on the table move never
-   generates or scores the rest of the list.
-6. **NNUE.** Tasks 1-3 of [docs/NNUE.md](docs/NNUE.md) are built and their
-   gates pass: `tools/datagen.c` generates and labels positions with the search
-   in the working tree, `trainer/` fits a 24576 -> 1024x2 -> 8 SCReLU network to
-   them, and `src/nnue.c` reproduces the quantised reference to the integer on
-   10,000 positions — the acceptance criterion is exact equality, not "close".
-   Next is Task 4: the incremental accumulator, which is most of the remaining
-   speed, then re-tuned margins and an SPRT before the default can change.
-   Generating the data in-house is what keeps the network clear of other
-   engines' licensing.
+   generates or scores the rest of the list — in the three steps the status
+   table breaks it into, each with its own SPRT.
+6. **A policy head for move ordering** — [docs/NNUE.md](docs/NNUE.md) Task 5b.
+   The cutoff-move sidecars are already written (`gen-001.pol`), so the data
+   cost is sunk. Read the honest expectations in that section before starting:
+   the track record in alpha-beta engines is much thinner than in MCTS ones,
+   and history heuristics are already very good.
+
+### Deliberately not on that list
+
+Two items that were on it and have been retired, so they do not get picked up
+again by accident:
+
+- **A pawn hash table.** It accelerates `eval.c` and nothing else. With the
+  network becoming the default evaluation, the code it speeds up is on its way
+  out of the hot path, and the work would be spent the day before it stopped
+  mattering.
+- **Ablating the E1 and E10 batches.** Both went in as batches and neither
+  attributes its gain to any individual term, which is a real gap in the
+  record — but closing it *explains* Elo already banked rather than adding
+  any. The pending table at the end of
+  [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) is kept for the day the queue is
+  empty; it should not compete with anything above.
 
 ---
 

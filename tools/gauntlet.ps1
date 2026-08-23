@@ -18,7 +18,7 @@
 .EXAMPLE
     pwsh tools\gauntlet.ps1 -Games 200
     pwsh tools\gauntlet.ps1 -Opponents external\baselines\v0.1.exe
-    pwsh tools\gauntlet.ps1 -IncludeStockfish -SkillLevel 3
+    pwsh tools\gauntlet.ps1 -IncludeStockfish -SkillLevel [0...20]
 #>
 [CmdletBinding()]
 param(

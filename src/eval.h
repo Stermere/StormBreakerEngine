@@ -58,4 +58,49 @@ Value eval_classical(const Position *pos);
  * when a game is lost to an evaluation blind spot and you need to see why. */
 void eval_trace(const Position *pos);
 
+/*
+ * Evaluation state carried across make/unmake.
+ *
+ * The classical evaluation has none - it
+ * reads the board and nothing else - so
+ * in a classical build these are empty inline functions
+ * and the search calls
+ * them for free. The network has an accumulator whose entire purpose is
+ * not
+ * being recomputed at every node, so it keeps a per-ply stack: push after the
+ * move is
+ * played, pop before it is retracted.
+ *
+ * CORRECTNESS DOES NOT DEPEND ON THESE BEING CALLED.
+ * Every level records the
+ * Zobrist key it describes and rebuilds itself from the board when that
+ * key
+ * does not match, so a push that goes missing costs a full recomputation
+ * rather than a
+ * wrong score. Speed very much does depend on it.
+ *
+ * `eval_state_clear` belongs to invariant 7
+ * in CLAUDE.md: search_clear() has
+ * to reset everything that carries between searches, and this
+ * now carries.
+ */
+#ifdef EVAL_NNUE
+
+void eval_state_clear(void);
+void eval_state_push(const Position *pos, Move m);
+void eval_state_push_null(const Position *pos);
+void eval_state_pop(void);
+
+#else
+
+static inline void eval_state_clear(void) {}
+static inline void eval_state_push(const Position *pos, Move m) {
+    (void)pos;
+    (void)m;
+}
+static inline void eval_state_push_null(const Position *pos) { (void)pos; }
+static inline void eval_state_pop(void) {}
+
+#endif
+
 #endif /* EVAL_H */

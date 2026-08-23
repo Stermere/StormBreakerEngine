@@ -165,6 +165,17 @@ static void cmd_uci(void) {
      * cheap to try before it is worth embedding. */
     printf("option name EvalFile type string default <internal>\n");
 #endif
+#ifdef TUNE_SEARCH
+    /* A tuning build advertises every search margin, so a sweep can drive the
+     * whole set through one binary rather than one build per candidate. */
+    for (int i = 0; i < search_tunable_count(); ++i) {
+        const char *name;
+        int value, min, max;
+
+        search_tunable_info(i, &name, &value, &min, &max);
+        printf("option name %s type spin default %d min %d max %d\n", name, value, min, max);
+    }
+#endif
     printf("uciok\n");
     fflush(stdout);
 }
@@ -217,6 +228,12 @@ static void cmd_setoption(char *args) {
         OptChess960  = strcmp(value, "true") == 0;
         Pos.chess960 = OptChess960;
     } else {
+#ifdef TUNE_SEARCH
+        if (value && search_tunable_set(name, atoi(value))) {
+            fflush(stdout);
+            return;
+        }
+#endif
         printf("info string unknown option '%s'\n", name);
     }
     fflush(stdout);

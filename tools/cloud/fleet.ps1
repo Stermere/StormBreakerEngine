@@ -2,6 +2,7 @@
 #
 #   .\tools\cloud\fleet.ps1 types           what SERVER_TYPE values actually exist
 #   .\tools\cloud\fleet.ps1 push-corpus     create the hub dirs, upload the corpus
+#   .\tools\cloud\fleet.ps1 push-net        publish the net EVAL=nnue pins by hash
 #   .\tools\cloud\fleet.ps1 prepare-corpus  one box, split the corpus, destroy it
 #   .\tools\cloud\fleet.ps1 calibrate   one box, measure records/sec, destroy it
 #   .\tools\cloud\fleet.ps1 up          create BOXES boxes, provision, launch
@@ -17,7 +18,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('up', 'down', 'status', 'logs', 'calibrate',
-                 'push-corpus', 'prepare-corpus', 'types')]
+                 'push-corpus', 'push-net', 'prepare-corpus', 'types')]
     [string]$Command = 'status',
 
     [Parameter(Position = 1)]
@@ -26,6 +27,7 @@ param(
     [string]$ConfigPath,
 
     # push-corpus: the compressed corpus to upload.
+    # push-net: the .nnue to upload, if not the exporter's default.
     [string]$Path,
 
     # prepare-corpus / calibrate: leave the throwaway box running afterwards.
@@ -313,6 +315,9 @@ function Initialize-Box([int]$i, [string]$ip) {
 }
 
 function Invoke-Up {
+    # Before the first create: a fleet that cannot provision should cost nothing.
+    Assert-NetReady
+
     Write-Section "Fleet up: $Gen, $Boxes x $($cfg['SERVER_TYPE'])"
     $ips = @()
     try {
@@ -481,6 +486,8 @@ function Invoke-Down {
 # One box, one measurement, then destroyed. Phase 3 of the plan: the fleet size
 # comes from this number, not from an estimate.
 function Invoke-Calibrate {
+    Assert-NetReady
+
     Write-Section "Calibration: one $($cfg['SERVER_TYPE'])"
     $name = "$Gen-calib"
     $hcloud = Get-Hcloud
@@ -556,6 +563,97 @@ function Invoke-PushCorpus {
     Write-Host "  next: .\tools\cloud\fleet.ps1 prepare-corpus"
 }
 
+function Test-NetOnHub([string]$Sha) {
+    # `ls` on the file itself, not a listing of the directory: nets/ accumulates
+    # a file per generation and this asks the only question that matters.
+    # The 2>/dev/null is inside the remote command on purpose: redirecting a
+    # native command's stderr on the PowerShell side wraps each line in an
+    # ErrorRecord and trips $ErrorActionPreference=Stop, so a missing file
+    # would throw instead of answering "no". Same pattern as Invoke-Status.
+    & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser `
+        "ls $HubDir/nets/$Sha.nnue 2>/dev/null" | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Get-LocalNet([string]$Sha) {
+    # -Path wins; otherwise the net the exporter writes, which is where a net
+    # that was just trained already is.
+    $local = $Path
+    if (-not $local) { $local = Join-Path $RepoRoot 'external\nets\net.nnue' }
+    if (-not (Test-Path $local)) {
+        throw "NET_SHA is $Sha but there is no net at $local to upload.`n" +
+              "    Export one with 'make nnue-export', or pass -Path <file>."
+    }
+
+    $got = (Get-FileHash -Algorithm SHA256 -Path $local).Hash.ToLower()
+    if ($got -ne $Sha.ToLower()) {
+        # Named in full, both values, the way a rejected net file is. A silent
+        # mismatch here is the worst class of failure this pipeline has: every
+        # box would build against a net nobody chose, label a few hundred
+        # million positions with it, and produce a dataset that looks perfect
+        # and cannot be compared to the generation before it.
+        throw "net mismatch - refusing to upload.`n" +
+              "    job.env NET_SHA : $Sha`n" +
+              "    $local : $got`n" +
+              "    Either point NET_SHA at the net you meant, or pass -Path to the file that hashes to it."
+    }
+    return $local
+}
+
+# Puts the net on the hub if it is not already there. Idempotent, and called
+# before anything is created - see the note on Assert-NetReady below.
+function Publish-Net {
+    $sha = ''
+    if ($cfg.ContainsKey('NET_SHA')) { $sha = $cfg['NET_SHA'] }
+    if (-not $sha) {
+        throw "EVAL=nnue needs NET_SHA in job.env - it is what the boxes fetch by.`n" +
+              "    Get it with: (Get-FileHash -Algorithm SHA256 external\nets\net.nnue).Hash.ToLower()"
+    }
+
+    if (Test-NetOnHub $sha) {
+        Write-Ok "net $($sha.Substring(0, 12)) already on the hub"
+        return
+    }
+
+    $local = Get-LocalNet $sha
+    Initialize-Hub
+    $mb = [math]::Round((Get-Item $local).Length / 1MB)
+    Write-Host "  uploading $(Split-Path -Leaf $local) ($mb MB) as $sha.nnue"
+
+    # Named by hash on the hub, never by the local filename. Every local net is
+    # called net.nnue; the hash is the only thing that says WHICH one, and
+    # provision.sh re-checks it after the download.
+    & scp @IdentityArgs -P $HubPort $local "${HubUser}:$HubDir/nets/$sha.nnue"
+    if ($LASTEXITCODE -ne 0) { throw "net upload failed" }
+
+    if (-not (Test-NetOnHub $sha)) { throw "net uploaded but is not readable at $HubDir/nets/$sha.nnue" }
+    Write-Ok "net $($sha.Substring(0, 12)) published"
+}
+
+<#
+Preflight for anything that provisions a box.
+
+provision.sh fetches the net and cannot supply it: it runs ON the box, and the
+net is a gitignored file that exists only here. So the check has to happen on
+this side - and it has to happen BEFORE a server is created, because the
+alternative is what it replaced: every box in the fleet boots, installs a
+toolchain, and dies on a missing net ten minutes in, having billed for all of
+it. A run that cannot succeed should cost nothing.
+#>
+function Assert-NetReady {
+    if (-not $cfg.ContainsKey('EVAL') -or $cfg['EVAL'] -ne 'nnue') { return }
+    Write-Section 'Net -> hub'
+    Publish-Net
+}
+
+function Invoke-PushNet {
+    Write-Section 'Net -> hub'
+    if (-not $cfg.ContainsKey('EVAL') -or $cfg['EVAL'] -ne 'nnue') {
+        Write-Warn2 "EVAL is '$($cfg['EVAL'])', so no net is needed. Uploading anyway because you asked."
+    }
+    Publish-Net
+}
+
 # The split is I/O bound, not CPU bound, and needs no engine - so this box skips
 # provisioning entirely and runs on a cheap shared-vCPU type with enough disk for
 # the corpus plus its chunks (~25 GB).
@@ -609,6 +707,7 @@ switch ($Command) {
     'logs'      { Invoke-Logs }
     'calibrate' { Invoke-Calibrate }
     'push-corpus'    { Invoke-PushCorpus }
+    'push-net'       { Invoke-PushNet }
     'prepare-corpus' { Invoke-PrepareCorpus }
     'types'          { Invoke-Types }
 }

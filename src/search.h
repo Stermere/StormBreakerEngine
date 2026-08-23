@@ -139,4 +139,16 @@ typedef void (*SearchNodeVisitor)(const Position *pos, const SearchNodeInfo *inf
 void search_set_node_visitor(SearchNodeVisitor fn, void *ctx);
 #endif /* DATAGEN */
 
+#ifdef TUNE_SEARCH
+/*
+ * The search's tunable pruning margins, exposed so uci.c can advertise them as
+ * spin options. Present only in a `make TUNE_SEARCH=on` build: a released engine has
+ * no business letting a GUI move its search margins, and the options would be
+ * one more thing for a test client to set wrong.
+ */
+int search_tunable_count(void);
+void search_tunable_info(int i, const char **name, int *value, int *min, int *max);
+bool search_tunable_set(const char *name, int value);
+#endif
+
 #endif /* SEARCH_H */
