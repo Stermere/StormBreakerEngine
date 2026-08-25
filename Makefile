@@ -46,6 +46,22 @@ EVAL     ?= classical
 EVALFILE ?= external/nets/net.nnue
 NET      ?= external/nets/net.pt
 
+# ------------------------------------------------------------- net pinning --
+#  Which net a build fetches when it has none. `make net-fetch` downloads
+#  NET_TAG's asset into EVALFILE and refuses anything whose SHA-256 is not
+#  NET_SHA256 - a net that is silently the wrong one scores plausibly and
+#  loses Elo, which is the failure mode invariant 8 exists to prevent.
+#
+#  Published nets are content-addressed: the tag is `net-` plus the first 12
+#  hex digits of the hash, so a tag can never come to mean a different file.
+#  These two lines are the only place a build learns which net is current;
+#  docs/EXPERIMENTS.md records WHY that one was adopted, beside the SPRT that
+#  adopted it. Bump them together. tools/publish-net.ps1 uploads a net and
+#  prints the replacement lines.
+NET_TAG    ?= net-0e35d891b25a
+NET_SHA256 ?= 0e35d891b25a691339ec4038d57526ad0e1642a51f80ce942d6f67512e381918
+NET_URL    ?= https://github.com/Stermere/StormBreakerEngine/releases/download/$(NET_TAG)/net.nnue
+
 # `CC ?= gcc` would NOT work here: make predefines CC as `cc`, so the variable
 # is already set and ?= does nothing. Overriding only when the value is still
 # make's built-in default leaves an explicit `make CC=clang` (or OpenBench's
@@ -124,6 +140,12 @@ CSTD     := -std=c17
 WARNINGS := -Wall -Wextra -Wshadow -Wcast-qual -Wstrict-prototypes \
             -Wmissing-prototypes -Wpointer-arith -Wwrite-strings
 OPTIMISE := -O3 -funroll-loops -fno-math-errno -fomit-frame-pointer
+
+# Names a distributable binary after the evaluation it carries, so that
+# `make release EVAL=nnue` does not overwrite the classical build of the same
+# ARCH with a binary that plays differently.
+EVALSUFFIX :=
+
 # EVAL_NNUE switches the evaluation; NNUE_EVALFILE is the path .incbin embeds,
 # resolved relative to the directory make was run from - which is where the
 # assembler looks too. Kept in their own variable so `make tuner` can filter
@@ -133,10 +155,12 @@ NNUEDEFS :=
 ifeq ($(EVAL),nnue)
     NNUEDEFS := -DEVAL_NNUE -DNNUE_EVALFILE='"$(EVALFILE)"'
     EVALDEP  := $(EVALFILE)
+    EVALSUFFIX := -nnue
     ifeq ($(wildcard $(EVALFILE)),)
-        $(error EVAL=nnue needs a net at '$(EVALFILE)'. Export one with 'make \
-nnue-export', or point EVALFILE somewhere else. Note that the path must not \
-contain spaces - it is embedded as an assembler string.)
+        $(error EVAL=nnue needs a net at '$(EVALFILE)'. Download the pinned \
+one with 'make net-fetch', export your own with 'make nnue-export', or point \
+EVALFILE somewhere else. Note that the path must not contain spaces - it is \
+embedded as an assembler string.)
     endif
 else ifneq ($(EVAL),classical)
     $(error Unknown EVAL '$(EVAL)'. Valid: classical nnue)
@@ -211,7 +235,7 @@ endif
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
         tuner datagen datagen-test trainer-setup trainer-test \
-        nnue nnue-export nnue-test nnue-info
+        nnue nnue-export nnue-test nnue-info net-fetch net-publish
 
 all: $(TARGET)
 
@@ -236,13 +260,17 @@ debug:
 # Every binary a release would ship. `native` is deliberately excluded: it is
 # not portable and must never be published.
 #
+# Honours EVAL: `make release EVAL=nnue` needs a net (see net-fetch) and names
+# what it builds -nnue, because the two evaluations play differently.
+#
 # The mkdir is not optional: the compiler is asked to write straight into
 # build/, and ld does not create the directory - it fails the link outright.
 release:
 	@mkdir -p build
 	@for arch in legacy popcnt avx2 bmi2 avx512; do \
-	    echo "==> $$arch"; \
-	    $(MAKE) --no-print-directory ARCH=$$arch EXE=build/$(EXE)-$$arch CC=$(CC) || exit 1; \
+	    echo "==> $$arch $(EVAL)"; \
+	    $(MAKE) --no-print-directory ARCH=$$arch EVAL=$(EVAL) \
+	        EXE=build/$(EXE)$(EVALSUFFIX)-$$arch CC=$(CC) || exit 1; \
 	done
 
 bench: $(TARGET)
@@ -387,6 +415,46 @@ nnue-test:
 nnue-info: nnue
 	@./$(EXE)-nnue$(SUFFIX) nnue
 
+# Download the pinned net (NET_TAG / NET_SHA256 near the top of this file) into
+# EVALFILE. This is how a machine that cannot run the trainer - a CI runner, an
+# OpenBench worker, a fresh clone - gets a net: `make net-fetch && make nnue`.
+#
+# The hash is checked before the file is put in place, and a mismatch names
+# both values and leaves EVALFILE untouched. Re-running is free: a net that
+# already hashes correctly is not downloaded again, which matters at 50 MB.
+net-fetch:
+	@set -e; \
+	sha256_of() { \
+	    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$$1" | cut -d' ' -f1; \
+	    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$$1" | cut -d' ' -f1; \
+	    else echo "net-fetch: need sha256sum or shasum on PATH" >&2; exit 1; fi; \
+	}; \
+	if [ -f "$(EVALFILE)" ] && [ "$$(sha256_of "$(EVALFILE)")" = "$(NET_SHA256)" ]; then \
+	    echo "net-fetch: $(EVALFILE) is already $(NET_TAG)"; \
+	    exit 0; \
+	fi; \
+	mkdir -p "$$(dirname "$(EVALFILE)")"; \
+	echo "net-fetch: $(NET_TAG) -> $(EVALFILE)"; \
+	curl -fL --retry 3 --retry-delay 2 -o "$(EVALFILE).part" "$(NET_URL)"; \
+	got=$$(sha256_of "$(EVALFILE).part"); \
+	if [ "$$got" != "$(NET_SHA256)" ]; then \
+	    rm -f "$(EVALFILE).part"; \
+	    echo "net-fetch: sha256 mismatch for $(NET_TAG), refusing it" >&2; \
+	    echo "  expected $(NET_SHA256)" >&2; \
+	    echo "  got      $$got" >&2; \
+	    exit 1; \
+	fi; \
+	mv -f "$(EVALFILE).part" "$(EVALFILE)"; \
+	printf '%s  %s\n' "$(NET_SHA256)" "$$(basename $(EVALFILE))" > "$(EVALFILE).sha256"; \
+	echo "net-fetch: ok, sha256 $(NET_SHA256)"
+
+
+# Upload the current net so a build that is not this machine can fetch it.
+# Prints the NET_TAG / NET_SHA256 to pin it by; -UpdateMakefile writes them
+# here for you. Windows-only, like the rest of tools/*.ps1.
+net-publish:
+	powershell -ExecutionPolicy Bypass -File tools/publish-net.ps1 -Net $(EVALFILE)
+
 # tools/tuner.c and tools/datagen.c are included: they are C in this
 # repository's style, and leaving them out of the check is how they stop being
 # that.
@@ -422,5 +490,7 @@ help:
 	@echo "make nnue               build the engine with the network evaluation"
 	@echo "make nnue-test          C inference == quantised Python reference"
 	@echo "make nnue-info          which net a build is carrying, by hash"
+	@echo "make net-fetch          download the pinned net into EVALFILE"
+	@echo "make net-publish        upload EVALFILE as a content-addressed release"
 	@echo "make format[-check]     apply / verify .clang-format"
 	@echo "make clean"

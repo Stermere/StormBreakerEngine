@@ -597,10 +597,29 @@ cannot be attributed to a specific net is not a measurement.
 
 Both halves of the flexibility question got built, as planned: embedded by
 default, and `setoption name EvalFile value <path>` overrides it at runtime.
-The exporter writes a `<net>.sha256` sidecar; the hash of a net that gets
-*adopted* is recorded in [EXPERIMENTS.md](EXPERIMENTS.md) beside the SPRT that
-adopted it, rather than in a separate committed file — one place that says
-which net, and why it is the one in use.
+The exporter writes a `<net>.sha256` sidecar.
+
+That leaves the question of how a machine that cannot run the trainer gets a
+net at all — a CI runner, an OpenBench worker, a fresh clone. A net is
+published as a GitHub release of its own, tagged by its own hash (`net-` plus
+the first twelve hex digits), and the Makefile pins one:
+
+```make
+NET_TAG    ?= net-1ee5325add50
+NET_SHA256 ?= 1ee5325add50950b3b8fb34c742988436664615895f02504dc5e2be9ea15c418
+```
+
+`make net-fetch` downloads that net and verifies the hash before putting it in
+place; `make net-publish` uploads one and prints the replacement pin. Neither
+is part of the engine build — `EVAL=nnue` still just embeds whatever is at
+`EVALFILE`. See [RELEASING.md](RELEASING.md).
+
+A content-addressed tag cannot come to mean a different file, which is what
+makes pinning it safe. The pin says **which** net a build embeds; the hash of a
+net that gets *adopted* is still recorded in [EXPERIMENTS.md](EXPERIMENTS.md)
+beside the SPRT that adopted it, which says **why** it is the one in use. Those
+are two different questions, and only the first one a build system can act on.
+Change them in the same commit.
 
 ### The test
 
@@ -624,6 +643,8 @@ make nnue-export    # quantise NET into EVALFILE, + vectors + .sha256 + manifest
 make nnue           # the engine with the network, as stormbreaker-nnue
 make nnue-test      # export, build, and require exact equality on every vector
 make nnue-info      # which net a build is carrying, by hash
+make net-fetch      # download the pinned net - no trainer, no torch, no venv
+make net-publish    # upload this net, and print the pin that names it
 ```
 
 ```

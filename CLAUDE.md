@@ -33,6 +33,7 @@ make format             # apply .clang-format
 make tuner              # build the evaluation fitter (docs/TUNING.md)
 
 make EVAL=nnue          # any build, with the network instead of eval.c
+make net-fetch          # fetch the pinned net; a clean clone has none
 make nnue-test          # C inference == the quantised reference, exactly
 make datagen-test       # datagen round-trips and its labels reproduce
 make trainer-test       # the trainer's pytest suite
@@ -141,7 +142,7 @@ correct response is to implement movegen, not to relax the check.
 | `tools/tuner.c` | the evaluation fitter; **not** part of the engine binary |
 | `tools/export_net.py` | quantises a checkpoint into `.nnue` + the equivalence vectors |
 | `trainer/` | PyTorch NNUE trainer, its own venv, not subject to the C style rules |
-| `docs/` | architecture, testing, tuning, UCI reference |
+| `docs/` | architecture, testing, tuning, releasing, UCI reference |
 | `external/` | **gitignored** — books, opponents, baselines, PGNs, training data |
 
 Never commit anything under `external/`, and never commit binaries or PGNs.

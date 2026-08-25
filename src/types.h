@@ -22,7 +22,7 @@
 /* ------------------------------------------------------------------ meta -- */
 
 #define ENGINE_NAME    "StormBreaker"
-#define ENGINE_VERSION "0.1.0-dev"
+#define ENGINE_VERSION "0.2.0-dev"
 #define ENGINE_AUTHOR  "Collin Kees"
 
 /* --------------------------------------------------------------- limits -- */

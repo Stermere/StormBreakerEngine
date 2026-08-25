@@ -1,0 +1,351 @@
+name: Release
+
+# Publishes the distributable binaries for a tagged version.
+#
+# The net is NOT in this repository (50 MB, gitignored), so an NNUE build has
+# to fetch one. `make net-fetch` downloads the net pinned by NET_TAG and
+# NET_SHA256 in the Makefile and refuses anything that hashes differently.
+# That net must already be published: upload it with tools/publish-net.ps1
+# BEFORE tagging a release, or every NNUE job here fails at the download.
+#
+# Releasing, end to end:
+#   1. powershell -File tools\publish-net.ps1           (once per net; prints the pin)
+#   2. commit the NET_TAG / NET_SHA256 it printed, and the ENGINE_VERSION
+#      bump in src/types.h
+#   3. git tag v0.2.0 && git push origin v0.2.0
+#   4. Actions -> Release -> Run workflow, and type v0.2.0
+#
+# Leave `tag` empty to watch it build and verify everything without
+# publishing anything - the same fourteen binaries, the same gates, no
+# release created.
+
+on:
+  # Deliberately manual: no push or tag trigger. A release goes out when you
+  # go to the Actions tab, pick this workflow and type the tag - never as a
+  # side effect of pushing one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.2.0). It must already exist on the remote. Empty = dry run: build and verify, publish nothing.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Everything that can reject a release before spending fourteen build jobs
+  # on it.
+  prepare:
+    name: version and net pin
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      net_tag: ${{ steps.net.outputs.tag }}
+      net_sha: ${{ steps.net.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag and the version the engine reports over UCI must agree. They
+      # are two hand-maintained strings, and when they drift it is the
+      # `id name` line that lies - the one every GUI, tournament and rating
+      # list records. Cheaper to fail here than to explain later.
+      - name: Tag agrees with ENGINE_VERSION
+        id: v
+        run: |
+          tag="${{ inputs.tag }}"
+          version=$(sed -n 's/^#define ENGINE_VERSION[[:space:]]*"\(.*\)".*/\1/p' src/types.h)
+          [ -n "$version" ] || { echo "::error::could not read ENGINE_VERSION from src/types.h"; exit 1; }
+          echo "ENGINE_VERSION = $version"
+
+          if [ -z "$tag" ]; then
+            echo "no tag given - dry run"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag = $tag"
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::tag $tag does not match ENGINE_VERSION $version"
+              echo "::error::bump ENGINE_VERSION in src/types.h to ${tag#v}, or tag v$version instead"
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # A version carrying a suffix (-dev, -rc1, -beta) is not a stable
+          # release, and GitHub should not offer it as the latest download.
+          case "$version" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag:-v$version}" >> "$GITHUB_OUTPUT"
+
+      # Read the pin once, here, so every build job embeds the same net and
+      # the notes name the net that was actually embedded.
+      - name: Read the net pin
+        id: net
+        run: |
+          tag=$(sed -n 's/^NET_TAG[[:space:]]*?=[[:space:]]*//p' Makefile)
+          sha=$(sed -n 's/^NET_SHA256[[:space:]]*?=[[:space:]]*//p' Makefile)
+          [ -n "$tag" ] && [ -n "$sha" ] || {
+            echo "::error::NET_TAG / NET_SHA256 missing from the Makefile"; exit 1; }
+          echo "net $tag  $sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  # The full-depth perft suite, which docs/TESTING.md says to run before a
+  # release rather than on every commit. A release is exactly that moment: an
+  # engine that generates one illegal move forfeits games for everyone who
+  # downloads it.
+  perft:
+    name: perft (full depth)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ARCH on both halves: perft-all builds its own prerequisite, and without
+      # a matching ARCH it would rebuild with -march=native and test a
+      # different binary than the one just verified.
+      - name: Full perft suites
+        run: make perft-all ARCH=popcnt
+
+  build:
+    name: ${{ matrix.target.platform }} ${{ matrix.target.arch }} ${{ matrix.eval }}
+    needs: prepare
+    runs-on: ${{ matrix.target.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        eval: [classical, nnue]
+        target:
+          # `makearch` is what the Makefile is given; `arch` is what the asset
+          # is called. They differ on Apple Silicon, where the Makefile drops
+          # the -march flags entirely but still validates the ARCH name it was
+          # handed. avx512 is deliberately absent: it is rarely a win outside
+          # Skylake-X, and GitHub's runners cannot reliably execute it.
+          - { os: ubuntu-latest,  platform: linux,   arch: popcnt, makearch: popcnt, cc: gcc }
+          - { os: ubuntu-latest,  platform: linux,   arch: avx2,   makearch: avx2,   cc: gcc }
+          - { os: ubuntu-latest,  platform: linux,   arch: bmi2,   makearch: bmi2,   cc: gcc }
+          - { os: windows-latest, platform: windows, arch: popcnt, makearch: popcnt, cc: gcc }
+          - { os: windows-latest, platform: windows, arch: avx2,   makearch: avx2,   cc: gcc }
+          - { os: windows-latest, platform: windows, arch: bmi2,   makearch: bmi2,   cc: gcc }
+          - { os: macos-latest,   platform: macos,   arch: arm64,  makearch: popcnt, cc: clang }
+
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NET_TAG: ${{ needs.prepare.outputs.net_tag }}
+      NET_SHA: ${{ needs.prepare.outputs.net_sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name this binary
+        id: name
+        run: |
+          suffix=""
+          [ "${{ matrix.eval }}" = "nnue" ] && suffix="-nnue"
+          base="stormbreaker-$VERSION-${{ matrix.target.platform }}-${{ matrix.target.arch }}$suffix"
+          exe="$base"
+          [ "${{ matrix.target.platform }}" = "windows" ] && exe="$base.exe"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "exe=$exe"   >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the pinned net
+        if: matrix.eval == 'nnue'
+        run: |
+          if ! make net-fetch; then
+            echo "::error::could not fetch net $NET_TAG"
+            echo "::error::publish it first with 'powershell -File tools\\publish-net.ps1', then re-run"
+            exit 1
+          fi
+
+      # The equivalence vectors ship beside the net. They are what makes the
+      # exactness check below possible without a Python environment.
+      - name: Fetch the net's equivalence vectors
+        if: matrix.eval == 'nnue'
+        run: |
+          url="https://github.com/${{ github.repository }}/releases/download/$NET_TAG/net.nnue.vectors"
+          if ! curl -fL --retry 3 -o external/nets/net.nnue.vectors "$url"; then
+            echo "::error::net release $NET_TAG has no net.nnue.vectors asset"
+            echo "::error::re-publish the net with tools\\publish-net.ps1, which uploads them"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          make ARCH=${{ matrix.target.makearch }} EVAL=${{ matrix.eval }} CC=${{ matrix.target.cc }} EXE=${{ steps.name.outputs.base }}
+
+      - name: UCI handshake
+        run: |
+          out=$(printf 'uci\nisready\nquit\n' | ./${{ steps.name.outputs.exe }})
+          grep -q 'uciok'   <<< "$out" || { echo "::error::no uciok";   exit 1; }
+          grep -q 'readyok' <<< "$out" || { echo "::error::no readyok"; exit 1; }
+          grep -q "id name StormBreaker $VERSION" <<< "$out" || {
+            echo "::error::id name does not report version $VERSION"
+            head -3 <<< "$out"
+            exit 1
+          }
+
+      # Invariant 8, checked per architecture rather than once: src/nnue.c has
+      # separate SIMD paths, and a wrong one is a plausible-looking evaluation
+      # that quietly loses Elo. Exact equality on 10,000 positions, on the
+      # binary that is actually about to be published.
+      - name: Net is the pinned one, and reproduces the reference exactly
+        if: matrix.eval == 'nnue'
+        run: |
+          info=$(./${{ steps.name.outputs.exe }} nnue)
+          echo "$info"
+          grep -q "net ${NET_SHA:0:12}" <<< "$info" || {
+            echo "::error::binary does not carry the pinned net ${NET_SHA:0:12}"; exit 1; }
+          ./${{ steps.name.outputs.exe }} nnue verify external/nets/net.nnue.vectors
+
+      # Invariants 1 and 2: the OpenBench contract, on every published binary.
+      - name: Bench format and determinism
+        run: |
+          n1=$(./${{ steps.name.outputs.exe }} bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
+          n2=$(./${{ steps.name.outputs.exe }} bench | sed -n 's/^\([0-9][0-9]*\) nodes [0-9][0-9]* nps.*/\1/p')
+          [ -n "$n1" ] || { echo "::error::bench did not print '<nodes> nodes <nps> nps'"; exit 1; }
+          [ "$n1" = "$n2" ] || { echo "::error::bench is not deterministic ($n1 vs $n2)"; exit 1; }
+          echo "$n1 nodes"
+          mkdir -p dist
+          cp ${{ steps.name.outputs.exe }} dist/
+          echo "$n1" > "dist/${{ steps.name.outputs.base }}.nodes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.base }}
+          path: dist/*
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [prepare, perft, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      NET_TAG: ${{ needs.prepare.outputs.net_tag }}
+      NET_SHA: ${{ needs.prepare.outputs.net_sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Nothing about an architecture profile may change what the search does:
+      # -mbmi2 only picks a different way to compute the same attack sets. If
+      # two ARCHs of one evaluation disagree on the node count, one of them is
+      # computing something else, and the bench has stopped being a
+      # fingerprint of the search.
+      - name: Bench agrees across architectures
+        id: nodes
+        run: |
+          cd dist
+          for eval in classical nnue; do
+            ref=""; first=""
+            for f in *.nodes; do
+              case "$f" in
+                *-nnue.nodes) this=nnue ;;
+                *)            this=classical ;;
+              esac
+              [ "$this" = "$eval" ] || continue
+              n=$(cat "$f")
+              if [ -z "$ref" ]; then ref="$n"; first="$f"; continue; fi
+              [ "$n" = "$ref" ] || {
+                echo "::error::$eval bench differs by architecture: $first=$ref but $f=$n"
+                exit 1
+              }
+            done
+            [ -n "$ref" ] || { echo "::error::no $eval binaries were built"; exit 1; }
+            echo "$eval bench: $ref nodes"
+            echo "${eval}_nodes=$ref" >> "$GITHUB_OUTPUT"
+          done
+          rm -f ./*.nodes
+
+      - name: Checksums
+        # Written outside dist/ and moved in, so the file being created can
+        # never end up as one of the entries it is supposed to cover.
+        run: |
+          (cd dist && sha256sum ./*) > SHA256SUMS.txt
+          mv SHA256SUMS.txt dist/
+          cat dist/SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          {
+            echo "StormBreaker $VERSION."
+            echo
+            echo "## Which download"
+            echo
+            echo "| You have | Take |"
+            echo "|---|---|"
+            echo "| An Intel CPU from 2013 or later (Haswell and newer) | \`bmi2\` |"
+            echo "| An AMD Zen 1-2 CPU | \`avx2\` (pext is slow there) |"
+            echo "| Anything older, or you are not sure | \`popcnt\` |"
+            echo "| An Apple Silicon Mac | \`macos-arm64\` |"
+            echo
+            echo "Files without a suffix use the classical evaluation. **The \`-nnue\`"
+            echo "files use the network and are the stronger engine** - +238 Elo at STC,"
+            echo "measured in \`docs/EXPERIMENTS.md\` (E11). The net is embedded, so an"
+            echo "\`-nnue\` binary is self-contained and needs no extra files."
+            echo
+            echo "On Linux and macOS, \`chmod +x <file>\` before running it."
+            echo
+            echo "## Net"
+            echo
+            echo "The \`-nnue\` binaries embed [\`$NET_TAG\`](https://github.com/$REPO/releases/tag/$NET_TAG):"
+            echo
+            echo '```'
+            echo "$NET_SHA"
+            echo '```'
+            echo
+            echo "Each was checked against that net's 10,000 reference vectors, on its"
+            echo "own architecture, before being published."
+            echo
+            echo "## Bench"
+            echo
+            echo "| Evaluation | Nodes |"
+            echo "|---|---|"
+            echo "| classical | ${{ steps.nodes.outputs.classical_nodes }} |"
+            echo "| nnue | ${{ steps.nodes.outputs.nnue_nodes }} |"
+            echo
+            echo "Check with \`<binary> bench\`. \`SHA256SUMS.txt\` covers every asset here."
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
+        if: needs.prepare.outputs.publish == 'true'
+        run: |
+          flags=""
+          [ "${{ needs.prepare.outputs.prerelease }}" = "true" ] && flags="--prerelease"
+          # --verify-tag: publish only a tag that already exists, so a typo in
+          # the workflow_dispatch input cannot create one.
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "StormBreaker $VERSION" \
+            --notes-file notes.md \
+            --verify-tag \
+            $flags \
+            dist/*
+
+      - name: Dry run summary
+        if: needs.prepare.outputs.publish != 'true'
+        run: |
+          {
+            echo "### Dry run - nothing was published"
+            echo
+            echo "\`$TAG\` would have shipped:"
+            echo '```'
+            ls -la dist
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

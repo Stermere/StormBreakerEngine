@@ -164,6 +164,8 @@ fast-chess -engine cmd=.\stormbreaker.exe name=dev `
 | `make nnue` | the engine with the network, as `stormbreaker-nnue` |
 | `make nnue-test` | C inference == the quantised Python reference, exactly |
 | `make nnue-info` | which net a build is carrying, by hash |
+| `make net-fetch` | download the pinned net into `EVALFILE`, hash-checked |
+| `make net-publish` | upload this net as a content-addressed release ([docs/RELEASING.md](docs/RELEASING.md)) |
 
 On non-x86 targets (Apple Silicon, ARM) the arch profiles are ignored and a
 portable build is produced automatically.
@@ -283,6 +285,7 @@ again by accident:
 - [trainer/README.md](trainer/README.md) — running the trainer: setup, the pipeline, the sanity table
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) — every measured change and what it scored
 - [docs/UCI.md](docs/UCI.md) — supported commands and options
+- [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, and how the net gets published
 
 ---
 
