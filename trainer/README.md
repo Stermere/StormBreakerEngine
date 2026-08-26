@@ -7,7 +7,7 @@ run it.
 
 ```
 nnue/format.py    the 32-byte record, and the features the network sees
-nnue/dataset.py   memory-mapped batches
+nnue/dataset.py   batches: memmap slices, or shuffled chunks at size
 nnue/model.py     the network and the loss
 nnue/train.py     the training loop
 nnue/sanity.py    score positions whose evaluation is known
@@ -76,8 +76,10 @@ cd trainer
 
 # Gen 1 net ~2800 -> ~3000 Elo
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-001.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.001 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
-# Gen 2 hybrid net ~3000 -> ~3060 Elo
-.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-1-gen-2-combo.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
+# Gen 2 + 1 hybrid net ~3000 -> ~3050 Elo
+.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-012.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
+# Gen 3 ~3050 -> ?
+
 
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..
@@ -303,16 +305,27 @@ be lived with. Record what each one scored in
 |---|---|
 | `--limit-batches 20` | smoke-test the whole loop in seconds |
 | `--sources 0 1` | train on self-play line + tree samples only |
-| `--workers 8` | the loader, not the model, is usually the bottleneck |
-| `--batch-size 32768` | bigger batches keep the 3070 busier |
+| `--workers 6` | four to six saturates the loader; more does nothing |
+| `--batch-size 32768` | bigger batches keep the 3070 busier — worth ~7% |
 | `--hidden 512` | narrower and faster; what a small dataset wants |
 | `--output-buckets 1` | one output row for every phase |
 | `--no-weight-clip` | measure what the clip costs; the export will then refuse the net |
 | `--device cpu` | force CPU, e.g. to reproduce a CI failure |
+| `--seed 1` | shuffling and initialisation, so a run repeats |
+| `--positions-per-epoch 50M` | see [Datasets too big for one epoch](#datasets-too-big-for-one-epoch) |
+| `--resume` | continue an interrupted run from its last epoch |
+| `--chunk-records 0` | force memmap slices at any dataset size |
 
 Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
-If it is much worse than that the bottleneck is the loader — raise `--workers`
-and `--batch-size` before touching anything else.
+At `--hidden 1024 --workers 6` that is about **390k positions/s**.
+
+**The loader is not the bottleneck there, and the old advice in this file that
+it was is wrong.** Measured on the same machine, the loader alone delivers
+**1.2M positions/s** — three times what training consumes — because 1.2M
+positions/s is only 38 MB/s of records, and the work is `unpack()` on the CPU
+rather than anything the drive does. So raise `--workers` until it stops
+helping, which is four to six, and then stop: past that the numbers that move
+are `--batch-size` (32768 is worth about 7% over 16384) and `--hidden`.
 
 ---
 

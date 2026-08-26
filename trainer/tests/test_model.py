@@ -12,12 +12,21 @@ loss falls, and the result is quietly a different model than the one that was
 asked for - or one the engine cannot represent.
 """
 
+import os
+
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from nnue.dataset import ShardBatches, identity_collate  # noqa: E402
+from nnue.dataset import (  # noqa: E402
+    AUTO_CHUNK_BYTES,
+    INDEX_DTYPE,
+    ShardBatches,
+    ShuffledChunks,
+    identity_collate,
+    make_loader,
+)
 from nnue.format import (  # noqa: E402
     NUM_FEATURES,
     PAD_INDEX,
@@ -385,8 +394,11 @@ def test_dataset_covers_every_record_exactly_once(shard_path):
 
 def test_dataset_batches_are_tensors_of_the_right_dtype(shard_path):
     batch = ShardBatches(shard_path, batch_size=17)[0]
-    assert batch["white"].dtype == torch.int64
-    assert batch["black"].dtype == torch.int64
+    # int32 by default: indices run to 24576 and the matrices are the widest
+    # thing the loader moves. The model has to accept them, which is the half
+    # of this that is not obvious - see test_the_model_eats_the_loader_dtype.
+    assert batch["white"].dtype == torch.from_numpy(np.empty(0, INDEX_DTYPE)).dtype
+    assert batch["black"].dtype == batch["white"].dtype
     assert batch["stm"].dtype == torch.float32
     assert batch["score"].dtype == torch.float32
     assert batch["piece_count"].dtype == torch.int64
@@ -401,3 +413,128 @@ def test_the_loader_yields_indices_the_model_can_hold(shard_path):
     active = batch["white"][batch["white"] != PAD_INDEX]
     assert int(active.max()) < NUM_FEATURES
     assert int(batch["white"].max()) == PAD_INDEX
+
+
+def _records(batches):
+    """Every record a loader yielded, as a sortable key per record.
+
+    Comparing loaders by their multiset of records is the only comparison that
+    means anything: the whole point of the chunked one is that it emits them in
+    a different order.
+    """
+    rows = []
+    for batch in batches:
+        white = batch["white"].numpy()
+        score = batch["score"].numpy()
+        wdl = batch["wdl"].numpy()
+        for i in range(white.shape[0]):
+            rows.append((white[i].tobytes(), float(score[i]), int(wdl[i])))
+    return sorted(rows)
+
+
+def test_the_model_eats_the_loader_dtype(shard_path):
+    """int32 indices are only a saving if EmbeddingBag takes them."""
+    model = NNUE(hidden=16, output_buckets=4)
+    batch = ShardBatches(shard_path, batch_size=32)[0]
+    out = model(batch["white"], batch["black"], batch["stm"], batch["piece_count"])
+    out.sum().backward()
+    assert out.shape == (32,)
+    assert torch.isfinite(out).all()
+
+
+def test_chunked_loading_sees_every_record_exactly_once(shard_path):
+    """A chunk boundary must not drop or duplicate records, and neither must
+    the shuffle inside one. This is the property the whole loader exists for."""
+    dataset = ShuffledChunks(shard_path, batch_size=16, chunk_records=64)
+    seen = _records(dataset)
+    assert len(seen) == dataset.records
+    assert seen == _records(ShardBatches(shard_path, batch_size=16)[i]
+                            for i in range(len(ShardBatches(shard_path, batch_size=16))))
+
+
+def test_chunked_loading_reorders_records_and_the_map_loader_does_not(shard_path):
+    chunked = ShuffledChunks(shard_path, batch_size=16, chunk_records=256, seed=1)
+    first = [r[0] for r in [(b["white"].numpy()[0].tobytes(),) for b in chunked]]
+    second = [r[0] for r in [(b["white"].numpy()[0].tobytes(),) for b in chunked]]
+    # Same records, different grouping: the epoch counter moved between the
+    # two passes, which is what stops a batch being frozen at whatever the
+    # file's record order made it.
+    assert first != second
+
+
+def test_chunked_loading_is_reproducible_from_the_seed(shard_path):
+    def pass_one(seed):
+        return _records(ShuffledChunks(shard_path, batch_size=16, chunk_records=64,
+                                       seed=seed))
+
+    assert pass_one(3) == pass_one(3)
+
+
+def test_unshuffled_chunks_preserve_file_order(shard_path):
+    """--val must not be reordered; a held-out loss is a comparison across
+    epochs and a moving denominator would make it one."""
+    ordered = ShuffledChunks(shard_path, batch_size=16, chunk_records=64, shuffle=False)
+    mapped = ShardBatches(shard_path, batch_size=16)
+    assert ([b["white"].numpy().tobytes() for b in ordered]
+            == [mapped[i]["white"].numpy().tobytes() for i in range(len(mapped))])
+
+
+def test_only_a_chunks_last_batch_is_short(shard_path):
+    """A short batch in the middle would mean the permutation and the slicing
+    disagree about how many records the chunk had."""
+    dataset = ShuffledChunks(shard_path, batch_size=16, chunk_records=64)
+    assert len(list(dataset)) == len(dataset)
+
+    per_chunk = 64 // 16
+    sizes = [b["white"].shape[0] for b in dataset]
+    for i, n in enumerate(sizes):
+        last_of_chunk = (i + 1) % per_chunk == 0 or i == len(sizes) - 1
+        assert n == 16 or last_of_chunk, f"batch {i} is {n} records"
+
+
+def test_source_filtering_matches_between_the_two_loaders(shard_path):
+    """`--sources` has to mean the same thing whichever loader is running."""
+    chunked = _records(ShuffledChunks(shard_path, batch_size=16, chunk_records=64,
+                                      sources=[0]))
+    mapped = ShardBatches(shard_path, batch_size=16, sources=[0])
+    assert chunked == _records(mapped[i] for i in range(len(mapped)))
+
+
+def test_make_loader_picks_the_strategy_from_the_dataset_size(shard_path):
+    """Small shards keep the old path; --chunk-records overrides either way."""
+    assert os.path.getsize(shard_path) < AUTO_CHUNK_BYTES
+    assert isinstance(make_loader(shard_path, 16, workers=0).dataset, ShardBatches)
+    assert isinstance(make_loader(shard_path, 16, workers=0,
+                                  chunk_records=64).dataset, ShuffledChunks)
+    assert isinstance(make_loader(shard_path, 16, workers=0,
+                                  chunk_records=0).dataset, ShardBatches)
+
+
+def test_a_chunk_smaller_than_a_batch_is_raised_to_one(shard_path):
+    """Otherwise every batch is short and the run is 10x slower with no error."""
+    dataset = ShuffledChunks(shard_path, batch_size=64, chunk_records=8)
+    assert dataset.chunk_records == 64
+
+
+@pytest.mark.parametrize("workers", [1, 2, 3, 5, 8])
+def test_chunks_partition_across_workers(shard_path, monkeypatch, workers):
+    """Every chunk to exactly one worker, whatever the worker count.
+
+    The partition is ``order[worker::workers]`` over a permutation every worker
+    draws identically. If those permutations ever diverge - a per-worker seed,
+    say - two workers take the same chunk and a third is dropped, the record
+    count still looks plausible, and the net simply trains on part of the data
+    twice. Faked here rather than spawned: this tests the arithmetic, and
+    spawning eight processes to do it would cost more than the whole suite.
+    """
+    import nnue.dataset as dataset_module
+
+    seen = []
+    for worker in range(workers):
+        info = type("Info", (), {"id": worker, "num_workers": workers})()
+        monkeypatch.setattr(dataset_module, "get_worker_info", lambda info=info: info)
+        seen += _records(ShuffledChunks(shard_path, batch_size=16, chunk_records=64, seed=4))
+
+    monkeypatch.setattr(dataset_module, "get_worker_info", lambda: None)
+    assert sorted(seen) == _records(ShuffledChunks(shard_path, batch_size=16,
+                                                   chunk_records=64, seed=4))

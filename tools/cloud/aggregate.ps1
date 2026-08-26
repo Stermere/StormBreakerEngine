@@ -4,6 +4,7 @@
 #   .\tools\cloud\aggregate.ps1                  download, check, merge, shuffle
 #   .\tools\cloud\aggregate.ps1 -Parallel 4      fewer concurrent scp streams
 #   .\tools\cloud\aggregate.ps1 -SkipDownload    re-merge what is already local
+#   .\tools\cloud\aggregate.ps1 -StrictVerify    stop if sampled labels disagree
 #
 # The download is the slow part (~6.5 GB for a full human pass) and it is not
 # bandwidth-bound: a Storage Box throttles per CONNECTION, so one scp saturates
@@ -15,6 +16,7 @@
 param(
     [string]$ConfigPath,
     [switch]$SkipDownload,
+    [switch]$StrictVerify,
     [int]$ShuffleSeed = 7,
     [int]$Parallel = 8
 )
@@ -68,7 +70,32 @@ $GenDir       = Ensure-Dir (Join-Path $DataDir $Gen)
 $MergeDir     = Ensure-Dir (Join-Path $GenDir 'merged')
 $ShardsRemote = "$HubDir/$Gen/shards"
 
-if (-not (Test-Path $Datagen)) { throw "no datagen.exe at $Datagen - run: make datagen" }
+$JobEval  = if ($cfg.ContainsKey('EVAL') -and $cfg['EVAL']) { $cfg['EVAL'] } else { 'classical' }
+$JobArch  = if ($cfg.ContainsKey('ARCH') -and $cfg['ARCH']) { $cfg['ARCH'] } else { 'popcnt' }
+$MakeLine = "make datagen EVAL=$JobEval ARCH=$JobArch"
+
+if (-not (Test-Path $Datagen)) { throw "no datagen.exe at $Datagen - run: $MakeLine" }
+
+# The label check below re-searches sampled positions with THIS binary and
+# expects the fleet's scores back, which only holds if this binary evaluates the
+# way the fleet's did. Plain `make datagen` builds the CLASSICAL eval, so a
+# generation labelled by an EVAL=nnue fleet and checked by a stock local build
+# mismatches on essentially every sampled record - a failure that says nothing
+# whatsoever about the data. An nnue build embeds its net with .incbin and so
+# cannot be smaller than the net; a classical one is a few hundred KB. That is
+# the whole difference, and it is enough to tell them apart before the download.
+if ($JobEval -eq 'nnue') {
+    $LocalNet = Join-Path $ExternalDir 'nets\net.nnue'
+    if (-not (Test-Path $LocalNet)) {
+        Write-Warn2 ("no net at $LocalNet to check datagen.exe against; if labels do not " +
+                     "reproduce below, suspect this build before you suspect the data")
+    } elseif ((Get-Item $Datagen).Length -lt (Get-Item $LocalNet).Length) {
+        Write-Warn2 ("datagen.exe carries no embedded net, but $Gen was labelled with " +
+                     "EVAL=nnue - its labels cannot reproduce here. Rebuild: $MakeLine")
+    } else {
+        Write-Ok "datagen.exe is an nnue build, matching EVAL=$JobEval"
+    }
+}
 
 # A BX11 Storage Box accepts ten simultaneous connections and each scp holds one,
 # so asking for more than that does not go faster - it starts failing units.
@@ -362,12 +389,109 @@ foreach ($g in $groups) {
 }
 
 # Relabelling a sample from a cleared engine is what catches a box whose build
-# drifted from the rest of the fleet. -relabel needs the -nodes the pass used,
-# not its own default.
-$sample = (Get-ChildItem $MergeDir -Filter '*.cnn' | Select-Object -First 1).FullName
-Write-Host "  verifying labels reproduce (relabel 256 @ $Nodes nodes)..."
-& $Datagen verify $sample -relabel 256 -nodes $Nodes
-if ($LASTEXITCODE -ne 0) { throw "label verification failed on $sample" }
+# drifted from the rest of the fleet - and, at least as often, a LOCAL build that
+# drifted from the fleet's. It is a check on the labels, not on the bytes, and by
+# this point the bytes are already known good, so a mismatch is reported as
+# loudly as it can be and aggregation continues. -StrictVerify makes it fatal
+# again, for when the fleet itself is what is under suspicion.
+#
+# -relabel is given the -nodes AND the -hash the pass actually used, both read
+# from the shard's own manifest rather than from job.env, which can have moved on
+# since the generation was produced. Nodes are the one that bites: a re-search at
+# a different node count disagrees with almost every label. Hash size is harmless
+# at these counts - a 10k-node search from a cleared table never fills even 8 MB,
+# and 8 MB against 128 MB was measured at 0 differences in 256 - but it costs
+# nothing to pass it and it removes the question from the list of suspects.
+$sampleFile = Get-ChildItem $MergeDir -Filter '*.cnn' | Select-Object -First 1
+$sample     = $sampleFile.FullName
+
+$vNodes = [int]$Nodes
+$vHash  = 8
+$manifest = Get-ChildItem $GenDir -Filter "$($sampleFile.BaseName)_*.json" | Select-Object -First 1
+if ($manifest) {
+    $m  = ConvertFrom-Json (Get-Content -LiteralPath $manifest.FullName -Raw)
+    $mf = $m.PSObject.Properties.Name
+    if ($mf -contains 'nodes')   { $vNodes = [int]$m.nodes }
+    if ($mf -contains 'hash_mb') { $vHash  = [int]$m.hash_mb }
+    if ($vNodes -ne [int]$Nodes) {
+        Write-Warn2 ("job.env says NODES=$Nodes but $($manifest.Name) was labelled at " +
+                     "$vNodes; relabelling at $vNodes")
+    }
+} else {
+    Write-Warn2 ("no manifest beside $($sampleFile.BaseName); relabelling at NODES=$Nodes and " +
+                 "a $vHash MB hash, either of which may not be what the pass used")
+}
+
+Write-Host "  verifying labels reproduce (relabel 256 @ $vNodes nodes, $vHash MB hash)..."
+
+# datagen names every mismatching record on stderr, and that is the useful half
+# of the output. Run the whole script under `2>&1 | Tee-Object` - which is what
+# anyone babysitting a multi-hour aggregation does - and PowerShell turns each of
+# those lines into an ErrorRecord, which $ErrorActionPreference = 'Stop' then
+# raises as a NativeCommandError. The script would die at exactly the point it is
+# supposed to keep going and explain itself, so the preference is lifted for this
+# one call and $LASTEXITCODE is trusted instead.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $verifyOut  = @(& $Datagen verify $sample -relabel 256 -nodes $vNodes -hash $vHash)
+    $verifyExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+$verifyOut | ForEach-Object { Write-Host "    $_" }
+
+$rtBad = $null; $polBad = 0; $labelBad = $null; $labelChecked = 0
+foreach ($line in $verifyOut) {
+    if     ($line -match '^round-trip:.*checked, (\d+) failures') { $rtBad  = [int]$Matches[1] }
+    elseif ($line -match '^policy:.*checked, (\d+) not legal')    { $polBad = [int]$Matches[1] }
+    elseif ($line -match '^relabel:\s+(\d+) checked, (\d+) mismatch') {
+        $labelChecked = [int]$Matches[1]
+        $labelBad     = [int]$Matches[2]
+    }
+}
+
+# A verify that printed no summary did not run - a missing file, a rejected
+# option, a crash - and its silence must not be read as a pass.
+if ($null -eq $rtBad -or $null -eq $labelBad) {
+    throw "datagen verify produced no result for $sample (exit $verifyExit)"
+}
+
+# A record that does not round-trip, or a policy move that is not legal in its
+# own record, is corruption rather than disagreement: the shuffle would carry it
+# straight into the training file. Those stay fatal.
+if ($rtBad -gt 0 -or $polBad -gt 0) {
+    throw "$sample is corrupt: $rtBad records do not round-trip, " +
+          "$polBad policy moves are not legal in their record"
+}
+
+if ($labelBad -eq 0) {
+    Write-Ok "$labelChecked sampled labels reproduce exactly"
+} else {
+    Write-Host ''
+    Write-Fail "$labelBad of $labelChecked sampled labels did not reproduce"
+    Write-Host "  The records are intact - they round-trip and their policy moves are legal."
+    Write-Host "  What does not reproduce is the SCORE, re-searched here at $vNodes nodes and"
+    Write-Host "  $vHash MB of hash. This engine is not the engine that labelled $Gen."
+    Write-Host ''
+    Write-Host '  In order of likelihood:'
+    Write-Host '    1. this datagen.exe was not built the way the fleet built its own. The job'
+    Write-Host "       asked for EVAL=$JobEval ARCH=$JobArch; rebuild with: $MakeLine"
+    if ($JobEval -eq 'nnue') {
+        $sha = if ($cfg.ContainsKey('NET_SHA') -and $cfg['NET_SHA']) { $cfg['NET_SHA'] }
+                        else { '(unset)' }
+        Write-Host "       and with the pinned net in place first - NET_SHA $sha"
+    }
+    Write-Host '    2. the fleet disagreed with itself. Every box verifies its own unit before'
+    Write-Host '       uploading it, so that should already have failed there - read the logs.'
+    Write-Host ''
+    Write-Host '  Case 1 costs nothing and the shuffled file is fine. Case 2 means the dataset'
+    Write-Host '  mixes labels from two different engines, which is precisely what this check'
+    Write-Host '  exists to catch - do not train on it until you know which one you have.'
+    Write-Host ''
+    if ($StrictVerify) { throw "label verification failed on $sample (-StrictVerify)" }
+    Write-Warn2 'aggregating anyway; -StrictVerify -SkipDownload reruns this as a hard gate'
+}
 
 $outFile = Join-Path $DataDir "$Gen.cnn"
 $inputs  = @(Get-ChildItem $MergeDir -Filter '*.cnn' | ForEach-Object { $_.FullName })

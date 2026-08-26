@@ -299,6 +299,77 @@ is why this measures as eval quality rather than as a trade.
 ---
 
 
+### E13 — Trainer throughput, and where the bottleneck actually is
+
+**Date** 2026-08-26 · **Not an Elo test.** No engine change, no SPRT. The
+network this produces is the same network; what moved is how long it takes to
+fit one, so the measurement is positions/s and the gate is that the loss curve
+is unchanged.
+
+Preparing a 500M-position dataset. The trainer gained a chunked loader above
+~2 GB, int32 feature indices, fused AdamW, virtual epochs and `--resume`.
+
+**End to end**, `--hidden 1024 --output-buckets 4 --batch-size 16384
+--workers 6`, on `gen-012.cnn` (8.14 GB, 254M records), RTX 3070. Steady-state
+rate between batch 200 and batch 1200, so startup is excluded; run in both
+orders to control for the page cache:
+
+| | before | after |
+|---|---|---|
+| steady state | 349k pos/s | **392k pos/s** (+12%) |
+| 1200 batches, wall clock | 67s | **53s** |
+| time to batch 200 | 19.7s | **10.5s** |
+| loss at batch 1200 | 0.008727 | 0.008720 |
+
+The loss column is the point: the two curves agree at every logged batch
+(0.019059/0.019162, 0.013404/0.013445, 0.011245/0.011256, ...), which is what
+"no functional change" has to mean for a change that touches the optimiser and
+the loader.
+
+**Where the time actually goes**, measured separately rather than assumed:
+
+| component | before | after |
+|---|---|---|
+| loader alone, 6 workers, 16.3 GB / 509M records | 1.11M pos/s | 1.23M pos/s |
+| model step alone, synthetic batches, batch 16384 | — | 323k pos/s |
+| model step alone, batch 32768 | — | 346k pos/s |
+
+**The loader was never the bottleneck, and this file and trainer/README.md both
+said it was.** At 1.2M pos/s the loader is moving 38 MB/s of records — it is
+CPU-bound in `unpack`, not IO-bound — while training consumes 390k pos/s. Three
+times headroom. The README advice to reach for `--workers` when a run is slow
+was wrong past about six workers, and has been corrected.
+
+Attribution of the +12%, from the component runs:
+
+- **fused AdamW: +7%** (323k vs 302k on the model step alone). The single
+  largest item, and it is the same arithmetic in one kernel launch over 25M
+  parameters.
+- **int32 indices**: the rest. Halves the (B, 32) index matrices, which are
+  memset in a worker, copied into pinned memory and pushed over PCIe.
+- **removing the per-step `.item()`: ~0.5%, not the win it looked like.** A
+  saturated GPU makes that sync nearly free, because it waits on work that had
+  to finish anyway. Kept because it costs nothing and stops being free on the
+  configurations where the GPU is not saturated, but it should not be cited as
+  a speedup.
+- **the chunked loader**: little of the throughput. It is worth ~11% of loader
+  throughput that training cannot spend, and half the time to steady state.
+
+**What the chunked loader is actually for**, since it is not throughput. On an
+NVMe the memmap path did *not* collapse at 16.3 GB — 1.11M pos/s, because
+scattered 512 KB reads at 38 MB/s do not trouble a drive that can seek. It
+earns its place on two other grounds: it holds one 64 MB buffer per worker
+rather than mapping 16 GB and leaving residency to the OS, and it recomposes
+every batch each epoch, where the memmap path freezes each batch at whatever
+grouping the file's record order gave it and reuses it every epoch. On a
+spinning disk, or a dataset well past RAM, the read pattern would matter too.
+
+`--batch-size 32768` is worth a further ~7% and was not adopted as the default:
+it changes the optimisation, so it is a hyperparameter for a run to choose, not
+a speedup to take for free.
+---
+
+
 ## Absolute strength
 
 Every Elo figure above is relative to another build in `external\baselines`,

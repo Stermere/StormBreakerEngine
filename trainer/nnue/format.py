@@ -171,17 +171,25 @@ WEIGHT_CLIP = 127.0 / QB
 # ------------------------------------------------------------ unpacking -----
 
 
-def unpack(records: np.ndarray) -> dict:
+def unpack(records: np.ndarray, index_dtype=np.int64) -> dict:
     """Explode a batch of packed records into arrays.
 
     Everything here is whole-array arithmetic on a memmap slice: there is no
     per-record Python, which is the difference between a loader that keeps a
     GPU busy and one that does not.
 
+    ``index_dtype`` is the width of the two feature-index matrices. They are
+    the largest thing this function produces - (B, 32) apiece - and every byte
+    of them is memset here, copied into pinned memory and pushed over PCIe, so
+    the loader asks for int32. It defaults to int64 because the callers that
+    are not the loader (the exporter, the sanity table, the tests) compare
+    against hand-written int64 arrays and there is nothing to gain there.
+    Indices run to NUM_FEATURES = 24576, so int32 loses nothing.
+
     Returns a dict with, for a batch of B records:
 
-        white       (B, 32) int64 feature indices from white's perspective
-        black       (B, 32) int64 feature indices from black's perspective
+        white       (B, 32) index_dtype feature indices from white's perspective
+        black       (B, 32) index_dtype feature indices from black's perspective
         stm         (B,)    int64, 1 when black is to move
         score       (B,)    int32 centipawns, side-to-move relative
         wdl         (B,)    int64 in {0, 1, 2, 3}
@@ -239,7 +247,7 @@ def unpack(records: np.ndarray) -> dict:
         plane = np.where(colour == perspective, 0, 6) + ptype
         feature = king_slot[rows] * (PIECE_PLANES * SQUARES) + plane * SQUARES + sq_n
 
-        idx = np.full((batch, MAX_PIECES), PAD_INDEX, dtype=np.int64)
+        idx = np.full((batch, MAX_PIECES), PAD_INDEX, dtype=index_dtype)
         idx[rows, slot] = feature
         out["white" if perspective == 0 else "black"] = idx
 

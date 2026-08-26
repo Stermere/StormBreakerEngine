@@ -457,11 +457,16 @@ function Invoke-Status {
 
     Write-Host ""
     Write-Host "  units finished (done-markers on the hub):"
-    $markers = & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser "ls $HubDir/$Gen/done/ 2>/dev/null"
-    if ($LASTEXITCODE -ne 0 -or -not $markers) {
+    # Before the first unit finishes there is no done/ directory at all, and the
+    # restricted shell makes the ls error unsuppressable from the remote side -
+    # see Test-NetOnHub. It printed above the "none yet" it already means.
+    $r = Invoke-Native 'ssh' ($IdentityArgs + @(
+        '-p', $HubPort, '-o', 'BatchMode=yes', $HubUser, "ls $HubDir/$Gen/done/"))
+    $markers = @($r.Output -split "`n" | Where-Object { $_.Trim() })
+    if ($r.ExitCode -ne 0 -or $markers.Count -eq 0) {
         Write-Warn2 "none yet"
     } else {
-        foreach ($m in $markers) { Write-Ok $m }
+        foreach ($m in $markers) { Write-Ok $m.Trim() }
     }
 }
 
@@ -566,13 +571,18 @@ function Invoke-PushCorpus {
 function Test-NetOnHub([string]$Sha) {
     # `ls` on the file itself, not a listing of the directory: nets/ accumulates
     # a file per generation and this asks the only question that matters.
-    # The 2>/dev/null is inside the remote command on purpose: redirecting a
-    # native command's stderr on the PowerShell side wraps each line in an
-    # ErrorRecord and trips $ErrorActionPreference=Stop, so a missing file
-    # would throw instead of answering "no". Same pattern as Invoke-Status.
-    & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser `
-        "ls $HubDir/nets/$Sha.nnue 2>/dev/null" | Out-Null
-    return $LASTEXITCODE -eq 0
+    #
+    # Absent is a NORMAL answer here - a net that has not been published yet is
+    # the entire reason to ask - but the hub is a Storage Box, whose restricted
+    # shell parses a command and its arguments and does not honour a redirect.
+    # So a `2>/dev/null` written into the remote command does nothing, and the
+    # ls error travels back and prints: "cannot access ... No such file", which
+    # reads exactly like a failed upload immediately before the upload starts.
+    # Invoke-Native is what keeps it off the console, since a plain `2>$null`
+    # on this side is what $ErrorActionPreference=Stop turns into a crash.
+    $r = Invoke-Native 'ssh' ($IdentityArgs + @(
+        '-p', $HubPort, '-o', 'BatchMode=yes', $HubUser, "ls $HubDir/nets/$Sha.nnue"))
+    return $r.ExitCode -eq 0
 }
 
 function Get-LocalNet([string]$Sha) {
