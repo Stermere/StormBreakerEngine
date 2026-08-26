@@ -167,7 +167,6 @@ static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
-static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 #ifdef DATAGEN
 static SearchNodeVisitor NodeVisitor;
@@ -410,6 +409,8 @@ TUNABLE(DELTA_MARGIN, 200);
 TUNABLE(SINGULAR_MARGIN, 32);
 
 #ifdef TUNE_SEARCH
+static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
 /*
  * The sweep's view of the margins above: a name to set them by and the range
  * a sweep is allowed to explore.

@@ -224,14 +224,30 @@ static void sha256_hex(const void *data, size_t len, char *out) {
  * is the assembler's working directory too.
  */
 #ifdef NNUE_EVALFILE
+/*
+ * Mach-O spells both halves of this differently to ELF: the read-only section
+ * is __TEXT,__const rather than .rodata, and the assembler prefixes every C
+ * identifier with an underscore, so a bare label here would not be the symbol
+ * the extern declarations below resolve to. Emitting the ELF spelling on macOS
+ * fails at the .section directive, which is where the arm64 release build was
+ * losing its net.
+ */
+#if defined(__APPLE__)
+#define NNUE_RODATA ".section __TEXT,__const\n"
+#define NNUE_SYM(name) "_" name
+#else
+#define NNUE_RODATA ".section .rodata\n"
+#define NNUE_SYM(name) name
+#endif
+
 /* clang-format off */
-__asm__(".section .rodata\n"
+__asm__(NNUE_RODATA
         ".balign 64\n"
-        ".globl nnueEmbeddedStart\n"
-        "nnueEmbeddedStart:\n"
+        ".globl " NNUE_SYM("nnueEmbeddedStart") "\n"
+        NNUE_SYM("nnueEmbeddedStart") ":\n"
         ".incbin \"" NNUE_EVALFILE "\"\n"
-        ".globl nnueEmbeddedEnd\n"
-        "nnueEmbeddedEnd:\n"
+        ".globl " NNUE_SYM("nnueEmbeddedEnd") "\n"
+        NNUE_SYM("nnueEmbeddedEnd") ":\n"
         ".balign 4\n"
         ".text\n");
 /* clang-format on */

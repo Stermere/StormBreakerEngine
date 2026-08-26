@@ -1,20 +1,14 @@
 # StormBreaker
 
-A UCI chess engine written in C, built for competitive strength.
+A UCI chess engine written in C, built for competitive strength built entirely
+from scratch with a mission to see how far a fully AI generated engine can go.
 
-The engine plays legal chess. Move generation is verified exact against the
-published perft suites, and the search is a principal variation search with the
-standard modern apparatus: transposition table, null move, late move
-reductions, singular extensions, SEE-based pruning and a set of history
-heuristics.
+The initial engine was built with a classical evaluation function and tuned with a large set of human games and the outcome of the games.
+This engine landed at a strength of ~2800 Elo when playing against Stockfish with UCI_Elo set to 3000.
 
-The evaluation is a 13,684-parameter linear model — material, piece-square
-tables, placement conditioned on king position, mobility, pawn structure, king
-safety and threats — with every weight fitted by logistic regression to 22.6
-million quiet positions from 3.4 million human games. See
-[docs/TUNING.md](docs/TUNING.md).
+Using that engine as a teacher, a NNUE was trained to reproduce the evaluation of the classical engine at 10k nodes using 200 million positions pulled from human games.
+The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish with UCI_Elo set to 3000.
 
-Every change from here is measured with SPRT rather than argued for.
 
 ---
 
