@@ -43,6 +43,17 @@ static inline Key pawn_key_term(Piece pc, Square s) {
     return ZobristPiece[pc][s] & ZobristPawnSelect[pc];
 }
 
+/* The same select trick for the structural keys correction history indexes by.
+ * All three selects together are 384 bytes and share the cache line traffic of
+ * ZobristPiece, which these functions were already touching. */
+static inline Key minor_key_term(Piece pc, Square s) {
+    return ZobristPiece[pc][s] & ZobristMinorSelect[pc];
+}
+
+static inline Key non_pawn_key_term(Piece pc, Square s) {
+    return ZobristPiece[pc][s] & ZobristNonPawnSelect[pc];
+}
+
 void board_put_piece(Position *pos, Piece pc, Square s) {
     pos->board[s] = pc;
     pos->byType[NO_PIECE_TYPE] |= square_bb(s);
@@ -50,6 +61,8 @@ void board_put_piece(Position *pos, Piece pc, Square s) {
     pos->byColor[color_of(pc)] |= square_bb(s);
     pos->pieceCount[pc]++;
     pos->pawnKey ^= pawn_key_term(pc, s);
+    pos->minorKey ^= minor_key_term(pc, s);
+    pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, s);
 }
 
 void board_remove_piece(Position *pos, Square s) {
@@ -60,6 +73,8 @@ void board_remove_piece(Position *pos, Square s) {
     pos->pieceCount[pc]--;
     pos->board[s] = NO_PIECE;
     pos->pawnKey ^= pawn_key_term(pc, s);
+    pos->minorKey ^= minor_key_term(pc, s);
+    pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, s);
 }
 
 void board_move_piece(Position *pos, Square from, Square to) {
@@ -71,6 +86,8 @@ void board_move_piece(Position *pos, Square from, Square to) {
     pos->board[from] = NO_PIECE;
     pos->board[to]   = pc;
     pos->pawnKey ^= pawn_key_term(pc, from) ^ pawn_key_term(pc, to);
+    pos->minorKey ^= minor_key_term(pc, from) ^ minor_key_term(pc, to);
+    pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, from) ^ non_pawn_key_term(pc, to);
 }
 
 /*
@@ -129,6 +146,32 @@ Key board_compute_pawn_key(const Position *pos) {
     Bitboard pawns = pos->byType[PAWN];
     while (pawns) {
         const Square s = pop_lsb(&pawns);
+        k ^= ZobristPiece[piece_on(pos, s)][s];
+    }
+
+    return k;
+}
+
+/* Side to move is left out here for the same reason as in the pawn key: this
+ * names a structure, and the consumer indexes the side separately. */
+Key board_compute_non_pawn_key(const Position *pos, Color c) {
+    Key k = 0;
+
+    Bitboard bb = pos->byColor[c] & ~pos->byType[PAWN] & pos->byType[NO_PIECE_TYPE];
+    while (bb) {
+        const Square s = pop_lsb(&bb);
+        k ^= ZobristPiece[piece_on(pos, s)][s];
+    }
+
+    return k;
+}
+
+Key board_compute_minor_key(const Position *pos) {
+    Key k = 0;
+
+    Bitboard bb = pos->byType[KNIGHT] | pos->byType[BISHOP] | pos->byType[KING];
+    while (bb) {
+        const Square s = pop_lsb(&bb);
         k ^= ZobristPiece[piece_on(pos, s)][s];
     }
 
@@ -499,7 +542,10 @@ bool board_is_consistent(const Position *pos) {
         }
     }
 
-    return pos->key == board_compute_key(pos) && pos->pawnKey == board_compute_pawn_key(pos);
+    return pos->key == board_compute_key(pos) && pos->pawnKey == board_compute_pawn_key(pos) &&
+           pos->minorKey == board_compute_minor_key(pos) &&
+           pos->nonPawnKey[WHITE] == board_compute_non_pawn_key(pos, WHITE) &&
+           pos->nonPawnKey[BLACK] == board_compute_non_pawn_key(pos, BLACK);
 }
 
 /* ========================================================================== *

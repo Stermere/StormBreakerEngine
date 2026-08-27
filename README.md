@@ -48,7 +48,7 @@ The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish 
 | **NNUE: re-tuned search margins, then the default switches** | **TODO** |
 | **Next data generation, labelled by the network rather than by `eval.c`** | **TODO** |
 | **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
-| **Staged movegen 1: try the TT move before generating anything** | **TODO** |
+| Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
 | **NN informed search (policy head for move ordering)** | **TODO** |
@@ -57,21 +57,46 @@ The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish 
 `make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
 so the engine can be registered with a distributed testing cluster.
 
-Staged move generation is listed after the NNUE integration deliberately: it is
-worth roughly 10% of search time (~5-9 Elo), and a more expensive evaluation
-shrinks that share, so it should be measured against the eval that ships. At
-bench depth 12, generation and ordering are ~25% of search cycles, 61% of
-generated moves are never picked, and 52% of generating nodes cut on the first
-move tried - 15% on the TT move, which need not generate at all.
+Staged move generation is listed after the NNUE integration deliberately: a more
+expensive evaluation shrinks whatever share generation occupies, so it should be
+measured against the eval that ships. At bench depth 12, generation and ordering
+are ~25% of search cycles, 61% of generated moves are never picked, and 52% of
+generating nodes cut on the first move tried - 15% on the TT move, which need not
+generate at all.
 
-Steps 1 and 2 are **pure speedups gated on an unchanged bench node count, not an
-SPRT**. The ordering bands in `src/search.c` are strictly separated, so a staged
-picker can reproduce today's order exactly. Promotions are the one exception and
-straddle the bands three ways: a quiet underpromotion is generated as a quiet but
-scores in the winning-capture band, and an SEE-losing capturing promotion scores
-down into the quiet band. The tactical stage has to generate promotions and spill
-whatever scores below `SCORE_KILLER_1` into the quiet stage - otherwise the bench
-count moves and the step needs an SPRT after all.
+Those four figures are profile measurements. The ~5-9 Elo once attached to them
+was not a measurement, and step 1 went looking for it and did not find it.
+
+Steps 1 and 2 were planned as **pure speedups gated on an unchanged bench node
+count**, on the reasoning that the ordering bands in `src/search.c` are strictly
+separated and so a staged picker can reproduce today's order exactly. **That is
+measurably wrong, and each step needs an SPRT.** Band separation governs the
+order in which a *scored* list is walked, but staging also moves *when* the
+scoring happens: `score_moves()` currently runs before any child is searched,
+whereas a staged picker runs it after the table move's subtree has already
+updated `History`, `ContHist`, `CaptureHist` and `CounterMoves`. The remaining
+moves are then scored against different tables and can reorder.
+
+**Step 1 was then built, measured and reverted - see E15.** It benched 277624
+against 299634, a 7.3% node reduction, with a control isolating that entirely to
+scoring time. But nps was flat (the only nodes that skip generating are the ones
+that cut on the table move, ~3.75% of cycles gross, and the picker spends part of
+it back), and the node reduction did not convert: +0.47 ± 8.52 Elo, stopped
+undecided at 2958 games.
+
+That is evidence against the ~10%-of-search-time estimate itself, not only
+against step 1, since step 1 took the cheapest and most certain part of that
+share. **Do not build steps 2 or 3 on the 5-9 Elo figure.** Measure first, on a
+profile, what a full staged picker actually saves in nps - rather than inferring
+it from the share of cycles generation occupies.
+
+Promotions are a second, independent reason step 2 cannot reproduce today's
+order for free. They straddle the bands three ways: a quiet underpromotion is
+generated as a quiet but scores in the winning-capture band, and an SEE-losing
+capturing promotion scores down into the quiet band. A tactical stage therefore
+has to generate promotions and spill whatever scores below `SCORE_KILLER_1` into
+the quiet stage - and unlike the scoring-time effect above, this one is at least
+fixable by construction.
 
 ---
 
@@ -233,11 +258,17 @@ The open work, roughly in order of Elo per unit of effort:
    [docs/NNUE.md](docs/NNUE.md) is built around, and the single largest item
    on this list. `gen-001` is also 100% `human`-sourced; the self-play arm is
    configured in `tools/cloud/job.env` and has never been run.
-3. **Train longer and wider.** The shipped net stopped at epoch 3 with its
-   validation loss still falling monotonically, at 512 hidden units — half the
-   width the architecture was designed around. Both are free Elo in the sense
-   that neither needs an idea, only time. Widen *after* step 1, not before:
-   the accumulator refresh is the one cost that scales with width.
+3. **Widening past 1024 is now gated on data, not on time.** The item that sat
+   here said the net stopped at epoch 3 and 512 hidden units, half the designed
+   width, and called both free Elo. Both are done: the shipped net is
+   `24576 -> 1024x2 -> 4`, tag `epoch20-h1024`, hash `1f36c07f4507`. It is
+   rewritten rather than deleted because that claim outlived the net it
+   described by many epochs, and a stale "free Elo" line is worse than no line
+   — someone reads it and goes looking for Elo that has already been spent.
+   `--hidden` accepts up to 2048, but the binding constraint has changed: 24576
+   feature rows need a dataset where each row is seen more than a handful of
+   times, so further width waits on step 2. Check the net a build is carrying
+   with `make nnue-info` before trusting any width written down here.
 4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
    and the accumulator stack in `src/nnue.c` are file-scope and must move into
    a per-thread block first. Worth nothing in a single-threaded SPRT and worth

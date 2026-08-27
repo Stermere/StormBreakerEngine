@@ -386,13 +386,22 @@ next static evaluation in that structure by the running average.
 | | classical | NNUE |
 |---|---|---|
 | TC / bounds | 8+0.08, [0, 5] normalized | 8+0.08, [0, 5] normalized |
-| **Result** | **H1** — LLR 2.96 at 2050 games | *(running)* |
-| Elo | **+25.81 ± 10.34** | |
-| nElo | +37.69 ± 15.04 | |
-| Record | 663W / 511L / 876D, 53.71% | |
-| Ptnml | [39, 219, 396, 293, 78] | |
-| LOS | 100.00% | |
-| PGN | `external/games/20260826-161029-STC.pgn` | |
+| **Result** | **H1** — LLR 2.96 at 2050 games | **H1** — LLR 2.95 at 3164 games |
+| Elo | **+25.81 ± 10.34** | **+17.25 ± 8.33** |
+| nElo | +37.69 ± 15.04 | +25.13 ± 12.11 |
+| Record | 663W / 511L / 876D, 53.71% | 1028W / 871L / 1265D, 52.48% |
+| Ptnml | [39, 219, 396, 293, 78] | [77, 333, 638, 424, 110] |
+| LOS | 100.00% | 100.00% |
+| PGN | `external/games/20260826-161029-STC.pgn` | `external/games/20260826-171852-STC.pgn` |
+
+**It is worth less on the network, and that is the expected direction.** The
+classical evaluation is a linear model fitted to a corpus; whole classes of
+position are systematically mis-scored by it in a way no choice of weights can
+fix, and that is exactly the residual correction history learns. A trained net
+has already absorbed most of that structure, so there is less left over — +17.3
+against +25.8, and 3164 games to resolve rather than 2050. Both intervals sit
+clear of zero and neither result depends on the other; the change is worth
+keeping under either evaluation.
 
 **The bench moves in opposite directions on the two evaluations, and that is
 the interesting part.** Classical goes up 4.1% (287826 → 299634) and NNUE goes
@@ -435,6 +444,163 @@ make and unmake — 25.2M nodes of it. `datagen-test` still passes, because
 `search_clear()` resets the new table and datagen clears before every label
 search; had it not, every label would have depended on which position was
 labelled before it.
+---
+
+
+### E15 — Staged move generation, step 1: no speedup, no Elo, reverted
+
+**Date** 2026-08-26 · **Baseline** commit 981fc22, `base-corrhist` (bench
+299634) · **Dev** the same with a staged move picker (bench 277624) ·
+**Reverted — not in the tree**
+
+The plan in README.md was: hand the search the transposition table move before
+generating anything, as a **pure speedup gated on an unchanged bench node
+count, not an SPRT**, worth part of the ~5-9 Elo attributed to staged movegen.
+All three of those claims came out wrong, in an instructive order.
+
+**1. It cannot be bench-exact, and the reason is not the one the plan
+considered.** The plan argued from the ordering bands: `SCORE_TT` sits a whole
+band above anything `score_moves()` can produce, so the table move was always
+picked first and handing it back early reproduces the order. True, and
+irrelevant. Staging also moves *when* the scoring happens. `score_moves()` used
+to run before any child was searched; a staged picker runs it after the table
+move's subtree has already updated `History`, `ContHist`, `CaptureHist` and
+`CounterMoves`. The rest of the list is then scored against different tables
+and reorders.
+
+Attributed rather than asserted:
+
+| build | bench |
+|---|---|
+| baseline | 299634 |
+| staged picker | **277624** (−7.3%) |
+| control: picker and table-move-first, but scored eagerly | **299634** (exact) |
+
+The control keeps every part of the change except the deferral, and reproduces
+the baseline to the node. So the whole difference is scoring time, not the set
+of moves tried — and separately, a debug build asserts on every table move
+handed back before generation that the generator would have produced it, which
+passes the full bench. In check the picker deliberately generates first:
+`movegen_is_pseudo_legal()` does not know about check, so a table move that
+does not answer one validates but never appears in the `GEN_EVASIONS` list, and
+handing it back early would search a move the engine previously skipped.
+
+**2. There is no speedup.** Three alternating runs each, cores otherwise idle:
+
+| | nps |
+|---|---|
+| baseline | 1193760 / 1189023 / 1161372 |
+| staged picker | 1166487 / 1142485 / 1181378 |
+
+Flat, marginally negative. In hindsight the ceiling was always small: only
+nodes that *cut on the table move* skip generating at all, the plan's own
+figures put that at 15% of generating nodes against ~25% of cycles spent
+generating and ordering, so ~3.75% gross — and the picker's per-node state
+machine spends part of that back. Bench wall time still fell ~6%, but from the
+node reduction, not from the generation that was skipped.
+
+**3. The node reduction did not convert into Elo.**
+
+| | STC |
+|---|---|
+| TC / bounds | 8+0.08, [0, 5] normalized |
+| **Result** | **stopped at 2958 games**, LLR −0.22 and drifting toward H0 |
+| Elo | **+0.47 ± 8.52** |
+| nElo | +0.69 ± 12.52 |
+| Record | 856W / 852L / 1250D, 50.07% |
+| Ptnml | [85, 349, 601, 365, 79] |
+| LOS | 54.30% |
+| PGN | `external/games/20260826-190703-STC.pgn` |
+
+The test did not reject; it was stopped while undecided, because a true value
+sitting between the bounds is the regime an SPRT resolves most slowly and the
+interval was already informative. Fewer nodes at a fixed *depth* is what a
+bench measures; a game is played at a fixed *clock*, and with nps flat there
+was nothing to spend the saving on.
+
+**What this means for steps 2 and 3.** They rest on the same premise — that
+generation and ordering are ~25% of search cycles and staging reclaims a useful
+share of it. Step 1 reclaimed the cheapest, most certain part of that share and
+returned nothing measurable. That is evidence against the estimate itself, not
+just against step 1, and the remaining steps are considerably larger changes.
+Neither should be built on the ~5-9 Elo figure without first measuring what a
+full staged picker actually saves in nps on a profile, rather than inferring it
+from the share of cycles generation occupies.
+
+**Kept from the attempt:** nothing in `src/`. The value is this entry and the
+corrected plan in README.md.
+---
+
+
+### E16 — Correction history, three more keys: first weights too strong
+
+**Date** 2026-08-26 · **Baseline** `corrhist-981fc22-nnue` (bench 213141), commit
+981fc22 · **Dev** the same with four correction history families (bench 249039) ·
+**Stopped at 914 games**
+
+E14 shipped one correction history table, keyed on pawn structure, and measured
+it at +17.25 on the network. This adds three more keys for the same mechanism —
+minor pieces (knights, bishops and kings), non-pawn material per colour, and the
+move that led to the node — on the argument that pawn structure is not the only
+structure an evaluation is systematically wrong about.
+
+Tested as one batch rather than as four changes. The mechanism was already
+measured in E14; what is unproven here is only whether additional keys carry
+additional information, and four SPRTs against a shared baseline would answer
+that no better than one.
+
+**The weights are the whole experiment, and the first guess was wrong.** Each
+table is fitted to the same residual conditioned differently, so summing them at
+full weight double-counts badly. The configuration tested gave the pawn table
+unit weight — unchanged from E14, so the change is strictly additive to the
+proven term — and the three newcomers a quarter each, with the summed correction
+clamped at 48cp against E14's 32cp.
+
+| | STC |
+|---|---|
+| TC / bounds | 8+0.08, [0, 5] normalized |
+| **Result** | **stopped at 914 games**, LLR −0.47 and drifting toward H0 |
+| Elo | **−6.84 ± 15.42** |
+| nElo | −10.01 ± 22.52 |
+| Record | 256W / 274L / 384D, 49.02% |
+| Ptnml | [30, 109, 191, 103, 24] |
+| LOS | 19.19% |
+| PGN | `external/games/20260826-210225-STC.pgn` |
+
+**This is not a rejection and must not be read as one.** The interval spans
+−22 to +9 and the test was stopped while undecided, on the same reasoning as
+E15: a true value between the bounds is what an SPRT resolves most slowly, and
+the next configuration was a better use of the machine than certifying this
+one's failure. E2 read +6.20 ± 32.26 at 280 games and finished at +18.61, so a
+negative point estimate at 914 games is evidence and not a verdict.
+
+**What argued for stopping was the bench, not the Elo.** The node count rose
+16.8% (213141 → 249039) against a baseline that the *same mechanism* had
+previously moved 7.0% in the opposite direction on this evaluation. Correction
+history prunes and extends nothing directly; it only moves the static
+evaluation, and E14 established that a correction pushing the evaluation away
+from beta costs nodes while one pushing it past beta saves them. A tree that
+grew this much is a correction that got larger, not one that got better placed —
+which is what over-correction looks like from the outside, and it points at the
+weights rather than at the keys.
+
+**Second configuration**, testing that reading directly: the three new tables
+drop to an eighth each and the summed bound returns to CORRHIST_LIMIT, the 32cp
+E14 shipped. The bench moves to **218965**, +2.7% over baseline instead of
++16.8%, which is the tree size the hypothesis predicts. Pending its own SPRT.
+
+**If an eighth also fails**, the conclusion to record is that the extra keys are
+not worth their cache against this network — not that a third weight would have
+worked. A trained net has already absorbed most of the structure these tables
+key on, which is exactly why E14 was worth less on the network than on `eval.c`
+(+17.3 against +25.8), and the marginal table has correspondingly less left to
+find.
+
+**Gates.** `perft` standard and tricky pass exactly under a debug build, whose
+`board_is_consistent()` now asserts the two new incremental keys against
+`board_compute_minor_key()` and `board_compute_non_pawn_key()` on every make and
+unmake — 25.2M nodes of it. `datagen-test` passes, so `search_clear()` resets
+all four families.
 ---
 
 

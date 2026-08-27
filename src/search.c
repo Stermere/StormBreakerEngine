@@ -167,15 +167,48 @@ static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
 /*
- * Correction history, indexed [side to move][pawn key]. See the section just
- * above quiescence for what it holds and why the key is the pawn structure.
+ * Correction history. See the section just above quiescence for what these
+ * hold; what follows is only which structures they are keyed by.
+ *
+ * Four families, all learning the same quantity - how far the static
+ * evaluation has been running from what the search actually returned - keyed
+ * by four different descriptions of "positions like this one". Pawn structure
+ * was the first and is measured (E14); the other three exist because pawn
+ * structure is not the only thing an evaluation is systematically wrong about.
  */
 #define CORRHIST_SIZE       16384                 /* power of two; the index is a mask */
 #define CORRHIST_GRAIN      256                   /* fixed point, so sub-pawn drift survives */
-#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32) /* at most 32cp of correction, either way */
+#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32) /* at most 32cp from any one table */
 #define CORRHIST_WEIGHT_MAX 256                   /* denominator of the moving average */
 
+/* Ceiling on the four summed. Deliberately not four times CORRHIST_LIMIT: the
+ * tables are keyed differently but fitted to the same residual, so when they
+ * agree they are largely restating one another's evidence rather than adding
+ * to it.
+ *
+ * It sits at CORRHIST_LIMIT - the single-table bound E14 shipped - rather than
+ * above it, because the first configuration tried was above it and measured
+ * worse. At 48cp the correction could exceed anything the proven pawn-only
+ * table could produce, the bench rose 16.8% against a baseline the same change
+ * had previously moved 7% the other way, and 914 games read -6.84 +/- 15.42.
+ * The reading was never decisive, but nothing about it argued for keeping the
+ * larger bound. See E16. */
+#define CORRHIST_TOTAL_LIMIT CORRHIST_LIMIT
+
 static int16_t PawnCorrHist[COLOR_NB][CORRHIST_SIZE];
+static int16_t MinorCorrHist[COLOR_NB][CORRHIST_SIZE];
+
+/* [side to move][whose material][key]. Indexed by colour twice on purpose: the
+ * bias in how White's pieces are priced is a different fact from the bias in
+ * how Black's are, and which side is on move changes what either is worth. */
+static int16_t NonPawnCorrHist[COLOR_NB][COLOR_NB][CORRHIST_SIZE];
+
+/* Keyed on the move that led here, exactly as continuation history is. The
+ * structure it names is "positions arrived at by playing this piece to this
+ * square", which catches the biases the three static keys cannot see - a
+ * sacrifice whose compensation the evaluation never scores, most of all. No
+ * side-to-move index: the previous move's piece already carries its colour. */
+static int16_t ContCorrHist[PIECE_NB][SQUARE_NB];
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -251,6 +284,9 @@ void search_clear(void) {
     memset(ContHist, 0, sizeof(ContHist));
     memset(CaptureHist, 0, sizeof(CaptureHist));
     memset(PawnCorrHist, 0, sizeof(PawnCorrHist));
+    memset(MinorCorrHist, 0, sizeof(MinorCorrHist));
+    memset(NonPawnCorrHist, 0, sizeof(NonPawnCorrHist));
+    memset(ContCorrHist, 0, sizeof(ContCorrHist));
     memset(Stack, 0, sizeof(Stack));
     eval_state_clear();
 }
@@ -421,6 +457,34 @@ TUNABLE(DELTA_MARGIN, 200);
 #define SINGULAR_DEPTH 7
 TUNABLE(SINGULAR_MARGIN, 32);
 
+/*
+ * How much each correction history family is believed, out of CORR_W_UNIT.
+ *
+ * The pawn table sits at unit weight because that is the configuration E14
+ * measured at +17.25 on the network, and this change is deliberately additive
+ * to it: if the three new keys turn out to hold nothing, they contribute noise
+ * around zero on top of an unchanged proven term rather than diluting it.
+ *
+ * The newcomers were first tried at a quarter each and measured slightly
+ * negative (E16). An eighth is the same hypothesis at half strength, and the
+ * reason for testing it rather than abandoning the keys is that the failure
+ * had the shape of over-correction and not of bad evidence: the bench moved
+ * 16.8% in the direction E14 says a correction pushed further from beta moves
+ * it. Against a network that has already absorbed most of this structure, the
+ * marginal table has less to say than it did against eval.c, and the weight
+ * should reflect that.
+ *
+ * If an eighth also fails to beat pawn-only, the honest conclusion is that the
+ * extra keys are not worth their cache on this evaluation - not that some
+ * third weight would have worked. They are TUNABLE so the margin sweep can
+ * settle them if they survive, rather than leaving guesses in the hot path.
+ */
+#define CORR_W_UNIT 128
+TUNABLE(CORR_W_PAWN, 128);
+TUNABLE(CORR_W_MINOR, 16);
+TUNABLE(CORR_W_NONPAWN, 16);
+TUNABLE(CORR_W_CONT, 16);
+
 #ifdef TUNE_SEARCH
 
 /*
@@ -450,6 +514,10 @@ static const struct {
     {"SeeQuietMargin", &SEE_QUIET_MARGIN, 5, 120},
     {"DeltaMargin", &DELTA_MARGIN, 50, 600},
     {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
+    {"CorrWPawn", &CORR_W_PAWN, 0, 256},
+    {"CorrWMinor", &CORR_W_MINOR, 0, 256},
+    {"CorrWNonPawn", &CORR_W_NONPAWN, 0, 256},
+    {"CorrWCont", &CORR_W_CONT, 0, 256},
 };
 
 int search_tunable_count(void) { return (int)(sizeof(Tunables) / sizeof(Tunables[0])); }
@@ -884,18 +952,46 @@ static void update_pv(int ply, Move m) {
  * since instead of inheriting a stale adjustment.
  */
 
-static inline int16_t *corr_entry(const Position *pos) {
-    return &PawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
+#define CORR_INDEX(key) ((key) & (CORRHIST_SIZE - 1))
+
+/* The continuation entry, or NULL where there is no previous move to key on -
+ * the root, and after a null move, which is nobody's plan and must not have a
+ * correction attributed to it. Same rule as cont_slice(), for the same reason. */
+static inline int16_t *cont_corr_entry(int ply) {
+    if (ply < 1)
+        return NULL;
+
+    const Move prev = Stack[ply - 1].move;
+    if (!is_ok_move(prev))
+        return NULL;
+
+    return &ContCorrHist[Stack[ply - 1].movedPiece][to_sq(prev)];
+}
+
+/* The four tables' combined opinion, in CORRHIST_GRAIN fixed point. */
+static int corr_total(const Position *pos, int ply) {
+    const Color us = pos->sideToMove;
+
+    int total = CORR_W_PAWN * PawnCorrHist[us][CORR_INDEX(pos->pawnKey)];
+    total += CORR_W_MINOR * MinorCorrHist[us][CORR_INDEX(pos->minorKey)];
+    total += CORR_W_NONPAWN * (NonPawnCorrHist[us][WHITE][CORR_INDEX(pos->nonPawnKey[WHITE])] +
+                               NonPawnCorrHist[us][BLACK][CORR_INDEX(pos->nonPawnKey[BLACK])]);
+
+    const int16_t *const cont = cont_corr_entry(ply);
+    if (cont)
+        total += CORR_W_CONT * *cont;
+
+    return iclamp(total / CORR_W_UNIT, -CORRHIST_TOTAL_LIMIT, CORRHIST_TOTAL_LIMIT);
 }
 
 /* Mate scores are clamped away deliberately: a correction is evidence about an
  * evaluation, and letting one push a score into mate range would have the
  * search report a mate that nothing proved. */
-static Value corrected_eval(const Position *pos, Value raw) {
+static Value corrected_eval(const Position *pos, Value raw, int ply) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
 
-    const int v = raw + *corr_entry(pos) / CORRHIST_GRAIN;
+    const int v = raw + corr_total(pos, ply) / CORRHIST_GRAIN;
     return (Value)iclamp(v, VALUE_MATED_IN_MAX_PLY + 1, VALUE_MATE_IN_MAX_PLY - 1);
 }
 
@@ -908,13 +1004,32 @@ static Value corrected_eval(const Position *pos, Value raw) {
  * What counts as an observation is the decision that matters, and it is made
  * at the call site rather than here.
  */
-static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth) {
-    int16_t *const e  = corr_entry(pos);
-    const int weight  = imin(depth + 1, 16);
-    const int diff    = (searched - staticEval) * CORRHIST_GRAIN;
+static void corr_fold(int16_t *e, int diff, int weight) {
     const int updated = (*e * (CORRHIST_WEIGHT_MAX - weight) + diff * weight) / CORRHIST_WEIGHT_MAX;
+    *e                = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
+}
 
-    *e = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
+/*
+ * Every family sees the same observation at the same weight. They differ only
+ * in what they are keyed by, which is the whole design: one node teaches each
+ * table something about a different description of the position it was in, and
+ * the tables that key on a description the error does not depend on average
+ * that same evidence away to nothing over the tree.
+ */
+static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth,
+                            int ply) {
+    const Color us   = pos->sideToMove;
+    const int weight = imin(depth + 1, 16);
+    const int diff   = (searched - staticEval) * CORRHIST_GRAIN;
+
+    corr_fold(&PawnCorrHist[us][CORR_INDEX(pos->pawnKey)], diff, weight);
+    corr_fold(&MinorCorrHist[us][CORR_INDEX(pos->minorKey)], diff, weight);
+    corr_fold(&NonPawnCorrHist[us][WHITE][CORR_INDEX(pos->nonPawnKey[WHITE])], diff, weight);
+    corr_fold(&NonPawnCorrHist[us][BLACK][CORR_INDEX(pos->nonPawnKey[BLACK])], diff, weight);
+
+    int16_t *const cont = cont_corr_entry(ply);
+    if (cont)
+        corr_fold(cont, diff, weight);
 }
 
 /* ----------------------------------------------------------- quiescence -- */
@@ -935,7 +1050,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         return VALUE_ZERO;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(pos, eval_evaluate(pos));
+        return corrected_eval(pos, eval_evaluate(pos), ply);
 
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
@@ -971,7 +1086,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
          * there is no such option - every reply must be searched. */
         rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
-        staticEval = corrected_eval(pos, rawEval);
+        staticEval = corrected_eval(pos, rawEval, ply);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1117,7 +1232,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         return VALUE_DRAW;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(pos, eval_evaluate(pos));
+        return corrected_eval(pos, eval_evaluate(pos), ply);
 
     /* Determined before mate distance pruning narrows the window: a node is a
      * PV node because of where it sits in the tree, and must keep being
@@ -1200,7 +1315,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
 
     /* The table keeps `rawEval`; everything below reasons with the corrected
      * one. See the correction history section for why those differ. */
-    const Value staticEval = corrected_eval(pos, rawEval);
+    const Value staticEval = corrected_eval(pos, rawEval, ply);
 
     Stack[ply].staticEval = staticEval;
 
@@ -1666,7 +1781,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
             !(bound == BOUND_LOWER && best <= staticEval) &&
             !(bound == BOUND_UPPER && best >= staticEval))
-            corrhist_update(pos, best, staticEval, depth);
+            corrhist_update(pos, best, staticEval, depth, ply);
     }
 
 #ifdef DATAGEN
