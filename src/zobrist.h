@@ -20,15 +20,6 @@ extern Key ZobristPiece[PIECE_NB][SQUARE_NB];
  * bytes that never leave L1. */
 extern Key ZobristPawnSelect[PIECE_NB];
 
-/* The same trick for the other structural keys correction history is indexed
- * by. Minor deliberately includes the king: the value of a knight-and-bishop
- * position is dominated by where the kings are, and a key that ignored them
- * would pool positions the evaluation scores nothing like each other. Non-pawn
- * covers knight through king, and is accumulated per colour, because the two
- * sides' non-pawn material goes wrong independently. */
-extern Key ZobristMinorSelect[PIECE_NB];
-extern Key ZobristNonPawnSelect[PIECE_NB];
-
 extern Key ZobristEnPassant[8]; /* indexed by file */
 extern Key ZobristCastling[16]; /* indexed by the CastlingRights bitmask */
 extern Key ZobristSideToMove;

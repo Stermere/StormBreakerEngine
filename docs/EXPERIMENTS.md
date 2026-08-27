@@ -532,82 +532,94 @@ corrected plan in README.md.
 ---
 
 
-### E16 — Correction history, three more keys: first weights too strong
+### E16 — Correction history: three more keys, measured twice, reverted
 
-**Date** 2026-08-26 · **Baseline** `corrhist-981fc22-nnue` (bench 213141), commit
-981fc22 · **Dev** the same with four correction history families (bench 249039) ·
-**Stopped at 914 games**
+**Date** 2026-08-26/27 · **Baseline** `corrhist-981fc22-nnue` (bench 213141),
+commit 981fc22 · **Reverted — not in the tree**
 
 E14 shipped one correction history table, keyed on pawn structure, and measured
-it at +17.25 on the network. This adds three more keys for the same mechanism —
-minor pieces (knights, bishops and kings), non-pawn material per colour, and the
-move that led to the node — on the argument that pawn structure is not the only
-structure an evaluation is systematically wrong about.
+it at +17.25 on the network. This added three more keys for the same mechanism
+— minor pieces (knights, bishops and kings), non-pawn material per colour, and
+the move that led to the node — on the argument that pawn structure is not the
+only structure an evaluation is systematically wrong about.
 
-Tested as one batch rather than as four changes. The mechanism was already
-measured in E14; what is unproven here is only whether additional keys carry
-additional information, and four SPRTs against a shared baseline would answer
-that no better than one.
+Tested as one batch rather than four changes: the mechanism was already
+measured in E14, and what was unproven was only whether additional keys carry
+additional information.
 
-**The weights are the whole experiment, and the first guess was wrong.** Each
-table is fitted to the same residual conditioned differently, so summing them at
-full weight double-counts badly. The configuration tested gave the pawn table
-unit weight — unchanged from E14, so the change is strictly additive to the
-proven term — and the three newcomers a quarter each, with the summed correction
-clamped at 48cp against E14's 32cp.
+**The weights were the experiment, and both settings failed.** Each table is
+fitted to the same residual conditioned differently, so summing them at full
+weight double-counts. Both configurations gave the pawn table unit weight —
+unchanged from E14, so each was strictly additive to the proven term — and
+differed only in how much the newcomers were believed.
 
-| | STC |
-|---|---|
-| TC / bounds | 8+0.08, [0, 5] normalized |
-| **Result** | **stopped at 914 games**, LLR −0.47 and drifting toward H0 |
-| Elo | **−6.84 ± 15.42** |
-| nElo | −10.01 ± 22.52 |
-| Record | 256W / 274L / 384D, 49.02% |
-| Ptnml | [30, 109, 191, 103, 24] |
-| LOS | 19.19% |
-| PGN | `external/games/20260826-210225-STC.pgn` |
+| | A: quarter weight, 48cp cap | B: eighth weight, 32cp cap |
+|---|---|---|
+| Bench | 249039 (+16.8%) | 218965 (+2.7%) |
+| Stopped at | 914 games | 1162 games |
+| Elo | **−6.84 ± 15.42** | **−6.28 ± 12.96** |
+| nElo | −10.01 ± 22.52 | −9.69 ± 19.98 |
+| Record | 256W / 274L / 384D | 333W / 354L / 475D |
+| Ptnml | [30, 109, 191, 103, 24] | [27, 145, 260, 120, 29] |
+| LOS | 19.19% | 17.10% |
+| LLR | −0.47 | −0.59 |
+| PGN | `20260826-210225-STC.pgn` | `20260826-231315-STC.pgn` |
 
-**This is not a rejection and must not be read as one.** The interval spans
-−22 to +9 and the test was stopped while undecided, on the same reasoning as
-E15: a true value between the bounds is what an SPRT resolves most slowly, and
-the next configuration was a better use of the machine than certifying this
-one's failure. E2 read +6.20 ± 32.26 at 280 games and finished at +18.61, so a
-negative point estimate at 914 games is evidence and not a verdict.
+Both at STC 8+0.08, bounds [0, 5] normalized. Neither rejected; both were
+stopped while undecided, on the same reasoning as E15 — a true value between
+the bounds is what an SPRT resolves most slowly.
 
-**What argued for stopping was the bench, not the Elo.** The node count rose
-16.8% (213141 → 249039) against a baseline that the *same mechanism* had
-previously moved 7.0% in the opposite direction on this evaluation. Correction
-history prunes and extends nothing directly; it only moves the static
-evaluation, and E14 established that a correction pushing the evaluation away
-from beta costs nodes while one pushing it past beta saves them. A tree that
-grew this much is a correction that got larger, not one that got better placed —
-which is what over-correction looks like from the outside, and it points at the
-weights rather than at the keys.
+**Combined, with the caveat that they are different treatments**, the two
+weightings give roughly **−6.5 ± 9.9 over 2076 games**. The interval still
+spans zero. What it excludes is the +15 to +25 this was predicted to be worth.
 
-**Second configuration**, testing that reading directly: the three new tables
-drop to an eighth each and the summed bound returns to CORRHIST_LIMIT, the 32cp
-E14 shipped. The bench moves to **218965**, +2.7% over baseline instead of
-+16.8%, which is the tree size the hypothesis predicts. Pending its own SPRT.
+**The hypothesis that justified configuration B was falsified, and that is the
+part worth keeping.** Configuration A grew the bench 16.8% against a baseline
+the same mechanism had previously *shrunk* by 7.0% on this evaluation. Since
+correction history prunes and extends nothing directly — it only moves the
+static evaluation, and E14 established that a correction pushing the evaluation
+away from beta costs nodes — that looked like over-correction, and predicted
+that a smaller correction would recover the Elo.
 
-**If an eighth also fails**, the conclusion to record is that the extra keys are
-not worth their cache against this network — not that a third weight would have
-worked. A trained net has already absorbed most of the structure these tables
-key on, which is exactly why E14 was worth less on the network than on `eval.c`
-(+17.3 against +25.8), and the marginal table has correspondingly less left to
-find.
+Configuration B removed 85% of the bench difference and **none** of the Elo
+deficit: −6.28 against −6.84. A magnitude problem would have responded to a
+magnitude fix. This one did not, so the extra keys are not mis-scaled — they
+are not carrying information.
 
-**Gates.** `perft` standard and tricky pass exactly under a debug build, whose
-`board_is_consistent()` now asserts the two new incremental keys against
-`board_compute_minor_key()` and `board_compute_non_pawn_key()` on every make and
-unmake — 25.2M nodes of it. `datagen-test` passes, so `search_clear()` resets
-all four families.
+**Why that is the expected answer in hindsight.** A trained network has already
+absorbed most of the structure these keys name; that is exactly why E14 was
+worth less on the network than on `eval.c` (+17.3 against +25.8). Pawn
+structure survives as a correction key because it is the residual the net still
+mis-prices. Minor-piece and non-pawn-material configurations are precisely what
+a 24576-row HalfKA input layer already encodes directly.
+
+**Why reverted rather than left at zero weight.** The three tables could have
+been kept and tuned to nothing, and the arithmetic would then match E14
+exactly. But the keys are not free at zero weight: `board_put_piece`,
+`board_remove_piece` and `board_move_piece` each carried two extra XORs to
+maintain `minorKey` and `nonPawnKey`, in the hottest functions in make/unmake,
+for tables nothing would read. The best available outcome from keeping them was
+"baseline, minus a small nps cost", so there was nothing to win.
+
+**Kept from the attempt:**
+
+- `CORR_W_PAWN`, a TUNABLE for how far the surviving correction is believed. At
+  the default of 128/128 it is arithmetically identical to what E14 shipped,
+  which the unchanged bench proves; it exists because "how much to trust a
+  learned evaluation bias" was chosen rather than fitted.
+- The revert is verified by node count, not by inspection: nnue returns to
+  **213141** and classical to **299634**, both exactly the committed E14
+  baselines.
+
+**Gates.** `perft` standard and tricky pass exactly under a debug build — 25.2M
+nodes. `datagen-test` passes.
 ---
 
 
 ## Absolute strength
 
 Every Elo figure above is relative to another build in `external\baselines`,
-none of which is itself rated. This anchors them. `tools\rating.ps1` plays a
+none of which is itself rated. This anchors them. `make rating` plays a
 ladder of Stockfish `UCI_Elo` rungs and fits one rating by inverse-variance
 weighting.
 

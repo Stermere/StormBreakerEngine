@@ -493,7 +493,7 @@ completely normal.
 ### Running it
 
 ```powershell
-pwsh tools\trainer-setup.ps1     # trainer\.venv, torch from a CUDA index
+make trainer-setup               # trainer\.venv, torch from a CUDA index
 make trainer-test                # the format, feature and pipeline tests
 
 cd trainer

@@ -73,10 +73,10 @@ rejects engines that fail this.
 ## 3. SPRT — Elo
 
 ```powershell
-pwsh tools\snapshot-baseline.ps1 -Name v0.1   # freeze the current build
+make snapshot ARGS="--name v0.1"   # freeze the current build
 # ... make your change, rebuild ...
-pwsh tools\sprt.ps1                            # dev vs baseline, STC
-pwsh tools\sprt.ps1 -Tc LTC                    # confirm at long time control
+make sprt                          # dev vs baseline, STC
+make sprt ARGS="--tc LTC"          # confirm at long time control
 ```
 
 SPRT plays games until it can accept or reject a hypothesis, then stops. A
@@ -128,8 +128,8 @@ time control needs LTC evidence, not an argument.
 ## 4. Gauntlets — absolute strength
 
 ```powershell
-pwsh tools\gauntlet.ps1 -Games 200
-pwsh tools\gauntlet.ps1 -IncludeStockfish -SkillLevel 3
+make gauntlet ARGS="--games 200"
+make gauntlet ARGS="--include-stockfish --skill-level 3"
 ```
 
 Self-play SPRT answers "better than before". A gauntlet answers "how strong,

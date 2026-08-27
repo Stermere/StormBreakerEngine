@@ -18,7 +18,7 @@ make tuner
 .\tuner.exe extract external\training\*.pgn -o external\training\human.epd
 .\tuner.exe tune external\training\human.epd -o src\evalparams.c
 make && make perft && make bench                     # rebuild and re-verify
-pwsh tools\sprt.ps1                                  # and only now, measure
+make sprt                                           # and only now, measure
 ```
 
 | Stage | Input | Output |

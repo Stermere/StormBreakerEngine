@@ -15,8 +15,8 @@
     the exact steps instead; it is a four-click operation.
 
 .EXAMPLE
-    pwsh tools\register-engines.ps1
-    pwsh tools\register-engines.ps1 -Name StormBreaker-dev
+    powershell -File tools\register-engines.ps1
+    powershell -File tools\register-engines.ps1 -Name StormBreaker-dev
 #>
 [CmdletBinding()]
 param(
@@ -121,7 +121,7 @@ Write-Section 'En Croissant'
 
 $ec = Get-EnCroissant
 if (-not $ec) {
-    Write-Warn2 'En Croissant not installed. Run: pwsh tools\setup.ps1'
+    Write-Warn2 'En Croissant not installed. Run: powershell -File tools\setup.ps1'
 } else {
     Write-Ok "installed at $ec"
     Write-Host ''

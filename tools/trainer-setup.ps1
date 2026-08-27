@@ -29,8 +29,8 @@
     Delete an existing trainer/.venv and start again.
 
 .EXAMPLE
-    pwsh tools\trainer-setup.ps1
-    pwsh tools\trainer-setup.ps1 -CudaTag cpu
+    powershell -File tools\trainer-setup.ps1
+    powershell -File tools\trainer-setup.ps1 -CudaTag cpu
 #>
 [CmdletBinding()]
 param(

@@ -45,6 +45,7 @@ The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish 
 | NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
 | NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
 | Correction history (pawn-structure keyed, +25.8 Elo) | complete |
+| Correction history: minor / non-pawn / continuation keys | tried, neutral (E16), reverted |
 | **NNUE: re-tuned search margins, then the default switches** | **TODO** |
 | **Next data generation, labelled by the network rather than by `eval.c`** | **TODO** |
 | **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
@@ -117,10 +118,10 @@ make help                # all targets
 First-time environment setup (Windows):
 
 ```powershell
-pwsh tools\setup.ps1              # install fastchess, GUIs, Stockfish; fetch the book
-pwsh tools\register-engines.ps1   # register the engine with Cute Chess
-pwsh tools\sprt.ps1 -Smoke        # verify the match pipeline end to end
-pwsh tools\trainer-setup.ps1      # create trainer\.venv and install PyTorch
+powershell -File tools\setup.ps1             # fastchess, GUIs, Stockfish; the book
+powershell -File tools\register-engines.ps1  # register with Cute Chess
+make sprt ARGS=--smoke                          # verify the match pipeline
+make trainer-setup                              # trainer\.venv, PyTorch
 ```
 
 ---
@@ -128,9 +129,9 @@ pwsh tools\trainer-setup.ps1      # create trainer\.venv and install PyTorch
 ## Using the GUIs
 
 ```powershell
-pwsh tools\gui.ps1                    # En Croissant (default)
-pwsh tools\gui.ps1 -App cutechess   # Cute Chess
-pwsh tools\gui.ps1 -App both
+powershell -File tools\gui.ps1                  # En Croissant (default)
+powershell -File tools\gui.ps1 -App cutechess   # Cute Chess
+powershell -File tools\gui.ps1 -App both
 ```
 
 `gui.ps1` re-registers the engine against your current build before launching,
@@ -146,9 +147,9 @@ For anything you want to measure rather than watch, use the scripts — they set
 the book, concurrency and PGN output correctly:
 
 ```powershell
-pwsh tools\sprt.ps1 -Smoke      # verify the pipeline
-pwsh tools\sprt.ps1             # dev vs baseline
-pwsh tools\gauntlet.ps1         # vs a field of opponents
+make sprt ARGS=--smoke          # verify the pipeline
+make sprt                       # dev vs baseline
+make gauntlet                   # vs a field of opponents
 ```
 
 A quick ad-hoc match (fastchess is on PATH as `fast-chess`):
@@ -219,7 +220,9 @@ embedding.
 ```
 src/                engine sources (flat, as in most strong engines)
 tests/perft/        move generation correctness suites (EPD)
-tools/              setup, GUI launch/registration, SPRT, gauntlet (PowerShell)
+tools/              SPRT, SPSA tuning, gauntlet, rating, baselines (Python,
+                    stdlib only); setup / GUI / engine registration (PowerShell,
+                    because they are Windows integration and nothing else)
                     plus tuner.c (evaluation fitter) and datagen.c (NNUE data)
 trainer/            the NNUE trainer: PyTorch, its own venv, its own tests
 docs/               architecture, testing methodology, UCI reference
@@ -235,20 +238,34 @@ Steps 1–5 of the original bring-up order (movegen, make/unmake, perft, eval,
 search) are done, and so is the network: it is measurably stronger than the
 tuned linear evaluation and the remaining work is about collecting the rest of
 what it is worth. **Every change from here is measured with
-`tools/sprt.ps1`** — read [docs/TESTING.md](docs/TESTING.md) first, because the
+`make sprt`** — read [docs/TESTING.md](docs/TESTING.md) first, because the
 testing methodology is what separates an engine that improves from one that
 drifts.
 
 The open work, roughly in order of Elo per unit of effort:
 
-1. **Re-tune the search margins against the network.** Every threshold in
-   `search.c` — `RFP_MARGIN`, `FUTILITY_MARGIN`, `RAZOR_MARGIN`, the two SEE
-   bands, `SINGULAR_MARGIN`, `DELTA_MARGIN`, the LMR formula — was fitted
-   against an evaluation with a particular scale and a particular noise
-   profile, and the network has neither. [docs/NNUE.md](docs/NNUE.md) Task 4
-   calls this out as where a meaningful fraction of the total NNUE gain
-   actually lives. Each SPRTs independently; `make TUNE_SEARCH=on` exposes
-   them as UCI spin options so a sweep needs no rebuild per candidate.
+1. **Re-tune the search parameters against the network.** Every threshold and
+   formula constant in `search.c` was fitted against an evaluation with a
+   particular scale and a particular noise profile, and the network has
+   neither. [docs/NNUE.md](docs/NNUE.md) Task 4 calls this out as where a
+   meaningful fraction of the total NNUE gain actually lives.
+
+   `make TUNE_SEARCH=on` exposes **21** of them as UCI spin options — the seven
+   margins, `CORR_W_PAWN`, and a second tier that had never been fitted at all:
+   the LMR curve itself (`LmrBase`, `LmrDivisor`), the history divisors, the
+   null-move reduction formula, the history bonus curve, the LMP constant and
+   the aspiration delta. Fitting 21 interacting parameters one SPRT at a time
+   is not possible, so `make tune` runs SPSA over the set and emits a
+   *candidate*, which then needs its own SPRT against the values it replaced —
+   SPSA has no null hypothesis and will report a walk as a result.
+
+   Two of them are deliberately narrower than they look: `HistBonusDepthMax`
+   above 20 and `NmpEvalMax` above 5 were measured to be indistinguishable from
+   their bounds at bench depth 12, so a wider range would only give the sweep
+   somewhere to random-walk. The seven *depth* thresholds are excluded for a
+   related reason — SPSA perturbs continuously and the engine takes an int, so
+   both sides of a gradient estimate round to the same small integer and the
+   measurement is noise. Those want a sweep of their own.
 2. **The next generation of training data, labelled by the network.** Every
    label in `gen-001` came from a 10,000-node search using the *classical*
    evaluation, because that was the only evaluation that existed when it was

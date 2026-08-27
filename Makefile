@@ -234,7 +234,7 @@ endif
 # ----------------------------------------------------------------- targets --
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
-        tuner datagen datagen-test trainer-setup trainer-test \
+        tuner datagen datagen-test trainer-setup trainer-test sprt tune rating gauntlet snapshot \
         nnue nnue-export nnue-test nnue-info net-fetch net-publish
 
 all: $(TARGET)
@@ -388,6 +388,39 @@ trainer-setup:
 trainer-test: datagen-test
 	$(PYTHON) -m pytest trainer/tests -q --shard $(DATAGEN_TEST_DIR)/all.cnn
 
+# ---------------------------------------------------------------- matches --
+#
+# The match tools are Python and stdlib-only: no venv, no pip, nothing to
+# install. Deliberately NOT $(PYTHON), which points into trainer/.venv and
+# exists to carry PyTorch - gating an SPRT behind a virtualenv is how a tool
+# stops being run.
+#
+# They are invoked through make so the docs can name a TARGET rather than an
+# interpreter. The old `pwsh tools/sprt.ps1` line in the docs was wrong on
+# every machine that never installed PowerShell 7, which is most of them,
+# including this one.
+#
+#   make sprt ARGS="--tc LTC"
+#   make tune ARGS="--engine ./stormbreaker-tune-nnue.exe --iterations 800"
+#   make rating ARGS="--levels 2600,2800,3000"
+TOOLPY ?= python
+ARGS ?=
+
+sprt:
+	@$(TOOLPY) tools/sprt.py $(ARGS)
+
+tune:
+	@$(TOOLPY) tools/tune.py $(ARGS)
+
+rating:
+	@$(TOOLPY) tools/rating.py $(ARGS)
+
+gauntlet:
+	@$(TOOLPY) tools/gauntlet.py $(ARGS)
+
+snapshot:
+	@$(TOOLPY) tools/snapshot-baseline.py $(ARGS)
+
 # ------------------------------------------------------------------- nnue --
 # Quantise a trained checkpoint into the file the engine embeds, plus the
 # test vectors and the SHA-256 sidecar. Needs the trainer's venv (torch reads
@@ -486,6 +519,11 @@ help:
 	@echo "make datagen-test       datagen round-trip + label reproducibility gate"
 	@echo "make trainer-setup      create trainer/.venv and install PyTorch"
 	@echo "make trainer-test       run the trainer's test suite"
+	@echo "make sprt               SPRT this build against a baseline"
+	@echo "make tune               SPSA-tune the TUNE_SEARCH=on parameters"
+	@echo "make rating             absolute rating vs a Stockfish ladder"
+	@echo "make gauntlet           play a field of baselines, Elo table"
+	@echo "make snapshot           freeze this build as a baseline"
 	@echo "make nnue-export        quantise NET into EVALFILE (+ test vectors)"
 	@echo "make nnue               build the engine with the network evaluation"
 	@echo "make nnue-test          C inference == quantised Python reference"

@@ -72,22 +72,6 @@ typedef struct {
      */
     Key pawnKey;
 
-    /*
-     * The same idea keyed on the pieces the pawn key ignores, maintained by the
-     * same three mutators. Correction history learns a per-structure bias in
-     * the evaluation, and pawn structure is only one of the structures an
-     * evaluation is systematically wrong about: a knight pair against a bishop
-     * pair is another, and so is one side having a rook too many. Keying those
-     * separately lets each accumulate its own evidence instead of being pooled
-     * into a pawn key that cannot see them.
-     *
-     * `nonPawnKey` is per colour because the two sides' non-pawn material is
-     * wrong independently - an evaluation that overrates White's queen tells
-     * you nothing about how it prices Black's.
-     */
-    Key nonPawnKey[COLOR_NB];
-    Key minorKey;
-
     /* Enemy pieces currently giving check to `sideToMove`, and the pieces of
      * `sideToMove` that are pinned against their own king. Maintained by
      * do_move/undo_move; see the note on Undo above. */
@@ -168,10 +152,6 @@ Key board_compute_key(const Position *pos);
 
 /* The same reference recomputation, for the pawn key the mutators maintain. */
 Key board_compute_pawn_key(const Position *pos);
-
-/* And for the structural keys beside it. See the note on Position. */
-Key board_compute_non_pawn_key(const Position *pos, Color c);
-Key board_compute_minor_key(const Position *pos);
 
 /* Pretty-prints the board, FEN and key - the UCI `d` command. */
 void board_print(const Position *pos);

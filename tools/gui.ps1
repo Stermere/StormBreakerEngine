@@ -19,9 +19,9 @@
     Skip re-registration and just launch.
 
 .EXAMPLE
-    pwsh tools\gui.ps1
-    pwsh tools\gui.ps1 -App cutechess
-    pwsh tools\gui.ps1 -App both
+    powershell -File tools\gui.ps1
+    powershell -File tools\gui.ps1 -App cutechess
+    powershell -File tools\gui.ps1 -App both
 #>
 [CmdletBinding()]
 param(
@@ -58,7 +58,7 @@ if ($App -eq 'cutechess' -or $App -eq 'both') {
         Write-Host '  Tournament:   Tournament -> New' -ForegroundColor Gray
         $launched++
     } else {
-        Write-Fail 'Cute Chess not installed. Run: pwsh tools\setup.ps1'
+        Write-Fail 'Cute Chess not installed. Run: powershell -File tools\setup.ps1'
     }
 }
 
@@ -72,7 +72,7 @@ if ($App -eq 'encroissant' -or $App -eq 'both') {
         Write-Host "                  path: $engine" -ForegroundColor Gray
         $launched++
     } else {
-        Write-Fail 'En Croissant not installed. Run: pwsh tools\setup.ps1'
+        Write-Fail 'En Croissant not installed. Run: powershell -File tools\setup.ps1'
     }
 }
 

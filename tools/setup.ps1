@@ -16,8 +16,8 @@
       UHO_Lichess_4852_v1.epd  the standard SPRT opening book
 
 .EXAMPLE
-    pwsh tools\setup.ps1
-    pwsh tools\setup.ps1 -SkipInstall     # book only, no winget
+    powershell -File tools\setup.ps1
+    powershell -File tools\setup.ps1 -SkipInstall     # book only, no winget
 #>
 [CmdletBinding()]
 param(
@@ -126,5 +126,5 @@ if (-not (Get-EngineBinary)) {
 Write-Host ''
 Write-Host 'Next steps:' -ForegroundColor White
 Write-Host '  make                          build the engine'
-Write-Host '  pwsh tools\register-engines.ps1   register it with Cute Chess'
-Write-Host '  pwsh tools\sprt.ps1 -Smoke    verify the match pipeline end to end'
+Write-Host '  powershell -File tools\register-engines.ps1   register it with Cute Chess'
+Write-Host '  make sprt ARGS=--smoke            verify the match pipeline end to end'

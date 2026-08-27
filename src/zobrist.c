@@ -7,8 +7,6 @@
 
 Key ZobristPiece[PIECE_NB][SQUARE_NB];
 Key ZobristPawnSelect[PIECE_NB];
-Key ZobristMinorSelect[PIECE_NB];
-Key ZobristNonPawnSelect[PIECE_NB];
 Key ZobristEnPassant[8];
 Key ZobristCastling[16];
 Key ZobristSideToMove;
@@ -37,13 +35,8 @@ void zobrist_init(void) {
     /* Derived rather than drawn: taking these from rng_next() would shift every
      * key generated after them, which moves the bench node count for a change
      * that alters no search decision. */
-    for (int p = 0; p < PIECE_NB; ++p) {
-        const PieceType pt = type_of((Piece)p);
-
-        ZobristPawnSelect[p]    = pt == PAWN ? ~(Key)0 : (Key)0;
-        ZobristMinorSelect[p]   = (pt == KNIGHT || pt == BISHOP || pt == KING) ? ~(Key)0 : (Key)0;
-        ZobristNonPawnSelect[p] = (pt >= KNIGHT && pt <= KING) ? ~(Key)0 : (Key)0;
-    }
+    for (int p = 0; p < PIECE_NB; ++p)
+        ZobristPawnSelect[p] = type_of((Piece)p) == PAWN ? ~(Key)0 : (Key)0;
 
     for (int f = 0; f < 8; ++f)
         ZobristEnPassant[f] = rng_next();

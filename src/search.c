@@ -167,48 +167,21 @@ static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
 /*
- * Correction history. See the section just above quiescence for what these
- * hold; what follows is only which structures they are keyed by.
+ * Correction history, indexed [side to move][pawn key]. See the section just
+ * above quiescence for what it holds and why the key is the pawn structure.
  *
- * Four families, all learning the same quantity - how far the static
- * evaluation has been running from what the search actually returned - keyed
- * by four different descriptions of "positions like this one". Pawn structure
- * was the first and is measured (E14); the other three exist because pawn
- * structure is not the only thing an evaluation is systematically wrong about.
+ * Three further keys were tried here - minor pieces, non-pawn material per
+ * colour, and the move that led to the node - at two different weightings, and
+ * both measured slightly negative against this network over 2076 games. See
+ * E16. Pawn structure is the one that carries information the trained net has
+ * not already absorbed.
  */
 #define CORRHIST_SIZE       16384                 /* power of two; the index is a mask */
 #define CORRHIST_GRAIN      256                   /* fixed point, so sub-pawn drift survives */
-#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32) /* at most 32cp from any one table */
+#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32) /* at most 32cp of correction, either way */
 #define CORRHIST_WEIGHT_MAX 256                   /* denominator of the moving average */
 
-/* Ceiling on the four summed. Deliberately not four times CORRHIST_LIMIT: the
- * tables are keyed differently but fitted to the same residual, so when they
- * agree they are largely restating one another's evidence rather than adding
- * to it.
- *
- * It sits at CORRHIST_LIMIT - the single-table bound E14 shipped - rather than
- * above it, because the first configuration tried was above it and measured
- * worse. At 48cp the correction could exceed anything the proven pawn-only
- * table could produce, the bench rose 16.8% against a baseline the same change
- * had previously moved 7% the other way, and 914 games read -6.84 +/- 15.42.
- * The reading was never decisive, but nothing about it argued for keeping the
- * larger bound. See E16. */
-#define CORRHIST_TOTAL_LIMIT CORRHIST_LIMIT
-
 static int16_t PawnCorrHist[COLOR_NB][CORRHIST_SIZE];
-static int16_t MinorCorrHist[COLOR_NB][CORRHIST_SIZE];
-
-/* [side to move][whose material][key]. Indexed by colour twice on purpose: the
- * bias in how White's pieces are priced is a different fact from the bias in
- * how Black's are, and which side is on move changes what either is worth. */
-static int16_t NonPawnCorrHist[COLOR_NB][COLOR_NB][CORRHIST_SIZE];
-
-/* Keyed on the move that led here, exactly as continuation history is. The
- * structure it names is "positions arrived at by playing this piece to this
- * square", which catches the biases the three static keys cannot see - a
- * sacrifice whose compensation the evaluation never scores, most of all. No
- * side-to-move index: the previous move's piece already carries its colour. */
-static int16_t ContCorrHist[PIECE_NB][SQUARE_NB];
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -259,12 +232,10 @@ static const int LogFixed[64] = {
  * with depth is what stops the reduction being reckless near the leaves, where
  * there is no depth left to absorb a mistake.
  */
-static void init_reductions(void) {
-    for (int d = 0; d < 64; ++d)
-        for (int m = 0; m < 64; ++m)
-            Reductions[d][m] =
-                (uint8_t)((int64_t)LogFixed[d] * LogFixed[m] * 10 / (1024LL * 1024 * 24));
-}
+/* Defined below the pruning-margin block rather than here, because the two
+ * constants that shape the curve are declared with the other tunables and an
+ * enum constant is not visible before its declaration. */
+static void init_reductions(void);
 
 void search_init(void) {
     atomic_store(&Searching, false);
@@ -284,9 +255,6 @@ void search_clear(void) {
     memset(ContHist, 0, sizeof(ContHist));
     memset(CaptureHist, 0, sizeof(CaptureHist));
     memset(PawnCorrHist, 0, sizeof(PawnCorrHist));
-    memset(MinorCorrHist, 0, sizeof(MinorCorrHist));
-    memset(NonPawnCorrHist, 0, sizeof(NonPawnCorrHist));
-    memset(ContCorrHist, 0, sizeof(ContCorrHist));
     memset(Stack, 0, sizeof(Stack));
     eval_state_clear();
 }
@@ -403,7 +371,10 @@ TUNABLE(FUTILITY_MARGIN, 40);
 
 /* Half-width of the first aspiration window, and the depth below which the
  * previous score is too unreliable to aim one at. */
-#define ASPIRATION_DELTA     18
+/* ASPIRATION_DELTA is a TUNABLE below. The depth floor stays a #define: it is
+ * a small integer threshold, and SPSA perturbs continuously and then rounds, so
+ * both sides of a gradient estimate land on the same value and the measurement
+ * is noise. Thresholds like this want a sweep of their own, not a sweep seat. */
 #define ASPIRATION_MIN_DEPTH 5
 
 /*
@@ -458,32 +429,63 @@ TUNABLE(DELTA_MARGIN, 200);
 TUNABLE(SINGULAR_MARGIN, 32);
 
 /*
- * How much each correction history family is believed, out of CORR_W_UNIT.
+ * How much the correction is believed, out of CORR_W_UNIT.
  *
- * The pawn table sits at unit weight because that is the configuration E14
- * measured at +17.25 on the network, and this change is deliberately additive
- * to it: if the three new keys turn out to hold nothing, they contribute noise
- * around zero on top of an unchanged proven term rather than diluting it.
- *
- * The newcomers were first tried at a quarter each and measured slightly
- * negative (E16). An eighth is the same hypothesis at half strength, and the
- * reason for testing it rather than abandoning the keys is that the failure
- * had the shape of over-correction and not of bad evidence: the bench moved
- * 16.8% in the direction E14 says a correction pushed further from beta moves
- * it. Against a network that has already absorbed most of this structure, the
- * marginal table has less to say than it did against eval.c, and the weight
- * should reflect that.
- *
- * If an eighth also fails to beat pawn-only, the honest conclusion is that the
- * extra keys are not worth their cache on this evaluation - not that some
- * third weight would have worked. They are TUNABLE so the margin sweep can
- * settle them if they survive, rather than leaving guesses in the hot path.
+ * At the default this is arithmetically identical to what E14 measured at
+ * +17.25 on the network - 128/128 is one - so the shipped engine is unchanged
+ * and the bench proves it. It is a TUNABLE because how far to trust a learned
+ * evaluation bias is exactly the kind of question a sweep answers better than
+ * a person, and it was never fitted, only chosen.
  */
 #define CORR_W_UNIT 128
 TUNABLE(CORR_W_PAWN, 128);
-TUNABLE(CORR_W_MINOR, 16);
-TUNABLE(CORR_W_NONPAWN, 16);
-TUNABLE(CORR_W_CONT, 16);
+
+/*
+ * ---------------------------------------------------------------------------
+ * The second tier: constants that shape a formula rather than sit in a
+ * comparison.
+ *
+ * These were written as plain numbers and never fitted to anything. That is
+ * not the same as being wrong, but it is not evidence of being right either,
+ * and several of them predate the network entirely. Wrapping them costs the
+ * shipped engine nothing - TUNABLE folds to an enum constant in a normal build
+ * and the compiler treats it exactly as it treated the literal, which the
+ * unchanged bench node count is the proof of.
+ *
+ * The DIVISORs all have a minimum of 1 rather than 0, and that is load-bearing:
+ * a sweep is allowed to walk a parameter to its bound, and a bound of zero here
+ * is a division by zero in the hot path.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Late move reduction curve. `Reductions[d][m]` is built from these once, so
+ * search_tunable_set() rebuilds the table - see the note there. */
+TUNABLE(LMR_BASE, 10);
+TUNABLE(LMR_DIVISOR, 24);
+
+/* How much history is allowed to pull a reduction back. Larger means less
+ * influence, which is why these are divisors and not multipliers. */
+TUNABLE(LMR_HIST_DIVISOR, 8192);
+TUNABLE(LMR_CONT_DIVISOR, 8192);
+TUNABLE(CAPHIST_DIVISOR, 4);
+
+/* Null-move reduction: base, how fast it grows with depth, and how much of the
+ * margin above beta is allowed to buy extra reduction before it is capped. */
+TUNABLE(NMP_BASE, 3);
+TUNABLE(NMP_DEPTH_DIVISOR, 4);
+TUNABLE(NMP_EVAL_DIVISOR, 200);
+TUNABLE(NMP_EVAL_MAX, 3);
+
+/* History bonus curve: the multiplier on depth-squared, and the depth past
+ * which extra confidence stops being real. */
+TUNABLE(HIST_BONUS_MUL, 4);
+TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
+
+/* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
+TUNABLE(LMP_BASE, 3);
+
+/* Half-width of the first aspiration window. */
+TUNABLE(ASPIRATION_DELTA, 18);
 
 #ifdef TUNE_SEARCH
 
@@ -515,9 +517,19 @@ static const struct {
     {"DeltaMargin", &DELTA_MARGIN, 50, 600},
     {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
     {"CorrWPawn", &CORR_W_PAWN, 0, 256},
-    {"CorrWMinor", &CORR_W_MINOR, 0, 256},
-    {"CorrWNonPawn", &CORR_W_NONPAWN, 0, 256},
-    {"CorrWCont", &CORR_W_CONT, 0, 256},
+    {"LmrBase", &LMR_BASE, 4, 24},
+    {"LmrDivisor", &LMR_DIVISOR, 12, 48},
+    {"LmrHistDivisor", &LMR_HIST_DIVISOR, 2048, 32768},
+    {"LmrContDivisor", &LMR_CONT_DIVISOR, 2048, 32768},
+    {"CapHistDivisor", &CAPHIST_DIVISOR, 1, 32},
+    {"NmpBase", &NMP_BASE, 1, 6},
+    {"NmpDepthDivisor", &NMP_DEPTH_DIVISOR, 1, 12},
+    {"NmpEvalDivisor", &NMP_EVAL_DIVISOR, 50, 600},
+    {"NmpEvalMax", &NMP_EVAL_MAX, 0, 5},
+    {"HistBonusMul", &HIST_BONUS_MUL, 1, 24},
+    {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 20},
+    {"LmpBase", &LMP_BASE, 1, 10},
+    {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
 };
 
 int search_tunable_count(void) { return (int)(sizeof(Tunables) / sizeof(Tunables[0])); }
@@ -537,19 +549,28 @@ bool search_tunable_set(const char *name, int value) {
              * engine silently keep the previous value for the rest of a match
              * while the other moved. */
             *Tunables[i].value = iclamp(value, Tunables[i].min, Tunables[i].max);
+
+            /* Reductions[][] is precomputed from LMR_BASE and LMR_DIVISOR, so
+             * setting either without rebuilding it would leave the sweep
+             * measuring the previous curve and quietly conclude the parameter
+             * does nothing. Rebuilt unconditionally: it is 4096 iterations,
+             * once per setoption, against a table read at every node. */
+            init_reductions();
             return true;
         }
     return false;
 }
 #endif /* TUNE_SEARCH */
 
-/*
- * Divisors that convert a history score into plies of reduction, and capture
- * history into ordering points. Larger means less influence.
- */
-#define LMR_HIST_DIVISOR 8192
-#define LMR_CONT_DIVISOR 8192
-#define CAPHIST_DIVISOR  4
+/* Forward-declared far above, beside the comment explaining the curve. It lives
+ * here because LMR_BASE and LMR_DIVISOR are declared with the other tunables
+ * and an enum constant cannot be used before it is declared. */
+static void init_reductions(void) {
+    for (int d = 0; d < 64; ++d)
+        for (int m = 0; m < 64; ++m)
+            Reductions[d][m] = (uint8_t)((int64_t)LogFixed[d] * LogFixed[m] * LMR_BASE /
+                                         (1024LL * 1024 * LMR_DIVISOR));
+}
 
 /*
  * The three quiet-move heuristics, all declared at the top of the file so
@@ -818,8 +839,8 @@ static Move counter_move(int ply) {
  * beyond a point the extra confidence is not real and a single deep cutoff
  * should not be able to saturate an entry on its own. */
 static int history_bonus(Depth depth) {
-    const Depth d = imin(depth, 20);
-    return d * d * 4;
+    const Depth d = imin(depth, HIST_BONUS_DEPTH_MAX);
+    return d * d * HIST_BONUS_MUL;
 }
 
 /*
@@ -952,46 +973,18 @@ static void update_pv(int ply, Move m) {
  * since instead of inheriting a stale adjustment.
  */
 
-#define CORR_INDEX(key) ((key) & (CORRHIST_SIZE - 1))
-
-/* The continuation entry, or NULL where there is no previous move to key on -
- * the root, and after a null move, which is nobody's plan and must not have a
- * correction attributed to it. Same rule as cont_slice(), for the same reason. */
-static inline int16_t *cont_corr_entry(int ply) {
-    if (ply < 1)
-        return NULL;
-
-    const Move prev = Stack[ply - 1].move;
-    if (!is_ok_move(prev))
-        return NULL;
-
-    return &ContCorrHist[Stack[ply - 1].movedPiece][to_sq(prev)];
-}
-
-/* The four tables' combined opinion, in CORRHIST_GRAIN fixed point. */
-static int corr_total(const Position *pos, int ply) {
-    const Color us = pos->sideToMove;
-
-    int total = CORR_W_PAWN * PawnCorrHist[us][CORR_INDEX(pos->pawnKey)];
-    total += CORR_W_MINOR * MinorCorrHist[us][CORR_INDEX(pos->minorKey)];
-    total += CORR_W_NONPAWN * (NonPawnCorrHist[us][WHITE][CORR_INDEX(pos->nonPawnKey[WHITE])] +
-                               NonPawnCorrHist[us][BLACK][CORR_INDEX(pos->nonPawnKey[BLACK])]);
-
-    const int16_t *const cont = cont_corr_entry(ply);
-    if (cont)
-        total += CORR_W_CONT * *cont;
-
-    return iclamp(total / CORR_W_UNIT, -CORRHIST_TOTAL_LIMIT, CORRHIST_TOTAL_LIMIT);
+static inline int16_t *corr_entry(const Position *pos) {
+    return &PawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
 }
 
 /* Mate scores are clamped away deliberately: a correction is evidence about an
  * evaluation, and letting one push a score into mate range would have the
  * search report a mate that nothing proved. */
-static Value corrected_eval(const Position *pos, Value raw, int ply) {
+static Value corrected_eval(const Position *pos, Value raw) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
 
-    const int v = raw + corr_total(pos, ply) / CORRHIST_GRAIN;
+    const int v = raw + (CORR_W_PAWN * *corr_entry(pos) / CORR_W_UNIT) / CORRHIST_GRAIN;
     return (Value)iclamp(v, VALUE_MATED_IN_MAX_PLY + 1, VALUE_MATE_IN_MAX_PLY - 1);
 }
 
@@ -1004,32 +997,13 @@ static Value corrected_eval(const Position *pos, Value raw, int ply) {
  * What counts as an observation is the decision that matters, and it is made
  * at the call site rather than here.
  */
-static void corr_fold(int16_t *e, int diff, int weight) {
+static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth) {
+    int16_t *const e  = corr_entry(pos);
+    const int weight  = imin(depth + 1, 16);
+    const int diff    = (searched - staticEval) * CORRHIST_GRAIN;
     const int updated = (*e * (CORRHIST_WEIGHT_MAX - weight) + diff * weight) / CORRHIST_WEIGHT_MAX;
-    *e                = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
-}
 
-/*
- * Every family sees the same observation at the same weight. They differ only
- * in what they are keyed by, which is the whole design: one node teaches each
- * table something about a different description of the position it was in, and
- * the tables that key on a description the error does not depend on average
- * that same evidence away to nothing over the tree.
- */
-static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth,
-                            int ply) {
-    const Color us   = pos->sideToMove;
-    const int weight = imin(depth + 1, 16);
-    const int diff   = (searched - staticEval) * CORRHIST_GRAIN;
-
-    corr_fold(&PawnCorrHist[us][CORR_INDEX(pos->pawnKey)], diff, weight);
-    corr_fold(&MinorCorrHist[us][CORR_INDEX(pos->minorKey)], diff, weight);
-    corr_fold(&NonPawnCorrHist[us][WHITE][CORR_INDEX(pos->nonPawnKey[WHITE])], diff, weight);
-    corr_fold(&NonPawnCorrHist[us][BLACK][CORR_INDEX(pos->nonPawnKey[BLACK])], diff, weight);
-
-    int16_t *const cont = cont_corr_entry(ply);
-    if (cont)
-        corr_fold(cont, diff, weight);
+    *e = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
 }
 
 /* ----------------------------------------------------------- quiescence -- */
@@ -1050,7 +1024,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         return VALUE_ZERO;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(pos, eval_evaluate(pos), ply);
+        return corrected_eval(pos, eval_evaluate(pos));
 
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
@@ -1086,7 +1060,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
          * there is no such option - every reply must be searched. */
         rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
-        staticEval = corrected_eval(pos, rawEval, ply);
+        staticEval = corrected_eval(pos, rawEval);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1232,7 +1206,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         return VALUE_DRAW;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(pos, eval_evaluate(pos), ply);
+        return corrected_eval(pos, eval_evaluate(pos));
 
     /* Determined before mate distance pruning narrows the window: a node is a
      * PV node because of where it sits in the tree, and must keep being
@@ -1315,7 +1289,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
 
     /* The table keeps `rawEval`; everything below reasons with the corrected
      * one. See the correction history section for why those differ. */
-    const Value staticEval = corrected_eval(pos, rawEval, ply);
+    const Value staticEval = corrected_eval(pos, rawEval);
 
     Stack[ply].staticEval = staticEval;
 
@@ -1389,7 +1363,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      */
     if (!pvNode && !inCheck && !isExcluded && depth >= 3 && staticEval >= beta &&
         Stack[ply - 1].move != MOVE_NULL && has_non_pawn_material(pos, us)) {
-        const Depth r = 3 + depth / 4 + imin((staticEval - beta) / 200, 3);
+        const Depth r = NMP_BASE + depth / NMP_DEPTH_DIVISOR +
+                        imin((staticEval - beta) / NMP_EVAL_DIVISOR, NMP_EVAL_MAX);
 
         Stack[ply].move       = MOVE_NULL;
         Stack[ply].movedPiece = NO_PIECE;
@@ -1482,8 +1457,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             /* Half as many quiets get a look when the position is not
              * improving: the moves are less likely to be worth it and the node
              * is less likely to be the one that matters. */
-            if (depth <= LMP_DEPTH &&
-                moveCount >= (improving ? 3 + depth * depth : (3 + depth * depth) / 2))
+            if (depth <= LMP_DEPTH && moveCount >= (improving ? LMP_BASE + depth * depth
+                                                              : (LMP_BASE + depth * depth) / 2))
                 continue;
 
             /*
@@ -1781,7 +1756,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
             !(bound == BOUND_LOWER && best <= staticEval) &&
             !(bound == BOUND_UPPER && best >= staticEval))
-            corrhist_update(pos, best, staticEval, depth, ply);
+            corrhist_update(pos, best, staticEval, depth);
     }
 
 #ifdef DATAGEN
