@@ -35,12 +35,21 @@ static Piece piece_from_char(char c) {
     }
 }
 
+/* A piece's contribution to the pawn key: its own Zobrist key if it is a pawn,
+ * zero otherwise. Branch-free on purpose - these three functions are the
+ * hottest code in make/unmake, and ZobristPiece[pc][s] is a line do_move is
+ * about to read anyway. */
+static inline Key pawn_key_term(Piece pc, Square s) {
+    return ZobristPiece[pc][s] & ZobristPawnSelect[pc];
+}
+
 void board_put_piece(Position *pos, Piece pc, Square s) {
     pos->board[s] = pc;
     pos->byType[NO_PIECE_TYPE] |= square_bb(s);
     pos->byType[type_of(pc)] |= square_bb(s);
     pos->byColor[color_of(pc)] |= square_bb(s);
     pos->pieceCount[pc]++;
+    pos->pawnKey ^= pawn_key_term(pc, s);
 }
 
 void board_remove_piece(Position *pos, Square s) {
@@ -50,6 +59,7 @@ void board_remove_piece(Position *pos, Square s) {
     pos->byColor[color_of(pc)] &= ~square_bb(s);
     pos->pieceCount[pc]--;
     pos->board[s] = NO_PIECE;
+    pos->pawnKey ^= pawn_key_term(pc, s);
 }
 
 void board_move_piece(Position *pos, Square from, Square to) {
@@ -60,6 +70,7 @@ void board_move_piece(Position *pos, Square from, Square to) {
     pos->byColor[color_of(pc)] ^= mask;
     pos->board[from] = NO_PIECE;
     pos->board[to]   = pc;
+    pos->pawnKey ^= pawn_key_term(pc, from) ^ pawn_key_term(pc, to);
 }
 
 /*
@@ -102,6 +113,24 @@ Key board_compute_key(const Position *pos) {
 
     if (pos->sideToMove == BLACK)
         k ^= ZobristSideToMove;
+
+    return k;
+}
+
+/*
+ * Side to move is deliberately not hashed here. This key names a pawn
+ * structure, and a structure is the same structure whoever is on move; the one
+ * consumer that cares indexes the side separately, which keeps both halves of
+ * the evidence addressable instead of splitting every entry in two.
+ */
+Key board_compute_pawn_key(const Position *pos) {
+    Key k = 0;
+
+    Bitboard pawns = pos->byType[PAWN];
+    while (pawns) {
+        const Square s = pop_lsb(&pawns);
+        k ^= ZobristPiece[piece_on(pos, s)][s];
+    }
 
     return k;
 }
@@ -470,7 +499,7 @@ bool board_is_consistent(const Position *pos) {
         }
     }
 
-    return pos->key == board_compute_key(pos);
+    return pos->key == board_compute_key(pos) && pos->pawnKey == board_compute_pawn_key(pos);
 }
 
 /* ========================================================================== *

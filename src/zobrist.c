@@ -6,6 +6,7 @@
 #include "zobrist.h"
 
 Key ZobristPiece[PIECE_NB][SQUARE_NB];
+Key ZobristPawnSelect[PIECE_NB];
 Key ZobristEnPassant[8];
 Key ZobristCastling[16];
 Key ZobristSideToMove;
@@ -30,6 +31,12 @@ void zobrist_init(void) {
     for (int p = 0; p < PIECE_NB; ++p)
         for (int s = 0; s < SQUARE_NB; ++s)
             ZobristPiece[p][s] = rng_next();
+
+    /* Derived rather than drawn: taking these from rng_next() would shift every
+     * key generated after them, which moves the bench node count for a change
+     * that alters no search decision. */
+    for (int p = 0; p < PIECE_NB; ++p)
+        ZobristPawnSelect[p] = type_of((Piece)p) == PAWN ? ~(Key)0 : (Key)0;
 
     for (int f = 0; f < 8; ++f)
         ZobristEnPassant[f] = rng_next();

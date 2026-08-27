@@ -166,7 +166,19 @@ static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
  */
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
+/*
+ * Correction history, indexed [side to move][pawn key]. See the section just
+ * above quiescence for what it holds and why the key is the pawn structure.
+ */
+#define CORRHIST_SIZE       16384                 /* power of two; the index is a mask */
+#define CORRHIST_GRAIN      256                   /* fixed point, so sub-pawn drift survives */
+#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32) /* at most 32cp of correction, either way */
+#define CORRHIST_WEIGHT_MAX 256                   /* denominator of the moving average */
+
+static int16_t PawnCorrHist[COLOR_NB][CORRHIST_SIZE];
+
 static inline int imin(int a, int b) { return a < b ? a : b; }
+static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 #ifdef DATAGEN
 static SearchNodeVisitor NodeVisitor;
@@ -238,6 +250,7 @@ void search_clear(void) {
     memset(CounterMoves, 0, sizeof(CounterMoves));
     memset(ContHist, 0, sizeof(ContHist));
     memset(CaptureHist, 0, sizeof(CaptureHist));
+    memset(PawnCorrHist, 0, sizeof(PawnCorrHist));
     memset(Stack, 0, sizeof(Stack));
     eval_state_clear();
 }
@@ -409,7 +422,6 @@ TUNABLE(DELTA_MARGIN, 200);
 TUNABLE(SINGULAR_MARGIN, 32);
 
 #ifdef TUNE_SEARCH
-static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /*
  * The sweep's view of the margins above: a name to set them by and the range
@@ -849,6 +861,62 @@ static void update_pv(int ply, Move m) {
     PvLength[ply] = childLength + 1;
 }
 
+/* --------------------------------------------------- correction history -- */
+
+/*
+ * The static evaluation is a guess about a position; the search is the truth
+ * about it. Correction history remembers how far apart the two have been
+ * running lately for a given pawn structure, and shifts the next static
+ * evaluation by that much.
+ *
+ * Pawn structure is the key because it is the feature that survives the moves
+ * a search actually makes. A blocked centre, a ruined king shelter, a passer
+ * the evaluation undervalues - each is wrong in the same direction across a
+ * whole region of the tree, and a standing bias is exactly what is worth
+ * learning. Keying on the full position instead would be a transposition table
+ * with a worse replacement policy: every entry written once and never
+ * confirmed.
+ *
+ * Nothing the search reports as a score is corrected. The corrected value
+ * feeds `improving`, the pruning margins and the reductions - decisions that
+ * are already bets - while what goes into the transposition table is the raw
+ * evaluation, so a later probe re-corrects with whatever the table has learned
+ * since instead of inheriting a stale adjustment.
+ */
+
+static inline int16_t *corr_entry(const Position *pos) {
+    return &PawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
+}
+
+/* Mate scores are clamped away deliberately: a correction is evidence about an
+ * evaluation, and letting one push a score into mate range would have the
+ * search report a mate that nothing proved. */
+static Value corrected_eval(const Position *pos, Value raw) {
+    if (raw == VALUE_NONE)
+        return VALUE_NONE;
+
+    const int v = raw + *corr_entry(pos) / CORRHIST_GRAIN;
+    return (Value)iclamp(v, VALUE_MATED_IN_MAX_PLY + 1, VALUE_MATE_IN_MAX_PLY - 1);
+}
+
+/*
+ * Folds one observation into the entry as an exponential moving average,
+ * weighted by depth because a deeper search is better evidence about the same
+ * question. The gravity term is the same idea as in history_update: an entry
+ * that cannot be moved once it is large describes the opening, not the board.
+ *
+ * What counts as an observation is the decision that matters, and it is made
+ * at the call site rather than here.
+ */
+static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth) {
+    int16_t *const e  = corr_entry(pos);
+    const int weight  = imin(depth + 1, 16);
+    const int diff    = (searched - staticEval) * CORRHIST_GRAIN;
+    const int updated = (*e * (CORRHIST_WEIGHT_MAX - weight) + diff * weight) / CORRHIST_WEIGHT_MAX;
+
+    *e = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
+}
+
 /* ----------------------------------------------------------- quiescence -- */
 
 /*
@@ -867,7 +935,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         return VALUE_ZERO;
 
     if (ply >= MAX_PLY - 1)
-        return eval_evaluate(pos);
+        return corrected_eval(pos, eval_evaluate(pos));
 
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
@@ -895,17 +963,19 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     const bool inCheck = board_checkers(pos) != BB_EMPTY;
     Value best         = -VALUE_INFINITE;
     Value staticEval   = VALUE_NONE;
+    Value rawEval      = VALUE_NONE;
 
     if (!inCheck) {
         /* Stand pat: the side to move is never obliged to capture, so the
          * static evaluation is a lower bound on what it can achieve. In check
          * there is no such option - every reply must be searched. */
-        staticEval =
+        rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
-        best = staticEval;
+        staticEval = corrected_eval(pos, rawEval);
+        best       = staticEval;
 
         if (best >= beta) {
-            tt_store(key, MOVE_NONE, best, staticEval, 0, BOUND_LOWER, ply);
+            tt_store(key, MOVE_NONE, best, rawEval, 0, BOUND_LOWER, ply);
             return best;
         }
         if (best > alpha)
@@ -1000,7 +1070,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     /* Quiescence never searches the full move list, so it can never prove an
      * exact score: the value is a lower bound if it failed high and an upper
      * bound otherwise. */
-    tt_store(key, bestMove, best, staticEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER, ply);
+    tt_store(key, bestMove, best, rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER, ply);
 
     return best;
 }
@@ -1047,7 +1117,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         return VALUE_DRAW;
 
     if (ply >= MAX_PLY - 1)
-        return eval_evaluate(pos);
+        return corrected_eval(pos, eval_evaluate(pos));
 
     /* Determined before mate distance pruning narrows the window: a node is a
      * PV node because of where it sits in the tree, and must keep being
@@ -1123,10 +1193,14 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * position whose king is attacked says nothing useful, and every heuristic
      * below that would consume it is disabled while in check anyway.
      */
-    const Value staticEval =
-        inCheck ? VALUE_NONE
-                : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
-                                                              : eval_evaluate(pos));
+    const Value rawEval = inCheck
+                              ? VALUE_NONE
+                              : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
+                                                                            : eval_evaluate(pos));
+
+    /* The table keeps `rawEval`; everything below reasons with the corrected
+     * one. See the correction history section for why those differ. */
+    const Value staticEval = corrected_eval(pos, rawEval);
 
     Stack[ply].staticEval = staticEval;
 
@@ -1553,7 +1627,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             return alpha;
 
         best = inCheck ? mated_in(ply) : VALUE_DRAW;
-        tt_store(key, MOVE_NONE, best, staticEval, depth, BOUND_EXACT, ply);
+        tt_store(key, MOVE_NONE, best, rawEval, depth, BOUND_EXACT, ply);
         return best;
     }
 
@@ -1573,7 +1647,26 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * one. */
     if (!isExcluded) {
         const Bound bound = best >= beta ? BOUND_LOWER : raisedAlpha ? BOUND_EXACT : BOUND_UPPER;
-        tt_store(key, bestMove, best, staticEval, depth, bound, ply);
+        tt_store(key, bestMove, best, rawEval, depth, bound, ply);
+
+        /*
+         * Learn from this node only where the search genuinely contradicted the
+         * static evaluation, on the static evaluation's own terms.
+         *
+         * In check there is no static evaluation to be wrong about. A mate
+         * score is not an evaluation error, it is a different kind of fact. A
+         * tactical best move means the gap was material that quiescence found
+         * rather than a standing bias, and crediting it would teach the table
+         * that every structure which once contained a hanging piece is worth a
+         * pawn more than it is. And a bound is evidence only in the direction
+         * it bounds: a fail high proves the truth is at least `best`, which
+         * says nothing at all if the evaluation was already above that.
+         */
+        if (!inCheck && !is_mate_score(best) &&
+            (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
+            !(bound == BOUND_LOWER && best <= staticEval) &&
+            !(bound == BOUND_UPPER && best >= staticEval))
+            corrhist_update(pos, best, staticEval, depth);
     }
 
 #ifdef DATAGEN

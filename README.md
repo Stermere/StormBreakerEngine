@@ -44,7 +44,7 @@ The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish 
 | NNUE export + C inference, bit-exact against the reference (`make nnue-test`) | complete |
 | NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
 | NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
-| **Correction history** | **TODO** |
+| Correction history (pawn-structure keyed, +25.8 Elo) | complete |
 | **NNUE: re-tuned search margins, then the default switches** | **TODO** |
 | **Next data generation, labelled by the network rather than by `eval.c`** | **TODO** |
 | **Lazy SMP (`Threads` is capped at 1)** | **TODO** |

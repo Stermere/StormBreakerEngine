@@ -63,6 +63,15 @@ typedef struct {
 
     Key key;
 
+    /*
+     * Zobrist key over the pawns alone, maintained by the same three mutators
+     * that maintain the bitboards. Pawn structure is the part of a position
+     * that survives the moves a search actually makes, which is what makes it
+     * a useful key for anything accumulating evidence across a whole tree -
+     * correction history today, a pawn evaluation cache if one is ever wanted.
+     */
+    Key pawnKey;
+
     /* Enemy pieces currently giving check to `sideToMove`, and the pieces of
      * `sideToMove` that are pinned against their own king. Maintained by
      * do_move/undo_move; see the note on Undo above. */
@@ -112,10 +121,15 @@ static inline Bitboard board_pinned(const Position *pos) { return pos->pinned; }
 
 /*
  * The ONLY sanctioned way to alter the board. Each keeps the bitboards, the
- * mailbox and the piece counts in lockstep; touching any of them directly is
- * how the three representations silently drift apart. They deliberately do NOT
- * update the Zobrist key - do_move owns that, because it also has to fold in
- * side-to-move, castling and en passant.
+ * mailbox, the piece counts and the pawn key in lockstep; touching any of them
+ * directly is how the representations silently drift apart. They deliberately
+ * do NOT update the full Zobrist key - do_move owns that, because it also has
+ * to fold in side-to-move, castling and en passant.
+ *
+ * The pawn key is here rather than in do_move precisely because it needs none
+ * of that. It is a function of where the pawns are, so the three ways a pawn
+ * can appear, vanish or travel are the three places that have to know - and
+ * undo gets it back for free, because XOR is its own inverse.
  */
 void board_put_piece(Position *pos, Piece pc, Square s);
 void board_remove_piece(Position *pos, Square s);
@@ -135,6 +149,9 @@ void board_to_fen(const Position *pos, char *buf);
 /* Recomputes the Zobrist key from scratch. do_move maintains the key
  * incrementally; this is the reference used to assert that it stayed correct. */
 Key board_compute_key(const Position *pos);
+
+/* The same reference recomputation, for the pawn key the mutators maintain. */
+Key board_compute_pawn_key(const Position *pos);
 
 /* Pretty-prints the board, FEN and key - the UCI `d` command. */
 void board_print(const Position *pos);

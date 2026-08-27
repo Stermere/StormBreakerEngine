@@ -370,6 +370,74 @@ a speedup to take for free.
 ---
 
 
+### E14 — Correction history
+
+**Date** 2026-08-26 · **Baseline** commit c009931, built two ways:
+`base-classical` (bench 287826) and `base-nnue`, net `1f36c07f4507` (bench
+229281) · **Dev** the same two builds with correction history (bench 299634
+classical, 213141 nnue)
+
+Task 5a of [NNUE.md](NNUE.md), which asks for it "first regardless of NNUE
+progress" — it needs no network and it composes with one rather than competing.
+The search records how far apart the static evaluation and the value the search
+actually returned have been running for a given pawn structure, and shifts the
+next static evaluation in that structure by the running average.
+
+| | classical | NNUE |
+|---|---|---|
+| TC / bounds | 8+0.08, [0, 5] normalized | 8+0.08, [0, 5] normalized |
+| **Result** | **H1** — LLR 2.96 at 2050 games | *(running)* |
+| Elo | **+25.81 ± 10.34** | |
+| nElo | +37.69 ± 15.04 | |
+| Record | 663W / 511L / 876D, 53.71% | |
+| Ptnml | [39, 219, 396, 293, 78] | |
+| LOS | 100.00% | |
+| PGN | `external/games/20260826-161029-STC.pgn` | |
+
+**The bench moves in opposite directions on the two evaluations, and that is
+the interesting part.** Classical goes up 4.1% (287826 → 299634) and NNUE goes
+down 7.0% (229281 → 213141). Correction history does not prune or extend
+anything by itself; it only changes what the static evaluation says, and every
+margin in the search is measured against that. A correction that pushes an
+evaluation further from beta costs nodes, one that pushes it past beta saves
+them. The classical evaluation and the network are wrong in different
+directions often enough for the net effect to flip sign between them.
+
+**What is corrected, and what is not.** The transposition table stores the raw
+evaluation and the search reasons with the corrected one. Storing the corrected
+value would bake a stale adjustment into every later probe of that entry, and
+the whole point is that the correction is re-derived from whatever the table
+has learned since. Nothing the search *reports* is corrected either — the value
+is clamped out of mate range, because a correction is evidence about an
+evaluation and must never be able to manufacture a mate nothing proved.
+
+**Update rule, and the three exclusions that matter more than the arithmetic.**
+The entry is an exponential moving average weighted by depth. A node teaches it
+nothing when the side to move is in check (there is no static evaluation to be
+wrong about), when the score is a mate (a different kind of fact, not an
+evaluation error), or when the best move was tactical (the gap was material
+quiescence found, not a standing bias — crediting it would teach the table that
+every structure which once contained a hanging piece is worth a pawn more than
+it is). A bound also only counts in the direction it bounds: a fail high proves
+the truth is at least `best`, which says nothing if the evaluation was already
+above that.
+
+**Cost.** A pawn key had to be maintained to key the table, and it lives in
+`board_put_piece` / `board_remove_piece` / `board_move_piece` rather than in
+`do_move`, because it is a function of where the pawns are and undo therefore
+restores it for free. The measured nps difference is ~1% and does not cleanly
+exceed run-to-run noise at this bench duration — the Elo above is a search
+quality result, not a trade.
+
+**Gates.** `perft` standard and tricky pass exactly under a debug build, which
+asserts the incremental pawn key against `board_compute_pawn_key()` on every
+make and unmake — 25.2M nodes of it. `datagen-test` still passes, because
+`search_clear()` resets the new table and datagen clears before every label
+search; had it not, every label would have depended on which position was
+labelled before it.
+---
+
+
 ## Absolute strength
 
 Every Elo figure above is relative to another build in `external\baselines`,

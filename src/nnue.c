@@ -233,10 +233,10 @@ static void sha256_hex(const void *data, size_t len, char *out) {
  * losing its net.
  */
 #if defined(__APPLE__)
-#define NNUE_RODATA ".section __TEXT,__const\n"
+#define NNUE_RODATA    ".section __TEXT,__const\n"
 #define NNUE_SYM(name) "_" name
 #else
-#define NNUE_RODATA ".section .rodata\n"
+#define NNUE_RODATA    ".section .rodata\n"
 #define NNUE_SYM(name) name
 #endif
 
