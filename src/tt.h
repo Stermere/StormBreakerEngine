@@ -34,7 +34,8 @@ typedef struct {
     int16_t eval;     /* static eval, cached to avoid recomputing it */
     uint8_t depth;    /* search depth this entry was produced at */
     uint8_t genBound; /* generation in the high bits, Bound in the low 2 */
-    uint8_t padding[6];
+    uint8_t pv;       /* the position was on a principal variation at some point */
+    uint8_t padding[5];
 } TTEntry;
 
 /* Field accessors. The packing of `genBound` is an implementation detail; go
@@ -44,6 +45,17 @@ static inline Value tt_entry_value(const TTEntry *e) { return (Value)e->value; }
 static inline Value tt_entry_eval(const TTEntry *e) { return (Value)e->eval; }
 static inline Depth tt_entry_depth(const TTEntry *e) { return (Depth)e->depth; }
 static inline Bound tt_entry_bound(const TTEntry *e) { return (Bound)(e->genBound & 3); }
+
+/*
+ * True if this position was ever searched with a full window - so it sat on
+ * somebody's principal variation, however long ago.
+ *
+ * Spends a whole byte of what was padding on a single bit, deliberately. The
+ * alternative is stealing a bit from `genBound`, which halves the generation
+ * cycle and so quietly changes how the replacement policy ages entries. The
+ * padding was doing nothing; this way the flag costs neither size nor policy.
+ */
+static inline bool tt_entry_is_pv(const TTEntry *e) { return e->pv != 0; }
 
 /* Allocates (or reallocates) the table to `mb` megabytes and clears it.
  * Driven by the Hash UCI option. Returns false if allocation failed. */
@@ -86,8 +98,10 @@ bool tt_probe(Key key, TTEntry *out);
 
 /* Stores a result. `value` is absolute (as the search sees it); `ply` is used
  * to make mate scores relative on the way in. Pass VALUE_NONE for `eval` when
- * no static evaluation was computed at this node. */
-void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, int ply);
+ * no static evaluation was computed at this node. `pv` records that this node
+ * was searched with a full window; it is sticky, so an entry never loses the
+ * flag except to a different position claiming its slot. */
+void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, bool pv, int ply);
 
 /* Converts a probed score back to one that is meaningful at `ply`. The inverse
  * of what tt_store does on the way in. */

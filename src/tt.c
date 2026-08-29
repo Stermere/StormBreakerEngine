@@ -187,7 +187,8 @@ static inline int entry_age(const TTEntry *e) {
  */
 static inline int replace_priority(const TTEntry *e) { return (int)e->depth - 8 * entry_age(e); }
 
-void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, int ply) {
+void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, bool pv,
+              int ply) {
     if (!Table)
         return;
 
@@ -218,6 +219,13 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
      * still the best guess anything has made about this position. */
     if (!sameSlot || m != MOVE_NONE)
         replace->move = (uint16_t)m;
+
+    /* Sticky within the slot, and written even when the value below is not
+     * refreshed. A node that was once on a principal variation still was, and
+     * a shallow re-visit that declines to overwrite the score has learned
+     * nothing that unsays it. Only a different position taking the slot
+     * clears the flag. */
+    replace->pv = (uint8_t)(pv || (sameSlot && replace->pv));
 
     /*
      * Overwrite when the slot is not already ours, when the new result is

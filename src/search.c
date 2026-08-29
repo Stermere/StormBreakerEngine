@@ -405,6 +405,38 @@ TUNABLE(SEE_CAPTURE_MARGIN, 94);
 TUNABLE(SEE_QUIET_MARGIN, 26);
 
 /*
+ * ProbCut: the mirror of razoring, at the other end of the window.
+ *
+ * A capture that still beats a beta raised by this margin after a search
+ * several plies shallow is strong evidence that the node fails high - the
+ * shallow search had every chance to find the refutation and did not.
+ * Razoring asks quiescence whether a hopeless-looking node is really hopeless;
+ * this asks a real search whether a winning-looking one is really winning, and
+ * answers a whole node for a fraction of what proving it properly costs.
+ *
+ * Only captures are tried, and that is the claim rather than a shortcut: the
+ * bet is that material alone carries the node past the raised bound. A quiet
+ * move that could do the same is exactly the case there is no cheap evidence
+ * for, so it is left to the full search.
+ *
+ * The margin has to cover the noise a search this much shallower carries. The
+ * depth floor is what keeps `depth - PROBCUT_REDUCTION` a real search rather
+ * than a quiescence with extra steps.
+ *
+ * A pawn is a starting point and nothing more; see E19 for what the bench had
+ * to say about the alternatives, which was mostly that it cannot tell.
+ */
+/* The floor is a TUNABLE only so that an ablation has a switch: set it above
+ * any depth the search reaches and ProbCut is off, with no rebuild. It is NOT
+ * a sweep seat - it is a depth threshold, and the note beside
+ * ASPIRATION_MIN_DEPTH says why those measure as noise under SPSA. Pass it to
+ * `make tune ARGS="--exclude ..."`. The minimum is 5 because the verification
+ * searches `depth - PROBCUT_REDUCTION` and that has to stay a real search. */
+TUNABLE(PROBCUT_DEPTH, 5);
+#define PROBCUT_REDUCTION 4
+TUNABLE(PROBCUT_MARGIN, 100);
+
+/*
  * Delta pruning margin for quiescence.
  *
  * Standing pat is always available, so a capture that cannot bring the
@@ -476,10 +508,48 @@ TUNABLE(NMP_DEPTH_DIVISOR, 3);
 TUNABLE(NMP_EVAL_DIVISOR, 190);
 TUNABLE(NMP_EVAL_MAX, 3);
 
+/* How much less a node that was on a principal variation, but is not one in
+ * this tree, gets reduced. Zero restores the pre-E19 rule exactly. */
+TUNABLE(TTPV_REDUCTION, 1);
+
 /* History bonus curve: the multiplier on depth-squared, and the depth past
- * which extra confidence stops being real. */
+ * which extra confidence stops being real.
+ *
+ * A note on tuning the cap, because it looks like a parameter and at short time
+ * controls it is not one. `history_bonus` takes `min(depth, cap)` and `depth`
+ * is remaining depth, so the cap cannot bind unless the search reaches past it.
+ * At STC this engine reaches depth 12-13, which makes a cap of 20 inert - not
+ * weakly measurable, inert - and a sweep run there will random-walk it inside a
+ * flat region and report the walk. E17 recorded it as "unchanged", which is
+ * what a zero gradient looks like from the outside. Its range now reaches 32
+ * for the sake of LTC sweeps, where depths do get there; at STC it should be
+ * excluded from the fit rather than given room to wander. */
 TUNABLE(HIST_BONUS_MUL, 5);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
+
+/*
+ * The same curve for the moves that FAILED, on its own multiplier.
+ *
+ * One number served both directions here, which quietly asserted that "this
+ * move caused a cutoff" and "this move was tried and did not" are claims of
+ * equal strength. They are not the same claim at all - the first names one
+ * move out of the list, the second is levelled at up to sixty-three of them at
+ * once - and nothing says the answer to one should size the other.
+ *
+ * The default leans the malus heavier, which is where the engines that have
+ * fitted the two separately have ended up, but only barely, and the bench is
+ * the reason. Swept at depths 10-12 the tree is flat between 5 and 6 - 0.7%
+ * apart, well inside the noise - and then degrades sharply: 7 costs 7%, 8
+ * costs 14% at depth 12. So the useful claim this change makes is structural
+ * rather than numeric. It gives the malus a seat of its own in the sweep,
+ * which it never had; fitting it is the tuner's job, and 6 is only a starting
+ * point chosen not to move the tree while the split gets measured.
+ *
+ * The depth cap stays shared on purpose: "past this depth the extra confidence
+ * is not real" is a statement about the search, and it is equally true of
+ * evidence pointing either way.
+ */
+TUNABLE(HIST_MALUS_MUL, 6);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 7);
@@ -515,6 +585,8 @@ static const struct {
     {"SeeCaptureMargin", &SEE_CAPTURE_MARGIN, 20, 300},
     {"SeeQuietMargin", &SEE_QUIET_MARGIN, 5, 120},
     {"DeltaMargin", &DELTA_MARGIN, 50, 600},
+    {"ProbCutMargin", &PROBCUT_MARGIN, 30, 300},
+    {"ProbCutDepth", &PROBCUT_DEPTH, 5, 99},
     {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
     {"CorrWPawn", &CORR_W_PAWN, 0, 256},
     {"LmrBase", &LMR_BASE, 4, 24},
@@ -527,8 +599,10 @@ static const struct {
     {"NmpEvalDivisor", &NMP_EVAL_DIVISOR, 50, 600},
     {"NmpEvalMax", &NMP_EVAL_MAX, 0, 5},
     {"HistBonusMul", &HIST_BONUS_MUL, 1, 24},
-    {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 20},
+    {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 32},
+    {"HistMalusMul", &HIST_MALUS_MUL, 1, 32},
     {"LmpBase", &LMP_BASE, 1, 10},
+    {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
 };
 
@@ -843,6 +917,14 @@ static int history_bonus(Depth depth) {
     return d * d * HIST_BONUS_MUL;
 }
 
+/* What everything tried before the cutoff is charged. Same shape, its own
+ * multiplier - see the note beside HIST_MALUS_MUL for why it is not simply the
+ * bonus negated. */
+static int history_malus(Depth depth) {
+    const Depth d = imin(depth, HIST_BONUS_DEPTH_MAX);
+    return d * d * HIST_MALUS_MUL;
+}
+
 /*
  * Applies `bonus`, decaying the entry towards zero in proportion to how large
  * it already is.
@@ -886,11 +968,14 @@ static void capture_hist_update(const Position *pos, Move m, int bonus) {
  * and both failed. Only the winner's own table is credited - a capture teaches
  * the quiet heuristics nothing, and a quiet cutoff says nothing about which
  * exchange was worth making.
+ *
+ * Credit and blame are sized by separate curves. See HIST_MALUS_MUL.
  */
 static void update_stats(const Position *pos, Move best, const Move *quiets, int quietCount,
                          const Move *captures, int captureCount, Depth depth, int ply) {
     const Color us   = pos->sideToMove;
     const int bonus  = history_bonus(depth);
+    const int malus  = history_malus(depth);
     const bool quiet = !is_tactical(pos, best);
 
     if (quiet) {
@@ -912,13 +997,13 @@ static void update_stats(const Position *pos, Move best, const Move *quiets, int
     for (int i = 0; i < quietCount; ++i) {
         if (quiets[i] == best)
             continue;
-        history_update(&History[us][from_sq(quiets[i])][to_sq(quiets[i])], -bonus);
-        cont_hist_update(ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -bonus);
+        history_update(&History[us][from_sq(quiets[i])][to_sq(quiets[i])], -malus);
+        cont_hist_update(ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -malus);
     }
 
     for (int i = 0; i < captureCount; ++i)
         if (captures[i] != best)
-            capture_hist_update(pos, captures[i], -bonus);
+            capture_hist_update(pos, captures[i], -malus);
 }
 
 /* Anything but kings and pawns. The test that decides whether null-move
@@ -1045,6 +1130,17 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     if (ttMove != MOVE_NONE && !movegen_is_pseudo_legal(pos, ttMove))
         ttMove = MOVE_NONE;
 
+    /*
+     * Quiescence PRESERVES the flag and never sets it. Seeding from `pvNode`
+     * here instead looks equivalent and is not: a PV node hands quiescence a
+     * full window, the window propagates through the whole capture tree below
+     * it, and every position in it would be marked. Measured, that was 18% of
+     * the classical bench tree reducing less for having once been a recapture
+     * on the principal variation. Marking a position is the main search's
+     * decision to make.
+     */
+    const bool ttPv = ttHit && tt_entry_is_pv(&tte);
+
     if (!pvNode && ttValue != VALUE_NONE &&
         (tt_entry_bound(&tte) & (ttValue >= beta ? BOUND_LOWER : BOUND_UPPER)))
         return ttValue;
@@ -1064,7 +1160,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         best       = staticEval;
 
         if (best >= beta) {
-            tt_store(key, MOVE_NONE, best, rawEval, 0, BOUND_LOWER, ply);
+            tt_store(key, MOVE_NONE, best, rawEval, 0, BOUND_LOWER, ttPv, ply);
             return best;
         }
         if (best > alpha)
@@ -1159,7 +1255,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     /* Quiescence never searches the full move list, so it can never prove an
      * exact score: the value is a lower bound if it failed high and an upper
      * bound otherwise. */
-    tt_store(key, bestMove, best, rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER, ply);
+    tt_store(key, bestMove, best, rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER, ttPv, ply);
 
     return best;
 }
@@ -1237,6 +1333,22 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * several moves of the game. Never play a probed move unvalidated. */
     if (ttMove != MOVE_NONE && !movegen_is_pseudo_legal(pos, ttMove))
         ttMove = MOVE_NONE;
+
+    /*
+     * Was this position ever on a principal variation?
+     *
+     * `pvNode` says where the node sits in THIS tree; the table says where the
+     * position sat in every tree that came before, which is the better-informed
+     * question. A position that was worth an exact score once is worth accuracy
+     * again now, even though the move order that reached it this time happens
+     * to have arrived on a null window.
+     *
+     * It cannot run away. The flag is seeded only by genuine PV nodes and
+     * spreads only through the table, never down the stack - a node computes it
+     * fresh rather than inheriting it - so the set it marks is bounded by the
+     * positions that have actually appeared on a principal variation.
+     */
+    const bool ttPv = pvNode || (ttHit && tt_entry_is_pv(&tte));
 
     /*
      * Cut off on a stored result that is at least as deep and whose bound
@@ -1383,6 +1495,83 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
          * at all. Return the bound the search is entitled to, not the claim. */
         if (v >= beta)
             return v >= VALUE_MATE_IN_MAX_PLY ? beta : v;
+    }
+
+    /*
+     * ProbCut. The margin's declaration has the idea; what matters here is the
+     * order of the two searches. Quiescence runs first because it refutes most
+     * candidates for the price of one capture sequence, and only what survives
+     * it is worth a real search.
+     *
+     * Skipped while verifying a singular move, and that is correctness rather
+     * than caution: this ignores `excluded`, so it could prove a fail high
+     * with the very move the verification is pretending does not exist.
+     *
+     * Skipped when the table already says, from a search of comparable depth,
+     * that the position does not reach the raised bound - that is the same
+     * evidence this is about to spend nodes gathering. Comparable means
+     * `depth - 3`, because what gets proved here is a move followed by a
+     * search of `depth - 4`.
+     *
+     * Skipped, too, when the static evaluation is already past the raised
+     * bound. There is then no gap for a capture to close, and the SEE filter
+     * below - which asks a capture to win `probCutBeta - staticEval` - has its
+     * threshold go negative, which admits every capture on the board including
+     * the losing ones. Stockfish rarely meets that case because its reverse
+     * futility pruning runs to depth 13 and has already returned; RFP_DEPTH
+     * here is 7, so without this the nodes between are exactly where ProbCut
+     * spends the most and proves the least.
+     */
+    const Value probCutBeta = beta + PROBCUT_MARGIN;
+
+    if (!pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta) &&
+        !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
+        !(ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth - 3 && ttValue < probCutBeta)) {
+        ScoredMove pcMoves[MAX_MOVES];
+        const int pcCount = movegen_generate(pos, GEN_CAPTURES, pcMoves);
+
+        /* No counter-move: the list is captures, which the quiet heuristics
+         * have no opinion about. */
+        score_moves(pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE);
+
+        for (int i = 0; i < pcCount; ++i) {
+            pick_move(pcMoves, pcCount, i);
+            const Move m = pcMoves[i].m;
+
+            /* The capture has to reach the raised bound on material alone. One
+             * that needs the search to find compensation is not what this is
+             * looking for, and searching it here only pays for it twice. */
+            if (!see_ge(pos, m, probCutBeta - staticEval))
+                continue;
+
+            if (!movegen_is_legal(pos, m))
+                continue;
+
+            Stack[ply].move       = m;
+            Stack[ply].movedPiece = piece_on(pos, from_sq(m));
+
+            board_do_move(pos, m);
+            eval_state_push(pos, m);
+            tt_prefetch(pos->key);
+
+            Value v = -qsearch(pos, -probCutBeta, -probCutBeta + 1, ply + 1);
+            if (v >= probCutBeta)
+                v = -negamax(pos, depth - PROBCUT_REDUCTION, -probCutBeta, -probCutBeta + 1,
+                             ply + 1, !cutNode);
+
+            eval_state_pop();
+            board_undo_move(pos, m);
+
+            if (search_stopped())
+                return VALUE_ZERO;
+
+            if (v >= probCutBeta) {
+                /* Stored at the depth the evidence actually covers, so a later
+                 * probe cannot read it as a full-depth result. */
+                tt_store(key, m, v, rawEval, depth - PROBCUT_REDUCTION + 1, BOUND_LOWER, ttPv, ply);
+                return v;
+            }
+        }
     }
 
     ScoredMove moves[MAX_MOVES];
@@ -1625,9 +1814,21 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && !givesCheck) {
             r = Reductions[imin(depth, 63)][imin(moveCount, 63)];
 
-            /* The PV is where accuracy is worth paying for. */
+            /* The principal variation is where accuracy is worth paying for -
+             * and a position that was on one before is still that position,
+             * whatever window this visit happens to be using.
+             *
+             * Written as two arms rather than the one `if (ttPv) --r` they are
+             * equivalent to, because the second arm is the whole of what E19
+             * added and an ablation needs to be able to switch it off. At
+             * TTPV_REDUCTION = 1 this is exactly `if (ttPv) --r`, since ttPv is
+             * true wherever pvNode is; at 0 it is exactly the rule that stood
+             * before, with the table flag still written but nothing reading
+             * it. */
             if (pvNode)
                 --r;
+            else if (ttPv)
+                r -= TTPV_REDUCTION;
 
             /* A position that is not improving is one where the search has
              * less to lose by looking at the tail more cheaply. */
@@ -1717,7 +1918,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             return alpha;
 
         best = inCheck ? mated_in(ply) : VALUE_DRAW;
-        tt_store(key, MOVE_NONE, best, rawEval, depth, BOUND_EXACT, ply);
+        tt_store(key, MOVE_NONE, best, rawEval, depth, BOUND_EXACT, ttPv, ply);
         return best;
     }
 
@@ -1737,7 +1938,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * one. */
     if (!isExcluded) {
         const Bound bound = best >= beta ? BOUND_LOWER : raisedAlpha ? BOUND_EXACT : BOUND_UPPER;
-        tt_store(key, bestMove, best, rawEval, depth, bound, ply);
+        tt_store(key, bestMove, best, rawEval, depth, bound, ttPv, ply);
 
         /*
          * Learn from this node only where the search genuinely contradicted the

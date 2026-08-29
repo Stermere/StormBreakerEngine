@@ -48,6 +48,8 @@ Adding on a correction history and an SPSA tuned search brought this to ~3095 El
 | Correction history (pawn-structure keyed, +25.8 Elo) | complete |
 | Correction history: minor / non-pawn / continuation keys | tried, neutral (E16), reverted |
 | NNUE: re-tuned search parameters (21 by SPSA, +66.1 Elo, E17) | complete |
+| Search: ProbCut, ttPv, history split (E19, E19b) | **+7.50 ± 8.71** |
+| Search: cut-node retry | tried twice, costs ~19 Elo (E6, E19a, E19b), removed |
 | **NNUE: the default evaluation switches to the network** | **TODO** |
 | Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
 | **Self-play data generation with deliberate variation** | **TODO** |
@@ -253,19 +255,40 @@ The open work, roughly in order of Elo per unit of effort:
    neither. [docs/NNUE.md](docs/NNUE.md) Task 4 calls this out as where a
    meaningful fraction of the total NNUE gain actually lives.
 
-   `make TUNE_SEARCH=on` exposes **21** of them as UCI spin options — the seven
+   `make TUNE_SEARCH=on` exposes **25** of them as UCI spin options — the seven
    margins, `CORR_W_PAWN`, and a second tier that had never been fitted at all:
    the LMR curve itself (`LmrBase`, `LmrDivisor`), the history divisors, the
    null-move reduction formula, the history bonus curve, the LMP constant and
-   the aspiration delta. Fitting 21 interacting parameters one SPRT at a time
+   the aspiration delta. Twenty-one of those were fitted by E17. E19 added
+   `ProbCutMargin`, `HistMalusMul` and `TtPvReduction`, none of which has ever
+   been fitted and all of which ship at values chosen to be defensible rather
+   than measured — so the continuation run is worth more than it was. It also
+   added `ProbCutDepth`, which is an **ablation switch and not a sweep seat**:
+   it is a depth threshold, and the paragraph below says why those measure as
+   noise. Exclude it. Fitting 24 interacting parameters one SPRT at a time
    is not possible, so `make tune` runs SPSA over the set and emits a
    *candidate*, which then needs its own SPRT against the values it replaced —
    SPSA has no null hypothesis and will report a walk as a result.
 
-   Two of them are deliberately narrower than they look: `HistBonusDepthMax`
-   above 20 and `NmpEvalMax` above 5 were measured to be indistinguishable from
-   their bounds at bench depth 12, so a wider range would only give the sweep
-   somewhere to random-walk. The seven *depth* thresholds are excluded for a
+   **`tune.py` had a defect that made seven of those parameters untunable**, and
+   E17's three "unchanged" results were three of them — see E19c. The step size
+   scaled with a parameter's declared range while every integer option needs the
+   same absolute resolution of one, so the narrow ones travelled 0.46 units in a
+   run and needed 0.5 to change at all. Fixed by sizing the step separately from
+   the perturbation, and by dividing the gradient by the separation the engines
+   actually saw rather than the one requested. No wide parameter's arithmetic
+   changed, so E17's fit stands.
+
+   `NmpEvalMax` above 5 measured as indistinguishable from its bound at bench
+   depth 12, so a wider range would only give the sweep somewhere to random-walk.
+   `HistBonusDepthMax` was capped at 20 for the same reason and the reason turned
+   out to be sharper than "indistinguishable": `history_bonus` takes
+   `min(depth, cap)` over *remaining* depth, so a cap of 20 cannot bind at all
+   until the search passes depth 20. At STC this engine reaches 12-13. The
+   parameter is inert there, which is what E17's "unchanged" actually recorded —
+   a zero gradient, not a weak one. Its range now reaches 32 so an **LTC** sweep
+   can move it; **exclude it from STC sweeps**, where widening the range only
+   buys somewhere to wander. The seven *depth* thresholds are excluded for a
    related reason — SPSA perturbs continuously and the engine takes an int, so
    both sides of a gradient estimate round to the same small integer and the
    measurement is noise. Those want a sweep of their own.

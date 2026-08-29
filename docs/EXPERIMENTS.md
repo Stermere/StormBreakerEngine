@@ -789,6 +789,275 @@ what the net is. `make nnue-info` and `NET_SHA256` are.
 ---
 
 
+### E19 — Search batch: ProbCut, cut-node retry, ttPv, history split
+
+**Date** 2026-08-29 · **Baseline** `5917ef9` (the tree E17/E18 measured) ·
+**Bench** nnue 204156 -> 185533, classical 252945 -> 280881
+
+**No SPRT has been run yet.** Four independent search changes, each written to
+be tested on its own; this entry records what the bench and the correctness
+probes said, and nothing about Elo. Every number below is a node count.
+
+| # | Change | nnue d7 | nnue d12 | classical d12 |
+|---|---|---|---|---|
+| — | baseline | 204156 | 3469791 | 5155842 |
+| 1 | + ProbCut | 203537 | 3448112 | — |
+| 2 | + cut-node retry | 203537 | 3497603 | 4177747 |
+| 3 | + ttPv | 206666 | 3212428 | 4409637 |
+| 4 | + history split | 185533 | 3144581 | 4199385 |
+
+The classical build's depth-7 count goes the other way, 252945 -> 280881
+(+11%), and depth 12 says why that is not the number to read: -18.6% there.
+Depth 7 is too shallow for any of these to pay - two of the four cannot fire at
+all at that depth.
+
+**1. ProbCut.** Captures only, `depth - 4` behind a quiescence pre-filter, at
+non-PV nodes, skipped while verifying a singular move because it ignores
+`excluded` and would otherwise prove a fail high with the very move being
+excluded.
+
+It needed a guard that the textbook version does not have. `see_ge(pos, m,
+probCutBeta - staticEval)` has its threshold go NEGATIVE when the static
+evaluation already sits above the raised beta, which admits every capture on
+the board including the losing ones, each buying a quiescence search and often
+a depth-4 search. Stockfish rarely meets that case because its reverse futility
+pruning runs to depth 13 and has already returned; `RFP_DEPTH` here is 7, so
+the depths between are exactly where ProbCut spent the most and proved the
+least. Measured over depths 10-12 and averaged across margins, the unguarded
+version **cost 2.4% of the tree** and the guarded one **saves 2.3%**.
+
+The margin itself could not be chosen by bench. Node counts across 50/70/100/
+150/190 came out non-monotonic - 50 saved 9% at depth 12 and cost 6% at depth
+10 - which is tree shape, not signal. It ships at 100 with a sweep seat.
+
+**2. Cut-node retry, and the version that had to be thrown away.** Written
+first in the form E6's note describes, a bare `depth -= 2` at cut nodes with no
+lower-bound table entry. It is wrong, and cheaply provable: on **WAC.001** the
+engine stopped finding a mate in two at depth 16 that it finds at depth 10
+without it. The reductions compound down a line and nothing re-searches. The
+reduction amount does not control it either — 1 also lost the mate, 3 found it
+again, which is a coin toss rather than a knob.
+
+Replaced by the verification the same E6 note prescribes: run the reduced
+search at the same ply with the same window, keep its answer only if it reaches
+beta, and otherwise fall through to the full-depth search immediately below. A
+line can now cost time here but cannot be lost here. The mate comes back, and
+the classical depth-12 tree is 5.8% smaller than the unverified version's.
+
+Two implementation notes worth keeping. `Stack[ply].cutRetry` is read-and-
+cleared exactly like `excludedMove`, because the reduced search re-enters at
+the same ply and must not start a retry of its own. And zero is special-cased:
+without that test a reduction of zero would not disable the retry but DOUBLE
+it, searching the node twice at the same depth.
+
+**3. ttPv.** A byte of what was `TTEntry` padding, so the entry stays 16 bytes
+and the generation cycle is untouched. `ttPv = pvNode || (ttHit && is_pv)`,
+sticky within a slot, and it generalises the existing `if (pvNode) --r` in the
+LMR curve to `if (ttPv) --r` rather than stacking a second rule beside it.
+
+The first version seeded the flag from `pvNode` inside quiescence as well. That
+looks equivalent and is not: a PV node hands quiescence a full window, the
+window propagates through the whole capture tree below it, and every position
+in it gets marked. It cost **18% of the classical bench tree**. Quiescence
+preserves the flag and never sets it; marking a position is the main search's
+decision.
+
+**4. History split.** `history_malus()` on its own multiplier, so that "this
+move caused a cutoff" and "this move was tried and did not" stop being sized by
+one number - the first names one move, the second is levelled at up to
+sixty-three at once.
+
+This one is honest about being structural. Swept at depths 10-12 the tree is
+flat between 5 and 6 (0.7% apart, inside the noise) and degrades sharply above:
+7 costs 7%, 8 costs 14% at depth 12. It ships at 6, which is chosen not to move
+the tree while the split gets measured. The value is for the tuner to fit, and
+`HistMalusMul` now has a seat in `Tunables[]` for the continuation run.
+
+**What was checked besides node counts.** `make perft` exact (14/14, 7/7);
+both suites again under `make debug` with assertions live; a depth-16 search
+from the start position and from Kiwipete under assertions; `nnue-test` exact
+on 10,000 positions; `datagen-test`; `openbench-check`; `format-check`. Across
+the 21 in-repo EPD positions at depth 14, baseline and candidate find the same
+three mates.
+
+**New sweep seats**: `ProbCutMargin` (30-300), `CutNodeRetryReduction` (0-3),
+`HistMalusMul` (1-32). All three default to values chosen to be defensible
+rather than fitted, which makes the tuner continuation run more valuable than
+it was before this batch.
+
+---
+
+### E19a — the batch measured negative, and what the ablations did and did not say
+
+**Date** 2026-08-29 · All at STC 8+0.08, bounds [0, 5] normalized.
+
+The four-feature batch, against `prev-5917ef9-nnue`:
+
+| | |
+|---|---|
+| **Result** | **negative**, stopped at LLR -1.19 |
+| Elo | **-11.74 ± 11.58** (nElo -18.72 ± 18.45) |
+| Record | 353W / 399L / 610D over 1362 games, 48.31% |
+| Ptnml | [28, 183, 302, 143, 25], LOS 2.34% |
+
+Then four ablations, each `dev = one feature OFF` against a baseline with all
+four ON, so a **negative** number means removing the feature LOSES Elo and the
+feature is earning its place. All were stopped early.
+
+| ablation | Elo | 95% interval | games | reads as |
+|---|---|---|---|---|
+| cut-node retry, first version | **+11.50 ± 16.28** | [-4.8, +27.8] | 816 | costing us |
+| cut-node retry, after the re-probe | **+3.64 ± 16.35** | [-12.7, +20.0] | 764 | ~neutral |
+| ttPv | -13.09 ± 21.98 | [-35.1, +8.9] | 478 | earning it |
+| ProbCut | -4.44 ± 19.31 | [-23.8, +14.9] | 548 | earning it |
+| history split | -18.65 ± 22.65 | [-41.3, +4.0] | 522 | earning it |
+
+**Every one of those intervals spans zero, and the set is internally
+inconsistent.** The three "earning it" point estimates imply the features are
+together worth **+36 Elo**, while the batch that contains them measured
+**-11.74** against the build without them - a 48-point contradiction. Both
+cannot be true, and the batch has the most games and the tightest interval. The
+honest reading is that the ablation point estimates are dominated by noise, and
+that selecting a subset on them would ship a configuration nothing tested. E2-E5
+reached the same wall for the same reason: resolving a ±5 Elo question needs
+several times 2000 games.
+
+**One conclusion does survive**, because three independent lines agree on it:
+the cut-node retry does not earn its place. Its two ablations sit at +11.50 and
++3.64 - the only two of the five whose sign says "remove me". It is the only
+one of the four that shrinks the tree by nothing measurable (0.25% at depth 12,
+against 8.5% for ProbCut, 5.3% for ttPv, 4.3% for the history split). And E6
+had already measured its per-move cousin at -16 Elo on this same search.
+
+**So it is removed**, and that is E6's verdict confirmed a second time in a
+second form. The re-probe did fix something real - a failed retry was
+discarding the move its own search had just found, and the ablation moved from
++11.50 to +3.64 after it - but fixing a feature into neutrality is not a reason
+to carry it.
+
+The removal was verified the way E17 verified its parameter rewrite: by node
+count. The build with the code deleted benches **3134217** at depth 12,
+identical to the ablation binary driven with `CutNodeRetryReduction=0`, so what
+ships is exactly the configuration that was measured.
+
+**What remains**: ProbCut, ttPv and the history split, bench nnue 204156 ->
+185533 (d7) and 3469791 -> 3134217 (d12), classical 5155842 -> 4199385 (d12).
+**None of the three is individually certified** and the batch containing them
+has never been measured in this form - the -11.74 above was the build with the
+broken retry in it. That single SPRT against `prev-5917ef9-nnue` is the number
+that decides whether any of this ships.
+
+**Ablation switches kept**, because the next round of this will want them:
+`ProbCutDepth` (5-99; set it above the search depth and ProbCut is off) and
+`TtPvReduction` (0-3; zero restores the pre-E19 reduction rule exactly, with
+the table flag still written and nothing reading it). `ProbCutDepth` is an
+ablation switch and NOT a sweep seat - it is a depth threshold, and the note
+beside `ASPIRATION_MIN_DEPTH` says why those measure as noise under SPSA. Pass
+it to `make tune ARGS="--exclude ..."`.
+
+---
+
+
+### E19b — the three that survived, against the build before them
+
+**Date** 2026-08-29 · **Baseline** `prev-5917ef9-nnue` · **Bench** nnue 204156
+-> 185533 (d7), 3469791 -> 3134217 (d12)
+
+ProbCut, ttPv and the history split, with the cut-node retry removed. Same
+baseline, time control and book as the E19a batch measurement, which is what
+makes the two directly comparable.
+
+| | |
+|---|---|
+| TC / bounds | STC 8+0.08, [0, 5] normalized |
+| **Result** | **positive, NOT a verdict** — LLR 0.97 of 2.94 (33%) at 2596 games |
+| Elo | **+7.50 ± 8.71** (nElo +11.51 ± 13.37) |
+| Record | 758W / 702L / 1136D, 51.08% |
+| Ptnml | [51, 307, 539, 337, 64], PairsRatio 1.12 |
+| LOS | 95.42% |
+
+**Read the interval, not the point estimate.** [-1.2, +16.2] still contains
+zero. LOS 95.42% is suggestive and it is not the 97.5% a two-sided interval
+would need, let alone the LLR the test is actually waiting on. Nothing here is
+certified yet.
+
+**What it does establish is the removal.** The same three features, measured
+the same way with the cut-node retry still in them, scored **-11.74**. Taking
+one feature out moved the batch by **+19.2 Elo**, against a first ablation that
+had put the retry at +11.50 on its own. Two independent measurements of the
+same quantity, agreeing inside their intervals, on the one conclusion this
+round supports.
+
+It also retires the reading in E19a that the ablation point estimates implied
++36 Elo for these three. They are worth about +7.5, and the +36 was noise, as
+that entry said it probably was.
+
+**Still open**: this needs to run to a verdict, and then LTC confirmation before
+anything is claimed. Two of the three defaults - `ProbCutMargin` at 100 and
+`HistMalusMul` at 6 - were chosen to be defensible rather than fitted, so a
+tuner continuation is the obvious next lever on the same code.
+
+---
+
+### E19c — why E17 could not move seven of its parameters
+
+**Date** 2026-08-29 · **Not a game result.** A defect in `tools/tune.py`, found
+by working out what its own schedule does rather than by playing anything.
+
+E17 reported `CapHistDivisor`, `NmpEvalMax` and `HistBonusDepthMax` as
+"unchanged" after 2300 iterations. That was read at the time as those values
+already being right. It was not.
+
+Travel over a run is about `r_end * c_end * iterations * E[result]`, and
+`c_end` defaults to a twentieth of the declared range. Every parameter
+therefore gets the same *relative* travel, while every integer UCI option needs
+the same *absolute* resolution, which is one. Worked through at E17's settings:
+
+| c_end | example | travel per run | can it change the shipped integer? |
+|---|---|---|---|
+| 1.0 | `LmpBase`, `NmpBase`, `NmpEvalMax` | **0.46** | no - it needs 0.5 |
+| 1.6 | `CapHistDivisor`, `HistMalusMul` | 0.71 | barely |
+| 27.5 | `DeltaMargin` | 12.65 | yes (moved +102) |
+| 1536 | `LmrHistDivisor` | 706 | yes (moved -364) |
+
+Nine of twenty-five parameters sat below the threshold. The three E17 called
+unchanged are three of them. `LmpBase` is in the same group and moved 3 -> 7,
+which is the model working rather than against it: travel scales with signal,
+and that one was badly enough wrong to clear the bar anyway.
+
+**Two fixes, both in `tools/tune.py`.**
+
+*The step is now sized separately from the perturbation.* `c_end` goes on
+setting how far the two test engines differ; a new `step_c = max(c_end, 5.0)`
+sets how far the value moves. Travel for the nine goes 0.46 -> 2.30 and **no
+parameter's step got smaller** - every wide one is arithmetically identical, so
+E17's fit is not disturbed.
+
+*The gradient divides by the perturbation the engines actually saw.* The update
+divided by the float `ck`, but what reached the engines went through
+`int(round(clamp(...)))` on both sides, and near a bound the clamp can halve the
+separation or remove it. Dividing by `ck` there understates the gradient exactly
+where it is weakest. It now divides by `(plus - minus) / 2`, and skips a
+parameter whose two sides collapsed onto the same integer instead of dividing
+into noise.
+
+**And one parameter that was never tunable at all.** `HistBonusDepthMax` is
+`min(depth, cap)` over *remaining* depth, so a cap of 20 cannot bind until the
+search passes depth 20 - and at STC this engine reaches 12-13. It was inert,
+not weakly measurable, and E17's "unchanged" was a zero gradient rather than a
+noisy one. Its range now reaches 32 so an **LTC** sweep can move it. At STC it
+should be excluded from the fit; widening a range a parameter cannot influence
+only buys somewhere to random-walk, which is what the README warned about and
+was right to.
+
+A third fix was identified and deliberately not applied: stochastic rounding of
+the perturbed values, which would make the expected engine value continuous in
+the tuned value rather than a staircase between integer crossings. It changes
+every run's trajectory, so it wants to land on its own.
+
+---
+
+
 ## Absolute strength
 
 Every Elo figure above is relative to another build in `external\baselines`,

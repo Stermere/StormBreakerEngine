@@ -45,6 +45,25 @@ import common as c
 ALPHA = 0.602
 GAMMA = 0.101
 
+# Floor on the c_end used to size the STEP (not the perturbation).
+#
+# Travel over a run is about `r_end * c_end * iterations * E[result]`, and
+# `c_end` defaults to a twentieth of the declared range. So a parameter declared
+# [1, 10] takes a step some 1500x smaller than one declared [2048, 32768] - while
+# needing the same absolute resolution as every other integer option, which is
+# one. Worked through for E17's run, a parameter with `c_end = 1` travels about
+# 0.46 units in 2300 iterations and needs 0.5 to change the value that ships.
+#
+# E17 is the evidence: of its 21 parameters the three reported unchanged -
+# CapHistDivisor, NmpEvalMax, HistBonusDepthMax - were three of the four with
+# the smallest c_end.
+#
+# Flooring c_end for the step alone leaves every wide parameter's arithmetic
+# bit-identical and gives the narrow ones a step that can cross an integer. It
+# buys travel, and travel is symmetric: a parameter that can now move for signal
+# can also random-walk. The drift test in E17 is still what separates the two.
+STEP_C_FLOOR = 5.0
+
 # Spin options that are engine configuration rather than search parameters.
 NOT_TUNABLE = {
     "hash", "threads", "move overhead", "multipv", "ponder",
@@ -127,7 +146,15 @@ class Param:
 
     `r_end` sets the final step size relative to that perturbation. 0.002 is
     the value the engine-tuning community converged on; it is deliberately
-    small, because SPSA's gradient estimate is one noisy game batch.
+    small, because SPSA's gradient estimate is one noisy game batch. Note that
+    travel scales as `iterations * r_end`, so a value carried over from a
+    20000-iteration run onto a 2000-iteration one measures the gradient
+    precisely and then declines to act on it - which is exactly what E17's
+    first run did.
+
+    `step_c` is `c_end` floored at STEP_C_FLOOR, and it sizes the step while
+    `c_end` goes on sizing the perturbation. The two were the same number until
+    that turned out to leave narrow-range parameters unable to move at all.
     """
 
     def __init__(self, name, value, lo, hi, c_end=None, r_end=0.002):
@@ -138,6 +165,11 @@ class Param:
         self.start = float(value)
         self.c_end = float(c_end) if c_end else max(1.0, (hi - lo) / 20.0)
         self.r_end = float(r_end)
+
+        # Sizes the step; c_end still sizes the perturbation. Equal for every
+        # parameter wide enough that the floor does not bite, which is what
+        # keeps this change invisible to them. See STEP_C_FLOOR.
+        self.step_c = max(self.c_end, STEP_C_FLOOR)
 
     def clamp(self, v: float) -> float:
         return min(self.hi, max(self.lo, v))
@@ -254,7 +286,10 @@ class Tuner:
         """(a_k, c_k) for this iteration, in the standard SPSA schedule."""
         n = max(1, self.iterations)
         A = 0.1 * n
-        a_end = p.r_end * p.c_end**2
+        # p.step_c rather than a second p.c_end: the end-of-run step works out
+        # to `a_end / c_end`, so this makes it `r_end * step_c` and decouples
+        # how far the two test engines differ from how far the value moves.
+        a_end = p.r_end * p.c_end * p.step_c
         a = a_end * (A + n) ** ALPHA
         c0 = p.c_end * n**GAMMA
         k = self.iteration
@@ -301,7 +336,23 @@ class Tuner:
         result = 2.0 * r.score - 1.0
 
         for p, d, (ak, ck) in zip(self.params, deltas, gains):
-            p.value = p.clamp(p.value + ak * result / ck * d)
+            # Divide by the perturbation the two engines ACTUALLY differed by,
+            # not the one that was asked for. `ck` is a float; what reached the
+            # engines went through int(round(clamp(...))) on both sides, and
+            # near a bound the clamp can halve the separation or remove it
+            # outright. Dividing by ck there understates the gradient exactly
+            # where it is already weakest, which is how a parameter sitting on
+            # its own bound - HistBonusDepthMax at 20 of [4, 20] - reports as
+            # "unchanged" when it was never given a fair measurement.
+            #
+            # Both sides are integers, so a non-zero separation is at least 1
+            # and eff is at least 0.5. Zero means the two engines were the same
+            # binary configuration and the result carries no information about
+            # this parameter, whatever it says about the others.
+            eff = (plus[p.name] - minus[p.name]) / 2.0 * d
+            if eff <= 0.0:
+                continue
+            p.value = p.clamp(p.value + ak * result / eff * d)
 
         self.iteration += 1
         self.log_row(result, r.score)
