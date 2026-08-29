@@ -261,7 +261,7 @@ make datagen-test      # the gate above, on a few games. Seconds.
 ```
 
 ```
-datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16
+datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2 -tree 0
 datagen label <in.epd>... -o out.cnn -source human -nodes 10000 -resume
 datagen shuffle <in.cnn>... -o train.cnn -seed 1
 datagen verify <shard.cnn>... -relabel 500     # the gate; exits non-zero on failure
@@ -288,15 +288,14 @@ complete; keep `-threads` the same, since workers split the input by line.
 default, in the same order the parser reads them; the list below only covers
 the parts that are surprising.
 
-### Tree sampling is on by default
+### Tree sampling is off by default
 
-There is no flag to switch it on, which is worth stating plainly because there
-is no obvious place to look for one. `selfplay` samples the search tree unless
-told not to:
+`selfplay` does not sample the search tree unless asked, which is worth stating
+plainly because the flag reads like a knob on something already running:
 
 | Flag | Default | What it does |
 |---|---|---|
-| `-tree N` | 1 | interior nodes reservoir-sampled per played move; `-tree 0` turns tree sampling off and generates a game-line-only shard |
+| `-tree N` | 0 | interior nodes reservoir-sampled per played move; `-tree 0` is a game-line-only shard |
 | `-treedepth N` | 4 | remaining depth a node must still have to be eligible. Lower reaches into the leaf shell, which is overwhelmingly quiescence positions — the thing the stratification exists to avoid |
 
 A tree sample is a full record: it is re-searched, deduplicated and written
@@ -315,7 +314,58 @@ filter discards a fraction of the game-line positions and none of the tree
 ones, so the tree share always runs higher than `-tree` alone suggests. Set the
 mixture by generating the sources into separate shards and combining them.
 
-Four things came out differently from the sketch above, each for a reason.
+### Openings: a book, and a deliberately tiny perturbation
+
+Everything after the opening is deterministic. The search is fixed-node on one
+thread and nothing randomises the move choice, so **a game is a function of its
+start position and its random plies, and of nothing else.** That makes the
+opening the entire coverage story.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `-book <file.epd>` | none | draw each game's start uniformly from this EPD — a FEN per line, anything after it ignored, which is exactly what `tuner extract` writes |
+| `-opening N` | 2 with a book, 8 without | random legal plies played out of the start position |
+| `-openingscore N` | 800 | throw the game away if the opening is already decided by more than this |
+
+Only the line offsets of a book are held in memory, so a 50 MB book costs ~6 MB
+per worker rather than being loaded once per core.
+
+The two settings are one decision. Without a book, 8 random plies are how a
+game gets anywhere other than the same game every time — and they produce
+positions no one would play into. With a book, they are a **perturbation**, and
+they want to be small for a specific reason: two games that share a book line
+and differ by a couple of plies play out deterministically from near-identical
+positions, so the difference in their *results* is attributable to the
+perturbation rather than to noise. That is the only thing that makes the
+trainer's game-result term (`--lambda-end` below 1) worth anything. Long random
+openings destroy it, because then no two games share a position to contrast.
+
+The book decides which positions a generation ever sees, so it is pinned by
+hash in `job.env` (`BOOK_SHA`) exactly as the net is, and the shard manifest
+records its path and how many entries it indexed.
+
+**Building one.** `tuner extract` writes the format directly, and `-minply N
+-maxply N` bounds the sampling window to a single ply, which is one position
+per game:
+
+```sh
+tuner extract external/training/ccrl/split_4040/*.pgn -o raw.epd \
+    -minply 20 -maxply 20 -stride 1 -maxscore 300
+sed 's/ \[[0-9.]*\]$//' raw.epd | LC_ALL=C sort -u > external/books/ccrl4040_ply20.epd
+```
+
+The dedup is not optional. CCRL games are themselves played from a shared
+opening book, so the raw extract repeats itself heavily — 15% unique at ply 12,
+25% at ply 16, 42% at ply 20. 2.42M games give **793,495 unique** ply-20
+positions, and a book with 6× duplicates is a sampler that visits a sixth as
+much of the opening tree as its line count suggests.
+
+Deeper is better on both counts: more unique, and more of each game already
+decided by real play rather than by the engine's own preferences. Against
+`-opening 8` from the start position, the ply-20 book measures *more* decisive
+— 53.3% draws against 59.5% — and its games are 15 moves shorter.
+
+Five things came out differently from the sketch above, each for a reason.
 
 **`-threads N` runs N processes, not N threads.** `search.c`'s state is
 file-scope and the transposition table is one global allocation, so two
@@ -347,6 +397,13 @@ quietness would defeat the entire purpose of taking them — they are wanted
 *because* they are mid-tactic. Promotions are excluded alongside captures,
 which the sketch above did not say: a promotion moves as much material as a
 capture does.
+
+**The start position became an input.** The sketch listed four position sources
+and started every game from the initial position with random plies for
+variation, which quietly made the engine's own opening taste the only opening
+the net ever sees — and made the game result nearly uninformative, since two
+games share no position to attribute a differing result to. `-book` replaced
+that; see "Openings" above.
 
 ### What the first dataset looked like
 

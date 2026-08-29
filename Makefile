@@ -373,6 +373,21 @@ datagen-test: datagen
 	./datagen$(SUFFIX) stats $(DATAGEN_TEST_DIR)/all.cnn | head -12
 	@echo "PASS: datagen round-trips and its labels reproduce"
 
+# And that -book is actually where the games start. One book entry played with
+# -opening 0 makes the first record of the shard the book position itself,
+# which is the only assertion that separates "the book was read" from "the book
+# was opened and ignored" - and a book silently ignored is a generation of
+# start-position self-play wearing the manifest of something else.
+	@echo 'r1bq1rk1/pp2ppbp/2np1np1/8/2PNP3/2N1B3/PP2BPPP/R2QK2R w KQ - 0 9' > $(DATAGEN_TEST_DIR)/book.epd
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/book.cnn \
+	    -book $(DATAGEN_TEST_DIR)/book.epd -opening 0 -noquiet \
+	    -games 1 -nodes 2000 -seed 9 -quiet
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/book.cnn -relabel 16 -nodes 2000
+	@./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/book.cnn -n 1 \
+	    | grep -q '^r1bq1rk1/pp2ppbp/2np1np1/8/2PNP3/2N1B3/PP2BPPP/R2QK2R w KQ - 0 9;' \
+	    || { echo 'FAIL: -book did not supply the start position'; exit 1; }
+	@echo "PASS: -book starts games from the book"
+
 # ---------------------------------------------------------------- trainer --
 # PyTorch, its own virtualenv, not part of the C build and not subject to the C
 # style rules. See trainer/README.md.

@@ -77,6 +77,7 @@ static void *xmalloc(size_t n) {
 
 typedef struct {
     int minPly;     /* skip this many plies of opening theory */
+    int maxPly;     /* stop sampling past this ply; 0 for no cap */
     int stride;     /* keep one in this many eligible positions */
     int minElo;     /* skip games below this rating */
     int minBase;    /* skip games whose base time control is below this (s) */
@@ -340,6 +341,13 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
     char token[32];
 
     while (*p) {
+        /* Past the window there is nothing left to sample, and a PGN is mostly
+         * moves this game will never look at: stopping here is what makes
+         * `-minply N -maxply N` a cheap pass over a large corpus rather than a
+         * full SAN decode of every game in it. */
+        if (ex->opt.maxPly > 0 && ply > ex->opt.maxPly)
+            break;
+
         while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
             ++p;
         if (!*p)
@@ -531,6 +539,7 @@ static int cmd_extract(int argc, char **argv) {
     Extractor ex;
     memset(&ex, 0, sizeof(ex));
     ex.opt.minPly     = 12;
+    ex.opt.maxPly     = 0;
     ex.opt.stride     = 6;
     ex.opt.minElo     = 0;
     ex.opt.minBase    = 0;
@@ -547,6 +556,8 @@ static int cmd_extract(int argc, char **argv) {
             out = argv[++i];
         else if (!strcmp(argv[i], "-minply") && i + 1 < argc)
             ex.opt.minPly = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-maxply") && i + 1 < argc)
+            ex.opt.maxPly = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-stride") && i + 1 < argc)
             ex.opt.stride = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-minelo") && i + 1 < argc)
@@ -564,9 +575,13 @@ static int cmd_extract(int argc, char **argv) {
     }
 
     if (!out || !fileCount)
-        die("usage: tuner extract <pgn>... -o <data.epd> [-minply N] [-stride N]\n"
-            "                    [-minelo N] [-minbase SECONDS] [-maxscore CP] [-qply N]\n"
-            "                    [-threads N]");
+        die("usage: tuner extract <pgn>... -o <data.epd> [-minply N] [-maxply N]\n"
+            "                    [-stride N] [-minelo N] [-minbase SECONDS] [-maxscore CP]\n"
+            "                    [-qply N] [-threads N]\n"
+            "\n"
+            "  -minply N -maxply N together bound the sampling window. Equal values take\n"
+            "  at most one position per game, at exactly that ply, which is how an\n"
+            "  opening book for `datagen selfplay -book` gets made.");
     if (ex.opt.stride < 1)
         ex.opt.stride = 1;
 
@@ -574,8 +589,10 @@ static int cmd_extract(int argc, char **argv) {
     if (nt > fileCount)
         nt = fileCount;
 
-    printf("extracting: minPly=%d stride=%d minElo=%d minBase=%ds maxScore=%dcp, %d threads\n",
-           ex.opt.minPly, ex.opt.stride, ex.opt.minElo, ex.opt.minBase, ex.opt.maxScore, nt);
+    printf("extracting: minPly=%d maxPly=%d stride=%d minElo=%d minBase=%ds maxScore=%dcp, "
+           "%d threads\n",
+           ex.opt.minPly, ex.opt.maxPly, ex.opt.stride, ex.opt.minElo, ex.opt.minBase,
+           ex.opt.maxScore, nt);
 
     ExtractJob *jobs      = xmalloc((size_t)nt * sizeof(ExtractJob));
     ThreadHandle *handles = xmalloc((size_t)nt * sizeof(ThreadHandle));

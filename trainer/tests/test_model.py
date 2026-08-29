@@ -480,16 +480,30 @@ def test_unshuffled_chunks_preserve_file_order(shard_path):
 
 
 def test_only_a_chunks_last_batch_is_short(shard_path):
-    """A short batch in the middle would mean the permutation and the slicing
-    disagree about how many records the chunk had."""
+    """A batch that is neither batch_size nor its chunk's remainder would mean
+    the permutation and the slicing disagree about how many records the chunk
+    had.
+
+    Compared as a multiset rather than by position, because the chunk ORDER is
+    shuffled per epoch and the one short chunk lands wherever the permutation
+    puts it. The index arithmetic this replaced - short only when i + 1 divides
+    the batches-per-chunk - assumed every chunk was full length, and passed for
+    as long as the test shard's last chunk happened to divide by the batch size
+    exactly. It did until the records per shard moved, at which point the check
+    failed on a loader that was doing the right thing.
+    """
     dataset = ShuffledChunks(shard_path, batch_size=16, chunk_records=64)
     assert len(list(dataset)) == len(dataset)
 
-    per_chunk = 64 // 16
+    expected = []
+    for _, _, n in dataset.chunks:
+        expected += [16] * (n // 16)
+        if n % 16:
+            expected.append(n % 16)
+
     sizes = [b["white"].shape[0] for b in dataset]
-    for i, n in enumerate(sizes):
-        last_of_chunk = (i + 1) % per_chunk == 0 or i == len(sizes) - 1
-        assert n == 16 or last_of_chunk, f"batch {i} is {n} records"
+    assert sum(sizes) == dataset.records
+    assert sorted(sizes) == sorted(expected)
 
 
 def test_source_filtering_matches_between_the_two_loaders(shard_path):

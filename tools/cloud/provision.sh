@@ -30,10 +30,39 @@ STAMP="$WORK/.provisioned"
 # built (a -dirty stamp becomes a clean one) without COMMIT moving at all.
 PROVISION_REV=2
 
+# Deliberately without BOOK_SHA: the book is a RUNTIME input that datagen opens
+# by path, not a build input the way the net is, and changing it must not cost
+# the fleet a rebuild. fetch_book below is what keeps it in step instead.
 BUILDID="$COMMIT $ARCH $EVAL ${NET_SHA:-} rev$PROVISION_REV"
+
+# The opening book `selfplay -book` draws start positions from, by hash for the
+# same reason the net is: two books under one name are two datasets that nothing
+# downstream can tell apart. Absent BOOK_SHA, games start from the initial
+# position and this is a no-op.
+fetch_book() {
+    [ -n "${BOOK_SHA:-}" ] || return 0
+    require HUB HUB_DIR HUB_PORT
+
+    _dst="$WORK/external/books/book.epd"
+    mkdir -p "$WORK/external/books"
+
+    if [ -f "$_dst" ] && [ "$(sha256sum "$_dst" | cut -d' ' -f1)" = "$BOOK_SHA" ]; then
+        log "book $BOOK_SHA already present"
+        return 0
+    fi
+
+    hub_get "books/$BOOK_SHA.epd" "$_dst"
+    _got=$(sha256sum "$_dst" | cut -d' ' -f1)
+    [ "$_got" = "$BOOK_SHA" ] || die "book sha256 is $_got, expected $BOOK_SHA"
+    log "book $BOOK_SHA verified"
+}
 
 if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$BUILDID" ] && [ -x "$WORK/datagen" ]; then
     log "already provisioned for [$BUILDID]"
+    # Before the early exit, not after it: a box provisioned for this build by an
+    # earlier generation still needs whatever book THIS one names, and skipping
+    # that is a run that dies on its first batch.
+    fetch_book
     sha256sum "$WORK/datagen"
     exit 0
 fi
@@ -137,6 +166,11 @@ fi
 # data that is worse than useless, because nothing downstream would notice.
 log "running the datagen acceptance gate"
 make datagen-test "ARCH=$ARCH"
+
+# After the build, and after the dirty check above: external/ is gitignored, but
+# the order means a book download can never be what a "the build dirtied the
+# tree" failure is actually reporting.
+fetch_book
 
 printf '%s' "$BUILDID" > "$STAMP"
 log "provisioned"

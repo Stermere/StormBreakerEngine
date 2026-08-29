@@ -3,6 +3,7 @@
 #   .\tools\cloud\fleet.ps1 types           what SERVER_TYPE values actually exist
 #   .\tools\cloud\fleet.ps1 push-corpus     create the hub dirs, upload the corpus
 #   .\tools\cloud\fleet.ps1 push-net        publish the net EVAL=nnue pins by hash
+#   .\tools\cloud\fleet.ps1 push-book       publish the book BOOK_SHA pins by hash
 #   .\tools\cloud\fleet.ps1 prepare-corpus  one box, split the corpus, destroy it
 #   .\tools\cloud\fleet.ps1 calibrate   one box, measure records/sec, destroy it
 #   .\tools\cloud\fleet.ps1 up          create BOXES boxes, provision, launch
@@ -18,7 +19,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('up', 'down', 'status', 'logs', 'calibrate',
-                 'push-corpus', 'push-net', 'prepare-corpus', 'types')]
+                 'push-corpus', 'push-net', 'push-book', 'prepare-corpus', 'types')]
     [string]$Command = 'status',
 
     [Parameter(Position = 1)]
@@ -28,6 +29,8 @@ param(
 
     # push-corpus: the compressed corpus to upload.
     # push-net: the .nnue to upload, if not the exporter's default.
+    # push-book: the .epd to upload, if not the one in external\books\ that
+    #            already hashes to BOOK_SHA.
     [string]$Path,
 
     # prepare-corpus / calibrate: leave the throwaway box running afterwards.
@@ -317,6 +320,7 @@ function Initialize-Box([int]$i, [string]$ip) {
 function Invoke-Up {
     # Before the first create: a fleet that cannot provision should cost nothing.
     Assert-NetReady
+    Assert-BookReady
 
     Write-Section "Fleet up: $Gen, $Boxes x $($cfg['SERVER_TYPE'])"
     $ips = @()
@@ -492,6 +496,7 @@ function Invoke-Down {
 # comes from this number, not from an estimate.
 function Invoke-Calibrate {
     Assert-NetReady
+    Assert-BookReady
 
     Write-Section "Calibration: one $($cfg['SERVER_TYPE'])"
     $name = "$Gen-calib"
@@ -547,7 +552,9 @@ function Initialize-Hub {
     if ($LASTEXITCODE -ne 0) { throw "cannot create $HubDir/corpus on the hub" }
     & ssh @IdentityArgs -p $HubPort $HubUser mkdir -p "$HubDir/nets"
     if ($LASTEXITCODE -ne 0) { throw "cannot create $HubDir/nets on the hub" }
-    Write-Ok "hub tree ready: $HubDir/{corpus,nets}"
+    & ssh @IdentityArgs -p $HubPort $HubUser mkdir -p "$HubDir/books"
+    if ($LASTEXITCODE -ne 0) { throw "cannot create $HubDir/books on the hub" }
+    Write-Ok "hub tree ready: $HubDir/{corpus,nets,books}"
 }
 
 function Invoke-PushCorpus {
@@ -656,6 +663,83 @@ function Assert-NetReady {
     Publish-Net
 }
 
+function Test-BookOnHub([string]$Sha) {
+    $r = Invoke-Native 'ssh' ($IdentityArgs + @(
+        '-p', $HubPort, '-o', 'BatchMode=yes', $HubUser, "ls $HubDir/books/$Sha.epd"))
+    return $r.ExitCode -eq 0
+}
+
+<#
+The book is content-addressed for the same reason the net is: it is the sampler
+that decides which positions a generation ever sees, and two books under one
+filename produce two datasets nothing downstream can tell apart.
+
+Unlike the net there is no canonical local filename, so -Path wins and
+otherwise every .epd under external\books\ is hashed and the one that matches
+is used. That is a second of I/O on a file already in the page cache, and it
+means BOOK_SHA on its own is enough to drive this.
+#>
+function Get-LocalBook([string]$Sha) {
+    if ($Path) {
+        $got = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLower()
+        if ($got -ne $Sha.ToLower()) {
+            throw "book mismatch - refusing to upload.`n" +
+                  "    job.env BOOK_SHA : $Sha`n" +
+                  "    $Path : $got"
+        }
+        return $Path
+    }
+
+    $dir = Join-Path $RepoRoot 'external\books'
+    if (Test-Path $dir) {
+        foreach ($f in Get-ChildItem -Path $dir -Filter *.epd -File) {
+            $got = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLower()
+            if ($got -eq $Sha.ToLower()) { return $f.FullName }
+        }
+    }
+    throw "BOOK_SHA is $Sha but no .epd under external\books\ hashes to it.`n" +
+          "    Extract one (see docs/NNUE.md), or pass -Path <file>."
+}
+
+function Publish-Book {
+    $sha = ''
+    if ($cfg.ContainsKey('BOOK_SHA')) { $sha = $cfg['BOOK_SHA'] }
+    if (-not $sha) { throw "no BOOK_SHA in job.env - there is no book to publish." }
+
+    if (Test-BookOnHub $sha) {
+        Write-Ok "book $($sha.Substring(0, 12)) already on the hub"
+        return
+    }
+
+    $local = Get-LocalBook $sha
+    Initialize-Hub
+    $mb = [math]::Round((Get-Item $local).Length / 1MB)
+    Write-Host "  uploading $(Split-Path -Leaf $local) ($mb MB) as $sha.epd"
+
+    & scp @IdentityArgs -P $HubPort $local "${HubUser}:$HubDir/books/$sha.epd"
+    if ($LASTEXITCODE -ne 0) { throw "book upload failed" }
+
+    if (-not (Test-BookOnHub $sha)) {
+        throw "book uploaded but is not readable at $HubDir/books/$sha.epd"
+    }
+    Write-Ok "book $($sha.Substring(0, 12)) published"
+}
+
+# Same preflight argument as Assert-NetReady: provision.sh fetches the book and
+# cannot supply it, so a missing one has to be caught before a box is billed for
+# discovering it. Only selfplay reads a book; `label` ignores BOOK_SHA.
+function Assert-BookReady {
+    if (-not $cfg.ContainsKey('BOOK_SHA') -or -not $cfg['BOOK_SHA']) { return }
+    if (-not $cfg.ContainsKey('JOB') -or $cfg['JOB'] -ne 'selfplay') { return }
+    Write-Section 'Book -> hub'
+    Publish-Book
+}
+
+function Invoke-PushBook {
+    Write-Section 'Book -> hub'
+    Publish-Book
+}
+
 function Invoke-PushNet {
     Write-Section 'Net -> hub'
     if (-not $cfg.ContainsKey('EVAL') -or $cfg['EVAL'] -ne 'nnue') {
@@ -718,6 +802,7 @@ switch ($Command) {
     'calibrate' { Invoke-Calibrate }
     'push-corpus'    { Invoke-PushCorpus }
     'push-net'       { Invoke-PushNet }
+    'push-book'      { Invoke-PushBook }
     'prepare-corpus' { Invoke-PrepareCorpus }
     'types'          { Invoke-Types }
 }

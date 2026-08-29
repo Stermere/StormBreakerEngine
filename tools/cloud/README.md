@@ -113,9 +113,11 @@ generation ever needs to upload anything again.
 ## Running a generation
 
 ```powershell
-# 1. publish the net, if EVAL=nnue. Idempotent, and `up` and `calibrate`
-#    both do it for you - this exists for when you want it done early.
+# 1. publish the net, if EVAL=nnue, and the book, if JOB=selfplay. Both are
+#    idempotent, and `up` and `calibrate` do them for you - these exist for
+#    when you want it done early.
 .\tools\cloud\fleet.ps1 push-net
+.\tools\cloud\fleet.ps1 push-book
 
 # 2. size the fleet from a measurement, not from an estimate
 .\tools\cloud\fleet.ps1 calibrate
@@ -176,6 +178,34 @@ retention was 97.6% at 14-way — so expect roughly 2% additional duplicates.
 That is tolerable, and cheaper than a global dedup pass nobody has needed yet.
 Watch the retention `datagen stats` reports against that 97.6% baseline; a
 materially worse number is the trigger to add one.
+
+## The opening book (JOB=selfplay)
+
+A self-play generation is only as broad as the positions its games start from,
+and everything after the opening is deterministic — fixed nodes, one thread,
+no randomised move choice. So `BOOK_SHA` and `SELFPLAY_OPENING` are the two
+settings that decide what a generation covers.
+
+`BOOK_SHA` is the sha256 of an EPD on the hub under `books/`, fetched and
+re-verified by `provision.sh` exactly the way the net is, and for the same
+reason: a book is the sampler for the whole generation, and two books under one
+filename are two datasets nothing downstream can tell apart. Leave it empty and
+games start from the initial position, as every generation before `gen-005`
+did.
+
+```powershell
+.\tools\cloud\fleet.ps1 push-book     # idempotent; `up` and `calibrate` also do it
+```
+
+It finds the local file by hashing every `.epd` under `external\books\`, so
+`BOOK_SHA` alone drives it; `-Path` overrides. See docs/NNUE.md for how a book
+gets extracted out of the CCRL archive, and why `SELFPLAY_OPENING` wants to be
+2 and not 8.
+
+Unlike the net, the book is **not** part of the provisioning stamp — it is a
+runtime input, not a build input, so changing it does not cost the fleet a
+rebuild. `provision.sh` fetches it before its own early exit, so a box already
+provisioned for this commit still picks up a book the config gained later.
 
 ## Bootstrapping onto the net
 

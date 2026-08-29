@@ -101,6 +101,22 @@ run_label() {
 
 run_selfplay() {
     require SELFPLAY_GAMES SELFPLAY_BATCHES SELFPLAY_SEED_BASE SELFPLAY_SEED_STRIDE
+
+    # Built once, here, rather than per batch. Each knob is optional and falls
+    # through to datagen's own default when job.env does not name it, so a
+    # config from an earlier generation still describes the same job it did.
+    _sp_opts=""
+    if [ -n "${BOOK_SHA:-}" ]; then
+        [ -f external/books/book.epd ] \
+            || die "BOOK_SHA is set but external/books/book.epd is missing - reprovision"
+        _sp_opts="$_sp_opts -book external/books/book.epd"
+    fi
+    [ -z "${SELFPLAY_TREE:-}" ] || _sp_opts="$_sp_opts -tree $SELFPLAY_TREE"
+    [ -z "${SELFPLAY_OPENING:-}" ] || _sp_opts="$_sp_opts -opening $SELFPLAY_OPENING"
+    [ -z "${SELFPLAY_OPENING_SCORE:-}" ] \
+        || _sp_opts="$_sp_opts -openingscore $SELFPLAY_OPENING_SCORE"
+    log "selfplay options:${_sp_opts:- (datagen defaults)}"
+
     _i=0
     while [ "$_i" -lt "$SELFPLAY_BATCHES" ]; do
         if mine "$_i"; then
@@ -116,8 +132,11 @@ run_selfplay() {
                 # selfplay has no -resume: an interrupted batch is redone from
                 # scratch, which is why batches exist at all. Nothing is uploaded
                 # until datagen exits 0, so a partial shard never reaches the hub.
+                # $_sp_opts is deliberately unquoted: it is a built-up
+                # argument list, not one argument.
+                # shellcheck disable=SC2086
                 "$DATAGEN" selfplay -o "$_pat" -games "$SELFPLAY_GAMES" \
-                    -nodes "$NODES" -threads "$THREADS" -seed "$_seed"
+                    -nodes "$NODES" -threads "$THREADS" -seed "$_seed" $_sp_opts
 
                 verify_and_push "data/${GEN}_sp_b${_n}_00.cnn" \
                     "data/${GEN}_sp_b${_n}_*" "$_marker"

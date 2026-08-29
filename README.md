@@ -285,7 +285,18 @@ The open work, roughly in order of Elo per unit of effort:
    concentrates on the lines the engine already likes, so a corpus without
    variation teaches the net its own blind spots. The levers are opening-book
    spread, randomised early plies and tree sampling (`-tree`, see
-   [docs/NNUE.md](docs/NNUE.md)); none has been swept.
+   [docs/NNUE.md](docs/NNUE.md)).
+
+   `gen-004` is the first pass at the first two. `datagen selfplay` gained
+   `-book`, and the generation is configured to start every game from one of
+   793,495 unique ply-20 positions taken out of the CCRL 40/40 archive,
+   perturb it by two random plies, and then play deterministically. The
+   perturbation is small on purpose: play after it is a fixed-node search on
+   one thread, so two games that share a book line differ only by those plies,
+   and the difference in their *results* is then attributable to the
+   perturbation rather than to noise — which is the only thing that makes the
+   trainer's game-result term worth training on. **Nothing has been measured
+   yet**; the generation has not been run.
 
    One cheap thing first: the shipped net was exported at **epoch 20** and its
    validation loss bottomed at **epoch 4**. An epoch-4 export from the same

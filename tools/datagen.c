@@ -51,6 +51,7 @@
 #endif
 
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -501,6 +502,130 @@ static uint64_t rng_below(Rng *s, uint64_t n) {
 }
 
 /* ========================================================================== *
+ *  EPD input, and the opening book
+ *
+ *  Both subcommands read the same line format, so it is parsed in one place:
+ *  `label` consumes a corpus of them, and `selfplay` draws start positions
+ *  from one.
+ * ========================================================================== */
+
+/*
+ * One line of a tuner-style EPD: a FEN, optionally followed by `[1.0]`,
+ * `[0.5]` or `[0.0]` - the game result from WHITE's point of view, which is
+ * what tools/tuner.c writes. A line without one still labels fine; its WDL is
+ * simply unknown, and the trainer drops the game-result term for it.
+ */
+static bool parse_epd_line(char *line, char **fenOut, int *whiteResult) {
+    char *bracket = strchr(line, '[');
+    *whiteResult  = -1;
+
+    if (bracket) {
+        *whiteResult = (int)(strtod(bracket + 1, NULL) * 2.0 + 0.5); /* 0, 1 or 2 */
+        if (*whiteResult < 0 || *whiteResult > 2)
+            *whiteResult = -1;
+        *bracket = '\0';
+    }
+
+    char *c = line;
+    while (*c == ' ' || *c == '\t')
+        ++c;
+    size_t n = strlen(c);
+    while (n && (c[n - 1] == ' ' || c[n - 1] == '\t' || c[n - 1] == '\r' || c[n - 1] == '\n'))
+        c[--n] = '\0';
+
+    *fenOut = c;
+    return n > 0;
+}
+
+/*
+ * An opening book is an EPD, so `tuner extract` writes one directly and the
+ * usual test books need no conversion.
+ *
+ * Only the line offsets are held in memory. A deep book is a couple of hundred
+ * MB of text, there is one worker PROCESS per core, and a game reads exactly
+ * one line before spending seconds searching it - so holding the text would
+ * cost gigabytes per box to save a seek nothing can measure.
+ */
+typedef struct {
+    FILE *f;
+    uint64_t *offset; /* start of every line that is not blank or a comment */
+    size_t count;
+} Book;
+
+static void book_open(Book *b, const char *path) {
+    memset(b, 0, sizeof(*b));
+    b->f = xfopen(path, "rb");
+
+    size_t cap = 1u << 16;
+    b->offset  = xmalloc(cap * sizeof(uint64_t));
+
+    char buf[1 << 16];
+    uint64_t base  = 0;
+    bool lineStart = true;
+    size_t n;
+
+    while ((n = fread(buf, 1, sizeof(buf), b->f)) > 0) {
+        for (size_t i = 0; i < n; ++i) {
+            const char c = buf[i];
+            if (lineStart && c != '\n' && c != '\r' && c != '#') {
+                if (b->count == cap) {
+                    cap *= 2;
+                    uint64_t *grown = realloc(b->offset, cap * sizeof(uint64_t));
+                    if (!grown)
+                        die("out of memory indexing the book");
+                    b->offset = grown;
+                }
+                b->offset[b->count++] = base + i;
+            }
+            lineStart = c == '\n';
+        }
+        base += n;
+    }
+
+    if (ferror(b->f))
+        dief("cannot read book '%s': %s", path, strerror(errno));
+    if (!b->count)
+        dief("book '%s' has no positions in it", path);
+    /* fseek takes a long, which is 32-bit on Windows. Refuse a book that
+     * cannot be seeked rather than silently drawing from its first 2 GB. */
+    if (base > (uint64_t)LONG_MAX)
+        dief("book '%s' is %llu bytes, past the %ld this build can seek", path,
+             (unsigned long long)base, LONG_MAX);
+}
+
+/*
+ * Entry `index` as a FEN. False for a line this build cannot use, which costs
+ * the game that drew it and nothing else: a book is somebody else's file, and
+ * one unreadable line in it is not a reason to throw away a fleet's work.
+ */
+static bool book_fen(Book *b, size_t index, char *out, size_t cap) {
+    if (fseek(b->f, (long)b->offset[index], SEEK_SET) != 0)
+        return false;
+
+    char line[512];
+    if (!fgets(line, sizeof(line), b->f))
+        return false;
+
+    char *fen;
+    int ignored;
+    if (!parse_epd_line(line, &fen, &ignored))
+        return false;
+
+    const size_t n = strlen(fen);
+    if (n >= cap)
+        return false;
+    memcpy(out, fen, n + 1);
+    return true;
+}
+
+static void book_close(Book *b) {
+    if (b->f)
+        fclose(b->f);
+    free(b->offset);
+    memset(b, 0, sizeof(*b));
+}
+
+/* ========================================================================== *
  *  Deduplication
  *
  *  Siblings inside a subtree differ by one piece, and a game line repeats
@@ -701,6 +826,8 @@ typedef struct {
     bool dedup;
     /* selfplay only; ignored when `games` is zero */
     int games;
+    const char *book;
+    uint64_t bookEntries;
     int openingPlies;
     int openingMaxScore;
     int treeSamples;
@@ -758,6 +885,16 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     if (m->games) {
         fprintf(f, "  \"selfplay\": {\n");
         fprintf(f, "    \"games\": %d,\n", m->games);
+        /* Which book, and how many entries it indexed. The name alone does not
+         * pin a dataset: a book that grew between two generations is a
+         * different sampler wearing the same filename. */
+        fprintf(f, "    \"book\": ");
+        if (m->book)
+            json_string(f, m->book);
+        else
+            fprintf(f, "null");
+        fprintf(f, ",\n");
+        fprintf(f, "    \"book_entries\": %llu,\n", (unsigned long long)m->bookEntries);
         fprintf(f, "    \"opening_plies\": %d,\n", m->openingPlies);
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
         fprintf(f, "    \"tree_samples_per_move\": %d,\n", m->treeSamples);
@@ -1233,6 +1370,7 @@ typedef struct {
     int threads;
     uint64_t seed;
 
+    const char *book; /* EPD of start positions, or NULL for the start position */
     int openingPlies;
     int openingMaxScore;
 
@@ -1341,11 +1479,18 @@ static int wdl_for(GameResult r, Color stm) {
     return (whiteWon == (stm == WHITE)) ? WDL_WIN : WDL_LOSS;
 }
 
-/* Plays `plies` uniformly random legal moves from the start position. Without
- * randomisation every self-play game is the same game. */
+/*
+ * Plays `plies` uniformly random legal moves from `pos` as it already stands.
+ * Everything after this is deterministic - fixed nodes, one worker thread, no
+ * randomisation in move choice - so these plies are the ONLY variation two
+ * games from the same start position ever get.
+ *
+ * Which is why the count wants to be small when a book supplies the start: two
+ * games sharing a book line and differing by a couple of random plies then play
+ * out deterministically from near-identical positions, and the difference in
+ * their results is attributable to the perturbation rather than to noise.
+ */
 static bool random_opening(Position *pos, int plies, Rng *rng) {
-    board_set_startpos(pos);
-
     for (int i = 0; i < plies; ++i) {
         ScoredMove list[MAX_MOVES];
         const int n = movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_ALL, list);
@@ -1378,6 +1523,11 @@ static int selfplay_worker(int index, int workers, void *ctx) {
 
     tt_resize((size_t)o->hashMb);
 
+    Book book;
+    memset(&book, 0, sizeof(book));
+    if (o->book)
+        book_open(&book, o->book);
+
     ShardWriter writer;
     shard_open(&writer, path, o->policy);
 
@@ -1404,8 +1554,23 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         cands.count = 0;
 
         for (;;) {
+            /* Reached by a book line this build cannot set up, and by an
+             * opening the search says is already decided. Both are normal a few
+             * times; a hundred in a row means -openingscore is tighter than the
+             * book is balanced, or the file is not a book at all. */
             if (++attempts > 100)
-                die("could not find a playable opening in 100 attempts");
+                dief("no playable opening in 100 attempts (%s, -openingscore %d)",
+                     o->book ? o->book : "start position", o->openingMaxScore);
+
+            if (o->book) {
+                char bookFen[FEN_MAX_LEN];
+                const uint64_t entry = rng_below(&rng, (uint64_t)book.count);
+                if (!book_fen(&book, (size_t)entry, bookFen, sizeof(bookFen)) ||
+                    !board_set_fen(&pos, bookFen))
+                    continue;
+            } else {
+                board_set_startpos(&pos);
+            }
 
             if (!random_opening(&pos, o->openingPlies, &rng))
                 continue;
@@ -1568,6 +1733,8 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.seed            = (uint64_t)(o->seed + (uint64_t)index * 0x9E3779B97F4A7C15ULL);
     man.dedup           = o->dedup;
     man.games           = games;
+    man.book            = o->book;
+    man.bookEntries     = (uint64_t)book.count;
     man.openingPlies    = o->openingPlies;
     man.openingMaxScore = o->openingMaxScore;
     man.treeSamples     = sampler.want;
@@ -1585,6 +1752,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     if (o->dedup)
         keyset_free(&seen);
     free(cands.items);
+    book_close(&book);
 
     if (!Quiet)
         fprintf(stdout, "[w%02d] wrote %llu records to %s\n", index,
@@ -1595,10 +1763,10 @@ static int selfplay_worker(int index, int workers, void *ctx) {
 static void usage_selfplay(void) {
     printf("datagen selfplay -o <shard%%02d.cnn> [options]\n"
            "\n"
-           "Plays games from randomised openings, samples positions from the game line\n"
-           "AND from inside the search trees, then re-searches every one of them from a\n"
-           "cleared engine to produce the label. Writes <shard>.cnn, <shard>.pol and\n"
-           "<shard>.json.\n"
+           "Plays games from book or randomised openings, samples positions from the\n"
+           "game line AND from inside the search trees, then re-searches every one of\n"
+           "them from a cleared engine to produce the label. Writes <shard>.cnn,\n"
+           "<shard>.pol and <shard>.json.\n"
            "\n"
            "output and scale\n"
            "  -o <pattern>       output shard. %%02d is replaced by the worker index; with\n"
@@ -1608,18 +1776,24 @@ static void usage_selfplay(void) {
            "  -nodes N           fixed nodes per search. Never fixed time: time would\n"
            "                     make labels depend on the machine.       (10000)\n"
            "  -threads N         worker PROCESSES, each with its own private hash. (1)\n"
-           "  -hash MB           hash per worker.                         (8)\n"
+           "  -hash MB           hash per worker.                        (64)\n"
            "  -seed N            base RNG seed; worker k derives its own.  (1)\n"
            "\n"
-           "tree sampling  (off by default - it is most of the dataset)\n"
+           "tree sampling  (off by default - when on, it is most of the dataset)\n"
            "  -tree N            interior nodes reservoir-sampled per played move, 0 to\n"
-           "                     switch tree sampling off entirely.       (1, max 8)\n"
+           "                     switch tree sampling off entirely.       (0, max 8)\n"
            "  -treedepth N       remaining depth a node must still have to be eligible.\n"
            "                     Lower reaches the leaf shell, which is mostly\n"
            "                     quiescence positions.                    (4)\n"
            "\n"
            "openings\n"
-           "  -opening N         random plies played before the game starts. (8)\n"
+           "  -book <file.epd>   draw each game's start position uniformly from this EPD\n"
+           "                     (a FEN per line, anything after it ignored - what\n"
+           "                     `tuner extract` writes). Default: the start position.\n"
+           "  -opening N         random plies played before the game starts, and the only\n"
+           "                     variation there is: everything after them is\n"
+           "                     deterministic. Out of a book this is a perturbation and\n"
+           "                     wants to be small.        (2 with -book, otherwise 8)\n"
            "  -openingscore N    discard the game if the opening is already decided by\n"
            "                     more than this many centipawns.          (800)\n"
            "\n"
@@ -1649,13 +1823,17 @@ static int cmd_selfplay(int argc, char **argv) {
 
     SelfplayOpts o;
     memset(&o, 0, sizeof(o));
-    o.out             = NULL;
-    o.games           = 100;
-    o.nodes           = 10000;
-    o.hashMb          = 64;
-    o.threads         = 1;
-    o.seed            = 1;
-    o.openingPlies    = 8;
+    o.out     = NULL;
+    o.games   = 100;
+    o.nodes   = 10000;
+    o.hashMb  = 64;
+    o.threads = 1;
+    o.seed    = 1;
+    o.book    = NULL;
+    /* Resolved below, once it is known whether a book was given: 8 random plies
+     * are how a game from the start position gets anywhere at all, and are far
+     * too many to play on top of a book line that was chosen for its depth. */
+    o.openingPlies    = -1;
     o.openingMaxScore = 800;
     o.treeSamples     = 0;
     o.treeMinDepth    = 4;
@@ -1684,6 +1862,8 @@ static int cmd_selfplay(int argc, char **argv) {
             o.threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-seed") && i + 1 < argc)
             o.seed = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "-book") && i + 1 < argc)
+            o.book = argv[++i];
         else if (!strcmp(argv[i], "-opening") && i + 1 < argc)
             o.openingPlies = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-openingscore") && i + 1 < argc)
@@ -1730,6 +1910,14 @@ static int cmd_selfplay(int argc, char **argv) {
         die("-threads must be between 1 and 64");
     if (o.dedupBits < 10 || o.dedupBits > 30)
         die("-dedupbits must be between 10 and 30");
+    if (o.openingPlies < 0)
+        o.openingPlies = o.book ? 2 : 8;
+    /* Every worker opens the book for itself, so an unreadable one is N
+     * identical deaths several seconds in. Say it once, here, first. */
+    if (o.book) {
+        FILE *probe = xfopen(o.book, "rb");
+        fclose(probe);
+    }
 
     /* Once, here, rather than N times inside N workers. */
     char probe[PATH_CAP];
@@ -1765,34 +1953,6 @@ typedef struct {
     bool policy;
     bool resume;
 } LabelOpts;
-
-/*
- * One line of a tuner-style EPD: a FEN, optionally followed by `[1.0]`,
- * `[0.5]` or `[0.0]` - the game result from WHITE's point of view, which is
- * what tools/tuner.c writes. A line without one still labels fine; its WDL is
- * simply unknown, and the trainer drops the game-result term for it.
- */
-static bool parse_epd_line(char *line, char **fenOut, int *whiteResult) {
-    char *bracket = strchr(line, '[');
-    *whiteResult  = -1;
-
-    if (bracket) {
-        *whiteResult = (int)(strtod(bracket + 1, NULL) * 2.0 + 0.5); /* 0, 1 or 2 */
-        if (*whiteResult < 0 || *whiteResult > 2)
-            *whiteResult = -1;
-        *bracket = '\0';
-    }
-
-    char *c = line;
-    while (*c == ' ' || *c == '\t')
-        ++c;
-    size_t n = strlen(c);
-    while (n && (c[n - 1] == ' ' || c[n - 1] == '\t' || c[n - 1] == '\r' || c[n - 1] == '\n'))
-        c[--n] = '\0';
-
-    *fenOut = c;
-    return n > 0;
-}
 
 static int label_worker(int index, int workers, void *ctx) {
     const LabelOpts *o = (const LabelOpts *)ctx;
