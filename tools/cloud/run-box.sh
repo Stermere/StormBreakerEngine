@@ -46,8 +46,26 @@ verify_and_push() {
     _glob="$2"
     _marker="$3"
 
-    log "verifying $_first"
-    "$DATAGEN" verify "$_first" -relabel 256 -nodes "$NODES"
+    # -nodes and -hash come from the shard's own manifest rather than from
+    # job.env. A label reproduces only under the conditions it was made under,
+    # and the hash size is one of them: search_clear() empties the table but
+    # keeps its geometry, so a position collides differently in a 64 MB table
+    # than in an 8 MB one and roughly one record in a thousand scores
+    # differently. `selfplay` labels with 64 MB and `verify` used to default to
+    # 8, which failed one sampled record in every few shards for no reason -
+    # after hours of selfplay that had produced perfectly good data.
+    #
+    # datagen reads the manifest itself now. The binary here was built at
+    # $COMMIT and may predate that, so pass the values explicitly; when both
+    # know, they agree and nothing warns.
+    _man="${_first%.cnn}.json"
+    [ -f "$_man" ] || die "no manifest beside $_first"
+    _nodes=$(sed -n 's/.*"nodes": *\([0-9][0-9]*\).*/\1/p' "$_man" | head -1)
+    _hash=$(sed -n 's/.*"hash_mb": *\([0-9][0-9]*\).*/\1/p' "$_man" | head -1)
+    [ -n "$_nodes" ] && [ -n "$_hash" ] || die "$_man records no nodes/hash_mb"
+
+    log "verifying $_first at $_nodes nodes, $_hash MB"
+    "$DATAGEN" verify "$_first" -relabel 256 -nodes "$_nodes" -hash "$_hash"
 
     log "uploading $_glob"
     for _f in $_glob; do
@@ -107,9 +125,12 @@ run_selfplay() {
     # config from an earlier generation still describes the same job it did.
     _sp_opts=""
     if [ -n "${BOOK_SHA:-}" ]; then
-        [ -f external/books/book.epd ] \
-            || die "BOOK_SHA is set but external/books/book.epd is missing - reprovision"
-        _sp_opts="$_sp_opts -book external/books/book.epd"
+        # Named for its hash, so the shard manifest records WHICH book the games
+        # were drawn from. gen-004 is extended with a second book; under one
+        # filename the two would be indistinguishable after the fact.
+        _book="external/books/book-$BOOK_SHA.epd"
+        [ -f "$_book" ] || die "BOOK_SHA is set but $_book is missing - reprovision"
+        _sp_opts="$_sp_opts -book $_book"
     fi
     [ -z "${SELFPLAY_TREE:-}" ] || _sp_opts="$_sp_opts -tree $SELFPLAY_TREE"
     [ -z "${SELFPLAY_OPENING:-}" ] || _sp_opts="$_sp_opts -opening $SELFPLAY_OPENING"

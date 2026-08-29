@@ -39,11 +39,16 @@ BUILDID="$COMMIT $ARCH $EVAL ${NET_SHA:-} rev$PROVISION_REV"
 # same reason the net is: two books under one name are two datasets that nothing
 # downstream can tell apart. Absent BOOK_SHA, games start from the initial
 # position and this is a no-op.
+#
+# The hash is in the FILENAME, not just on the hub, because the shard manifest
+# records the path datagen was handed. Landing every book as book.epd made that
+# field constant and threw the identity away at the last step - which bites the
+# moment one generation is extended with a second book, as gen-004 was.
 fetch_book() {
     [ -n "${BOOK_SHA:-}" ] || return 0
     require HUB HUB_DIR HUB_PORT
 
-    _dst="$WORK/external/books/book.epd"
+    _dst="$WORK/external/books/book-$BOOK_SHA.epd"
     mkdir -p "$WORK/external/books"
 
     if [ -f "$_dst" ] && [ "$(sha256sum "$_dst" | cut -d' ' -f1)" = "$BOOK_SHA" ]; then

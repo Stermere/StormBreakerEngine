@@ -922,6 +922,49 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     fclose(f);
 }
 
+/*
+ * Reads one integer field back out of a shard's manifest.
+ *
+ * Deliberately a scanner and not a parser: the fields `verify` needs are the
+ * flat integers manifest_write emits one per line, and a JSON parser here
+ * would be a dependency earned by two call sites. The pattern matched is
+ * exactly what is written above - `"key": <int>` - so a nested key of the same
+ * name is unreachable, which is the one ambiguity worth caring about.
+ *
+ * False when there is no manifest or no such field. That is not an error: a
+ * shard from an older datagen, or one whose .json did not travel with it,
+ * still verifies - just against the caller's defaults.
+ */
+static bool manifest_int(const char *shardPath, const char *key, int *out) {
+    char path[PATH_CAP];
+    replace_ext(path, sizeof(path), shardPath, ".json");
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        const char *at = strstr(line, pattern);
+        if (!at)
+            continue;
+        at += strlen(pattern);
+        char *end    = NULL;
+        const long v = strtol(at, &end, 10);
+        if (end != at && v > 0 && v <= INT_MAX) {
+            *out  = (int)v;
+            found = true;
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
 /* ========================================================================== *
  *  Shard writer
  * ========================================================================== */
@@ -2462,6 +2505,26 @@ static int cmd_shuffle(int argc, char **argv) {
     man.command = "shuffle";
     man.inputs  = joined;
     man.seed    = seed;
+    /* Carry the labelling conditions forward when every input agrees on them.
+     * Shuffling reorders records without relabelling any, so the output was
+     * labelled at the same nodes and hash as its inputs - and `verify -relabel`
+     * needs both to reproduce a score. Left at zero when the inputs disagree or
+     * do not say, which readers take as "not recorded". */
+    for (int i = 0; i < inputCount; ++i) {
+        int n = 0, h = 0;
+        const bool haveNodes = manifest_int(inputs[i], "nodes", &n);
+        const bool haveHash  = manifest_int(inputs[i], "hash_mb", &h);
+        if (i == 0) {
+            man.nodes  = haveNodes ? n : 0;
+            man.hashMb = haveHash ? h : 0;
+        } else {
+            if (!haveNodes || n != man.nodes)
+                man.nodes = 0;
+            if (!haveHash || h != man.hashMb)
+                man.hashMb = 0;
+        }
+    }
+
     manifest_write(out, &man, written, bySource, policy);
 
     fprintf(stdout, "shuffled %llu records into %s\n", (unsigned long long)written, out);
@@ -2719,12 +2782,13 @@ static void usage_verify(void) {
            "  2. the .pol sidecar is still aligned: every move it holds was produced for\n"
            "     that record's position, so every one must be legal in it;\n"
            "  3. with -relabel, that a label re-searched from scratch reproduces the\n"
-           "     score it was stored with. Use the SAME -nodes the shard was made with,\n"
-           "     or every record will look wrong.\n"
+           "     score it was stored with. Both the node count and the hash size are\n"
+           "     part of how a label was made, and both are taken from the shard's own\n"
+           "     manifest; name one on the command line only to override it.\n"
            "\n"
            "  -relabel N         re-search N randomly chosen records.     (0, max 4096)\n"
-           "  -nodes N           nodes for those re-searches.             (10000)\n"
-           "  -hash MB           hash for those re-searches.              (8)\n"
+           "  -nodes N           nodes for those re-searches.        (manifest, or 10000)\n"
+           "  -hash MB           hash for those re-searches.             (manifest, or 8)\n"
            "  -seed N            which records get sampled.               (1)\n"
            "  -quiet             progress lines off.\n");
 }
@@ -2741,15 +2805,21 @@ static int cmd_verify(int argc, char **argv) {
     int nodes      = 10000;
     int hashMb     = 8;
     uint64_t seed  = 1;
+    /* Both are read from the shard's manifest below unless the caller names
+     * them, so the defaults above only survive for a shard with no .json. */
+    bool nodesGiven = false;
+    bool hashGiven  = false;
 
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "-relabel") && i + 1 < argc)
             relabel = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-nodes") && i + 1 < argc)
-            nodes = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-hash") && i + 1 < argc)
-            hashMb = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-seed") && i + 1 < argc)
+        else if (!strcmp(argv[i], "-nodes") && i + 1 < argc) {
+            nodes      = atoi(argv[++i]);
+            nodesGiven = true;
+        } else if (!strcmp(argv[i], "-hash") && i + 1 < argc) {
+            hashMb    = atoi(argv[++i]);
+            hashGiven = true;
+        } else if (!strcmp(argv[i], "-seed") && i + 1 < argc)
             seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-quiet"))
             Quiet = true;
@@ -2767,6 +2837,63 @@ static int cmd_verify(int argc, char **argv) {
 
     if (relabel > 4096)
         relabel = 4096;
+
+    /*
+     * A label reproduces only under the conditions it was made under, and the
+     * hash size is one of them. `search_clear()` empties the table but keeps
+     * its geometry, so the same position at the same node count collides
+     * differently in an 8 MB table than in a 64 MB one and occasionally scores
+     * differently - about one record in a thousand. That is invisible in a spot
+     * check and fatal to a 256-record gate, and it bit exactly once per
+     * selfplay shard: `selfplay` defaults to 64 MB and this gate to 8.
+     *
+     * The manifest already records both numbers. Reading them back is what
+     * makes the gate check the shard rather than the caller's memory of it.
+     */
+    if (relabel > 0) {
+        int manNodes = 0, manHash = 0;
+        bool haveNodes = false, haveHash = false;
+
+        for (int i = 0; i < inputCount; ++i) {
+            int v;
+            if (manifest_int(inputs[i], "nodes", &v)) {
+                if (haveNodes && v != manNodes)
+                    die("these shards were labelled at different node counts - one relabel run "
+                        "can only use one, so verify them separately");
+                manNodes  = v;
+                haveNodes = true;
+            }
+            if (manifest_int(inputs[i], "hash_mb", &v)) {
+                if (haveHash && v != manHash)
+                    die("these shards were labelled with different hash sizes - one relabel run "
+                        "can only use one, so verify them separately");
+                manHash  = v;
+                haveHash = true;
+            }
+        }
+
+        if (haveNodes && nodesGiven && nodes != manNodes)
+            fprintf(stderr,
+                    "datagen: -nodes %d overrides the manifest's %d - every record will "
+                    "look wrong\n",
+                    nodes, manNodes);
+        else if (haveNodes)
+            nodes = manNodes;
+
+        if (haveHash && hashGiven && hashMb != manHash)
+            fprintf(stderr,
+                    "datagen: -hash %d overrides the manifest's %d - expect spurious "
+                    "mismatches\n",
+                    hashMb, manHash);
+        else if (haveHash)
+            hashMb = manHash;
+
+        if (!haveNodes || !haveHash)
+            fprintf(stderr,
+                    "datagen: %s has no manifest to read the labelling conditions from - "
+                    "relabelling at %d nodes, %d MB\n",
+                    inputs[0], nodes, hashMb);
+    }
 
     RelabelSample *samples = relabel ? xmalloc((size_t)relabel * sizeof(RelabelSample)) : NULL;
     int sampleCount        = 0;
@@ -2892,7 +3019,8 @@ static int cmd_verify(int argc, char **argv) {
     uint64_t mismatched = 0;
     if (sampleCount) {
         tt_resize((size_t)hashMb);
-        fprintf(stdout, "relabel:    re-searching %d records at %d nodes\n", sampleCount, nodes);
+        fprintf(stdout, "relabel:    re-searching %d records at %d nodes, %d MB hash\n",
+                sampleCount, nodes, hashMb);
 
         for (int i = 0; i < sampleCount; ++i) {
             Position p;

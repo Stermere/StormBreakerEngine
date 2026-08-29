@@ -397,11 +397,18 @@ foreach ($g in $groups) {
 #
 # -relabel is given the -nodes AND the -hash the pass actually used, both read
 # from the shard's own manifest rather than from job.env, which can have moved on
-# since the generation was produced. Nodes are the one that bites: a re-search at
-# a different node count disagrees with almost every label. Hash size is harmless
-# at these counts - a 10k-node search from a cleared table never fills even 8 MB,
-# and 8 MB against 128 MB was measured at 0 differences in 256 - but it costs
-# nothing to pass it and it removes the question from the list of suspects.
+# since the generation was produced. Nodes are the one that bites hardest: a
+# re-search at a different node count disagrees with almost every label.
+#
+# Hash size was once believed harmless here - "8 MB against 128 MB, 0 differences
+# in 256" - and that belief was wrong. 256 samples at the true rate of roughly one
+# in a thousand finds nothing about three times in four, so the measurement never
+# had the power to see what it concluded. gen-004 found it the expensive way: the
+# fleet's own gate defaulted to 8 MB against selfplay's 64 and failed two boxes,
+# twice each, on one sampled record out of 256 after hours of good selfplay.
+# search_clear() empties the table but keeps its geometry, so the table size
+# decides which entries collide, and a collision that changes a score is rare
+# rather than impossible.
 $sampleFile = Get-ChildItem $MergeDir -Filter '*.cnn' | Select-Object -First 1
 $sample     = $sampleFile.FullName
 
