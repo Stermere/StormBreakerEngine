@@ -9,6 +9,7 @@ This engine landed at a strength of ~2800 Elo when playing against Stockfish wit
 Using that engine as a teacher, a NNUE was trained to reproduce the evaluation of the classical engine at 10k nodes using 200 million positions pulled from human games.
 The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish with UCI_Elo set to 3000.
 
+Adding on a correction history and an SPSA tuned search brought this to ~3095 Elo at 40+0.4, beating Stockfish with UCI_Elo set to 3000 (60.3%) and losing to it at 3190 (39.5%).
 
 ---
 
@@ -46,8 +47,10 @@ The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish 
 | NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
 | Correction history (pawn-structure keyed, +25.8 Elo) | complete |
 | Correction history: minor / non-pawn / continuation keys | tried, neutral (E16), reverted |
-| **NNUE: re-tuned search margins, then the default switches** | **TODO** |
-| **Next data generation, labelled by the network rather than by `eval.c`** | **TODO** |
+| NNUE: re-tuned search parameters (21 by SPSA, +66.1 Elo, E17) | complete |
+| **NNUE: the default evaluation switches to the network** | **TODO** |
+| Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
+| **Self-play data generation with deliberate variation** | **TODO** |
 | **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
@@ -266,15 +269,27 @@ The open work, roughly in order of Elo per unit of effort:
    related reason — SPSA perturbs continuously and the engine takes an int, so
    both sides of a gradient estimate round to the same small integer and the
    measurement is noise. Those want a sweep of their own.
-2. **The next generation of training data, labelled by the network.** Every
-   label in `gen-001` came from a 10,000-node search using the *classical*
-   evaluation, because that was the only evaluation that existed when it was
-   generated. That teacher is now the weaker of the two. Re-labelling at the
-   same node count with `EVAL=nnue` costs nothing but machine time and raises
-   the ceiling on every net trained afterwards — which is the bootstrap loop
-   [docs/NNUE.md](docs/NNUE.md) is built around, and the single largest item
-   on this list. `gen-001` is also 100% `human`-sourced; the self-play arm is
-   configured in `tools/cloud/job.env` and has never been run.
+2. **Self-play data with deliberate variation.** The item that sat here called
+   re-labelling the human corpus with the stronger engine "the single largest
+   item on this list". It has been run, and it was worth something but not
+   that: `gen-003` re-labelled 178.8M human positions with engine `0.2.0-dev`
+   against `gen-001`'s `0.1.0-dev`, and the net it produced is the one the
+   engine now ships. It is ahead of the `gen-012` hybrid net by a point
+   estimate of 49 Elo, which does not separate from noise, where the previous
+   step was worth ~50 (E18).
+
+   Read that as label quality no longer being the binding constraint —
+   **coverage is**. A better label on a position the net already predicts well
+   teaches it nothing, and a human corpus is fixed in what it covers however
+   good the labeller gets. Self-play then has the opposite problem: it
+   concentrates on the lines the engine already likes, so a corpus without
+   variation teaches the net its own blind spots. The levers are opening-book
+   spread, randomised early plies and tree sampling (`-tree`, see
+   [docs/NNUE.md](docs/NNUE.md)); none has been swept.
+
+   One cheap thing first: the shipped net was exported at **epoch 20** and its
+   validation loss bottomed at **epoch 4**. An epoch-4 export from the same
+   `gen-003` data has never been tried, and it costs four epochs of GPU time.
 3. **Widening past 1024 is now gated on data, not on time.** The item that sat
    here said the net stopped at epoch 3 and 512 hidden units, half the designed
    width, and called both free Elo. Both are done: the shipped net is
@@ -284,8 +299,14 @@ The open work, roughly in order of Elo per unit of effort:
    — someone reads it and goes looking for Elo that has already been spent.
    `--hidden` accepts up to 2048, but the binding constraint has changed: 24576
    feature rows need a dataset where each row is seen more than a handful of
-   times, so further width waits on step 2. Check the net a build is carrying
-   with `make nnue-info` before trusting any width written down here.
+   times, so further width waits on step 2.
+
+   **Do not trust any net identity written down here, including the one above.**
+   `external/nets/net.json` describes whichever net was *exported* last, which
+   is not necessarily the one in `external/nets/net.nnue` — `make net-fetch`
+   replaces the net without touching the metadata beside it. The pinned net is
+   `NET_SHA256` in the Makefile; what a given binary actually carries is
+   `make nnue-info`. Those two are the only reliable answers.
 4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
    and the accumulator stack in `src/nnue.c` are file-scope and must move into
    a per-thread block first. Worth nothing in a single-threaded SPRT and worth

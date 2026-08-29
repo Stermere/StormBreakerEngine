@@ -58,8 +58,8 @@ NET      ?= external/nets/net.pt
 #  docs/EXPERIMENTS.md records WHY that one was adopted, beside the SPRT that
 #  adopted it. Bump them together. tools/publish-net.ps1 uploads a net and
 #  prints the replacement lines.
-NET_TAG    ?= net-0e35d891b25a
-NET_SHA256 ?= 0e35d891b25a691339ec4038d57526ad0e1642a51f80ce942d6f67512e381918
+NET_TAG    ?= net-1f36c07f4507
+NET_SHA256 ?= 1f36c07f4507d96404a2a4db8206cd7829cff5ae9ffca22d32036fc05ee4967c
 NET_URL    ?= https://github.com/Stermere/StormBreakerEngine/releases/download/$(NET_TAG)/net.nnue
 
 # `CC ?= gcc` would NOT work here: make predefines CC as `cc`, so the variable

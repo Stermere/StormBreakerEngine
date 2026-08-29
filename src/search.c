@@ -349,7 +349,7 @@ static inline void count_node(void) {
 #define TUNABLE(name, def) enum { name = (def) }
 #endif
 
-TUNABLE(RFP_MARGIN, 80); /* reverse futility: how far above beta is "safely won" */
+TUNABLE(RFP_MARGIN, 59); /* reverse futility: how far above beta is "safely won" */
 #define RFP_DEPTH 7
 
 #define LMP_DEPTH 8 /* deepest node that will discard its late quiet moves */
@@ -367,7 +367,7 @@ TUNABLE(RFP_MARGIN, 80); /* reverse futility: how far above beta is "safely won"
  * tree. The useful range is narrow and the whole curve is worth re-measuring
  * before anyone "corrects" this number upwards.
  */
-TUNABLE(FUTILITY_MARGIN, 40);
+TUNABLE(FUTILITY_MARGIN, 52);
 
 /* Half-width of the first aspiration window, and the depth below which the
  * previous score is too unreliable to aim one at. */
@@ -387,7 +387,7 @@ TUNABLE(FUTILITY_MARGIN, 40);
  * certain no quiet move here recovers the deficit. Verified rather than
  * assumed - the qsearch actually runs, and only its result can prune.
  */
-TUNABLE(RAZOR_MARGIN, 240);
+TUNABLE(RAZOR_MARGIN, 292);
 #define RAZOR_DEPTH 3
 
 /*
@@ -400,9 +400,9 @@ TUNABLE(RAZOR_MARGIN, 240);
  * should rise much faster as depth falls.
  */
 #define SEE_CAPTURE_DEPTH 6
-TUNABLE(SEE_CAPTURE_MARGIN, 100);
+TUNABLE(SEE_CAPTURE_MARGIN, 94);
 #define SEE_QUIET_DEPTH 8
-TUNABLE(SEE_QUIET_MARGIN, 28);
+TUNABLE(SEE_QUIET_MARGIN, 26);
 
 /*
  * Delta pruning margin for quiescence.
@@ -412,7 +412,7 @@ TUNABLE(SEE_QUIET_MARGIN, 28);
  * outright is not going to raise it. The margin has to cover what the rest of
  * the sequence might swing, which is why it is a piece rather than a pawn.
  */
-TUNABLE(DELTA_MARGIN, 200);
+TUNABLE(DELTA_MARGIN, 302);
 
 /*
  * Singular extension: the shallowest depth worth testing, and how far below
@@ -426,7 +426,7 @@ TUNABLE(DELTA_MARGIN, 200);
  * still does.
  */
 #define SINGULAR_DEPTH 7
-TUNABLE(SINGULAR_MARGIN, 32);
+TUNABLE(SINGULAR_MARGIN, 38);
 
 /*
  * How much the correction is believed, out of CORR_W_UNIT.
@@ -438,7 +438,7 @@ TUNABLE(SINGULAR_MARGIN, 32);
  * a person, and it was never fitted, only chosen.
  */
 #define CORR_W_UNIT 128
-TUNABLE(CORR_W_PAWN, 128);
+TUNABLE(CORR_W_PAWN, 132);
 
 /*
  * ---------------------------------------------------------------------------
@@ -460,32 +460,32 @@ TUNABLE(CORR_W_PAWN, 128);
 
 /* Late move reduction curve. `Reductions[d][m]` is built from these once, so
  * search_tunable_set() rebuilds the table - see the note there. */
-TUNABLE(LMR_BASE, 10);
-TUNABLE(LMR_DIVISOR, 24);
+TUNABLE(LMR_BASE, 12);
+TUNABLE(LMR_DIVISOR, 23);
 
 /* How much history is allowed to pull a reduction back. Larger means less
  * influence, which is why these are divisors and not multipliers. */
-TUNABLE(LMR_HIST_DIVISOR, 8192);
-TUNABLE(LMR_CONT_DIVISOR, 8192);
+TUNABLE(LMR_HIST_DIVISOR, 7828);
+TUNABLE(LMR_CONT_DIVISOR, 7819);
 TUNABLE(CAPHIST_DIVISOR, 4);
 
 /* Null-move reduction: base, how fast it grows with depth, and how much of the
  * margin above beta is allowed to buy extra reduction before it is capped. */
-TUNABLE(NMP_BASE, 3);
-TUNABLE(NMP_DEPTH_DIVISOR, 4);
-TUNABLE(NMP_EVAL_DIVISOR, 200);
+TUNABLE(NMP_BASE, 4);
+TUNABLE(NMP_DEPTH_DIVISOR, 3);
+TUNABLE(NMP_EVAL_DIVISOR, 190);
 TUNABLE(NMP_EVAL_MAX, 3);
 
 /* History bonus curve: the multiplier on depth-squared, and the depth past
  * which extra confidence stops being real. */
-TUNABLE(HIST_BONUS_MUL, 4);
+TUNABLE(HIST_BONUS_MUL, 5);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
-TUNABLE(LMP_BASE, 3);
+TUNABLE(LMP_BASE, 7);
 
 /* Half-width of the first aspiration window. */
-TUNABLE(ASPIRATION_DELTA, 18);
+TUNABLE(ASPIRATION_DELTA, 20);
 
 #ifdef TUNE_SEARCH
 

@@ -33,6 +33,20 @@ bootstraps: net *n+1* is trained on searches that used net *n*.
 So the pipeline is a loop, not a line, and the first turn of it is the one this
 document plans in detail.
 
+**One turn of that loop has now been run against the human corpus, and it
+returned much less than the turn before it.** `gen-003` re-labelled 178.8M
+human positions with a much stronger engine than `gen-001` had used. The net it
+produced is the one the engine ships, and it is ahead of the `gen-012` hybrid
+net it replaced - but by a margin that does not separate from noise, where the
+step from `gen-001` to `gen-012` was worth ~50 Elo (E18 in
+[EXPERIMENTS.md](EXPERIMENTS.md)).
+
+The distillation argument above is not wrong, but it has a premise it does not
+state: the *positions* have to be worth labelling. A better label on a position
+the net already predicts well teaches it nothing, and a corpus of human games
+is fixed in what it covers however good the labeller gets. Read the loop as
+being about position selection at least as much as about label quality.
+
 ---
 
 ## Task order

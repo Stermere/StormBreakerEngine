@@ -615,6 +615,179 @@ for tables nothing would read. The best available outcome from keeping them was
 nodes. `datagen-test` passes.
 ---
 
+### E17 — SPSA tuning of 21 search parameters against the network
+
+**Date** 2026-08-27/28 · **Baseline** the same TUNE_SEARCH build at its default
+options · **Bench** 213141 -> 204156 nnue, 299634 -> 252945 classical
+
+Task 4 of [NNUE.md](NNUE.md), and the largest single gain since the network
+itself. Every threshold and formula constant in `search.c` was fitted against
+the classical evaluation's scale and noise profile; the network has neither.
+Twenty-one of them were exposed as UCI options under `TUNE_SEARCH=on` and fitted
+jointly by SPSA (`tools/tune.py`, `make tune`).
+
+| | STC 8+0.08 | LTC 40+0.4 |
+|---|---|---|
+| Bounds | [0, 5] normalized | [0.5, 4.5] normalized |
+| **Result** | **H1 accepted** — LLR 2.95 at 830 games | positive, not run to a verdict |
+| Elo | **+66.09 ± 16.36** | **+54.03 ± 29.30** |
+| nElo | +97.89 ± 23.64 | +93.28 ± 49.66 |
+| Record | 331W / 175L / 324D, 59.40% | 63W / 34L / 91D, 57.71% |
+| Ptnml | [12, 57, 152, 151, 43] | [1, 14, 38, 37, 4] |
+| LOS | 100.00% | 99.99% |
+
+The LTC column is 188 games and LLR 0.51, so it is corroboration rather than a
+second verdict. It is recorded because the specific risk this candidate carried
+was fast-time-control overfitting - the values were derived at 2+0.02 - and
+`RFP_MARGIN` moving *down* means pruning **more**, which is the classic change
+that wins at blitz and regresses at depth. The point estimates agree inside
+their intervals and no decay appeared.
+
+**What moved.** Eighteen of twenty-one defaults changed:
+
+| | from | to | | | from | to |
+|---|---|---|---|---|---|---|
+| `LMP_BASE` | 3 | **7** | | `LMR_BASE` | 10 | 12 |
+| `DELTA_MARGIN` | 200 | **302** | | `SINGULAR_MARGIN` | 32 | 38 |
+| `NMP_BASE` | 3 | 4 | | `ASPIRATION_DELTA` | 18 | 20 |
+| `HIST_BONUS_MUL` | 4 | 5 | | `LMR_HIST_DIVISOR` | 8192 | 7828 |
+| `FUTILITY_MARGIN` | 40 | 52 | | `LMR_CONT_DIVISOR` | 8192 | 7819 |
+| `RFP_MARGIN` | 80 | **59** | | `NMP_EVAL_DIVISOR` | 200 | 190 |
+| `NMP_DEPTH_DIVISOR` | 4 | 3 | | `SEE_CAPTURE_MARGIN` | 100 | 94 |
+| `RAZOR_MARGIN` | 240 | 292 | | `SEE_QUIET_MARGIN` | 28 | 26 |
+| `LMR_DIVISOR` | 24 | 23 | | `CORR_W_PAWN` | 128 | 132 |
+
+`CAPHIST_DIVISOR`, `NMP_EVAL_MAX` and `HIST_BONUS_DEPTH_MAX` were unchanged.
+**All twenty-one shipped as a set**, including the six whose drift was
+statistically indistinguishable from noise: the SPRT measured the set as a
+unit, and adopting a subset would ship a configuration nothing tested.
+
+**The first run measured nothing, and why is the useful part.** 2300 iterations
+at `r_end = 0.002` moved `RfpMargin` by 4.9 units out of a 230-unit range and
+looked like "the defaults are already right". They were not. A drift test -
+total displacement over the random-walk scale of the same increments - showed
+fourteen of twenty-one parameters drifting **coherently**, several past 10
+sigma, `DeltaMargin` at +15.7 and `RfpMargin` at -13.3. The gradient was
+measured precisely and then not acted on, because `r_end = 0.002` is the value
+the engine-tuning community uses for runs of 20000-40000 iterations and it was
+carried onto a 2300-iteration run without rescaling. Travel scales as
+`iterations x r_end`. At 0.02 the same 2300 iterations produced the result
+above.
+
+**The tuner was validated before it was trusted, with a sign-flip control.** At
+a fixed depth, searching more nodes is free, so every pruning parameter should
+walk toward pruning *less* - a direction known in advance and opposite to what a
+clock rewards. Run at `--depth 6`, three parameters reversed exactly as
+predicted: `RfpMargin` -4.9 at VSTC became **+33**, `NmpBase` +0.5 became -2,
+`LmrBase` +0.2 became -3, with `LmpBase` pinned at its ceiling and `RazorMargin`
++58%. An implementation artefact cannot produce a sign flip that tracks the
+objective function. Those fixed-depth values are meaningless for play and were
+discarded; the control is what they were for.
+
+**An intermediate set was measured on the way.** At iteration 188 of 2300 -
+eight percent of the run, `RfpMargin` -8 and `DeltaMargin` +22 - the partial
+values already scored **+12.99 ± 9.33** (LOS 99.68%, 2302 games) at STC. That
+answered the open question of whether VSTC-derived values transfer, before the
+full run had finished.
+
+**It had not converged when it stopped.** `DeltaMargin` (z +13.2), `LmpBase`
+(+13.2), `RazorMargin` (+7.2), `FutilityMargin` (+6.1), `LmrBase` (+5.4) and
+`HistBonusMul` (+4.4) were all still climbing at iteration 2300, while
+`RfpMargin` genuinely settled at 59. There is more here. `LMP_BASE` is the one
+to watch: it tripled and was still rising against a ceiling of 10, so a
+continuation run wants that range widened before it pins.
+
+**Verification.** The 21 values were written into `search.c` programmatically
+from the tuner's checkpoint, using the UCI-name-to-C-identifier mapping parsed
+out of `search.c`'s own `Tunables[]` table rather than retyped. The gate was a
+node count: the new default build benches **204156**, identical to the
+TUNE_SEARCH build driven with the same 21 options by `setoption`. A single
+mistyped digit moves the tree and would have shown immediately. `datagen-test`
+passes.
+
+**Cost.** About 15 hours of machine time for the tuning run, 64,400 games at
+2+0.02, plus the SPRTs. No idea was required, only the harness - which is the
+argument for building the harness.
+---
+
+### E18 — Re-labelling the human corpus: marginal, and the corpus is the ceiling
+
+**Date** 2026-08-28 · **Not a completed SPRT.** Recorded because a negative
+result that never gets written down is a result that gets re-derived.
+
+The bootstrap loop [NNUE.md](NNUE.md) is built around says net *n+1* is trained
+on searches that used net *n*. README listed the first turn of it - re-labelling
+the human corpus with the network instead of `eval.c` - as "the single largest
+item on this list". It was run and it did not pay.
+
+| dataset | records | sources | labelling engine |
+|---|---|---|---|
+| `gen-001` | 175,876,025 | 100% human | 0.1.0-dev |
+| `gen-002` | 78,548,872 | 100% self-play | 0.1.0-dev |
+| `gen-012` | 254,424,897 | human + self-play | 0.1.0-dev |
+| **`gen-003`** | **178,808,618** | **100% human** | **0.2.0-dev** |
+
+`gen-003` is the re-label: the same corpus `gen-001` drew from, labelled by a
+much stronger engine. The net trained on it - `1f36c07f4507`, tag
+`epoch20-h1024` - is the net every measurement from E14 onward was made
+against, and it is now the pinned net.
+
+**It is not a regression.** Against the `gen-012` hybrid net it replaced
+(`0e35d891b25a`, tag `epoch3-h1024`, the ~3050 net in `trainer/README.md`) the
+point estimate favours it by 49 Elo. What it is not is a *step change*: the
+gap does not separate from noise at the sample sizes run, and the README
+predicted this would be "the single largest item on this list".
+
+**Three things confound the reading, and all are worth recording.**
+
+*Epoch selection, and it cuts in gen-003's favour.* The `gen-003` run's
+validation loss bottomed at **epoch 4** (0.014153) and rose monotonically to
+**epoch 20** (0.014521), +2.6% over 16 epochs while train loss kept falling -
+textbook overfitting. The exported candidate was epoch 20, sixteen epochs past
+its own minimum, and it *still* matched or beat a net exported at epoch 3.
+**An epoch-4 export from `gen-003` has never been tried**, and on this evidence
+it is the cheapest untested thing on the board - four epochs of GPU time.
+
+*The ladder cannot separate them.* Measured against SF-3190 at 40+0.4:
+
+| net | tag | score | implied | games |
+|---|---|---|---|---|
+| `1f36c07f4507` | epoch20-h1024 | 39.50% | 3116 ± 40 | 300 |
+| `0e35d891b25a` | epoch3-h1024 | 33.04% | 3067 ± 97 | 56 |
+
+A 49 Elo gap at **z = 0.91** - not significant. Two ladder runs differenced is
+also the wrong instrument for comparing two nets: a head-to-head with the same
+binary and `setoption name EvalFile` removes the Stockfish variance entirely
+and resolves far faster. It was not run.
+
+*The search parameters were fitted against the winner, and this one has no
+clean fix.* All 21 tunables from E17 were tuned by SPSA with `1f36c07f4507`
+loaded, so every comparison above runs the challenger on the incumbent's home
+ground. That biases the +49 **in gen-003's favour** - it is an upper bound on
+the net's own contribution, not a neutral estimate. The only honest way to
+remove it is to re-tune against each net before comparing, which costs ~15
+hours per net and is why the number stands as it is.
+
+**What is worth taking from this.** Not "the re-label failed" and not "human
+data is useless". The supported claim is narrower and more useful: **a much
+better labeller on the same corpus bought at most a marginal gain**, where the
+step from `gen-001` to the `gen-012` hybrid had been worth ~50 Elo by the
+trainer's own notes. Label quality is no longer the binding constraint;
+coverage is. A better label on a position the net already predicts well teaches
+it nothing, and a human game corpus is fixed in what it covers however good the
+labeller becomes.
+
+**What that makes the next lever:** self-play with deliberate variation -
+opening spread, randomised early plies, and the tree sampling `-tree` already
+supports. None of those has been swept.
+
+**A trap this exposed, unrelated to the result.** `external/nets/net.json`
+describes whichever net was last *exported*; `make net-fetch` replaces
+`net.nnue` without touching it, and `make nnue-test` re-exports from the local
+checkpoint and replaces it back. The metadata beside a net is not evidence of
+what the net is. `make nnue-info` and `NET_SHA256` are.
+---
+
 
 ## Absolute strength
 
@@ -622,6 +795,40 @@ Every Elo figure above is relative to another build in `external\baselines`,
 none of which is itself rated. This anchors them. `make rating` plays a
 ladder of Stockfish `UCI_Elo` rungs and fits one rating by inverse-variance
 weighting.
+
+**2026-08-28**, after E17, at LTC 40+0.4, on the **network** build:
+
+| SF rung | W-L-D | score | implied rating |
+|---|---|---|---|
+| 3000 | 114-64-66 | 60.25% | 3072 ± 45 |
+| 3190 | 76-139-85 | 39.50% | 3116 ± 40 |
+
+**Combined: 3096 ± 30.** Interpolating the 50% crossing between the two rungs
+independently gives SF-3094, which is the same answer by a different route.
+
+This is a better-anchored measurement than the 2026-08-19 one below, and the
+reason is the bracket: both rungs sit near even (60.25% and 39.50%) with the
+crossing between them, so neither leans on extrapolation. The older table's
+3000 rung scored 28.5%, far enough from even that its implied rating was mostly
+inference. The two rungs here disagree by 44 Elo (z = 1.43, not significant),
+and in the direction the compression artefact predicts - the higher rung
+implies the higher rating, exactly as it did in 2026-08-19's 2791/2790/2840/2915
+progression. Read that as the lower rung being the safer of the two.
+
+The **classical** build at the same time control, for comparison: 38-66-32
+against SF-3000, 39.71%, implying **2927 ± 60** on one rung. The implied gap to
+the network is +145, but that is two ladder runs differenced rather than a
+head-to-head, and E11 measured the same gap at +238 at STC before correction
+history and the search tuning both landed. Correction history was worth more to
+`eval.c` (+25.8) than to the net (+17.3), and E17 transferred to the classical
+build despite being fitted against the network, so a narrowing gap is the
+expected direction. A head-to-head SPRT is the way to actually measure it.
+
+**What moved since the 2026-08-19 table**: the network (E11, E12), correction
+history (E14) and the search parameter fit (E17). The time control differs too,
+so the two blocks are not directly subtractable.
+
+---
 
 **2026-08-19**, after E10, at STC 8+0.08, 100 games per rung:
 
