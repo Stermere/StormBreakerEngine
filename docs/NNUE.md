@@ -63,7 +63,7 @@ no symptom for any of them except "the net is a bit weak".
 | 2 | **Trainer** — `trainer/`, PyTorch, its own venv | Loss curve on held-out shard; sanity scores on known positions | **built** — `make trainer-test` |
 | 3 | **Export + inference** — `tools/export_net.py`, `src/nnue.c` | C inference matches the quantised Python reference **exactly** on 10k positions | **built** — `make nnue-test` |
 | 4 | **Integration** — NNUE replaces `eval_evaluate`, margins re-tuned | SPRT vs the current build | TODO |
-| 5 | **Search integration** — correction history, then a policy head for ordering | SPRT each | TODO |
+| 5 | **Search integration** — correction history, then an uncertainty head for the margins | SPRT each | corrhist **shipped** (E14); head TODO |
 
 Tasks 1–3 produce no Elo and cannot be SPRT'd. That is normal and it is why
 they need their own hard gates: they are the tasks where a bug survives.
@@ -169,11 +169,11 @@ The sampler itself:
   label does not depend on what the game search happened to leave in the table.
   Reproducibility here is the same property `search_clear()` protects.
 
-What *is* worth harvesting from the tree for free is the **move ordering
-labels** — which move caused the cutoff at each node. Those are exact, they
-require no re-search, and they are the training data for Task 5. Record them
-now (see the policy sidecar below); they cost 4 bytes per record and cannot be
-recovered later without regenerating everything.
+The tree also offers move-ordering labels for free — which move caused each
+cutoff. The policy head that would have consumed them was Task 5b and has been
+**cancelled**; the `.pol` sidecar machinery in datagen stays (see the record
+format below), but new generation runs may pass `-nopolicy` rather than paying
+4 bytes per record for a consumer that no longer exists.
 
 ### The mixture is an experiment, not a decision
 
@@ -228,10 +228,11 @@ Metadata — engine commit, node count, filter settings, record count — goes i
 sidecar `.json` next to each shard. A shard whose manifest is missing is a
 shard that cannot be trusted, and that is the correct default.
 
-**Policy sidecar** (Task 5, written now): `shardNN.pol`, 4 bytes per record in
-the same order — best move and cutoff move as two `uint16` in the engine's
-existing move encoding. Optional to read, cheap to write, impossible to
-backfill.
+**Policy sidecar**: `shardNN.pol`, 4 bytes per record in the same order — best
+move and cutoff move as two `uint16` in the engine's existing move encoding.
+Its intended consumer, the cancelled policy head, is gone. The machinery stays
+because existing shards carry sidecars and every tool that permutes records
+must keep the two files aligned; `-nopolicy` turns it off for new runs.
 
 ### Shuffling
 
@@ -896,41 +897,56 @@ last and in increasing order of risk.
 
 ### 5a. Correction history
 
-Already on the roadmap, no network required, and it is the cheapest version of
-the same idea: track the observed difference between the static evaluation and
-what the search actually returned, keyed by pawn structure and material, and
-correct the static evaluation by it. Proven in several strong engines, worth
-15–25 Elo, and it composes with the net rather than competing with it. Do this
-first regardless of NNUE progress.
+Shipped: track the observed difference between the static evaluation and what
+the search actually returned, keyed by pawn structure, and correct the static
+evaluation by it. E14 measured it at **+25.8** (STC). The obvious extensions
+were tried and are dead: E16 added minor-piece, non-pawn and continuation keys
+and measured neutral twice. The conditional **mean** of the eval-vs-search
+residual is mined out.
 
-### 5b. A policy head for move ordering
+### 5b. An uncertainty head for the pruning margins
 
-The genuinely interesting one. A second head on the same accumulator produces a
-prior over moves, which enters `score_moves()` as an additive term alongside
-history — the network's opinion about which moves are worth trying, available
-before any of them are searched.
+The second moment of the same idea, and the replacement for the policy head
+that used to sit here (cancelled: policy ordering's track record in
+alpha-beta engines is thin, history heuristics are already very good, and the
+seat is better spent).
 
-The cost structure is what makes this plausible: the accumulator is already
-computed for the evaluation, so the policy head costs **one extra forward pass
-per node**, not one per move. A head that emits a full 64×64 move map is too
-large; factorise it the way the evaluation factorises placement — a from-square
-term, a to-square term, and a (piece, to-square) term, a few hundred outputs
-total.
+Every margin-based prune in `search.c` — reverse futility, futility, razoring,
+ProbCut, delta — is one claim in different clothes: that *k* centipawns cover
+the gap between the static evaluation and what a deeper search would say, with
+*k* a global constant fitted by SPSA to the average position. That residual is
+measurably heteroscedastic: over the d12 bench tree the correction magnitude
+has **median zero and mean ~6cp** — half the tree is structures where the
+evaluation has never been caught drifting, a twentieth is pinned at the
+correction clamp, and one margin serves both only by being wrong for both.
+ProbCut's own original formulation (Buro) is explicitly a fixed-σ confidence
+prune, so this generalises an idea the engine already runs rather than
+importing a foreign one.
 
-The training data is the cutoff-move sidecar from Task 1, which is why it gets
-written now. Label: the move that caused the beta cutoff, or the PV move at
-exact nodes.
+Order of operations, each SPRT'd:
 
-**Honest expectations.** Policy-guided ordering is standard in MCTS engines and
-has a much thinner track record in alpha-beta ones, where history heuristics are
-already extremely good and the bar is correspondingly high. The realistic
-outcome is a modest gain at low depths that shrinks as the history tables warm
-up. That is still worth having, and the infrastructure cost is small once the
-net exists — but it should not be the reason the NNUE work happens, and it
-should not be started before Task 4 has passed its SPRT.
+1. **The probe, no network change**: `unc_scale()` in `search.c` scales the
+   five margins by the corrhist magnitude, centred on the measured
+   distribution so the node-weighted average margin is unchanged and the SPRT
+   measures the conditioning alone. **Measured: +25.61 ± 9.85 at STC, H1
+   (E20)** — the margin surface has real structure, and the head below is
+   funded. The head's SPRT runs against the probe, which is now the baseline
+   to beat.
+2. **The head**: a second output on the accumulator trained to predict the
+   scale of the residual `|search score − net value|`. The target is already
+   in every record — the fixed-node search score is the label the value head
+   trains against — so this costs a retrain, not a regeneration. Train with
+   an L1 or Gaussian-NLL term against the absolute residual, value loss
+   untouched. Export adds a versioned header field per invariant 8, and
+   `make nnue-test` gates the σ path bit-exactly like the value path. In the
+   search it replaces `unc_scale()`'s input; none of the call sites move.
+3. **Extensions, one at a time**: aspiration half-width, the null-move
+   static-eval condition, LMR confidence.
 
-Order of operations inside 5b, each SPRT'd: prior on quiets only → prior
-weighted by depth → prior used to seed LMR reductions.
+**Honest expectations.** No engine is known to ship a learned variance head
+driving its margins, which cuts both ways: the seam is unmined, and unmined
+seams are usually unmined for a reason. The probe exists precisely to buy the
+answer cheaply before the trainer is touched.
 
 ---
 

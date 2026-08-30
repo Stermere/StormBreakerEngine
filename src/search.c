@@ -473,6 +473,16 @@ TUNABLE(SINGULAR_MARGIN, 41);
 TUNABLE(CORR_W_PAWN, 129);
 
 /*
+ * Uncertainty scaling of the margins above: floor percentage, percent per
+ * centipawn of learned correction, and the cap. The idea, the measured
+ * distribution these defaults are centred on, and the reason the floor stays
+ * near 100 all live with unc_scale(), beside the correction history.
+ */
+TUNABLE(UNC_SCALE_BASE, 89);
+TUNABLE(UNC_SCALE_SLOPE, 2);
+TUNABLE(UNC_SCALE_MAX, 140);
+
+/*
  * ---------------------------------------------------------------------------
  * The second tier: constants that shape a formula rather than sit in a
  * comparison.
@@ -589,6 +599,9 @@ static const struct {
     {"ProbCutDepth", &PROBCUT_DEPTH, 5, 99},
     {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
     {"CorrWPawn", &CORR_W_PAWN, 0, 256},
+    {"UncScaleBase", &UNC_SCALE_BASE, 60, 120},
+    {"UncScaleSlope", &UNC_SCALE_SLOPE, 0, 12},
+    {"UncScaleMax", &UNC_SCALE_MAX, 100, 200},
     {"LmrBase", &LMR_BASE, 4, 24},
     {"LmrDivisor", &LMR_DIVISOR, 12, 48},
     {"LmrHistDivisor", &LMR_HIST_DIVISOR, 2048, 32768},
@@ -1091,6 +1104,43 @@ static void corrhist_update(const Position *pos, Value searched, Value staticEva
     *e = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
 }
 
+/*
+ * How wide this node's margin-based prunes should be, as a percentage.
+ *
+ * Every margin above is the same claim wearing different clothes: that k
+ * centipawns cover the gap between the static evaluation and what a deeper
+ * search would have said. k is a global constant fitted by SPSA, which makes
+ * it a statement about the AVERAGE position - and the residual it insures
+ * against is nowhere near homoscedastic. Measured on the d12 bench tree, the
+ * learned correction's magnitude has median zero and mean ~6cp: half the tree
+ * is structures where the evaluation has never been caught drifting, and a
+ * twentieth is structures pinned at the correction clamp. One margin serves
+ * both only by being wrong for both.
+ *
+ * So the margins are scaled by how far the evaluation has provably been wrong
+ * here before. |correction| is a measure of bias, standing in for the
+ * residual's spread; the bet is that the two travel together. It is
+ * deliberately the crudest signal that could work, because this is a probe:
+ * if conditioning the margins on it carries no Elo, the margin surface has no
+ * exploitable structure and the trained version is not worth building. The
+ * destination is docs/NNUE.md Task 5b - an uncertainty head on the
+ * accumulator predicting the residual's scale directly. When that lands it
+ * replaces this function's body, and none of the call sites move.
+ *
+ * The defaults are centred, not chosen: 89 + 2 * 6cp (the measured mean)
+ * lands the node-weighted average scale at ~100%, so the shipped margins are
+ * on average what E17 fitted and an SPRT on this change measures the
+ * conditioning alone rather than a disguised global margin shift. A cold
+ * entry reads as zero and lands on the floor, which is why the floor sits
+ * just under 100 rather than lower: the floor is also the engine's posture in
+ * structures it knows nothing about.
+ */
+static inline int unc_scale(const Position *pos) {
+    const int c  = *corr_entry(pos);
+    const int ac = (c < 0 ? -c : c) / CORRHIST_GRAIN;
+    return imin(UNC_SCALE_BASE + ac * UNC_SCALE_SLOPE, UNC_SCALE_MAX);
+}
+
 /* ----------------------------------------------------------- quiescence -- */
 
 /*
@@ -1149,6 +1199,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     Value best         = -VALUE_INFINITE;
     Value staticEval   = VALUE_NONE;
     Value rawEval      = VALUE_NONE;
+    int uncScale       = 100; /* only read where !inCheck guards already hold */
 
     if (!inCheck) {
         /* Stand pat: the side to move is never obliged to capture, so the
@@ -1157,6 +1208,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
         staticEval = corrected_eval(pos, rawEval);
+        uncScale   = unc_scale(pos);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1211,7 +1263,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
          * pat to fall back on and every reply must be searched.
          */
         if (!inCheck && type_of_move(m) != MT_PROMOTION && !is_mate_score(alpha) &&
-            staticEval + PieceValues[victim_of(pos, m)] + DELTA_MARGIN <= alpha)
+            staticEval + PieceValues[victim_of(pos, m)] + DELTA_MARGIN * uncScale / 100 <= alpha)
             continue;
 
         if (!movegen_is_legal(pos, m))
@@ -1402,6 +1454,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     /* The table keeps `rawEval`; everything below reasons with the corrected
      * one. See the correction history section for why those differ. */
     const Value staticEval = corrected_eval(pos, rawEval);
+    const int uncScale     = inCheck ? 100 : unc_scale(pos);
 
     Stack[ply].staticEval = staticEval;
 
@@ -1437,7 +1490,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * was going to use.
      */
     if (!pvNode && !inCheck && depth <= RFP_DEPTH && !is_mate_score(beta) &&
-        staticEval - RFP_MARGIN * (depth - improving) >= beta)
+        staticEval - RFP_MARGIN * (depth - improving) * uncScale / 100 >= beta)
         return staticEval;
 
     /*
@@ -1454,7 +1507,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * opinion, and the node is dropped only if that opinion agrees.
      */
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
-        staticEval + RAZOR_MARGIN * depth < alpha) {
+        staticEval + RAZOR_MARGIN * depth * uncScale / 100 < alpha) {
         const Value v = qsearch(pos, alpha - 1, alpha, ply);
         if (v < alpha)
             return v;
@@ -1522,7 +1575,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * here is 7, so without this the nodes between are exactly where ProbCut
      * spends the most and proves the least.
      */
-    const Value probCutBeta = beta + PROBCUT_MARGIN;
+    const Value probCutBeta = beta + PROBCUT_MARGIN * uncScale / 100;
 
     if (!pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta) &&
         !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
@@ -1670,7 +1723,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
              * searched, which is the point - material is exactly what a quiet
              * move cannot produce and a capture can.
              */
-            if (depth <= FUTILITY_DEPTH && staticEval + FUTILITY_MARGIN * depth <= alpha)
+            if (depth <= FUTILITY_DEPTH &&
+                staticEval + FUTILITY_MARGIN * depth * uncScale / 100 <= alpha)
                 continue;
         }
 

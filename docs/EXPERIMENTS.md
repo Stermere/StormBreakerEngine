@@ -1057,6 +1057,47 @@ every run's trajectory, so it wants to land on its own.
 
 ---
 
+### E20 — Uncertainty-scaled pruning margins: the corrhist-magnitude probe
+
+**Date** 2026-08-30 · **Baseline** `stormbreaker-nnue-best-gen-4` ·
+**Bench** nnue 226961 -> 238814 (d7), 3286704 -> 3194362 (d12)
+
+Every margin-based prune insures against the eval-vs-search residual with a
+globally constant width; the residual is heteroscedastic (measured |corrhist|:
+median 0, mean ~6cp over the d12 tree). `unc_scale()` scales the five margins
+(RFP, razoring, ProbCut, futility, qsearch delta) by
+`min(89 + 2 * |correction|cp, 140)` percent, centred so the node-weighted
+average margin is unchanged and the SPRT measures the conditioning alone. See
+docs/NNUE.md Task 5b for the idea's full arc; this is its step 1, the probe
+that cost no trainer work.
+
+| | |
+|---|---|
+| TC / bounds | STC 8+0.08, [0, 5] normalized |
+| **Result** | **H1 accepted** — LLR 2.97 of 2.94 at 1862 games |
+| Elo | **+25.61 ± 9.85** (nElo +41.20 ± 15.78) |
+| Record | 584W / 447L / 831D, 53.68% |
+| Ptnml | [20, 183, 425, 246, 57], PairsRatio 1.49 |
+| LOS | 100.00% |
+
+Both binaries were verified mid-run to embed the same pinned gen-4 net
+(`54f9285f0585`), with depth-1 evals identical position-by-position — the
+measured difference is the search change alone. The point estimate came down
+from +38 at 558 games to +25.6 at the verdict, which is the usual drift and
+why only the verdict is quoted.
+
+Two honest caveats. The centering distribution was measured on the *previous*
+net (`cacfebf399cb`) — the net was re-pinned to gen-4 mid-development and the
+constants were never re-centred, so `UncScaleBase/Slope/Max` go to the sweep
+as unfitted seats. And this is STC only; LTC confirmation is pending, like
+E19b's.
+
+What this licenses is Task 5b step 2: the trained σ head. Its SPRT must run
+against **this** build — the head has to beat the probe it replaces, not the
+engine without scaling.
+
+---
+
 
 ## Absolute strength
 

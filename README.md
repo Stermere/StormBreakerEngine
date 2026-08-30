@@ -57,7 +57,8 @@ Adding on a correction history and an SPSA tuned search brought this to ~3095 El
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
-| **NN informed search (policy head for move ordering)** | **TODO** |
+| Search: uncertainty-scaled margins (corrhist-magnitude probe) | **+25.61 ± 9.85** (E20) |
+| **NNUE: uncertainty head driving the margin scale** | **TODO** |
 | **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
@@ -349,11 +350,18 @@ The open work, roughly in order of Elo per unit of effort:
 5. **Staged move generation**, so a node that cuts on the table move never
    generates or scores the rest of the list — in the three steps the status
    table breaks it into, each with its own SPRT.
-6. **A policy head for move ordering** — [docs/NNUE.md](docs/NNUE.md) Task 5b.
-   The cutoff-move sidecars are already written (`gen-001.pol`), so the data
-   cost is sunk. Read the honest expectations in that section before starting:
-   the track record in alpha-beta engines is much thinner than in MCTS ones,
-   and history heuristics are already very good.
+6. **An uncertainty head for the pruning margins** — [docs/NNUE.md](docs/NNUE.md)
+   Task 5b, which replaced the cancelled policy head. Every margin the sweep
+   fits is a global constant insuring against an eval-vs-search residual that
+   is measurably heteroscedastic: over the d12 bench tree the correction
+   magnitude has median zero and mean ~6cp. Correction history was the
+   residual's conditional mean (E14, +25.8; more keys neutral, E16); the head
+   is its conditional scale, trained on labels every shard already carries.
+   The search-side hook is already in — `unc_scale()` scales the five margin
+   prunes, driven today by corrhist magnitude and centred so the average
+   margin is unchanged. That probe's SPRT is the cheap first answer: if
+   conditioning the margins carries no Elo even crudely, stop before the
+   trainer is touched.
 
 ### Deliberately not on that list
 
