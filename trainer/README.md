@@ -77,9 +77,9 @@ cd trainer
 # Gen 1 net ~2800 -> ~3000 Elo
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-001.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.001 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
 # Gen 2 + 1 hybrid net ~3000 -> ~3050 Elo
-.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-012.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
-# Gen 3 ~3050 -> ?
-
+.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-001.cnn ..\external\data\gen-002.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
+# Gen 3 ~3100 -> ?
+.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-003.cnn ..\external\data\gen-004.cnn --val ..\external\data\val.cnn --epochs 4 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512
 
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..

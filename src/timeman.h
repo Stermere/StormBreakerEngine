@@ -27,8 +27,13 @@ typedef struct {
  *
  * Divide the remaining clock by an assumed twenty moves left, bank three
  * quarters of the increment, scale by where the game is, and cap the whole
- * thing well short of flag fall. `Move Overhead` is held back for GUI and
- * network latency.
+ * thing well short of flag fall.
+ *
+ * `Move Overhead` is held back for GUI and network latency once per move still
+ * to be played, not once for this one. With an increment the clock converges
+ * rather than decays, and whatever it converges on has to cover the latency of
+ * every move after this one too; reserving it up front is what keeps that
+ * number off the floor. See the note in timeman.c.
  *
  * Every constant in here is a guess that has not been through an SPRT yet.
  * Time management is worth real Elo and is confined to this module, so it

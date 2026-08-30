@@ -601,7 +601,7 @@ static const struct {
     {"HistBonusMul", &HIST_BONUS_MUL, 1, 24},
     {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 32},
     {"HistMalusMul", &HIST_MALUS_MUL, 1, 32},
-    {"LmpBase", &LMP_BASE, 1, 10},
+    {"LmpBase", &LMP_BASE, 1, 24},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
 };

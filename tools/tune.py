@@ -144,20 +144,24 @@ class Param:
     plays two engines that barely resemble the one being tuned. A twentieth of
     the declared range is a starting heuristic, not a law.
 
-    `r_end` sets the final step size relative to that perturbation. 0.002 is
-    the value the engine-tuning community converged on; it is deliberately
-    small, because SPSA's gradient estimate is one noisy game batch. Note that
-    travel scales as `iterations * r_end`, so a value carried over from a
-    20000-iteration run onto a 2000-iteration one measures the gradient
-    precisely and then declines to act on it - which is exactly what E17's
-    first run did.
+    `r_end` sets the final step size relative to that perturbation, and it is
+    only meaningful against an iteration count: travel scales as
+    `iterations * r_end`. 0.002 is the value the engine-tuning community
+    converged on and it assumes the 20000-40000 iteration runs they do. Carried
+    onto a 2000-iteration run it measures the gradient precisely and then
+    declines to act on it, which is exactly what E17's first run did - 2300
+    iterations that moved `RfpMargin` 4.9 units out of 230 and read as "the
+    defaults are already right" while fourteen parameters drifted coherently
+    underneath. The default here is 0.02, sized for the runs this harness
+    actually does; a run an order of magnitude longer wants it back down by the
+    same factor, or the walk will be all step and no gradient.
 
     `step_c` is `c_end` floored at STEP_C_FLOOR, and it sizes the step while
     `c_end` goes on sizing the perturbation. The two were the same number until
     that turned out to leave narrow-range parameters unable to move at all.
     """
 
-    def __init__(self, name, value, lo, hi, c_end=None, r_end=0.002):
+    def __init__(self, name, value, lo, hi, c_end=None, r_end=0.02):
         self.name = name
         self.value = float(value)
         self.lo = float(lo)
@@ -396,7 +400,8 @@ def main() -> int:
     ap.add_argument("--book")
     ap.add_argument("--seed", type=int, default=0, help="0 picks one and records it")
     ap.add_argument("--c-end", type=float, help="override the perturbation for every parameter")
-    ap.add_argument("--r-end", type=float, default=0.002, help="final learning rate factor")
+    ap.add_argument("--r-end", type=float, default=0.02,
+                    help="final learning rate factor; scale it INVERSELY with --iterations")
     ap.add_argument("--state", default=str(c.TUNE_DIR / "spsa.json"))
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--list", action="store_true", help="show what the engine exposes and exit")

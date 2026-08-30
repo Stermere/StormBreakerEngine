@@ -34,11 +34,32 @@ int64_t time_ms(void) {
 #endif
 }
 
-/* Never plan to use more than this fraction of the remaining clock on one
- * move, however good the reason. Flagging loses the whole game; thinking for
- * one move too briefly costs a fraction of one. */
-#define MAX_CLOCK_FRACTION_NUM 4
-#define MAX_CLOCK_FRACTION_DEN 5
+/* Never plan to use more than this fraction of the clock on one move, however
+ * good the reason. Flagging loses the whole game; thinking for one move too
+ * briefly costs a fraction of one.
+ *
+ * This bound only bites once the clock has fallen to somewhere around fifteen
+ * times the increment - above that `MAX_NOMINAL_MULT` is the smaller of the
+ * two and this one never applies - so it has exactly one job: leaving a clock
+ * to play the next move from when this move went badly. It was 4/5, which is
+ * to say it did not do that job: at the clock this allocator converges on,
+ * four fifths of the remainder is the difference between a scramble and a
+ * loss. */
+#define MAX_CLOCK_FRACTION_NUM 1
+#define MAX_CLOCK_FRACTION_DEN 2
+
+/* The exception, and the reason the bound above can afford to be strict: when
+ * `movestogo` says this is the last move before the clock is replenished, no
+ * further move comes out of it and there is nothing left to protect. Held
+ * short of the whole clock anyway, because the search stops on a poll and a
+ * plan to use every last millisecond has no room to be slightly wrong. */
+#define LAST_MOVE_FRACTION_NUM 4
+#define LAST_MOVE_FRACTION_DEN 5
+
+/* How far past the nominal allocation one move may run when the search will
+ * not settle. Bounded by MAX_CLOCK_FRACTION above, which is what stops this
+ * from being a licence to spend the whole clock late in a game. */
+#define MAX_NOMINAL_MULT 5
 
 /* Beyond this many moves to the time control the horizon stops mattering, and
  * treating it as sudden death allocates better than dividing by a huge N. */
@@ -118,13 +139,10 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
         return;
     }
 
-    const int64_t remaining = clamp64(limits->time[us] - uci_move_overhead(), 1, INT64_MAX);
-    const int64_t inc       = limits->inc[us] > 0 ? limits->inc[us] : 0;
-
     /*
      * Sudden death plus increment: assume the game has about twenty moves left
-     * in it and bank three quarters of the increment, keeping a little back so
-     * a stream of slightly-over-budget moves cannot drain the clock.
+     * in it, keeping a little of the increment back so a stream of
+     * slightly-over-budget moves cannot drain the clock.
      *
      * With a move count to the next control, divide by that instead - but cap
      * it, because dividing by 40 early in a long control just wastes time that
@@ -134,17 +152,54 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
         limits->movestogo > 0
             ? (limits->movestogo < MOVESTOGO_CAP ? limits->movestogo : MOVESTOGO_CAP)
             : 20;
-    const int64_t nominal = remaining / moves + inc * 3 / 4;
-    const int64_t optimum = nominal * phase_percent(gamePly) / 100;
-    const int64_t ceiling = remaining * MAX_CLOCK_FRACTION_NUM / MAX_CLOCK_FRACTION_DEN;
 
-    /* The ceiling is computed off the nominal allocation rather than the
+    const int64_t clock    = limits->time[us];
+    const int64_t overhead = uci_move_overhead();
+    const int64_t inc      = limits->inc[us] > 0 ? limits->inc[us] : 0;
+
+    /*
+     * Move Overhead is owed on every move still to be played, not only on this
+     * one.
+     *
+     * Charging it once is right for the move in hand and wrong for the game.
+     * Spending `remaining / moves + 3/4 inc` and being paid `inc` back is a
+     * contraction, so the clock does not decay - it converges, on five times
+     * the increment. That is the number this engine was living on: at 8+0.08,
+     * around 400ms in hand for the rest of the game, with the latency of every
+     * one of those moves still to come out of it. Nothing is left to absorb a
+     * slow GUI round trip or one search that overshoots, which is what running
+     * out of time on the last few moves actually looks like.
+     *
+     * Reserving the latency up front instead moves that convergence point up
+     * by the whole reserve, and does it in proportion to how much latency was
+     * declared - a network game with a 100ms overhead gets a wide margin
+     * without anyone having to ask for one. Capped at half the clock, so a
+     * large declared overhead cannot leave the allocator with no budget to
+     * divide.
+     */
+    const int64_t reserve = clamp64(overhead * (moves + 2), 0, clock / 2);
+
+    /* Two different questions, and conflating them is the other half of the
+     * bug. `spendable` is what this move can physically use without flagging;
+     * `budget` is what it may use given that the rest of the game comes out of
+     * the same clock. The allocation is divided out of the budget, and the
+     * hard ceiling is measured against what is really there. */
+    const int64_t spendable = clamp64(clock - overhead, 1, INT64_MAX);
+    const int64_t budget    = clamp64(clock - reserve, 1, INT64_MAX);
+
+    const int64_t nominal = budget / moves + inc * 3 / 4;
+    const int64_t optimum = nominal * phase_percent(gamePly) / 100;
+    const int64_t ceiling = moves > 1 ? spendable * MAX_CLOCK_FRACTION_NUM / MAX_CLOCK_FRACTION_DEN
+                                      : spendable * LAST_MOVE_FRACTION_NUM / LAST_MOVE_FRACTION_DEN;
+
+    /* The ceiling is applied to the nominal allocation rather than the
      * phase-scaled one, so the phase curve moves the target without also
      * moving the hard limit that protects the clock. */
-    const int64_t maximum = nominal * 5 < ceiling ? nominal * 5 : ceiling;
+    const int64_t maximum =
+        nominal * MAX_NOMINAL_MULT < ceiling ? nominal * MAX_NOMINAL_MULT : ceiling;
 
-    /* Both are clamped into [1, remaining]: an allocation larger than the
+    /* Both are clamped into [1, spendable]: an allocation larger than the
      * clock is how engines lose on time in won positions. */
-    tm->maximum = clamp64(maximum, 1, remaining);
+    tm->maximum = clamp64(maximum, 1, spendable);
     tm->optimum = clamp64(optimum, 1, tm->maximum);
 }
