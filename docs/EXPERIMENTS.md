@@ -1061,9 +1061,60 @@ every run's trajectory, so it wants to land on its own.
 ## Absolute strength
 
 Every Elo figure above is relative to another build in `external\baselines`,
-none of which is itself rated. This anchors them. `make rating` plays a
-ladder of Stockfish `UCI_Elo` rungs and fits one rating by inverse-variance
-weighting.
+none of which is itself rated. This anchors them. Two ladders do it: `make
+rating` plays Stockfish `UCI_Elo` rungs, and `make gauntlet` plays the
+third-party engines `make engines-fetch` puts in `external\engines`, each
+carrying a published CCRL rating. Both fit one rating by inverse-variance
+weighting; they are different pools and are not interchangeable.
+
+**2026-08-30**, after E19b, at STC 8+0.08, on the **network** build, against
+the CCRL ladder. 638 games round-robin, ~44 against each rung:
+
+| CCRL rung | W-L-D | score | implied rating |
+|---|---|---|---|
+| halogen-8.1, 3008 | 22-12-9 | 61.6% | 3090 ± 107 |
+| berserk-4.1.0, 3133 | 19-13-12 | 56.8% | 3181 ± 104 |
+| weiss-1.4, 3256 | 7-29-7 | 24.4% | 3060 ± 121 |
+| clover-3.0, 3340 | 6-33-5 | 19.3% | 3092 ± 130 |
+| ethereal-12.75, 3426 | 0-40-4 | 4.5% | 2897 ± 246 |
+
+**Combined: 3100 ± 55**, on the CCRL Blitz scale.
+
+**What this measurement is for, and it is not "a second opinion on 3096".**
+The `UCI_Elo` ladder's largest caveat is that a strength-limited Stockfish is
+not a weaker engine - it plays near-full-strength moves with occasional
+deliberate errors, and that error distribution is not the one a genuinely
+weaker opponent produces. This ladder has no such problem: all five are real
+engines at full strength, so the objection does not apply at all. That is the
+reason to run it, not the agreement with 3096.
+
+**Do not read the agreement with the 2026-08-28 figure as a validation.** Two
+things differ at once - the pool (CCRL's, not Stockfish's self-calibration)
+and the time control (STC here, LTC there). Landing 4 Elo apart across both is
+a coincidence of the size the confidence intervals permit, not a replication.
+There is no same-build STC number on the `UCI_Elo` ladder to difference
+against, which is what a real cross-check would need.
+
+**Read the bracket, not the sweep.** berserk (56.8%) and weiss (24.4%) straddle
+the 50% crossing; they imply 3181 and 3060 and disagree by 121 Elo, which their
+intervals permit (z = 0.76). The ethereal rung is a 4.5% near-sweep, and its
+±246 correctly says it locates nothing - it is in the table because omitting a
+rung after seeing its result is how a ladder gets talked into the answer you
+wanted, not because it carries weight.
+
+**One pattern worth watching, not yet a finding.** The two handcrafted-eval
+opponents imply lower ratings for us (weiss 3060, ethereal 2897) than the three
+network ones (halogen 3090, berserk 3181, clover 3092). If that is real rather
+than 44-game noise, the likeliest cause is time-control scaling: CCRL Blitz is
+2+1 and this ran at 8+0.08, roughly 15x faster, and a cheap evaluation converts
+that deficit into depth better than a network does. It would mean the CCRL
+numbers slightly understate the handcrafted rungs *at this TC*. Re-running at
+LTC would separate the two explanations; until then it is an anomaly on the
+record, not a correction to apply.
+
+The interval is statistical only, and understates the real uncertainty for the
+usual reason: a rating list is a pool, and ours is not CCRL's. Quote this as
+"roughly this class at blitz", never as a rating the engine holds.
 
 **2026-08-28**, after E17, at LTC 40+0.4, on the **network** build:
 

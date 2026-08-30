@@ -235,7 +235,7 @@ endif
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
         tuner datagen datagen-test trainer-setup trainer-test sprt tune rating gauntlet snapshot \
-        nnue nnue-export nnue-test nnue-info net-fetch net-publish
+        nnue nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch
 
 all: $(TARGET)
 
@@ -432,6 +432,12 @@ rating:
 
 gauntlet:
 	@$(TOOLPY) tools/gauntlet.py $(ARGS)
+
+# Downloads the rated opponent ladder into external/engines, which the gauntlet
+# then plays by default. external/ is gitignored, so a fresh clone has none of
+# them and this is how they come back. Re-running skips what is already there.
+engines-fetch:
+	@$(TOOLPY) tools/fetch-engines.py $(ARGS)
 
 snapshot:
 	@$(TOOLPY) tools/snapshot-baseline.py $(ARGS)

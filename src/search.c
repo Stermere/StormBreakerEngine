@@ -349,7 +349,7 @@ static inline void count_node(void) {
 #define TUNABLE(name, def) enum { name = (def) }
 #endif
 
-TUNABLE(RFP_MARGIN, 59); /* reverse futility: how far above beta is "safely won" */
+TUNABLE(RFP_MARGIN, 64); /* reverse futility: how far above beta is "safely won" */
 #define RFP_DEPTH 7
 
 #define LMP_DEPTH 8 /* deepest node that will discard its late quiet moves */
@@ -367,7 +367,7 @@ TUNABLE(RFP_MARGIN, 59); /* reverse futility: how far above beta is "safely won"
  * tree. The useful range is narrow and the whole curve is worth re-measuring
  * before anyone "corrects" this number upwards.
  */
-TUNABLE(FUTILITY_MARGIN, 52);
+TUNABLE(FUTILITY_MARGIN, 57);
 
 /* Half-width of the first aspiration window, and the depth below which the
  * previous score is too unreliable to aim one at. */
@@ -387,7 +387,7 @@ TUNABLE(FUTILITY_MARGIN, 52);
  * certain no quiet move here recovers the deficit. Verified rather than
  * assumed - the qsearch actually runs, and only its result can prune.
  */
-TUNABLE(RAZOR_MARGIN, 292);
+TUNABLE(RAZOR_MARGIN, 305);
 #define RAZOR_DEPTH 3
 
 /*
@@ -400,9 +400,9 @@ TUNABLE(RAZOR_MARGIN, 292);
  * should rise much faster as depth falls.
  */
 #define SEE_CAPTURE_DEPTH 6
-TUNABLE(SEE_CAPTURE_MARGIN, 94);
+TUNABLE(SEE_CAPTURE_MARGIN, 90);
 #define SEE_QUIET_DEPTH 8
-TUNABLE(SEE_QUIET_MARGIN, 26);
+TUNABLE(SEE_QUIET_MARGIN, 20);
 
 /*
  * ProbCut: the mirror of razoring, at the other end of the window.
@@ -434,7 +434,7 @@ TUNABLE(SEE_QUIET_MARGIN, 26);
  * searches `depth - PROBCUT_REDUCTION` and that has to stay a real search. */
 TUNABLE(PROBCUT_DEPTH, 5);
 #define PROBCUT_REDUCTION 4
-TUNABLE(PROBCUT_MARGIN, 100);
+TUNABLE(PROBCUT_MARGIN, 103);
 
 /*
  * Delta pruning margin for quiescence.
@@ -444,7 +444,7 @@ TUNABLE(PROBCUT_MARGIN, 100);
  * outright is not going to raise it. The margin has to cover what the rest of
  * the sequence might swing, which is why it is a piece rather than a pawn.
  */
-TUNABLE(DELTA_MARGIN, 302);
+TUNABLE(DELTA_MARGIN, 361);
 
 /*
  * Singular extension: the shallowest depth worth testing, and how far below
@@ -458,7 +458,7 @@ TUNABLE(DELTA_MARGIN, 302);
  * still does.
  */
 #define SINGULAR_DEPTH 7
-TUNABLE(SINGULAR_MARGIN, 38);
+TUNABLE(SINGULAR_MARGIN, 41);
 
 /*
  * How much the correction is believed, out of CORR_W_UNIT.
@@ -470,7 +470,7 @@ TUNABLE(SINGULAR_MARGIN, 38);
  * a person, and it was never fitted, only chosen.
  */
 #define CORR_W_UNIT 128
-TUNABLE(CORR_W_PAWN, 132);
+TUNABLE(CORR_W_PAWN, 129);
 
 /*
  * ---------------------------------------------------------------------------
@@ -492,25 +492,25 @@ TUNABLE(CORR_W_PAWN, 132);
 
 /* Late move reduction curve. `Reductions[d][m]` is built from these once, so
  * search_tunable_set() rebuilds the table - see the note there. */
-TUNABLE(LMR_BASE, 12);
+TUNABLE(LMR_BASE, 14);
 TUNABLE(LMR_DIVISOR, 23);
 
 /* How much history is allowed to pull a reduction back. Larger means less
  * influence, which is why these are divisors and not multipliers. */
-TUNABLE(LMR_HIST_DIVISOR, 7828);
-TUNABLE(LMR_CONT_DIVISOR, 7819);
-TUNABLE(CAPHIST_DIVISOR, 4);
+TUNABLE(LMR_HIST_DIVISOR, 7622);
+TUNABLE(LMR_CONT_DIVISOR, 7162);
+TUNABLE(CAPHIST_DIVISOR, 5);
 
 /* Null-move reduction: base, how fast it grows with depth, and how much of the
  * margin above beta is allowed to buy extra reduction before it is capped. */
-TUNABLE(NMP_BASE, 4);
+TUNABLE(NMP_BASE, 5);
 TUNABLE(NMP_DEPTH_DIVISOR, 3);
-TUNABLE(NMP_EVAL_DIVISOR, 190);
-TUNABLE(NMP_EVAL_MAX, 3);
+TUNABLE(NMP_EVAL_DIVISOR, 189);
+TUNABLE(NMP_EVAL_MAX, 2);
 
 /* How much less a node that was on a principal variation, but is not one in
  * this tree, gets reduced. Zero restores the pre-E19 rule exactly. */
-TUNABLE(TTPV_REDUCTION, 1);
+TUNABLE(TTPV_REDUCTION, 2);
 
 /* History bonus curve: the multiplier on depth-squared, and the depth past
  * which extra confidence stops being real.
@@ -524,7 +524,7 @@ TUNABLE(TTPV_REDUCTION, 1);
  * what a zero gradient looks like from the outside. Its range now reaches 32
  * for the sake of LTC sweeps, where depths do get there; at STC it should be
  * excluded from the fit rather than given room to wander. */
-TUNABLE(HIST_BONUS_MUL, 5);
+TUNABLE(HIST_BONUS_MUL, 8);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
 
 /*
@@ -549,10 +549,10 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * is not real" is a statement about the search, and it is equally true of
  * evidence pointing either way.
  */
-TUNABLE(HIST_MALUS_MUL, 6);
+TUNABLE(HIST_MALUS_MUL, 7);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
-TUNABLE(LMP_BASE, 7);
+TUNABLE(LMP_BASE, 11);
 
 /* Half-width of the first aspiration window. */
 TUNABLE(ASPIRATION_DELTA, 20);
