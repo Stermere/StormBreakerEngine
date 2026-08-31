@@ -234,7 +234,7 @@ endif
 # ----------------------------------------------------------------- targets --
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
-        tuner datagen datagen-test trainer-setup trainer-test sprt tune rating gauntlet snapshot \
+        tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet snapshot \
         nnue nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch
 
 all: $(TARGET)
@@ -417,7 +417,7 @@ trainer-test: datagen-test
 #
 #   make sprt ARGS="--tc LTC"
 #   make tune ARGS="--engine ./stormbreaker-tune-nnue.exe --iterations 800"
-#   make rating ARGS="--levels 2600,2800,3000"
+#   make gauntlet ARGS="--field stockfish --games 200"
 TOOLPY ?= python
 ARGS ?=
 
@@ -426,9 +426,6 @@ sprt:
 
 tune:
 	@$(TOOLPY) tools/tune.py $(ARGS)
-
-rating:
-	@$(TOOLPY) tools/rating.py $(ARGS)
 
 gauntlet:
 	@$(TOOLPY) tools/gauntlet.py $(ARGS)
@@ -542,8 +539,7 @@ help:
 	@echo "make trainer-test       run the trainer's test suite"
 	@echo "make sprt               SPRT this build against a baseline"
 	@echo "make tune               SPSA-tune the TUNE_SEARCH=on parameters"
-	@echo "make rating             absolute rating vs a Stockfish ladder"
-	@echo "make gauntlet           play a field of baselines, Elo table"
+	@echo "make gauntlet           play a field (or Stockfish alone), Elo table"
 	@echo "make snapshot           freeze this build as a baseline"
 	@echo "make nnue-export        quantise NET into EVALFILE (+ test vectors)"
 	@echo "make nnue               build the engine with the network evaluation"

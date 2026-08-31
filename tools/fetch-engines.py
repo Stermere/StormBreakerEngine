@@ -10,7 +10,9 @@ of THIS engine, so the table it prints is relative to a scale nobody outside
 this repository recognises. These opponents are third-party engines with
 published CCRL ratings, which turns the same table into an absolute reading:
 beating the 3256 rung and losing to the 3426 one says where the engine sits
-without going through Stockfish's UCI_Elo ladder and its caveats (rating.py).
+without going through Stockfish's UCI_Elo rungs and their caveats - a ladder
+this repository no longer keeps, now that `--field stockfish` plays the real
+thing.
 
 WHY THESE FIVE. They span 3008-3426 in ~100 Elo steps, which brackets the
 engine on both sides - a field entirely above or entirely below it produces

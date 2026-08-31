@@ -3,8 +3,8 @@ gauntlet.py - run the engine against a field of opponents and report a table.
 
     python tools/gauntlet.py --games 200
     python tools/gauntlet.py --opponents external/baselines/v0.1.exe
-    python tools/gauntlet.py --include-stockfish --skill-level 5
     python tools/gauntlet.py --field engines --games 200
+    python tools/gauntlet.py --field stockfish --games 200
 
 Where sprt.py answers "is this patch better than the last version?", a gauntlet
 answers "how strong is the engine, actually?". Use it to confirm real progress
@@ -17,14 +17,22 @@ The default field is external/baselines (past versions of this engine) plus
 external/engines (third-party engines with published CCRL ratings, fetched by
 `make engines-fetch`). Use `--field engines` for a reading against rated
 opponents alone. The CCRL numbers are landmarks on someone else's pool, not a
-rating this engine has earned - see the caveats at the top of rating.py, which
-apply just as much here.
+rating this engine has earned.
 
-NOTE ON STOCKFISH: at full strength it wins 100% and tells you nothing. Use
---skill-level to weaken it to something informative, and raise it as the engine
-improves. For a calibrated *rating* rather than a table, use rating.py, which
-drives UCI_Elo properly - Skill Level and UCI_Elo are different mechanisms and
-only the latter claims to be on an Elo scale.
+STOCKFISH. `--field stockfish` plays it and nothing else; `--include-stockfish`
+adds it to whatever field is already there. Both play it at full strength, which
+is the point - the engine is now close enough that an unlimited Stockfish is an
+informative opponent rather than a guaranteed 100% loss, and full strength
+avoids the objection that sinks every handicapped ladder: a strength-limited
+engine plays mostly full-strength moves with occasional deliberate errors, which
+is not the error distribution any real opponent produces. `--skill-level N`
+(0-20) applies Stockfish's handicap anyway if a weaker seat is wanted; it is a
+handicap, not an Elo scale, and no number derived from it should be quoted as
+one.
+
+For an absolute reading prefer `--field engines`, whose rungs are real engines
+at full strength carrying published ratings - see docs/EXPERIMENTS.md,
+"Absolute strength", for what that ladder can and cannot support.
 """
 
 from __future__ import annotations
@@ -43,16 +51,26 @@ def main() -> int:
     ap.add_argument("--opponents", default="",
                     help="comma-separated paths; default is every saved baseline plus "
                          "every fetched third-party engine")
-    ap.add_argument("--field", choices=("all", "baselines", "engines"), default="all",
+    ap.add_argument("--field", choices=("all", "baselines", "engines", "stockfish"), default="all",
                     help="which default field to play; ignored when --opponents is given")
     ap.add_argument("--games", type=int, default=100, help="games per pairing")
     ap.add_argument("--tc", default="STC")
     ap.add_argument("--concurrency", type=int, default=0)
     ap.add_argument("--hash", type=int, default=16, dest="hash_mb")
-    ap.add_argument("--include-stockfish", action="store_true")
-    ap.add_argument("--skill-level", type=int, default=0)
+    ap.add_argument("--include-stockfish", action="store_true",
+                    help="add Stockfish to the field, alongside the rest of it")
+    ap.add_argument("--skill-level", type=int, default=None,
+                    help="handicap Stockfish (0-20); the default plays it at full strength")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+
+    want_sf = args.include_stockfish or args.field == "stockfish"
+    if not want_sf and args.skill_level is not None:
+        # Accepting a strength knob and then ignoring it is how a run gets read
+        # as a match it never was. Refuse instead.
+        c.fail("--skill-level configures Stockfish, which is not in this field. "
+               "Add --field stockfish or --include-stockfish.")
+        return 1
 
     fastchess = c.require(c.get_fastchess(), "fastchess not found. Run: powershell -File tools\\setup.ps1")
 
@@ -87,23 +105,30 @@ def main() -> int:
             continue
         engines.append(c.engine_args(str(p.resolve()), p.stem))
 
-    if args.include_stockfish:
+    sf_seat = ""
+    if want_sf:
         sf = c.get_stockfish()
-        if sf:
+        if not sf:
+            missing = "Stockfish not found. Run: powershell -File tools\\setup.ps1"
+            if args.field == "stockfish":
+                c.fail(missing)
+                return 1
+            c.warn(f"{missing} Continuing without it.")
+        elif args.skill_level is None:
+            sf_seat = "SF"
+            engines.append(c.engine_args(sf, sf_seat))
+        else:
             # "Skill Level" really does contain a space; fastchess passes the
             # whole token through to the engine, which is what UCI expects.
-            engines.append(
-                c.engine_args(sf, f"SF-skill{args.skill_level}",
-                              {"Skill Level": args.skill_level})
-            )
-        else:
-            c.warn("Stockfish not found; continuing without it.")
+            sf_seat = f"SF-skill{args.skill_level}"
+            engines.append(c.engine_args(sf, sf_seat, {"Skill Level": args.skill_level}))
 
     if len(engines) < 2:
-        c.fail("No opponents. Snapshot a baseline, fetch the rated field, or pass "
-               "--opponents / --include-stockfish.")
+        c.fail("No opponents. Snapshot a baseline, fetch the rated field, or play "
+               "Stockfish on its own.")
         print("  make snapshot ARGS=\"--name v0.1\"")
         print("  make engines-fetch")
+        print("  make gauntlet ARGS=\"--field stockfish\"")
         return 1
 
     c.ensure_dir(c.GAMES_DIR)
@@ -125,6 +150,8 @@ def main() -> int:
     c.section("Gauntlet")
     print(f"  engine       {engine}")
     print(f"  opponents    {len(engines) - 1}")
+    if sf_seat:
+        print(f"  stockfish    {sf_seat}")
     print(f"  time control {tc}  ({tc_label})")
     print(f"  games        ~{args.games} per pairing")
     print(f"  concurrency  {concurrency}")

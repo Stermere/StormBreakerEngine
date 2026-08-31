@@ -139,7 +139,7 @@ correct response is to implement movegen, not to relax the check.
 |---|---|
 | `src/` | engine sources |
 | `tests/perft/` | correctness suites (EPD) |
-| `tools/` | SPRT, SPSA tuning, gauntlet, rating, baselines (Python, stdlib only). Setup, GUI launch and engine registration stay PowerShell - they are Windows integration. Invoke the Python ones through `make sprt` / `make tune` / `make gauntlet` / `make rating` / `make snapshot`, never by naming an interpreter |
+| `tools/` | SPRT, SPSA tuning, gauntlet, baselines (Python, stdlib only). Setup, GUI launch and engine registration stay PowerShell - they are Windows integration. Invoke the Python ones through `make sprt` / `make tune` / `make gauntlet` / `make snapshot`, never by naming an interpreter |
 | `tools/tuner.c` | the evaluation fitter; **not** part of the engine binary |
 | `tools/export_net.py` | quantises a checkpoint into `.nnue` + the equivalence vectors |
 | `trainer/` | PyTorch NNUE trainer, its own venv, not subject to the C style rules |

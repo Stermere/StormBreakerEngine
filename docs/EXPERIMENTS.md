@@ -1153,11 +1153,17 @@ an untried one-SPRT experiment.
 ## Absolute strength
 
 Every Elo figure above is relative to another build in `external\baselines`,
-none of which is itself rated. This anchors them. Two ladders do it: `make
-rating` plays Stockfish `UCI_Elo` rungs, and `make gauntlet` plays the
+none of which is itself rated. This anchors them: `make gauntlet` plays the
 third-party engines `make engines-fetch` puts in `external\engines`, each
-carrying a published CCRL rating. Both fit one rating by inverse-variance
-weighting; they are different pools and are not interchangeable.
+carrying a published CCRL rating, and the tables below fit one rating by
+inverse-variance weighting over those rungs.
+
+Entries below dated before 2026-08-30 use a second ladder — Stockfish `UCI_Elo`
+rungs, run by `tools/rating.py`. Both the tool and the ladder are gone. They
+were never the CCRL pool, and a strength-limited Stockfish is not a genuinely
+weaker engine, so those numbers do not difference against the CCRL tables. The
+engine is now strong enough to play Stockfish unlimited instead — `make gauntlet
+ARGS="--field stockfish"` — which is an honest opponent rather than a rung.
 
 **2026-08-30**, after E19b, at STC 8+0.08, on the **network** build, against
 the CCRL ladder. 638 games round-robin, ~44 against each rung:

@@ -142,8 +142,7 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 | Command | Purpose and main flags |
 |---|---|
 | `make sprt` | SPRT dev vs baseline. `--dev <exe>` `--base <exe>` (default: newest in `external\baselines`), `--tc VSTC\|STC\|LTC\|10+0.1`, `--bounds "0,5"`, `--smoke`, `--dry-run` |
-| `make gauntlet` | Elo table vs a field. `--engine`, `--field all\|baselines\|engines`, `--games N`, `--tc`, `--include-stockfish`, `--dry-run` |
-| `make rating` | absolute rating vs Stockfish `UCI_Elo` rungs. `--levels 2200,...`, `--games`, `--tc`, `--dry-run` |
+| `make gauntlet` | Elo table vs a field. `--engine`, `--field all\|baselines\|engines\|stockfish`, `--games N`, `--tc`, `--include-stockfish`, `--skill-level N`, `--dry-run` |
 | `make tune` | SPSA over the `TUNE_SEARCH=on` parameters. `--params`, `--exclude`, `--iterations`, `--tc`, `--list` (inspect state; `--dry-run` rotates it), `--resume` |
 | `make snapshot ARGS="--name v0.x"` | freeze the current build into `external\baselines` |
 | `make engines-fetch` | download the CCRL-rated opponent ladder into `external\engines` |
@@ -180,7 +179,7 @@ For anything you intend to *measure* rather than watch, use `make sprt` /
 ```
 src/                engine sources (flat, as in most strong engines)
 tests/perft/        move generation correctness suites (EPD)
-tools/              SPRT, SPSA tuning, gauntlet, rating, baselines (Python,
+tools/              SPRT, SPSA tuning, gauntlet, baselines (Python,
                     stdlib only); setup / GUI / engine registration (PowerShell);
                     tuner.c (evaluation fitter) and datagen.c (NNUE data)
 trainer/            the NNUE trainer: PyTorch, its own venv, its own tests

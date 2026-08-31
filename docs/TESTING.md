@@ -129,15 +129,21 @@ time control needs LTC evidence, not an argument.
 
 ```powershell
 make gauntlet ARGS="--games 200"
-make gauntlet ARGS="--include-stockfish --skill-level 3"
+make gauntlet ARGS="--field engines --games 200"
+make gauntlet ARGS="--field stockfish --games 200"
 ```
 
 Self-play SPRT answers "better than before". A gauntlet answers "how strong,
 really". It also catches regressions that self-play hides — an engine can beat
 its previous self while getting worse against different opponents.
 
-Full-strength Stockfish will win 100% and teach you nothing; use `-SkillLevel`
-to pick a useful opponent and raise it as you improve.
+`--field stockfish` plays Stockfish and nothing else, at full strength — the
+engine is now close enough for that to be informative rather than a guaranteed
+100% loss. `--skill-level N` handicaps it if a weaker seat is wanted, but a
+handicapped Stockfish plays mostly full-strength moves with occasional
+deliberate errors, which is not how a genuinely weaker opponent errs, and the
+level is not an Elo scale. For an absolute reading, `--field engines` is the
+ladder to use — see "Absolute strength" in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ---
 

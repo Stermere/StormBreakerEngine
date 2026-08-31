@@ -1,8 +1,8 @@
 """
 sprt.py - run a sequential probability ratio test between two builds.
 
-Answers "is this better than the last version?" and nothing else. For an
-absolute number see rating.py; for a field see gauntlet.py.
+Answers "is this better than the last version?" and nothing else. For a
+field, a rated ladder or a Stockfish rung, see gauntlet.py.
 
     python tools/sprt.py --smoke
     python tools/sprt.py
