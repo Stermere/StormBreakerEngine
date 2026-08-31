@@ -131,6 +131,16 @@ typedef enum {
  *     int16  ftBias[hidden]
  *     int16  outWeight[outputBuckets][2 * hidden]
  *     int32  outBias[outputBuckets]
+ *     int16  uncWeight[outputBuckets][2 * hidden]   only when reserved[0] == 1
+ *     int32  uncBias[outputBuckets]                 only when reserved[0] == 1
+ *
+ * reserved[0] is the UNCERTAINTY flag: 1 means the payload carries a second
+ * output head, trained to predict the value head's own |error| against the
+ * search label, which search.c uses to scale its pruning margins. A flag in
+ * the reserved bytes rather than a version bump because a headless net is
+ * still a complete net: both engine generations load it identically, and an
+ * engine too old for the flag rejects a flagged net on the payload size
+ * rather than misreading it.
  *
  * There is no checksum field on purpose. The SHA-256 is of the whole file, so
  * a field holding it could not describe the bytes containing it; the engine
@@ -149,7 +159,7 @@ typedef struct {
     int32_t scale;          /* centipawns per unit of float output, 400 */
     uint32_t payloadBytes;  /* weight bytes following this header */
     char tag[NNUE_TAG_LEN]; /* free-form provenance: training run, epoch, commit */
-    uint8_t reserved[16];   /* zero; room to add a field without a version bump */
+    uint8_t reserved[16];   /* [0] uncertainty flag; the rest zero, room for more */
 } NnueHeader;
 
 /* Loads the embedded net (or EvalFile, if one was set). Fatal on failure: an
@@ -164,6 +174,17 @@ bool nnue_load_file(const char *path);
 /* Side-to-move-relative centipawns, the same convention eval_evaluate() uses
  * and clamped to the same safe range - see NNUE_EVAL_LIMIT in nnue.c. */
 Value nnue_evaluate(const Position *pos);
+
+/* Whether the loaded net carries the uncertainty head. Constant between loads,
+ * so callers may branch on it once per node without paying for the nets that
+ * lack it. */
+bool nnue_has_uncertainty(void);
+
+/* The head's prediction of the evaluation's own |error| in centipawns, >= 0.
+ * One extra output-row pass over the accumulator the evaluation already keeps.
+ * Meaningless (and asserted against) on a net without the head - check
+ * nnue_has_uncertainty() first. */
+Value nnue_uncertainty(const Position *pos);
 
 /* Short hex prefix of the loaded net's SHA-256, for the bench header. A node
  * count that cannot be attributed to a specific net is not a measurement. */

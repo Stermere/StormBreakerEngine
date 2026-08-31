@@ -1098,6 +1098,57 @@ engine without scaling.
 
 ---
 
+### E21 — The trained uncertainty head replaces the corrhist probe
+
+**Date** 2026-08-30 · **Baseline** the E20 build (`stormbreaker-nnue-best-gen-4`,
+net `54f9285f0585`) · **Bench** nnue 238814 -> 218976 (d7),
+3194362 -> 2989539 (d12)
+
+Dev is one batch with two parts. The net is a retrain of the baseline's own
+recipe (gen-3 + gen-4 data, 512x2, 4 epochs) with `--uncertainty`: a second
+output head on the shared trunk, trained by L1 against the detached residual
+`|search score − value|`, exported behind the header's `reserved[0]` flag as
+net `0ba56166ba9c`. The search is unchanged except that `unc_scale()` now
+derives its margin factor from the head's predicted error instead of the
+corrhist magnitude: `min(72 + sigma/2, 140)` percent, centred like E20's
+constants on the measured d12 distribution (sigma median 47cp, node-weighted
+mean ~72cp, taken with scaling held neutral so the mapping could not shape the
+tree it was measured on).
+
+| | |
+|---|---|
+| TC / bounds | STC 8+0.08, [0, 5] normalized |
+| **Result** | **H1 accepted** — LLR 2.98 at 2516 games |
+| Elo | **+21.29 ± 9.22** (nElo +31.44 ± 13.58) |
+| Record | 844W / 690L / 982D, 53.06% |
+| Ptnml | [58, 246, 526, 340, 88], PairsRatio 1.41 |
+| LOS | 100.00% |
+
+With E20, that is two verdicts and ~+47 at STC over the pre-probe best, from
+one idea taken in two steps. A sanity run of the same dev against the older
+pre-E20 baseline trended consistently (+27.7 ± 18.8 at 528 games) and was
+superseded by this test rather than run to a verdict.
+
+**What this does and does not attribute.** The batch measures the retrain and
+the signal swap together. The value trunk was retrained with the head's
+gradients flowing into it, and two same-recipe training runs differ by
+run-to-run variance on their own, so "the head's signal beats corrhist's" is
+NOT isolated here — that A/B (same net, same binary, only `unc_scale()`'s
+input differing) remains unrun and is a one-line experiment if attribution
+ever matters. What IS established: the corrhist-magnitude signal was replaced
+by a position-only learned prior and the engine got stronger, against the
+prediction (argued from Stockfish's corrplexity being path-dependent, see the
+prior-art note under E20) that the value lives in the running measurement. As
+far as known, this is the first measured instance of a learned uncertainty
+head paying its way in an alpha-beta engine.
+
+**Open debts.** STC only — with E20 that is two entries of LTC confirmation
+debt. The five `Unc*` tunables are sweep seats fitted by centring, not by
+SPSA. The corrhist and sigma signals are not exclusive, and combining them is
+an untried one-SPRT experiment.
+
+---
+
 
 ## Absolute strength
 

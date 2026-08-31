@@ -59,7 +59,8 @@ WIDTH_MULTIPLE = 16
 
 class NNUE(nn.Module):
     def __init__(self, hidden: int = DEFAULT_HIDDEN,
-                 output_buckets: int = DEFAULT_OUTPUT_BUCKETS):
+                 output_buckets: int = DEFAULT_OUTPUT_BUCKETS,
+                 uncertainty: bool = False):
         super().__init__()
         if hidden < 1 or hidden % WIDTH_MULTIPLE:
             raise ValueError(f"hidden width must be a multiple of {WIDTH_MULTIPLE}, "
@@ -67,6 +68,7 @@ class NNUE(nn.Module):
 
         self.hidden = hidden
         self.output_buckets = check_output_buckets(output_buckets)
+        self.uncertainty = bool(uncertainty)
 
         # One extra row for the padding slot. padding_idx pins it to zero and
         # keeps it there: it takes no gradient, so a record with 12 pieces
@@ -75,6 +77,16 @@ class NNUE(nn.Module):
         self.ft = nn.EmbeddingBag(NUM_FEATURES + 1, hidden, mode="sum", padding_idx=PAD_INDEX)
         self.ft_bias = nn.Parameter(torch.zeros(hidden))
         self.out = nn.Linear(2 * hidden, self.output_buckets)
+
+        # The uncertainty head: a second output layer on the same activated
+        # trunk, predicting the SCALE of the value head's own error against the
+        # search label - E[|score - value|] - per bucket, in the same units as
+        # the value. It exists so search.c can widen its pruning margins where
+        # the evaluation is unreliable and tighten them where it is not (the
+        # idea E20 measured with a cruder signal). Optional because the head is
+        # a file-format feature: a net without one is still a complete net.
+        if self.uncertainty:
+            self.unc = nn.Linear(2 * hidden, self.output_buckets)
 
         # Small enough that a 32-piece sum starts inside the activation's
         # active range. Starting outside it means most units are saturated and
@@ -85,6 +97,9 @@ class NNUE(nn.Module):
         nn.init.uniform_(self.ft.weight, -0.02, 0.02)
         nn.init.uniform_(self.out.weight, -0.05, 0.05)
         nn.init.zeros_(self.out.bias)
+        if self.uncertainty:
+            nn.init.uniform_(self.unc.weight, -0.05, 0.05)
+            nn.init.zeros_(self.unc.bias)
         with torch.no_grad():
             self.ft.weight[PAD_INDEX].zero_()
 
@@ -105,11 +120,13 @@ class NNUE(nn.Module):
             "output_buckets": self.output_buckets,
             "features": FEATURE_SET_NAME,
             "activation": ACTIVATION_NAME,
+            "uncertainty": self.uncertainty,
         }
 
     def describe(self) -> str:
         return (f"{NUM_FEATURES} -> {self.hidden}x2 -> {self.output_buckets}, "
-                f"{ACTIVATION_NAME}, {FEATURE_SET_NAME}")
+                f"{ACTIVATION_NAME}, {FEATURE_SET_NAME}"
+                + (", +uncertainty" if self.uncertainty else ""))
 
     # -------------------------------------------------------- the forward --
 
@@ -147,13 +164,32 @@ class NNUE(nn.Module):
         default would silently evaluate every position out of the opening
         bucket, and the loss curve would look completely normal for that too.
         """
+        return self._pick(self.out(self._activated(white, black, stm)), piece_count)
+
+    def forward_heads(self, white: torch.Tensor, black: torch.Tensor, stm: torch.Tensor,
+                      piece_count: torch.Tensor | None = None) -> tuple:
+        """Value and predicted-|error|, sharing one pass over the trunk.
+
+        Only valid on a net built with ``uncertainty=True``; the training loop
+        is the caller. The uncertainty output is raw and unclamped here - the
+        non-negativity clamp is an inference-time convention, applied
+        identically by the exporter's reference and src/nnue.c, and clamping in
+        training would zero the gradient exactly where the head most needs to
+        learn it overshot.
+        """
+        x = self._activated(white, black, stm)
+        return self._pick(self.out(x), piece_count), self._pick(self.unc(x), piece_count)
+
+    def _activated(self, white: torch.Tensor, black: torch.Tensor,
+                   stm: torch.Tensor) -> torch.Tensor:
         acc_white, acc_black = self.accumulators(white, black)
 
         own = acc_black * stm + acc_white * (1.0 - stm)
         other = acc_white * stm + acc_black * (1.0 - stm)
 
-        y = self.out(self.activate(torch.cat([own, other], dim=1)))
+        return self.activate(torch.cat([own, other], dim=1))
 
+    def _pick(self, y: torch.Tensor, piece_count: torch.Tensor | None) -> torch.Tensor:
         if self.output_buckets == 1:
             return y.squeeze(1)
         if piece_count is None:
@@ -185,6 +221,11 @@ class NNUE(nn.Module):
         self.ft.weight.clamp_(-bound, bound)
         self.ft_bias.clamp_(-bound, bound)
         self.out.weight.clamp_(-bound, bound)
+        # The uncertainty head multiplies the same QA-clamped activation as the
+        # value head in the same int16 SIMD lanes, so it lives under the same
+        # bound for the same reason.
+        if self.uncertainty:
+            self.unc.weight.clamp_(-bound, bound)
         # clamp_ leaves a zero row at zero, but the pad row is load-bearing
         # enough to re-pin rather than reason about.
         self.ft.weight[PAD_INDEX].zero_()
@@ -219,6 +260,12 @@ def arch_from_checkpoint(state: dict) -> dict:
         "output_buckets": int(arch["output_buckets"]),
         "features": FEATURE_SET_NAME,
         "activation": ACTIVATION_NAME,
+        # Absent from every checkpoint written before the head existed, and
+        # absent means the same thing as False: no head. That is a safe
+        # default in a way a shape default would not be - the weights either
+        # contain an `unc.*` tensor or they do not, and load_state_dict cross
+        # checks it against this flag either way.
+        "uncertainty": bool(arch.get("uncertainty", False)),
     }
 
 
@@ -230,7 +277,8 @@ def from_checkpoint(state: dict) -> NNUE:
     loaded under the wrong feature set would run, and be wrong.
     """
     arch = arch_from_checkpoint(state)
-    model = NNUE(hidden=arch["hidden"], output_buckets=arch["output_buckets"])
+    model = NNUE(hidden=arch["hidden"], output_buckets=arch["output_buckets"],
+                 uncertainty=arch["uncertainty"])
     model.load_state_dict(state["model"])
     return model
 
@@ -265,3 +313,23 @@ def loss_fn(prediction: torch.Tensor, target: torch.Tensor,
     """
     predicted = torch.sigmoid(prediction * NET_TO_CP / sigmoid_k)
     return torch.nn.functional.mse_loss(predicted, target)
+
+
+def uncertainty_loss_fn(unc_prediction: torch.Tensor, value_prediction: torch.Tensor,
+                        score: torch.Tensor) -> torch.Tensor:
+    """L1 against the value head's own absolute error, in net units.
+
+    The target is |search score - value|, DETACHED: the uncertainty head
+    observes the value head and must never steer it - a joint target would let
+    the value head shrink the loss by making its errors more predictable
+    rather than smaller. The trunk still receives the head's gradient, which
+    is the deliberate part of joint training: features that explain the
+    error's size are features worth having.
+
+    L1 rather than MSE because the prediction is then the conditional MEDIAN
+    of |error| rather than its mean, which a heavy-tailed residual would
+    otherwise let a few blown positions dominate. In cp space via NET units so
+    the head's output rides the same quantisation pipeline as the value's.
+    """
+    residual = (score / NET_TO_CP - value_prediction).abs().detach()
+    return torch.nn.functional.l1_loss(unc_prediction, residual)

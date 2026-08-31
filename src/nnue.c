@@ -266,6 +266,8 @@ typedef struct {
     const int16_t *ftBias;    /* [hidden] */
     const int16_t *outWeight; /* [outputBuckets][2 * hidden] */
     const int32_t *outBias;   /* [outputBuckets] */
+    const int16_t *uncWeight; /* [outputBuckets][2 * hidden], NULL without the head */
+    const int32_t *uncBias;   /* [outputBuckets], NULL without the head */
 
     unsigned char *owned; /* non-NULL only when the net came from a file */
     char hash[65];
@@ -288,12 +290,16 @@ static uint32_t nnue_king_slots(uint32_t featureSet) {
     }
 }
 
-/* Bytes the payload must occupy for this header to be self-consistent. */
+/* Bytes the payload must occupy for this header to be self-consistent. The
+ * uncertainty head is a second output layer, so its flag adds exactly one more
+ * outWeight-and-outBias worth of bytes - which is also why an engine that has
+ * never heard of the flag rejects a flagged net on this count. */
 static uint64_t nnue_payload_bytes(const NnueHeader *h) {
+    const uint64_t headBytes = (uint64_t)h->outputBuckets * 2u * h->hidden * sizeof(int16_t) +
+                               (uint64_t)h->outputBuckets * sizeof(int32_t);
+
     return (uint64_t)h->features * h->hidden * sizeof(int16_t) +
-           (uint64_t)h->hidden * sizeof(int16_t) +
-           (uint64_t)h->outputBuckets * 2u * h->hidden * sizeof(int16_t) +
-           (uint64_t)h->outputBuckets * sizeof(int32_t);
+           (uint64_t)h->hidden * sizeof(int16_t) + headBytes * (h->reserved[0] == 1 ? 2u : 1u);
 }
 
 /*
@@ -364,6 +370,20 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
     if (h->qa == 0 || h->qb == 0 || h->scale == 0)
         REJECT("degenerate quantisation (qa %u, qb %u, scale %d)", h->qa, h->qb, h->scale);
 
+    /* reserved[0] is the uncertainty flag. The rest must still be zero: a
+     * future exporter that uses one would otherwise have its field silently
+     * ignored, which is the exact failure the reserved block exists to make
+     * loud. */
+    if (h->reserved[0] > 1)
+        REJECT("uncertainty flag %u, this build reads 0 or 1 - re-export with the current "
+               "tools/export_net.py",
+               h->reserved[0]);
+    for (int i = 1; i < 16; ++i)
+        if (h->reserved[i] != 0)
+            REJECT("reserved byte %d is %u; this build understands only the uncertainty "
+                   "flag in byte 0 - it is too old for whatever wrote this net",
+                   i, h->reserved[i]);
+
     const uint64_t need = nnue_payload_bytes(h);
     if (h->payloadBytes != need)
         REJECT("header claims %u payload bytes, its own shape needs %llu", h->payloadBytes,
@@ -404,6 +424,16 @@ static void nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *o
     Loaded.outWeight = p;
     p += (size_t)Loaded.hdr.outputBuckets * 2u * Loaded.hdr.hidden;
     Loaded.outBias = (const int32_t *)(const void *)p;
+
+    if (Loaded.hdr.reserved[0] == 1) {
+        p = (const int16_t *)(const void *)(Loaded.outBias + Loaded.hdr.outputBuckets);
+        Loaded.uncWeight = p;
+        p += (size_t)Loaded.hdr.outputBuckets * 2u * Loaded.hdr.hidden;
+        Loaded.uncBias = (const int32_t *)(const void *)p;
+    } else {
+        Loaded.uncWeight = NULL;
+        Loaded.uncBias   = NULL;
+    }
 
     sha256_hex(blob, bytes, Loaded.hash);
     snprintf(Loaded.source, sizeof(Loaded.source), "%s", source);
@@ -659,11 +689,12 @@ static inline int64_t nnue_screlu_half(const int16_t *acc, const int16_t *w, uin
  * UPGRADE POINT: a new NnueActivation gets a branch here and a case in the
  * exporter's forward().
  */
-static int32_t nnue_output(const int16_t *own, const int16_t *other, int bucket) {
+static int32_t nnue_head(const int16_t *own, const int16_t *other, const int16_t *weights,
+                         const int32_t *biases, int bucket) {
     const uint32_t hidden  = Loaded.hdr.hidden;
     const int32_t qa       = (int32_t)Loaded.hdr.qa;
-    const int16_t *const w = Loaded.outWeight + (size_t)bucket * 2u * hidden;
-    const int32_t bias     = Loaded.outBias[bucket];
+    const int16_t *const w = weights + (size_t)bucket * 2u * hidden;
+    const int32_t bias     = biases[bucket];
 
 #ifdef NNUE_AVX2
     const int64_t sum =
@@ -685,6 +716,12 @@ static int32_t nnue_output(const int16_t *own, const int16_t *other, int bucket)
 #endif
 
     return (int32_t)(sum / qa) + bias;
+}
+
+/* The evaluation: the value head over the given accumulators. The uncertainty
+ * head is the same arithmetic over its own weights - see nnue_uncertainty(). */
+static inline int32_t nnue_output(const int16_t *own, const int16_t *other, int bucket) {
+    return nnue_head(own, other, Loaded.outWeight, Loaded.outBias, bucket);
 }
 
 /*
@@ -1034,6 +1071,38 @@ Value eval_evaluate(const Position *pos) {
     return nnue_centipawns(raw);
 }
 
+bool nnue_has_uncertainty(void) { return Loaded.uncWeight != NULL; }
+
+/* The uncertainty head's raw output over the given accumulators, shared by the
+ * evaluation path and the verifier for the same reason nnue_raw() is. */
+static int32_t nnue_unc_output(const int16_t *own, const int16_t *other, int bucket) {
+    assert(Loaded.uncWeight != NULL && "uncertainty asked of a net without the head");
+    return nnue_head(own, other, Loaded.uncWeight, Loaded.uncBias, bucket);
+}
+
+/* The head predicts a magnitude, so the clamp floor is zero rather than the
+ * value head's -NNUE_EVAL_LIMIT: a negative prediction is the head saying
+ * "less error than I can express". tools/export_net.py clamps identically. */
+static Value nnue_unc_centipawns(int32_t raw) {
+    const int64_t num = (int64_t)raw * (int64_t)Loaded.hdr.scale;
+    const int64_t den = (int64_t)Loaded.hdr.qa * (int64_t)Loaded.hdr.qb;
+    const int64_t cp  = num / den;
+
+    if (cp < 0)
+        return 0;
+    if (cp > NNUE_EVAL_LIMIT)
+        return NNUE_EVAL_LIMIT;
+    return (Value)cp;
+}
+
+Value nnue_uncertainty(const Position *pos) {
+    const Accumulator *const a = nnue_current(pos);
+    const Color stm            = pos->sideToMove;
+
+    return nnue_unc_centipawns(
+        nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos)));
+}
+
 /* ------------------------------------------------------------- reporting -- */
 
 const char *nnue_hash(void) { return Loaded.loaded ? Loaded.hash : "no-net"; }
@@ -1053,9 +1122,9 @@ void nnue_print_info(void) {
     /* Which inference path this binary took, as well as which net it carries:
      * an nps that cannot be attributed to a build is as useless as a node
      * count that cannot be attributed to a net. */
-    printf("info string net %.12s  %u->%ux2->%u  screlu halfka-32sq %s  qa %u qb %u "
+    printf("info string net %.12s  %u->%ux2->%u%s  screlu halfka-32sq %s  qa %u qb %u "
            "scale %d  tag %s  from %s\n",
-           Loaded.hash, h->features, h->hidden, h->outputBuckets,
+           Loaded.hash, h->features, h->hidden, h->outputBuckets, Loaded.uncWeight ? "+unc" : "",
 #ifdef NNUE_AVX2
            "avx2",
 #else
@@ -1078,14 +1147,26 @@ int nnue_verify_vectors(const char *path) {
     char line[512];
     long checked = 0, failed = 0;
 
+    /* The net says whether every line carries the two uncertainty columns.
+     * The vectors were written beside the net they describe, so a count that
+     * disagrees means these vectors belong to a different net - which the
+     * hash comment would also say, less loudly. */
+    const bool wantUnc = nnue_has_uncertainty();
+
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
             continue;
 
-        long expectedRaw, expectedCp;
+        long expectedRaw, expectedCp, expectedUncRaw = 0, expectedUncCp = 0;
         int consumed = 0;
-        if (sscanf(line, "%ld %ld %n", &expectedRaw, &expectedCp, &consumed) != 2 || !consumed) {
-            printf("nnue verify: malformed line: %s", line);
+
+        const int fields = wantUnc
+                               ? sscanf(line, "%ld %ld %ld %ld %n", &expectedRaw, &expectedCp,
+                                        &expectedUncRaw, &expectedUncCp, &consumed)
+                               : sscanf(line, "%ld %ld %n", &expectedRaw, &expectedCp, &consumed);
+        if (fields != (wantUnc ? 4 : 2) || !consumed) {
+            printf("nnue verify: expected %d columns (net %s the uncertainty head): %s",
+                   wantUnc ? 4 : 2, wantUnc ? "carries" : "lacks", line);
             ++failed;
             continue;
         }
@@ -1108,13 +1189,31 @@ int nnue_verify_vectors(const char *path) {
         const int32_t raw = nnue_raw(&pos);
         const Value cp    = nnue_centipawns(raw);
 
-        if ((long)raw != expectedRaw || (long)cp != expectedCp) {
+        bool ok     = (long)raw == expectedRaw && (long)cp == expectedCp;
+        long uncRaw = 0, uncCp = 0;
+        if (wantUnc) {
+            /* Through the same accumulators the value just used, exactly as
+             * the reference computes both heads from one activation. */
+            const Accumulator *const a = nnue_current(&pos);
+            const Color stm            = pos.sideToMove;
+
+            uncRaw = nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(&pos));
+            uncCp  = nnue_unc_centipawns((int32_t)uncRaw);
+            ok     = ok && uncRaw == expectedUncRaw && uncCp == expectedUncCp;
+        }
+
+        if (!ok) {
             /* Print the first handful and then stop counting out loud: a
              * quantisation bug fails every line, and ten thousand of them
              * buries the one worth reading. */
-            if (failed < 10)
-                printf("nnue verify: MISMATCH  raw %ld != %ld   cp %ld != %ld   %s\n", (long)raw,
-                       expectedRaw, (long)cp, expectedCp, fen);
+            if (failed < 10) {
+                printf("nnue verify: MISMATCH  raw %ld != %ld   cp %ld != %ld", (long)raw,
+                       expectedRaw, (long)cp, expectedCp);
+                if (wantUnc)
+                    printf("   unc %ld != %ld   ucp %ld != %ld", uncRaw, expectedUncRaw, uncCp,
+                           expectedUncCp);
+                printf("   %s\n", fen);
+            }
             ++failed;
         }
         ++checked;

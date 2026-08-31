@@ -154,14 +154,42 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
             f"{(buckets, 2 * hidden)}/{(buckets,)} for {buckets} output buckets"
         )
 
-    return {
+    q = {
         "ft_w": np.rint(ft_w * qa).astype(np.int32),
         "ft_b": np.rint(ft_b * qa).astype(np.int32),
         "out_w": np.rint(out_w * qb).astype(np.int32),
         "out_b": np.rint(out_b * qa * qb).astype(np.int32),
         "hidden": hidden,
         "buckets": buckets,
+        "uncertainty": bool(arch.get("uncertainty", False)),
     }
+
+    # The head's presence is claimed twice - by the arch record and by the
+    # weights themselves - and the two must agree, because the exporter that
+    # trusts one over the other writes either a head of garbage or a header
+    # that promises one it does not have.
+    has_unc_weights = "unc.weight" in state
+    if q["uncertainty"] != has_unc_weights:
+        raise SystemExit(
+            f"checkpoint arch says uncertainty={q['uncertainty']} but its weights "
+            f"{'do' if has_unc_weights else 'do not'} contain an unc.* tensor"
+        )
+
+    if q["uncertainty"]:
+        unc_w = state["unc.weight"].detach().cpu().numpy().astype(np.float64)
+        unc_b = state["unc.bias"].detach().cpu().numpy().astype(np.float64).reshape(-1)
+        if unc_w.shape != (buckets, 2 * hidden) or unc_b.shape != (buckets,):
+            raise SystemExit(
+                f"uncertainty layer is {unc_w.shape}/{unc_b.shape}, expected "
+                f"{(buckets, 2 * hidden)}/{(buckets,)} for {buckets} output buckets"
+            )
+        # The same grid as the value head: the C forward runs both heads
+        # through the same SCReLU arithmetic, so they must be quantised the
+        # same way or one of them is a different function than was trained.
+        q["unc_w"] = np.rint(unc_w * qb).astype(np.int32)
+        q["unc_b"] = np.rint(unc_b * qa * qb).astype(np.int32)
+
+    return q
 
 
 def check_ranges(q: dict, qa: int) -> dict:
@@ -195,10 +223,13 @@ def check_ranges(q: dict, qa: int) -> dict:
     """
     limits = {}
 
-    for name in ("ft_w", "ft_b", "out_w", "out_b"):
+    names = ["ft_w", "ft_b", "out_w", "out_b"]
+    if q["uncertainty"]:
+        names += ["unc_w", "unc_b"]
+    for name in names:
         peak = int(np.abs(q[name]).max())
         limits[f"{name}_peak"] = peak
-        if name != "out_b" and peak > INT16_MAX:
+        if name not in ("out_b", "unc_b") and peak > INT16_MAX:
             raise SystemExit(
                 f"{name} quantises to {peak}, which does not fit int16. The net is "
                 f"unusable at this QA/QB; retrain with weight clipping or lower the scale."
@@ -216,7 +247,9 @@ def check_ranges(q: dict, qa: int) -> dict:
             f"would wrap. Retrain with a smaller QA or with weight clipping."
         )
 
-    activation_product = qa * limits["out_w_peak"]
+    # The uncertainty head rides the same int16 SIMD multiply as the value
+    # head, so its weights live under the same bound.
+    activation_product = qa * max(limits["out_w_peak"], limits.get("unc_w_peak", 0))
     limits["activation_product_bound"] = activation_product
     if activation_product > INT16_MAX:
         raise SystemExit(
@@ -235,6 +268,13 @@ def check_ranges(q: dict, qa: int) -> dict:
     limits["output_bound"] = out_bound
     if out_bound > INT32_MAX:
         raise SystemExit(f"the output sum can reach {out_bound}, past int32.")
+
+    if q["uncertainty"]:
+        per_bucket = np.abs(q["unc_w"]).sum(axis=1, dtype=np.int64)
+        unc_bound = int((np.abs(q["unc_b"]) + qa * per_bucket).max())
+        limits["uncertainty_bound"] = unc_bound
+        if unc_bound > INT32_MAX:
+            raise SystemExit(f"the uncertainty sum can reach {unc_bound}, past int32.")
 
     return limits
 
@@ -271,6 +311,7 @@ def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 25
     table = np.concatenate([q["ft_w"], np.zeros((1, hidden), dtype=np.int32)], axis=0)
 
     raw = np.empty(n, dtype=np.int64)
+    unc_raw = np.empty(n, dtype=np.int64) if q["uncertainty"] else None
 
     for start in range(0, n, chunk):
         stop = min(start + chunk, n)
@@ -291,11 +332,27 @@ def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 25
 
         raw[start:stop] = trunc_div((x * x * w).sum(axis=1), qa) + b
 
+        if unc_raw is not None:
+            uw = q["unc_w"][bucket[start:stop]].astype(np.int64)
+            ub = q["unc_b"][bucket[start:stop]].astype(np.int64)
+            unc_raw[start:stop] = trunc_div((x * x * uw).sum(axis=1), qa) + ub
+
     if np.abs(raw).max(initial=0) > INT32_MAX:
         raise SystemExit("a test position overflowed int32; the bound check is wrong")
 
     cp = np.clip(trunc_div(raw * scale, qa * qb), -EVAL_LIMIT, EVAL_LIMIT)
-    return raw, cp
+
+    if unc_raw is None:
+        return raw, cp, None, None
+
+    if np.abs(unc_raw).max(initial=0) > INT32_MAX:
+        raise SystemExit("a test position overflowed int32 in the uncertainty head")
+
+    # The head predicts a magnitude, so the clamp floor is zero rather than
+    # -EVAL_LIMIT: a negative prediction is the head saying "less than any
+    # error I can express", and the engine clamps identically.
+    unc_cp = np.clip(trunc_div(unc_raw * scale, qa * qb), 0, EVAL_LIMIT)
+    return raw, cp, unc_raw, unc_cp
 
 
 # ------------------------------------------------------------- positions ----
@@ -352,17 +409,30 @@ def collect_fens(args) -> list:
 def write_net(path: str, q: dict, args, tag: str) -> bytes:
     hidden, buckets = q["hidden"], q["buckets"]
 
-    payload = b"".join(
-        [
-            q["ft_w"].astype(np.int16).tobytes(order="C"),
-            q["ft_b"].astype(np.int16).tobytes(order="C"),
-            q["out_w"].astype(np.int16).tobytes(order="C"),
-            q["out_b"].astype(np.int32).tobytes(order="C"),
-        ]
-    )
+    blocks = [
+        q["ft_w"].astype(np.int16).tobytes(order="C"),
+        q["ft_b"].astype(np.int16).tobytes(order="C"),
+        q["out_w"].astype(np.int16).tobytes(order="C"),
+        q["out_b"].astype(np.int32).tobytes(order="C"),
+    ]
     expect = (NUM_FEATURES * hidden * 2 + hidden * 2
               + buckets * 2 * hidden * 2 + buckets * 4)
+    if q["uncertainty"]:
+        blocks += [
+            q["unc_w"].astype(np.int16).tobytes(order="C"),
+            q["unc_b"].astype(np.int32).tobytes(order="C"),
+        ]
+        expect += buckets * 2 * hidden * 2 + buckets * 4
+    payload = b"".join(blocks)
     assert len(payload) == expect, (len(payload), expect)
+
+    # The head's presence rides in reserved[0] rather than a version bump, and
+    # that is what the reserved bytes are for: every headless net stays
+    # loadable by old and new engines alike, and an engine that predates the
+    # head computes a smaller payload than a flagged header claims and rejects
+    # the file loudly on the size check. src/nnue.h documents the byte beside
+    # the struct.
+    reserved = (b"\x01" if q["uncertainty"] else b"\x00") + b"\x00" * 15
 
     header = struct.pack(
         HEADER_FMT,
@@ -378,7 +448,7 @@ def write_net(path: str, q: dict, args, tag: str) -> bytes:
         args.scale,
         len(payload),
         tag.encode("utf-8")[:32],
-        b"\0" * 16,
+        reserved,
     )
 
     blob = header + payload
@@ -431,7 +501,8 @@ def main() -> None:
 
     print(f"wrote {out}  ({len(blob):,} bytes)")
     print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2 -> {q['buckets']}, "
-          f"screlu, {FEATURE_SET_NAME}")
+          f"screlu, {FEATURE_SET_NAME}"
+          + (", +uncertainty" if q["uncertainty"] else ""))
     print(f"  quant     qa {args.qa}  qb {args.qb}  scale {args.scale}")
     print(f"  peaks     ft_w {limits['ft_w_peak']}  ft_b {limits['ft_b_peak']}  "
           f"out_w {limits['out_w_peak']}  (int16 holds {INT16_MAX})")
@@ -443,13 +514,20 @@ def main() -> None:
     # ------------------------------------------------------------ vectors --
     fens = collect_fens(args)
     fields = unpack(pack_fens(fens))
-    raw, cp = forward(q, fields, args.qa, args.qb, args.scale)
+    raw, cp, unc_raw, unc_cp = forward(q, fields, args.qa, args.qb, args.scale)
 
     with open(vectors, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"# {os.path.basename(out)} sha256 {digest}\n")
-        f.write("# <raw int32> <centipawns> <fen>  - src/nnue.c must reproduce both exactly\n")
-        for value, centipawns, fen in zip(raw, cp, fens):
-            f.write(f"{int(value)} {int(centipawns)} {fen}\n")
+        if unc_raw is not None:
+            f.write("# <raw int32> <centipawns> <unc raw> <unc cp> <fen>  "
+                    "- src/nnue.c must reproduce all four exactly\n")
+            for value, centipawns, uraw, ucp, fen in zip(raw, cp, unc_raw, unc_cp, fens):
+                f.write(f"{int(value)} {int(centipawns)} {int(uraw)} {int(ucp)} {fen}\n")
+        else:
+            f.write("# <raw int32> <centipawns> <fen>  "
+                    "- src/nnue.c must reproduce both exactly\n")
+            for value, centipawns, fen in zip(raw, cp, fens):
+                f.write(f"{int(value)} {int(centipawns)} {fen}\n")
     print(f"wrote {vectors}  ({len(fens):,} vectors)")
 
     # How far the quantised net drifted from the float one it came from. Not a
@@ -472,6 +550,10 @@ def main() -> None:
     drift = np.abs(float_cp - cp)
     print(f"  vs float  mean |diff| {drift.mean():.2f} cp, max {drift.max():.2f} cp")
     print(f"  scores    |cp| max {np.abs(cp).max()} (clamp is {EVAL_LIMIT})")
+    if unc_cp is not None:
+        print(f"  unc       predicted |error| mean {unc_cp.mean():.1f} cp, "
+              f"median {np.median(unc_cp):.1f} cp, max {unc_cp.max()} cp "
+              f"- search.c's UncSigma* constants are centred against this")
 
     manifest = {
         "net": os.path.basename(out),
@@ -485,6 +567,7 @@ def main() -> None:
         "output_buckets": q["buckets"],
         "activation": "screlu",
         "feature_set": FEATURE_SET_NAME,
+        "uncertainty": q["uncertainty"],
         "qa": args.qa,
         "qb": args.qb,
         "scale": args.scale,

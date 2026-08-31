@@ -345,12 +345,39 @@ def test_a_checkpoint_describes_its_own_architecture():
     assert arch_from_checkpoint(state) == {
         "hidden": 48, "output_buckets": 4,
         "features": "halfka-32sq", "activation": "screlu",
+        "uncertainty": False,
     }
 
     restored = from_checkpoint(state)
     assert restored.arch == model.arch
     white, black, stm, pieces = tensors([START], restored)
     assert torch.allclose(restored(white, black, stm, pieces), model(white, black, stm, pieces))
+
+
+def test_the_uncertainty_head_rides_the_checkpoint_and_the_headless_default_holds():
+    """A checkpoint written before the head existed carries no `uncertainty`
+    key, and absent must mean False: the weights either contain an unc.*
+    tensor or they do not, and from_checkpoint must construct the matching
+    model for both generations of file."""
+    headless = NNUE(hidden=48, output_buckets=4)
+    old_style_arch = {k: v for k, v in headless.arch.items() if k != "uncertainty"}
+    restored = from_checkpoint({"model": headless.state_dict(), "arch": old_style_arch})
+    assert restored.uncertainty is False
+
+    model = NNUE(hidden=48, output_buckets=4, uncertainty=True)
+    assert model.arch["uncertainty"] is True
+
+    restored = from_checkpoint({"model": model.state_dict(), "arch": model.arch})
+    assert restored.uncertainty is True
+    white, black, stm, pieces = tensors([START], restored)
+    value, unc = restored.forward_heads(white, black, stm, pieces)
+    expected_value, expected_unc = model.forward_heads(white, black, stm, pieces)
+    assert torch.allclose(value, expected_value)
+    assert torch.allclose(unc, expected_unc)
+
+    # The value head must be the same function it is without the head wired
+    # in: forward() and forward_heads() answer from one trunk.
+    assert torch.allclose(value, restored(white, black, stm, pieces))
 
 
 def test_a_checkpoint_from_the_old_architecture_is_refused_rather_than_guessed():

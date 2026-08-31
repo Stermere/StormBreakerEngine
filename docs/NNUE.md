@@ -935,18 +935,43 @@ Order of operations, each SPRT'd:
 2. **The head**: a second output on the accumulator trained to predict the
    scale of the residual `|search score − net value|`. The target is already
    in every record — the fixed-node search score is the label the value head
-   trains against — so this costs a retrain, not a regeneration. Train with
-   an L1 or Gaussian-NLL term against the absolute residual, value loss
-   untouched. Export adds a versioned header field per invariant 8, and
-   `make nnue-test` gates the σ path bit-exactly like the value path. In the
-   search it replaces `unc_scale()`'s input; none of the call sites move.
+   trains against — so this costs a retrain, not a regeneration.
+
+   **The code is complete end to end**; what remains is the retrain and the
+   measurement. `python -m nnue.train --uncertainty` adds the head (L1
+   against the detached absolute residual, weighted by `--unc-weight`; the
+   value loss is untouched), the exporter writes it behind the header's
+   `reserved[0]` flag so every headless net stays loadable by every engine,
+   `src/nnue.c` computes it as one extra output-row pass over the
+   accumulator the evaluation already keeps, and `unc_scale()` in search.c
+   prefers it over the corrhist signal whenever the loaded net carries one.
+   The whole path is gated the same way as the value head: the vectors gain
+   two columns and the C inference must match them exactly — proven on a
+   smoke net before this was written down.
+
+   **Measured: +21.29 ± 9.22 at STC, H1 (E21)**, as a retrain-plus-signal
+   batch against the E20 build. `UncSigmaBase`/`UncSigmaSlope` were centred
+   on the bench tree's σ distribution (median 47cp, mean ~72cp — far below
+   the exporter's vector-set figures, which come from training data rather
+   than search). Still owed: LTC confirmation for both E20 and E21, the
+   same-net signal A/B if attribution ever matters, and the combination of
+   the two signals.
 3. **Extensions, one at a time**: aspiration half-width, the null-move
    static-eval condition, LMR confidence.
 
-**Honest expectations.** No engine is known to ship a learned variance head
-driving its margins, which cuts both ways: the seam is unmined, and unmined
-seams are usually unmined for a reason. The probe exists precisely to buy the
-answer cheaply before the trainer is touched.
+**Prior art, stated precisely.** The probe's mechanism is not novel: Stockfish
+merged corrhist-conditioned futility margins in early 2025 ("corrplexity",
+PRs #5735/#5748, plus corrhist-conditioned extensions in #5767), worth 1-2 Elo
+there on margins SPSA'd for a decade. E20's +25 against margins that had never
+been conditioned at all is the same idea meeting a whole missing class, which
+is also why the crude form extends weakly to engines that already carry it.
+The **learned head** is the part with no known precedent in an alpha-beta
+engine, and that cuts both ways: the seam is unmined, and unmined seams are
+usually unmined for a reason. It is also a genuinely different signal from
+corrhist - a position-only prior versus a running measurement that adapts
+within the game - so the probe's result funds the head without proving it.
+The two are not exclusive; if the head passes, combining them is a further
+one-SPRT experiment.
 
 ---
 

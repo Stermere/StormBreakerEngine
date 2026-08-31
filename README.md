@@ -58,7 +58,9 @@ Adding on a correction history and an SPSA tuned search brought this to ~3095 El
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
 | Search: uncertainty-scaled margins (corrhist-magnitude probe) | **+25.61 ± 9.85** (E20) |
-| **NNUE: uncertainty head driving the margin scale** | **TODO** |
+| NNUE: uncertainty head (trainer, export, inference, search) | code complete, bit-exact |
+| NNUE: uncertainty-head net + σ-scaled margins | **+21.29 ± 9.22** (E21) |
+| **Uncertainty margins: LTC confirmation (E20 + E21 are STC-only)** | **TODO** |
 | **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly; `make openbench-check` passes,

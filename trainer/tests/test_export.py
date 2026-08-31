@@ -55,19 +55,22 @@ FENS = [
 ]
 
 
-def build(hidden=32, buckets=8, seed=0):
+def build(hidden=32, buckets=8, seed=0, uncertainty=False):
     """A small model with weights spread over the whole clipped range.
 
     Deliberately not a trained net: a trained one has small weights and would
     pass a scale test that a saturated one fails.
     """
     torch.manual_seed(seed)
-    model = NNUE(hidden=hidden, output_buckets=buckets)
+    model = NNUE(hidden=hidden, output_buckets=buckets, uncertainty=uncertainty)
     with torch.no_grad():
         model.ft.weight.uniform_(-0.08, 0.08)
         model.ft_bias.uniform_(-0.05, 0.05)
         model.out.weight.uniform_(-1.5, 1.5)
         model.out.bias.uniform_(-0.2, 0.2)
+        if uncertainty:
+            model.unc.weight.uniform_(-1.5, 1.5)
+            model.unc.bias.uniform_(-0.2, 0.2)
     model.clip_weights()
     return model
 
@@ -95,7 +98,7 @@ def run(model):
 
     dequantise_into(model, q)
     fields = unpack(pack_fens(FENS))
-    raw, cp = forward(q, fields, QA, QB, SCALE)
+    raw, cp, _unc_raw, _unc_cp = forward(q, fields, QA, QB, SCALE)
 
     with torch.no_grad():
         model.eval()
@@ -145,6 +148,60 @@ def test_a_missing_screlu_rescale_would_have_been_caught():
     assert np.abs(unscaled - raw).max() > 1000, "the rescale did nothing"
 
 
+def test_the_uncertainty_head_quantises_and_reproduces_its_float_self():
+    """The head is a second output layer through the same trunk, and its
+    integer forward must track the float model it came from the same way the
+    value head's does - same grid, same rescale, same truncation. The clamp
+    floor is the one asymmetry: a magnitude clamps at zero, not -EVAL_LIMIT,
+    so the comparison is against the float prediction clamped the same way."""
+    model = build(uncertainty=True)
+    q = quantise(model.state_dict(), model.arch, QA, QB)
+    q["qb"] = QB
+    check_ranges(q, QA)
+
+    with torch.no_grad():
+        model.ft.weight[:NUM_FEATURES] = torch.from_numpy(
+            q["ft_w"].astype(np.float64) / QA).float()
+        model.ft.weight[PAD_INDEX].zero_()
+        model.ft_bias.copy_(torch.from_numpy(q["ft_b"].astype(np.float64) / QA).float())
+        model.unc.weight.copy_(torch.from_numpy(q["unc_w"].astype(np.float64) / QB).float())
+        model.unc.bias.copy_(
+            torch.from_numpy(q["unc_b"].astype(np.float64) / (QA * QB)).float())
+
+    fields = unpack(pack_fens(FENS))
+    _raw, _cp, unc_raw, unc_cp = forward(q, fields, QA, QB, SCALE)
+    assert unc_raw is not None
+    assert unc_cp.min() >= 0, "a predicted magnitude must clamp at zero"
+
+    with torch.no_grad():
+        model.eval()
+        _value, float_unc = model.forward_heads(
+            torch.from_numpy(fields["white"]),
+            torch.from_numpy(fields["black"]),
+            torch.from_numpy(fields["stm"]).float().unsqueeze(1),
+            torch.from_numpy(fields["piece_count"]),
+        )
+    float_unc_cp = np.clip(float_unc.numpy() * SCALE, 0, None)
+
+    worst = float(np.abs(float_unc_cp - unc_cp).max())
+    assert worst < 1.5, (
+        f"quantised and float uncertainty disagree by {worst:.1f} cp on identical "
+        f"weights - check the unc path in export_net.forward()."
+    )
+    # Not all zero, or the assertion above would pass on a head that says
+    # nothing.
+    assert np.abs(unc_cp).max() > 10
+
+
+def test_a_headless_checkpoint_and_a_headed_one_disagreeing_is_refused():
+    """The head's presence is claimed by the arch and by the weights, and the
+    exporter must refuse the pair that disagrees rather than trust either."""
+    model = build(uncertainty=True)
+    lying_arch = dict(model.arch, uncertainty=False)
+    with pytest.raises(SystemExit, match="unc"):
+        quantise(model.state_dict(), lying_arch, QA, QB)
+
+
 def test_output_buckets_actually_route_to_different_rows():
     """Two nets identical but for their output rows must score positions of
     different piece counts differently - and a bucketed net must not be
@@ -154,12 +211,12 @@ def test_output_buckets_actually_route_to_different_rows():
     q["qb"] = QB
 
     fields = unpack(pack_fens(FENS))
-    _raw, cp = forward(q, fields, QA, QB, SCALE)
+    _raw, cp, _u, _ucp = forward(q, fields, QA, QB, SCALE)
 
     flat = dict(q)
     flat["out_w"] = np.repeat(q["out_w"][:1], q["buckets"], axis=0)
     flat["out_b"] = np.repeat(q["out_b"][:1], q["buckets"], axis=0)
-    _raw0, cp0 = forward(flat, fields, QA, QB, SCALE)
+    _raw0, cp0, _u0, _ucp0 = forward(flat, fields, QA, QB, SCALE)
 
     buckets = (fields["piece_count"] - 2) // 4
     assert len(set(buckets.tolist())) > 1, "the test positions cover only one bucket"

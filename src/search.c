@@ -33,6 +33,7 @@
 #include "bitboard.h"
 #include "eval.h"
 #include "movegen.h"
+#include "nnue.h"
 #include "thread.h"
 #include "timeman.h"
 #include "tt.h"
@@ -483,6 +484,15 @@ TUNABLE(UNC_SCALE_SLOPE, 2);
 TUNABLE(UNC_SCALE_MAX, 140);
 
 /*
+ * The same mapping for a net that carries the trained uncertainty head, whose
+ * signal is centipawns of predicted |eval error| rather than centipawns of
+ * learned bias - a larger number with a different distribution, hence its own
+ * floor and slope (the slope is sixteenths of a percent per cp).
+ */
+TUNABLE(UNC_SIGMA_BASE, 72);
+TUNABLE(UNC_SIGMA_SLOPE, 8);
+
+/*
  * ---------------------------------------------------------------------------
  * The second tier: constants that shape a formula rather than sit in a
  * comparison.
@@ -602,6 +612,8 @@ static const struct {
     {"UncScaleBase", &UNC_SCALE_BASE, 60, 120},
     {"UncScaleSlope", &UNC_SCALE_SLOPE, 0, 12},
     {"UncScaleMax", &UNC_SCALE_MAX, 100, 200},
+    {"UncSigmaBase", &UNC_SIGMA_BASE, 40, 120},
+    {"UncSigmaSlope", &UNC_SIGMA_SLOPE, 0, 64},
     {"LmrBase", &LMR_BASE, 4, 24},
     {"LmrDivisor", &LMR_DIVISOR, 12, 48},
     {"LmrHistDivisor", &LMR_HIST_DIVISOR, 2048, 32768},
@@ -1117,25 +1129,39 @@ static void corrhist_update(const Position *pos, Value searched, Value staticEva
  * twentieth is structures pinned at the correction clamp. One margin serves
  * both only by being wrong for both.
  *
- * So the margins are scaled by how far the evaluation has provably been wrong
- * here before. |correction| is a measure of bias, standing in for the
- * residual's spread; the bet is that the two travel together. It is
- * deliberately the crudest signal that could work, because this is a probe:
- * if conditioning the margins on it carries no Elo, the margin surface has no
- * exploitable structure and the trained version is not worth building. The
- * destination is docs/NNUE.md Task 5b - an uncertainty head on the
- * accumulator predicting the residual's scale directly. When that lands it
- * replaces this function's body, and none of the call sites move.
+ * So the margins are scaled by the position's expected evaluation error, from
+ * whichever of two signals the loaded net can offer:
  *
- * The defaults are centred, not chosen: 89 + 2 * 6cp (the measured mean)
- * lands the node-weighted average scale at ~100%, so the shipped margins are
- * on average what E17 fitted and an SPRT on this change measures the
- * conditioning alone rather than a disguised global margin shift. A cold
+ *   - A net carrying the trained uncertainty head (docs/NNUE.md Task 5b)
+ *     predicts the residual's scale directly, from the accumulator the
+ *     evaluation already keeps, for one extra output-row pass. The branch is
+ *     on a load-time constant, so it predicts perfectly; a compile-time split
+ *     would tie the binary to one net generation, which invariant 8 exists to
+ *     prevent.
+ *   - Otherwise, |correction| stands in: how far the evaluation has provably
+ *     been wrong in this pawn structure before. A measure of bias standing in
+ *     for the residual's spread - the bet that the two travel together. It
+ *     was deliberately the crudest signal that could work, the probe built
+ *     before the head existed, and E20 measured it at +25.6: the margin
+ *     surface has real structure, which is what funded the head.
+ *
+ * The corrhist defaults are centred, not chosen: 89 + 2 * 6cp (the measured
+ * mean) lands the node-weighted average scale at ~100%, so the shipped
+ * margins are on average what E17 fitted and an SPRT on this change measures
+ * the conditioning alone rather than a disguised global margin shift. A cold
  * entry reads as zero and lands on the floor, which is why the floor sits
  * just under 100 rather than lower: the floor is also the engine's posture in
- * structures it knows nothing about.
+ * structures it knows nothing about. The sigma mapping's constants are NOT
+ * yet centred - see the note at their declaration before running the head's
+ * SPRT.
  */
 static inline int unc_scale(const Position *pos) {
+#ifdef EVAL_NNUE
+    if (nnue_has_uncertainty()) {
+        const int sigma = nnue_uncertainty(pos);
+        return imin(UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16, UNC_SCALE_MAX);
+    }
+#endif
     const int c  = *corr_entry(pos);
     const int ac = (c < 0 ? -c : c) / CORRHIST_GRAIN;
     return imin(UNC_SCALE_BASE + ac * UNC_SCALE_SLOPE, UNC_SCALE_MAX);

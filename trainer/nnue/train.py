@@ -54,7 +54,8 @@ import torch
 from . import sanity
 from .dataset import make_loader, set_epoch, to_device
 from .format import DEFAULT_OUTPUT_BUCKETS
-from .model import DEFAULT_HIDDEN, NNUE, arch_from_checkpoint, blended_target, loss_fn
+from .model import (DEFAULT_HIDDEN, NNUE, arch_from_checkpoint, blended_target, loss_fn,
+                    uncertainty_loss_fn)
 
 # The evaluation's sigmoid scale, in centipawns. Keeping it equal to the value
 # tools/tuner.c fitted is what keeps the target in the same win-probability
@@ -142,7 +143,8 @@ def load_resume(args, model, optimiser, scheduler, device):
     # Weights loaded under a shape that merely happens to fit train fine and
     # are wrong, which is the failure mode worth being loud about.
     arch = arch_from_checkpoint(checkpoint)
-    for field, asked in (("hidden", args.hidden), ("output_buckets", args.output_buckets)):
+    for field, asked in (("hidden", args.hidden), ("output_buckets", args.output_buckets),
+                         ("uncertainty", args.uncertainty)):
         if arch[field] != asked:
             raise SystemExit(f"--resume: {net_path} has {field} {arch[field]}, this run "
                              f"asks for {asked}. Pass the flags the original run used, or "
@@ -195,7 +197,8 @@ def train(args) -> None:
     print(f"device: {device}"
           f"{' (' + torch.cuda.get_device_name(0) + ')' if device.type == 'cuda' else ''}")
 
-    model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets).to(device)
+    model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
+                 uncertainty=args.uncertainty).to(device)
     print(f"net:    {model.describe()}")
 
     train_loader = make_loader(args.train, args.batch_size, args.workers, shuffle=True,
@@ -269,10 +272,17 @@ def train(args) -> None:
                 break  # a plain epoch: the pass over the data ended
             batch = to_device(batch, device)
 
-            prediction = model(batch["white"], batch["black"], batch["stm"],
-                               batch["piece_count"])
             target = blended_target(batch["score"], batch["wdl"], lam, args.sigmoid_k)
-            loss = loss_fn(prediction, target, args.sigmoid_k)
+            if args.uncertainty:
+                prediction, unc = model.forward_heads(batch["white"], batch["black"],
+                                                      batch["stm"], batch["piece_count"])
+                loss = loss_fn(prediction, target, args.sigmoid_k) \
+                    + args.unc_weight * uncertainty_loss_fn(unc, prediction,
+                                                            batch["score"].float())
+            else:
+                prediction = model(batch["white"], batch["black"], batch["stm"],
+                                   batch["piece_count"])
+                loss = loss_fn(prediction, target, args.sigmoid_k)
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
@@ -364,6 +374,17 @@ def parse_args(argv=None):
                         help="hidden width per perspective; a multiple of 16")
     parser.add_argument("--output-buckets", type=int, default=DEFAULT_OUTPUT_BUCKETS,
                         help="output rows, selected by piece count; must divide 32")
+    parser.add_argument("--uncertainty", action="store_true",
+                        help="add the uncertainty head: a second output layer predicting "
+                             "|search score - value| per bucket, which search.c uses to "
+                             "scale its pruning margins (docs/NNUE.md Task 5b). A header "
+                             "flag the engine reads from the net file; older nets and "
+                             "older engines are both unaffected")
+    parser.add_argument("--unc-weight", type=float, default=0.05,
+                        help="weight of the uncertainty head's L1 term in the total loss. "
+                             "A hyperparameter, not a fitted value: the value loss is MSE "
+                             "in win-probability space and the head's is L1 in net units, "
+                             "so their natural scales differ by roughly this factor")
     parser.add_argument("--no-weight-clip", action="store_true",
                         help="do not hold weights inside the quantised range. The export "
                              "will then refuse nets it cannot represent, which is the "
