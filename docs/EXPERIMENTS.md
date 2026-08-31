@@ -1180,6 +1180,36 @@ weaker opponent produces. This ladder has no such problem: all five are real
 engines at full strength, so the objection does not apply at all. That is the
 reason to run it, not the agreement with 3096.
 
+**2026-08-30**, after E21, at STC 8+0.08, 16MB hash, on the shipping build
+(net `0ba56166ba9c`), against the same CCRL ladder. Round-robin, 1000 games
+per engine, 200 per pairing:
+
+| CCRL rung | W-L-D | score | implied rating |
+|---|---|---|---|
+| halogen-8.1, 3008 | 172-9-19 | 90.8% | 3406 |
+| berserk-4.1.0, 3133 | 146-24-30 | 80.5% | 3379 |
+| weiss-1.4, 3256 | 111-46-43 | 66.2% | 3373 |
+| clover-3.0, 3340 | 111-43-46 | 67.0% | 3463 |
+| ethereal-12.75, 3426 | 74-68-58 | 51.5% | 3436 |
+
+**Combined: ~3410 ± 40 (statistical)** on the CCRL Blitz scale; the rung
+offsets agree within ±25 of their mean and the internal spread matches the
+CCRL spread to within ~10%, so the event is internally coherent. The single
+most defensible datapoint is the direct match with the strongest anchor:
+even with Ethereal 12.75.
+
+**Two reasons this is claimed as ~3300, not 3410.** First, the delta from the
+entry above - 3100 ± 55 to ~3410 on the same ladder in the same conditions -
+exceeds what the measured relative gains in between (E20 +25.6, E21 +21.3)
+can explain. The gen-4 net, the timeman fixes and the tunable retune shipped
+between the two events without a gauntlet of their own, so either those were
+worth ~+230 together, or one of the two events mismeasures; nothing currently
+distinguishes the cases. Second, both this event and every SPRT feeding it
+are STC-only, and ratings are time-control specific - the CCRL anchors were
+earned at 2'+1", not 8+0.08, against 2020-era time management. The claim is
+**~3300 blitz, provisional**, until a 40+0.4 gauntlet with CCRL-comparable
+hash confirms it.
+
 **Do not read the agreement with the 2026-08-28 figure as a validation.** Two
 things differ at once - the pool (CCRL's, not Stockfish's self-calibration)
 and the time control (STC here, LTC there). Landing 4 Elo apart across both is

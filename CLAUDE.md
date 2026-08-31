@@ -18,7 +18,8 @@ quantises it, and `src/nnue.c` runs it, bit-exactly against the Python
 reference. It is **not** the default evaluation — `make EVAL=nnue` builds it,
 `make` still builds the classical one, and it stays that way until the
 integration passes an SPRT (docs/NNUE.md, Task 4). What remains is ablating the
-eval batch, Lazy SMP, and NNUE Tasks 4-5 — see the status table in README.md.
+eval batch, Lazy SMP, and NNUE Tasks 4-5 — see the status table in
+docs/STATUS.md.
 
 ## Build and test
 

@@ -1,7 +1,8 @@
 # StormBreaker
 
 A UCI chess engine written in C, built for competitive strength built entirely
-from scratch with a mission to see how far a fully AI generated engine can go.
+from scratch with a mission to see how far a fully AI generated engine can go,
+with some human help along the way of course.
 
 The initial engine was built with a classical evaluation function and tuned with a large set of human games and the outcome of the games.
 This engine landed at a strength of ~2800 Elo when playing against Stockfish with UCI_Elo set to 3000.
@@ -11,116 +12,75 @@ The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish 
 
 Adding on a correction history and an SPSA tuned search brought this to ~3095 Elo at 40+0.4, beating Stockfish with UCI_Elo set to 3000 (60.3%) and losing to it at 3190 (39.5%).
 
+Retraining the net on self-play data brought the next step, and on top of that came an **uncertainty head**:
+a second output on the network that predicts the evaluation's own error, which the search uses to widen its
+pruning margins where the evaluation is unreliable and tighten them where it is not. That idea went in as two
+SPRT-gated steps worth ~+47 Elo together (E20, E21), and as far as we can find it is the first measured instance
+of a learned uncertainty head paying its way in an alpha-beta engine.
+
+The current build scores ~3410 on a gauntlet against five CCRL-rated engines at short time control, dead even
+head-to-head with Ethereal 12.75 (CCRL 3426). Ratings do not transfer perfectly across time controls, so we
+claim **~3300 CCRL Blitz** until a long-time-control gauntlet confirms it — the anchoring math and its caveats
+are in [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) under *Absolute strength*.
+
 ---
 
-## Status
+## How it works
 
-| Component | State |
-|---|---|
-| Build system (multi-arch, OpenBench-compatible) | complete |
-| UCI protocol layer | complete |
-| Threading (async search, `stop`, `ponderhit`) | complete |
-| Bitboard attack tables, Zobrist hashing, FEN I/O | complete |
-| Transposition table allocation | complete |
-| Perft harness + test suites | complete |
-| Bench harness | complete |
-| SPRT / gauntlet tooling, GUI integration, CI | complete |
-| Move generation (perft-exact, magic/PEXT sliders) | complete |
-| Make / unmake move | complete |
-| Time management | complete |
-| Search: iterative deepening, alpha-beta, quiescence | complete |
-| Transposition table probe / store | complete |
-| Killers, history, counter-moves, null move, LMR, PVS | complete |
-| Aspiration windows, IIR, reverse futility, LMP, futility | complete |
-| Razoring, SEE pruning, quiescence delta pruning | complete |
-| Singular extensions, multi-cut, negative extensions | complete |
-| Capture history, multi-ply continuation history | complete |
-| Time management: phase curve + best-move stability | complete |
-| Evaluation: material + tapered piece-square tables | complete |
-| Evaluation: pawn structure, mobility, king safety, threats | complete |
-| Evaluation: king-relative placement (factorised HalfKA, 6144 weights) | complete |
-| Evaluation tuning on real game data (`make tuner`) | complete |
-| NNUE data generation, record format, shuffler (`make datagen`) | complete |
-| NNUE trainer: features, dataset, model, training loop (`trainer/`) | complete |
-| NNUE export + C inference, bit-exact against the reference (`make nnue-test`) | complete |
-| NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
-| NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
-| Correction history (pawn-structure keyed, +25.8 Elo) | complete |
-| Correction history: minor / non-pawn / continuation keys | tried, neutral (E16), reverted |
-| NNUE: re-tuned search parameters (21 by SPSA, +66.1 Elo, E17) | complete |
-| Search: ProbCut, ttPv, history split (E19, E19b) | **+7.50 ± 8.71** |
-| Search: cut-node retry | tried twice, costs ~19 Elo (E6, E19a, E19b), removed |
-| **NNUE: the default evaluation switches to the network** | **TODO** |
-| Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
-| **Self-play data generation with deliberate variation** | **TODO** |
-| **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
-| Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
-| **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
-| **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
-| Search: uncertainty-scaled margins (corrhist-magnitude probe) | **+25.61 ± 9.85** (E20) |
-| NNUE: uncertainty head (trainer, export, inference, search) | code complete, bit-exact |
-| NNUE: uncertainty-head net + σ-scaled margins | **+21.29 ± 9.22** (E21) |
-| **Uncertainty margins: LTC confirmation (E20 + E21 are STC-only)** | **TODO** |
-| **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
+**Board and move generation.** Bitboards with magic/PEXT sliding-piece
+attacks, Zobrist hashing, and a move generator that is perft-exact against
+the standard test suites (`make perft`). All board mutation flows through
+three functions, so the bitboards, mailbox and piece counts can never drift
+apart.
 
-`make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
-so the engine can be registered with a distributed testing cluster.
+**Search.** A principal variation search with iterative deepening, aspiration
+windows and a lockless transposition table. Above that, the modern pruning
+and ordering stack: null move, late move reductions, reverse futility,
+futility, razoring, ProbCut, SEE pruning, late move pruning, singular
+extensions with multi-cut, killers, counter-moves, butterfly / capture /
+continuation history, and a pawn-structure-keyed correction history. The
+search runs on a worker thread so the UCI loop never blocks.
 
-Staged move generation is listed after the NNUE integration deliberately: a more
-expensive evaluation shrinks whatever share generation occupies, so it should be
-measured against the eval that ships. At bench depth 12, generation and ordering
-are ~25% of search cycles, 61% of generated moves are never picked, and 52% of
-generating nodes cut on the first move tried - 15% on the TT move, which need not
-generate at all.
+**Uncertainty-scaled margins.** Every margin-based prune is a claim that *k*
+centipawns cover the gap between the static evaluation and what a deeper
+search would say — with *k* traditionally a global constant. That residual is
+measurably heteroscedastic, so `unc_scale()` in [src/search.c](src/search.c)
+scales the five margin prunes per-position by the expected evaluation error:
+from the network's trained uncertainty head when the loaded net carries one,
+else from the correction-history magnitude. Both variants passed their SPRTs
+(E20, E21); the constants are centred so the *average* margin stays where the
+SPSA sweep fitted it.
 
-Those four figures are profile measurements. The ~5-9 Elo once attached to them
-was not a measurement, and step 1 went looking for it and did not find it.
+**Evaluation.** A HalfKA-style NNUE — 24576 features over 32 mirrored king
+squares, SCReLU activation, piece-count output buckets, plus the uncertainty
+head — run with an incremental int16 accumulator and AVX2. The net file
+describes its own architecture in its header, so a retrain at a different
+width or bucket count is a drop-in. The classical evaluation still builds
+(`make`, without `EVAL=nnue`) and remains the tuner's model.
 
-Steps 1 and 2 were planned as **pure speedups gated on an unchanged bench node
-count**, on the reasoning that the ordering bands in `src/search.c` are strictly
-separated and so a staged picker can reproduce today's order exactly. **That is
-measurably wrong, and each step needs an SPRT.** Band separation governs the
-order in which a *scored* list is walked, but staging also moves *when* the
-scoring happens: `score_moves()` currently runs before any child is searched,
-whereas a staged picker runs it after the table move's subtree has already
-updated `History`, `ContHist`, `CaptureHist` and `CounterMoves`. The remaining
-moves are then scored against different tables and can reorder.
+**Training pipeline.** `tools/datagen.c` generates and labels positions with
+fixed-node searches into a packed 32-byte format; `trainer/` (PyTorch) fits
+the net; `tools/export_net.py` quantises it and writes test vectors; and
+`make nnue-test` requires the C inference to reproduce those vectors
+**exactly** — integer arithmetic, no tolerance. A net that is misread scores
+plausibly and loses Elo silently, which is the worst failure mode in this
+repository; the bit-exactness gate is what rules it out.
 
-**Step 1 was then built, measured and reverted - see E15.** It benched 277624
-against 299634, a 7.3% node reduction, with a control isolating that entirely to
-scoring time. But nps was flat (the only nodes that skip generating are the ones
-that cut on the table move, ~3.75% of cycles gross, and the picker spends part of
-it back), and the node reduction did not convert: +0.47 ± 8.52 Elo, stopped
-undecided at 2958 games.
-
-That is evidence against the ~10%-of-search-time estimate itself, not only
-against step 1, since step 1 took the cheapest and most certain part of that
-share. **Do not build steps 2 or 3 on the 5-9 Elo figure.** Measure first, on a
-profile, what a full staged picker actually saves in nps - rather than inferring
-it from the share of cycles generation occupies.
-
-Promotions are a second, independent reason step 2 cannot reproduce today's
-order for free. They straddle the bands three ways: a quiet underpromotion is
-generated as a quiet but scores in the winning-capture band, and an SEE-losing
-capturing promotion scores down into the quiet band. A tactical stage therefore
-has to generate promotions and spill whatever scores below `SCORE_KILLER_1` into
-the quiet stage - and unlike the scoring-time effect above, this one is at least
-fixable by construction.
+**Testing discipline.** Correctness changes must pass perft exactly. Pure
+speedups must leave the bench node count unchanged. Everything else is a
+behavioural change and needs a passing SPRT before it ships — roughly half of
+"obviously good" engine patches measure neutral or worse, and
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) records every result either way.
 
 ---
 
 ## Quick start
 
 ```sh
-make                     # build for this machine
+make                     # build for this machine (classical eval)
+make nnue                # build with the network, as stormbreaker-nnue
 make bench               # deterministic node-count benchmark
 make perft               # move generation correctness suite
-make openbench-check     # verify OpenBench compliance
-make tuner               # build the evaluation fitter
-make datagen             # build the NNUE training-data generator
-make datagen-test        # datagen round-trip + label reproducibility gate
-make nnue-test           # C network inference == the quantised reference
-make help                # all targets
 ```
 
 First-time environment setup (Windows):
@@ -128,39 +88,81 @@ First-time environment setup (Windows):
 ```powershell
 powershell -File tools\setup.ps1             # fastchess, GUIs, Stockfish; the book
 powershell -File tools\register-engines.ps1  # register with Cute Chess
-make sprt ARGS=--smoke                          # verify the match pipeline
-make trainer-setup                              # trainer\.venv, PyTorch
+make sprt ARGS=--smoke                       # verify the match pipeline
+make trainer-setup                           # trainer\.venv, PyTorch
 ```
 
----
-
-## Using the GUIs
+To watch it play:
 
 ```powershell
 powershell -File tools\gui.ps1                  # En Croissant (default)
 powershell -File tools\gui.ps1 -App cutechess   # Cute Chess
-powershell -File tools\gui.ps1 -App both
 ```
 
-`gui.ps1` re-registers the engine against your current build before launching,
-so the GUI never runs a stale binary. It starts the app detached — your terminal
-stays usable.
+`gui.ps1` re-registers the engine against your current build before
+launching, so the GUI never runs a stale binary. `bestmove 0000` means the
+engine found no legal move — checkmate, stalemate, or an empty `go
+searchmoves` list; anywhere else it is a bug.
 
-`bestmove 0000` means the engine found no legal move — checkmate, stalemate, or
-a `go searchmoves` list with nothing legal in it. Anywhere else it is a bug.
+---
 
-### Command-line matches
+## Make commands
 
-For anything you want to measure rather than watch, use the scripts — they set
-the book, concurrency and PGN output correctly:
+### Building
 
-```powershell
-make sprt ARGS=--smoke          # verify the pipeline
-make sprt                       # dev vs baseline
-make gauntlet                   # vs a field of opponents
-```
+| Command | Purpose |
+|---|---|
+| `make` | `-march=native`, fastest on this machine, **not portable** |
+| `make ARCH=avx512\|bmi2\|avx2\|popcnt\|legacy` | portable arch profiles (`popcnt` is what CI uses) |
+| `make EVAL=classical\|nnue` | pick the evaluation at compile time; classical is the default |
+| `make EVAL=nnue EVALFILE=<path.nnue>` | embed a specific net |
+| `make nnue` | the network build under its own name, `stormbreaker-nnue` |
+| `make EXE=<name>` | name the output binary (OpenBench requirement); `CC=` is honoured too |
+| `make debug` | assertions on, sanitizers on POSIX |
+| `make release` | every distributable ARCH into `build/` |
+| `make TUNE_SEARCH=on` | expose the search constants as UCI spin options for a sweep |
+| `make clean` / `make format` | clean; apply `.clang-format` |
 
-A quick ad-hoc match (fastchess is on PATH as `fast-chess`):
+There is no runtime evaluation switch, and `EVAL`/`ARCH` changes rebuild
+correctly — a `.buildflags` stamp is a prerequisite of every binary.
+
+### Verifying
+
+| Command | Purpose |
+|---|---|
+| `make bench` | deterministic node count; final line is the OpenBench contract |
+| `make perft` / `make perft-all` | movegen correctness, depth-capped / full depth |
+| `make openbench-check` | verify OpenBench compliance |
+| `make nnue-test` | C inference == quantised Python reference, exactly. **Re-exports `net.nnue` from the local checkpoint** — run `make net-fetch` afterwards if you want the pinned net back |
+| `make datagen-test` | datagen round-trip + label reproducibility gate |
+| `make trainer-test` | the trainer's pytest suite |
+
+### Measuring (the Python tools, always via `make <tool> ARGS="..."`)
+
+| Command | Purpose and main flags |
+|---|---|
+| `make sprt` | SPRT dev vs baseline. `--dev <exe>` `--base <exe>` (default: newest in `external\baselines`), `--tc VSTC\|STC\|LTC\|10+0.1`, `--bounds "0,5"`, `--smoke`, `--dry-run` |
+| `make gauntlet` | Elo table vs a field. `--engine`, `--field all\|baselines\|engines`, `--games N`, `--tc`, `--include-stockfish`, `--dry-run` |
+| `make rating` | absolute rating vs Stockfish `UCI_Elo` rungs. `--levels 2200,...`, `--games`, `--tc`, `--dry-run` |
+| `make tune` | SPSA over the `TUNE_SEARCH=on` parameters. `--params`, `--exclude`, `--iterations`, `--tc`, `--list` (inspect state; `--dry-run` rotates it), `--resume` |
+| `make snapshot ARGS="--name v0.x"` | freeze the current build into `external\baselines` |
+| `make engines-fetch` | download the CCRL-rated opponent ladder into `external\engines` |
+
+### The network
+
+| Command | Purpose |
+|---|---|
+| `make nnue-export` | quantise `NET` (default `external/nets/net.pt`) into `EVALFILE` + test vectors |
+| `make net-fetch` | download the pinned net (`NET_SHA256` in the Makefile), hash-checked |
+| `make nnue-info` | which net a build is carrying, by hash — the only trustworthy answer |
+| `make net-publish` | upload `EVALFILE` as a content-addressed release |
+
+Training itself runs from `trainer/` — see [trainer/README.md](trainer/README.md);
+`--uncertainty` adds the error-predicting head ([docs/NNUE.md](docs/NNUE.md),
+Task 5b).
+
+An ad-hoc match, if you want one without the scripts (fastchess is on PATH as
+`fast-chess`):
 
 ```powershell
 fast-chess -engine cmd=.\stormbreaker.exe name=dev `
@@ -168,58 +170,8 @@ fast-chess -engine cmd=.\stormbreaker.exe name=dev `
            -each tc=10+0.1 -rounds 2 -pgnout file=external\games\quick.pgn
 ```
 
----
-
-## Build targets
-
-| Target | Purpose |
-|---|---|
-| `make` | `-march=native`, fastest on this machine, **not portable** |
-| `make ARCH=avx2` | portable x86-64-v3 build |
-| `make ARCH=popcnt` | portable x86-64-v2 build (used by CI) |
-| `make ARCH=legacy` | any x86-64 |
-| `make release` | every distributable ARCH into `build/` |
-| `make debug` | assertions on, sanitizers on POSIX |
-| `make EXE=name` | name the output binary (OpenBench requirement) |
-| `make tuner` | the evaluation fitter ([docs/TUNING.md](docs/TUNING.md)) |
-| `make datagen` | the NNUE data generator ([docs/NNUE.md](docs/NNUE.md)) |
-| `make datagen-test` | datagen round-trip + label reproducibility gate |
-| `make trainer-setup` | create `trainer/.venv` and install PyTorch |
-| `make trainer-test` | the trainer's test suite |
-| `make EVAL=nnue` | build with the network instead of the classical evaluation |
-| `make TUNE_SEARCH=on` | expose the pruning margins as UCI spin options, for a sweep |
-| `make nnue-export` | quantise `NET` into `EVALFILE` + test vectors |
-| `make nnue` | the engine with the network, as `stormbreaker-nnue` |
-| `make nnue-test` | C inference == the quantised Python reference, exactly |
-| `make nnue-info` | which net a build is carrying, by hash |
-| `make net-fetch` | download the pinned net into `EVALFILE`, hash-checked |
-| `make net-publish` | upload this net as a content-addressed release ([docs/RELEASING.md](docs/RELEASING.md)) |
-
-On non-x86 targets (Apple Silicon, ARM) the arch profiles are ignored and a
-portable build is produced automatically.
-
-### Which evaluation gets built
-
-`EVAL` picks one, at compile time, and there is no runtime switch - an
-evaluation that tested a flag at every node would pay for the flexibility in
-the only currency that matters.
-
-```sh
-make                      # classical: the tuned 13,684-parameter linear model
-make EVAL=nnue            # the network, embedded from EVALFILE
-make EVAL=nnue EVALFILE=external/nets/candidate.nnue
-```
-
-The default is classical and stays classical until an NNUE build has passed
-its own SPRT ([docs/NNUE.md](docs/NNUE.md), Task 4). The switch exists so the
-two can be compared; a default flipped ahead of the measurement is how an
-untested change ships.
-
-A net is embedded with `.incbin`, so an NNUE binary is self-contained and its
-bench prints the net's SHA-256 in the header - a node count that cannot name
-its net is not a measurement. `setoption name EvalFile value <path>` swaps the
-net at runtime, which is how a candidate is tried before it is worth
-embedding.
+For anything you intend to *measure* rather than watch, use `make sprt` /
+`make gauntlet` — they set the book, concurrency and PGN output correctly.
 
 ---
 
@@ -229,166 +181,23 @@ embedding.
 src/                engine sources (flat, as in most strong engines)
 tests/perft/        move generation correctness suites (EPD)
 tools/              SPRT, SPSA tuning, gauntlet, rating, baselines (Python,
-                    stdlib only); setup / GUI / engine registration (PowerShell,
-                    because they are Windows integration and nothing else)
-                    plus tuner.c (evaluation fitter) and datagen.c (NNUE data)
+                    stdlib only); setup / GUI / engine registration (PowerShell);
+                    tuner.c (evaluation fitter) and datagen.c (NNUE data)
 trainer/            the NNUE trainer: PyTorch, its own venv, its own tests
-docs/               architecture, testing methodology, UCI reference
-external/           gitignored: books, opponent engines, baselines, PGNs
+docs/               architecture, status, testing methodology, UCI reference
+external/           gitignored: books, opponent engines, baselines, PGNs, nets
 .github/workflows/  CI
 ```
 
 ---
 
-## Where to go next
-
-Steps 1–5 of the original bring-up order (movegen, make/unmake, perft, eval,
-search) are done, and so is the network: it is measurably stronger than the
-tuned linear evaluation and the remaining work is about collecting the rest of
-what it is worth. **Every change from here is measured with
-`make sprt`** — read [docs/TESTING.md](docs/TESTING.md) first, because the
-testing methodology is what separates an engine that improves from one that
-drifts.
-
-The open work, roughly in order of Elo per unit of effort:
-
-1. **Re-tune the search parameters against the network.** Every threshold and
-   formula constant in `search.c` was fitted against an evaluation with a
-   particular scale and a particular noise profile, and the network has
-   neither. [docs/NNUE.md](docs/NNUE.md) Task 4 calls this out as where a
-   meaningful fraction of the total NNUE gain actually lives.
-
-   `make TUNE_SEARCH=on` exposes **25** of them as UCI spin options — the seven
-   margins, `CORR_W_PAWN`, and a second tier that had never been fitted at all:
-   the LMR curve itself (`LmrBase`, `LmrDivisor`), the history divisors, the
-   null-move reduction formula, the history bonus curve, the LMP constant and
-   the aspiration delta. Twenty-one of those were fitted by E17. E19 added
-   `ProbCutMargin`, `HistMalusMul` and `TtPvReduction`, none of which has ever
-   been fitted and all of which ship at values chosen to be defensible rather
-   than measured — so the continuation run is worth more than it was. It also
-   added `ProbCutDepth`, which is an **ablation switch and not a sweep seat**:
-   it is a depth threshold, and the paragraph below says why those measure as
-   noise. Exclude it. Fitting 24 interacting parameters one SPRT at a time
-   is not possible, so `make tune` runs SPSA over the set and emits a
-   *candidate*, which then needs its own SPRT against the values it replaced —
-   SPSA has no null hypothesis and will report a walk as a result.
-
-   **`tune.py` had a defect that made seven of those parameters untunable**, and
-   E17's three "unchanged" results were three of them — see E19c. The step size
-   scaled with a parameter's declared range while every integer option needs the
-   same absolute resolution of one, so the narrow ones travelled 0.46 units in a
-   run and needed 0.5 to change at all. Fixed by sizing the step separately from
-   the perturbation, and by dividing the gradient by the separation the engines
-   actually saw rather than the one requested. No wide parameter's arithmetic
-   changed, so E17's fit stands.
-
-   `NmpEvalMax` above 5 measured as indistinguishable from its bound at bench
-   depth 12, so a wider range would only give the sweep somewhere to random-walk.
-   `HistBonusDepthMax` was capped at 20 for the same reason and the reason turned
-   out to be sharper than "indistinguishable": `history_bonus` takes
-   `min(depth, cap)` over *remaining* depth, so a cap of 20 cannot bind at all
-   until the search passes depth 20. At STC this engine reaches 12-13. The
-   parameter is inert there, which is what E17's "unchanged" actually recorded —
-   a zero gradient, not a weak one. Its range now reaches 32 so an **LTC** sweep
-   can move it; **exclude it from STC sweeps**, where widening the range only
-   buys somewhere to wander. The seven *depth* thresholds are excluded for a
-   related reason — SPSA perturbs continuously and the engine takes an int, so
-   both sides of a gradient estimate round to the same small integer and the
-   measurement is noise. Those want a sweep of their own.
-2. **Self-play data with deliberate variation.** The item that sat here called
-   re-labelling the human corpus with the stronger engine "the single largest
-   item on this list". It has been run, and it was worth something but not
-   that: `gen-003` re-labelled 178.8M human positions with engine `0.2.0-dev`
-   against `gen-001`'s `0.1.0-dev`, and the net it produced is the one the
-   engine now ships. It is ahead of the `gen-012` hybrid net by a point
-   estimate of 49 Elo, which does not separate from noise, where the previous
-   step was worth ~50 (E18).
-
-   Read that as label quality no longer being the binding constraint —
-   **coverage is**. A better label on a position the net already predicts well
-   teaches it nothing, and a human corpus is fixed in what it covers however
-   good the labeller gets. Self-play then has the opposite problem: it
-   concentrates on the lines the engine already likes, so a corpus without
-   variation teaches the net its own blind spots. The levers are opening-book
-   spread, randomised early plies and tree sampling (`-tree`, see
-   [docs/NNUE.md](docs/NNUE.md)).
-
-   `gen-004` is the first pass at the first two. `datagen selfplay` gained
-   `-book`, and the generation is configured to start every game from one of
-   793,495 unique ply-20 positions taken out of the CCRL 40/40 archive,
-   perturb it by two random plies, and then play deterministically. The
-   perturbation is small on purpose: play after it is a fixed-node search on
-   one thread, so two games that share a book line differ only by those plies,
-   and the difference in their *results* is then attributable to the
-   perturbation rather than to noise — which is the only thing that makes the
-   trainer's game-result term worth training on. **Nothing has been measured
-   yet**; the generation has not been run.
-
-   One cheap thing first: the shipped net was exported at **epoch 20** and its
-   validation loss bottomed at **epoch 4**. An epoch-4 export from the same
-   `gen-003` data has never been tried, and it costs four epochs of GPU time.
-3. **Widening past 1024 is now gated on data, not on time.** The item that sat
-   here said the net stopped at epoch 3 and 512 hidden units, half the designed
-   width, and called both free Elo. Both are done: the shipped net is
-   `24576 -> 1024x2 -> 4`, tag `epoch20-h1024`, hash `1f36c07f4507`. It is
-   rewritten rather than deleted because that claim outlived the net it
-   described by many epochs, and a stale "free Elo" line is worse than no line
-   — someone reads it and goes looking for Elo that has already been spent.
-   `--hidden` accepts up to 2048, but the binding constraint has changed: 24576
-   feature rows need a dataset where each row is seen more than a handful of
-   times, so further width waits on step 2.
-
-   **Do not trust any net identity written down here, including the one above.**
-   `external/nets/net.json` describes whichever net was *exported* last, which
-   is not necessarily the one in `external/nets/net.nnue` — `make net-fetch`
-   replaces the net without touching the metadata beside it. The pinned net is
-   `NET_SHA256` in the Makefile; what a given binary actually carries is
-   `make nnue-info`. Those two are the only reliable answers.
-4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
-   and the accumulator stack in `src/nnue.c` are file-scope and must move into
-   a per-thread block first. Worth nothing in a single-threaded SPRT and worth
-   a great deal to anyone actually playing the engine — and it makes every
-   future data generation run cheaper.
-5. **Staged move generation**, so a node that cuts on the table move never
-   generates or scores the rest of the list — in the three steps the status
-   table breaks it into, each with its own SPRT.
-6. **An uncertainty head for the pruning margins** — [docs/NNUE.md](docs/NNUE.md)
-   Task 5b, which replaced the cancelled policy head. Every margin the sweep
-   fits is a global constant insuring against an eval-vs-search residual that
-   is measurably heteroscedastic: over the d12 bench tree the correction
-   magnitude has median zero and mean ~6cp. Correction history was the
-   residual's conditional mean (E14, +25.8; more keys neutral, E16); the head
-   is its conditional scale, trained on labels every shard already carries.
-   The search-side hook is already in — `unc_scale()` scales the five margin
-   prunes, driven today by corrhist magnitude and centred so the average
-   margin is unchanged. That probe's SPRT is the cheap first answer: if
-   conditioning the margins carries no Elo even crudely, stop before the
-   trainer is touched.
-
-### Deliberately not on that list
-
-Two items that were on it and have been retired, so they do not get picked up
-again by accident:
-
-- **A pawn hash table.** It accelerates `eval.c` and nothing else. With the
-  network becoming the default evaluation, the code it speeds up is on its way
-  out of the hot path, and the work would be spent the day before it stopped
-  mattering.
-- **Ablating the E1 and E10 batches.** Both went in as batches and neither
-  attributes its gain to any individual term, which is a real gap in the
-  record — but closing it *explains* Elo already banked rather than adding
-  any. The pending table at the end of
-  [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) is kept for the day the queue is
-  empty; it should not compete with anything above.
-
----
-
 ## Documentation
 
+- [docs/STATUS.md](docs/STATUS.md) — what is built, what it measured, what comes next
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the modules fit together
 - [docs/TESTING.md](docs/TESTING.md) — perft, bench, SPRT, OpenBench
-- [docs/TUNING.md](docs/TUNING.md) — fitting the evaluation to real games
-- [docs/NNUE.md](docs/NNUE.md) — the network plan: data schema, trainer, export, search integration
+- [docs/TUNING.md](docs/TUNING.md) — fitting the classical evaluation to real games
+- [docs/NNUE.md](docs/NNUE.md) — the network: data schema, trainer, export, search integration
 - [trainer/README.md](trainer/README.md) — running the trainer: setup, the pipeline, the sanity table
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) — every measured change and what it scored
 - [docs/UCI.md](docs/UCI.md) — supported commands and options
