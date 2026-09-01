@@ -196,8 +196,10 @@ did.
 
 It finds the local file by hashing every `.epd` under `external\books\`, so
 `BOOK_SHA` alone drives it; `-Path` overrides. See docs/NNUE.md for how a book
-gets extracted out of the CCRL archive, and why `SELFPLAY_OPENING` wants to be
-2 and not 8.
+gets extracted out of the CCRL archive, why `SELFPLAY_OPENING` wants to be 2 and
+not 8, and why it wants to be the RANGE `2-3` and not the number 2: a book cut
+at one ply is one side to move on every line of it, so a fixed count starts
+every game in the generation on the same side.
 
 Unlike the net, the book is **not** part of the provisioning stamp — it is a
 runtime input, not a build input, so changing it does not cost the fleet a

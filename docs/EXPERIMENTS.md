@@ -1144,6 +1144,234 @@ an untried one-SPRT experiment.
 
 ---
 
+### E22 — SPSA continuation: 28 parameters re-fitted, the uncertainty pair included
+
+**Date** 2026-08-31 · **Baseline** the same `TUNE_SEARCH` build at its default
+options (the E21 build, net `0ba56166ba9c`) · **Bench** nnue 218976 -> 204540
+(d7), 2989539 -> 3537141 (d12); classical 300904 -> 275123
+
+A second SPSA pass over `search.c`'s tunables, following E17. Two things had
+changed since that fit: E19b's search batch altered what the parameters act on,
+and E20/E21 added five `Unc*` seats that had never been swept — E21 listed them
+as an open debt in as many words, "sweep seats fitted by centring, not by
+SPSA". This run is the first gradient ever taken on them.
+
+Twenty-eight of the thirty seats in `Tunables[]` were fitted jointly at STC
+8+0.08. `ProbCutDepth` and `HistBonusDepthMax` were excluded: both are depth
+caps that cannot bind at the depths STC reaches, so a sweep there random-walks
+them inside a flat region and reports the walk (the reasoning is spelled out
+beside `HIST_BONUS_DEPTH_MAX`).
+
+| | STC 8+0.08 |
+|---|---|
+| Bounds | [0, 5] normalized |
+| **Result** | **H1 accepted** — LLR 2.96 at 3466 games |
+| Elo | **+14.24 ± 7.10** (nElo +23.24 ± 11.57) |
+| Record | 1006W / 864L / 1596D, 52.05% |
+| Ptnml | [48, 373, 769, 475, 68], PairsRatio 1.29, DrawRatio 44.37% |
+| LOS | 100.00% |
+
+**The test isolates the options and nothing else.** Both sides were the same
+`stormbreaker-tune-nnue.exe`, the same net, the same binary on disk; dev was
+that binary with 28 `option.*` values on its command line and base was that
+binary with none. No build difference, no net difference, no compile flags to
+confound it — the only thing that differed between the two players was the 28
+integers.
+
+**What moved.** Nineteen of the twenty-eight defaults changed after rounding:
+
+| | from | to | | | from | to |
+|---|---|---|---|---|---|---|
+| `LMR_CONT_DIVISOR` | 7162 | **6845** | | `PROBCUT_MARGIN` | 103 | 108 |
+| `DELTA_MARGIN` | 361 | **374** | | `RAZOR_MARGIN` | 305 | 309 |
+| `UNC_SIGMA_SLOPE` | 8 | **12** | | `UNC_SCALE_MAX` | 140 | 143 |
+| `LMR_HIST_DIVISOR` | 7622 | 7714 | | `CORR_W_PAWN` | 129 | 132 |
+| `SEE_QUIET_MARGIN` | 20 | **16** | | `RFP_MARGIN` | 64 | 67 |
+| `SEE_CAPTURE_MARGIN` | 90 | 86 | | `SINGULAR_MARGIN` | 41 | 39 |
+| `HIST_MALUS_MUL` | 7 | 9 | | `NMP_EVAL_DIVISOR` | 189 | 187 |
+| `NMP_DEPTH_DIVISOR` | 3 | 4 | | `LMR_DIVISOR` | 23 | 22 |
+| `NMP_EVAL_MAX` | 2 | 3 | | `FUTILITY_MARGIN` | 57 | 58 |
+| `UNC_SCALE_SLOPE` | 2 | 1 | | | | |
+
+Nine rounded back to their starting values and are unchanged in the source:
+`UNC_SCALE_BASE`, `UNC_SIGMA_BASE`, `LMR_BASE`, `CAPHIST_DIVISOR`, `NMP_BASE`,
+`HIST_BONUS_MUL`, `LMP_BASE`, `TTPV_REDUCTION`, `ASPIRATION_DELTA`. As in E17
+**all twenty-eight shipped as a set**, the low-confidence movers included: the
+SPRT measured the set as a unit, and adopting a subset would ship a
+configuration nothing tested.
+
+**The uncertainty head's slope is the largest coherent mover in the run.**
+Drift z — total displacement over the random-walk scale of the same increments,
+the same statistic E17 used — over 876 iterations:
+
+| param | z | | param | z |
+|---|---|---|---|---|
+| `UncSigmaSlope` | **+5.6** | | `HistMalusMul` | +2.7 |
+| `SeeQuietMargin` | **−5.1** | | `ProbCutMargin` | +2.6 |
+| `UncScaleMax` | **+3.7** | | `SeeCaptureMargin` | −2.1 |
+| `DeltaMargin` | **+3.1** | | `NmpDepthDivisor` | +2.1 |
+
+Everything else is under 2. Two of the four strongest are the pair E21 flagged,
+and they moved the way E21's own comment predicted they would: that comment
+observed the sigma distribution is right-skewed and `UNC_SCALE_MAX` truncates
+its tail, so "a sweep that moves the cap moves the average margin with it". The
+sweep raised the cap and the slope together — margins scaled harder off
+predicted error, with more headroom to scale into. Centring got the mapping to
+the right neighbourhood; it did not get the slope right, and it was 50% low.
+
+`SeeQuietMargin` falling to 16 is the one clear tightening in an otherwise
+loosening set, and it is the parameter with the second-strongest gradient.
+
+**Shallow and deep trees moved in opposite directions.** d7 nodes fell 7% while
+d12 nodes rose 18%. Most margins went up, which prunes less, so the d12
+direction is the expected one and the d7 number is the surprise — the LMR
+changes dominate where depth is short and the margins dominate where it is not.
+Recorded mainly as another instance of the habit from E1's ablations: a
+single-depth bench diff would have read this change as "searches less" and been
+wrong about the tree that actually plays the games.
+
+**This is an intermediate checkpoint, not a converged run.** The tuner was
+stopped at **iteration 876 of 2500** (24,528 games, 6712W/6626L/11190D, seed
+652340824, 28 games/iteration, concurrency 14) and the checkpoint was tested as
+it stood — the same move E17 made at its iteration 188. The state file is
+intact and `python tools/tune.py --resume` continues it.
+
+If it is resumed, **the next checkpoint must be SPRT'd against these new
+defaults, not against the pre-E22 ones.** The tuner's own `start` values are
+now stale relative to the shipped source, and testing a later checkpoint
+against the old baseline would re-measure this gain and count it twice.
+
+**E22a below is that continuation**, run narrow rather than resumed: the drift
+table is what it was chosen from.
+
+**Verification.** The 28 values were written into `search.c` programmatically
+from the tuner's checkpoint, using the UCI-name-to-C-identifier mapping parsed
+out of `search.c`'s own `Tunables[]` table rather than retyped — the E17
+procedure. The gate was the node count, checked at two depths: the new default
+build benches **204540** at d7 and **3537141** at d12, both identical to the
+`TUNE_SEARCH` build driven with the same 28 options by `setoption`. A single
+mistyped digit moves the tree and would have shown immediately. `perft`,
+`datagen-test` and `openbench-check` pass.
+
+**Caveats.** STC only — the LTC confirmation debt from E20 and E21 now stands
+at three entries. The values were fitted against the network and shipped as the
+defaults for **both** evaluations, so the classical build's search changed
+(bench 300904 -> 275123) at values no game was played on; that is E17's
+precedent rather than a new decision, and it matters less while `classical` is
+not what plays. +14.24 against E17's +66.09 is what a second pass over
+already-fitted parameters should look like — the large errors were taken out
+the first time, and what remains here is mostly the five seats that had never
+been fitted at all.
+
+---
+
+### E22a — the same run narrowed to the nine seats that still had a gradient
+
+**Date** 2026-09-01 · **Baseline** the same `TUNE_SEARCH` build at its E22
+defaults (`0a0e072`, net `0ba56166ba9c`) · **Bench** nnue 204540 -> 203047
+(d7), 3537141 -> 2963084 (d12); classical 275123 -> 277139
+
+E22 swept 28 seats and found eight of them moving coherently. Continuing that
+run spends 20/28 of the games measuring parameters it had already shown to be
+flat, so this is a narrower run instead: the six E22 measured at |z| >= 2, plus
+the uncertainty seats that bind under this net. Nine parameters, same TC, same
+book, fresh state in `external\tune\spsa-unc.json`.
+
+**Two of the five `Unc*` seats cannot be tuned against this net, and were left
+out on that ground.** `unc_scale()` branches on `nnue_has_uncertainty()`: a net
+carrying the head returns `UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16`
+capped at `UNC_SCALE_MAX` and returns before ever reading `UNC_SCALE_BASE` or
+`UNC_SCALE_SLOPE`, which serve the corrhist fallback below it. Net
+`0ba56166ba9c` carries the head, so in a tuning game that pair is unreachable
+and a sweep of it measures its own random walk. E22 swept them anyway — that is
+what its sub-noise z scores for the pair were saying — and shipped
+`UNC_SCALE_SLOPE` 2 -> 1 out of a walk rather than a fit. The value only binds
+in a classical build or under a headless net, so nothing measured here is
+affected, but the constants are centred values with a walk on top and should be
+read that way. The cap is shared by both branches and stayed in the sweep.
+
+| | STC 8+0.08 |
+|---|---|
+| Bounds | [0, 5] normalized |
+| **Result** | **H1 accepted** — LLR 2.97 at 3914 games |
+| Elo | **+12.88 ± 6.71** (nElo +20.90 ± 10.88) |
+| Record | 1123W / 978L / 1813D, 51.85% |
+| Ptnml | [58, 428, 855, 543, 73], PairsRatio 1.27, DrawRatio 43.69% |
+| LOS | 99.99% |
+
+The isolation is E22's: both sides were `stormbreaker-tune-nnue.exe`, the same
+net, the same binary on disk, dev carrying nine `option.*` values on its command
+line and base carrying none.
+
+**What moved.** Seven of the nine defaults changed after rounding:
+
+| | from | to | | | from | to |
+|---|---|---|---|---|---|---|
+| `SEE_QUIET_MARGIN` | 16 | **12** | | `UNC_SIGMA_BASE` | 72 | 73 |
+| `DELTA_MARGIN` | 374 | **389** | | `UNC_SCALE_MAX` | 143 | 144 |
+| `NMP_DEPTH_DIVISOR` | 4 | 5 | | `PROBCUT_MARGIN` | 108 | 109 |
+| `UNC_SIGMA_SLOPE` | 12 | 13 | | | | |
+
+`SEE_CAPTURE_MARGIN` (86) and `HIST_MALUS_MUL` (9) rounded back to where they
+started. All nine shipped as a set, for E17's reason: the SPRT measured the set.
+
+**Two parameters carry the run.** Drift z — total displacement over the
+random-walk scale of the same increments — over 781 iterations:
+
+| param | z | | param | z |
+|---|---|---|---|---|
+| `SeeQuietMargin` | **−5.6** | | `NmpDepthDivisor` | +1.2 |
+| `DeltaMargin` | **+4.2** | | `ProbCutMargin` | +0.8 |
+| `UncSigmaSlope` | +2.0 | | `HistMalusMul` | +0.3 |
+| `UncSigmaBase` | +1.4 | | `SeeCaptureMargin` | −0.2 |
+| `UncScaleMax` | +1.4 | | | |
+
+**The uncertainty mapping has converged and the SEE/delta pair has not.**
+`UncSigmaSlope` entered this run as E22's strongest mover at z +5.6 and leaves
+at +2.0; `UncScaleMax` entered at +3.7 and leaves at +1.4. Both moved one unit
+and stopped. That is the shape of a parameter that was mis-centred once and has
+since been found: E22 took out the 50% error in the slope, and a second pass
+over the same seats finds nothing left worth games. `SeeQuietMargin` and
+`DeltaMargin` were E22's second and fourth strongest and are this run's first
+and second, moving the same direction on both passes — down and up. After two
+sweeps they are the only seats in `search.c` still visibly climbing.
+
+**The d12 tree lost 16% of its nodes while d7 lost 0.7%.** Three of the seven
+changes loosen — `DELTA_MARGIN` up prunes fewer captures in qsearch,
+`NMP_DEPTH_DIVISOR` up shrinks the null-move reduction, `PROBCUT_MARGIN` up
+cuts less — and one tightens. The one that tightens wins by a wide margin,
+because `SEE_QUIET_MARGIN` gates quiet moves against `-margin * depth * depth`,
+a threshold that is shallowest near the leaves and therefore applies to almost
+every node in a deep tree. Dropping 16 -> 12 raises that floor everywhere it
+bites. E22 recorded the mirror image of this — d7 down 7%, d12 up 18% — and the
+lesson is the same one twice: a single-depth bench diff describes a tree that
+is not the one playing the games.
+
+**This is again an intermediate checkpoint.** Stopped at **iteration 781 of
+1500** (21,868 games, 5972W/5857L/10039D, seed 1866954482, 28 games/iteration,
+concurrency 14) and tested as it stood. `python tools/tune.py --resume --state
+external/tune/spsa-unc.json` continues it, and as in E22 the next checkpoint
+must be SPRT'd against **these** defaults rather than the ones before them.
+
+**Verification.** The nine values were written into `search.c` programmatically
+from the tuner's checkpoint, using the UCI-name-to-C-identifier mapping parsed
+out of `search.c`'s own `Tunables[]` table — the E17 procedure, for the third
+time. The gate was the node count at two depths: the new default build benches
+**203047** at d7 and **2963084** at d12, both identical to the `TUNE_SEARCH`
+build driven with the same nine options by `setoption`. `perft`,
+`datagen-test` and `openbench-check` pass.
+
+**Caveats.** STC only, so the LTC confirmation debt stands at four entries
+(E20, E21, E22, E22a). The values were fitted against the network and shipped as
+the defaults for both evaluations: the two `UNC_SIGMA_*` seats are compiled out
+of a classical build, but `UNC_SCALE_MAX`, `SEE_QUIET_MARGIN`, `DELTA_MARGIN`,
+`PROBCUT_MARGIN` and `NMP_DEPTH_DIVISOR` all bind there at values no game was
+played on (classical bench 275123 -> 277139). +12.88 after E22's +14.24 and
+E17's +66.09 is a third pass behaving like a third pass, and the narrowing is
+the point: 3914 games bought most of E22's gain from a third of the seats.
+
+---
+
 
 ## Absolute strength
 

@@ -388,6 +388,22 @@ datagen-test: datagen
 	    || { echo 'FAIL: -book did not supply the start position'; exit 1; }
 	@echo "PASS: -book starts games from the book"
 
+# And that `-opening MIN-MAX` really draws per game. A book cut at one ply is
+# one side to move on every line of it, so a FIXED count starts every game in a
+# generation on the same side and no amount of sampling downstream recovers the
+# other half. -maxplies 4 makes the draw observable: a game that drew 2 plies
+# contributes two records and one that drew 3 contributes one, so a shard
+# strictly between one and two records per game is a shard that drew both.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/range.cnn \
+	    -book $(DATAGEN_TEST_DIR)/book.epd -opening 2-3 -maxplies 4 \
+	    -games 40 -nodes 2000 -seed 3 -nodedup -noquiet -maxscore 0 -quiet
+	@n=$$(( $$(wc -c < $(DATAGEN_TEST_DIR)/range.cnn) / 32 )); \
+	    if [ $$n -le 40 ] || [ $$n -ge 80 ]; then \
+	        echo "FAIL: -opening 2-3 drew one count for all 40 games ($$n records)"; \
+	        exit 1; \
+	    fi; \
+	    echo "PASS: -opening 2-3 splits the game start ($$n records over 40 games)"
+
 # ---------------------------------------------------------------- trainer --
 # PyTorch, its own virtualenv, not part of the C build and not subject to the C
 # style rules. See trainer/README.md.

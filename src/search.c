@@ -350,7 +350,7 @@ static inline void count_node(void) {
 #define TUNABLE(name, def) enum { name = (def) }
 #endif
 
-TUNABLE(RFP_MARGIN, 64); /* reverse futility: how far above beta is "safely won" */
+TUNABLE(RFP_MARGIN, 67); /* reverse futility: how far above beta is "safely won" */
 #define RFP_DEPTH 7
 
 #define LMP_DEPTH 8 /* deepest node that will discard its late quiet moves */
@@ -368,7 +368,7 @@ TUNABLE(RFP_MARGIN, 64); /* reverse futility: how far above beta is "safely won"
  * tree. The useful range is narrow and the whole curve is worth re-measuring
  * before anyone "corrects" this number upwards.
  */
-TUNABLE(FUTILITY_MARGIN, 57);
+TUNABLE(FUTILITY_MARGIN, 58);
 
 /* The depth below which the previous score is too unreliable to aim an
  * aspiration window at. ASPIRATION_DELTA, its half-width, is a TUNABLE below;
@@ -388,7 +388,7 @@ TUNABLE(FUTILITY_MARGIN, 57);
  * certain no quiet move here recovers the deficit. Verified rather than
  * assumed - the qsearch actually runs, and only its result can prune.
  */
-TUNABLE(RAZOR_MARGIN, 305);
+TUNABLE(RAZOR_MARGIN, 309);
 #define RAZOR_DEPTH 3
 
 /*
@@ -401,9 +401,9 @@ TUNABLE(RAZOR_MARGIN, 305);
  * should rise much faster as depth falls.
  */
 #define SEE_CAPTURE_DEPTH 6
-TUNABLE(SEE_CAPTURE_MARGIN, 90);
+TUNABLE(SEE_CAPTURE_MARGIN, 86);
 #define SEE_QUIET_DEPTH 8
-TUNABLE(SEE_QUIET_MARGIN, 20);
+TUNABLE(SEE_QUIET_MARGIN, 12);
 
 /*
  * ProbCut: the mirror of razoring, at the other end of the window.
@@ -432,7 +432,7 @@ TUNABLE(SEE_QUIET_MARGIN, 20);
  * searches `depth - PROBCUT_REDUCTION` and that has to stay a real search. */
 TUNABLE(PROBCUT_DEPTH, 5);
 #define PROBCUT_REDUCTION 4
-TUNABLE(PROBCUT_MARGIN, 103);
+TUNABLE(PROBCUT_MARGIN, 109);
 
 /*
  * Delta pruning margin for quiescence.
@@ -442,7 +442,7 @@ TUNABLE(PROBCUT_MARGIN, 103);
  * outright is not going to raise it. The margin has to cover what the rest of
  * the sequence might swing, which is why it is a piece rather than a pawn.
  */
-TUNABLE(DELTA_MARGIN, 361);
+TUNABLE(DELTA_MARGIN, 389);
 
 /*
  * Singular extension: the shallowest depth worth testing, and how far below
@@ -456,7 +456,7 @@ TUNABLE(DELTA_MARGIN, 361);
  * still does.
  */
 #define SINGULAR_DEPTH 7
-TUNABLE(SINGULAR_MARGIN, 41);
+TUNABLE(SINGULAR_MARGIN, 39);
 
 /*
  * How much the correction is believed, out of CORR_W_UNIT - so CORR_W_UNIT
@@ -465,17 +465,24 @@ TUNABLE(SINGULAR_MARGIN, 41);
  * person; it was chosen rather than fitted. See E14.
  */
 #define CORR_W_UNIT 128
-TUNABLE(CORR_W_PAWN, 129);
+TUNABLE(CORR_W_PAWN, 132);
 
 /*
  * Uncertainty scaling of the margins above: floor percentage, percent per
  * centipawn of learned correction, and the cap. The idea, the measured
- * distribution these defaults are centred on, and the reason the floor stays
- * near 100 all live with unc_scale(), beside the correction history.
+ * distribution these were originally centred on, and the reason the floor
+ * stays near 100 all live with unc_scale(), beside the correction history.
+ *
+ * The cap is SPSA-fitted (E22, E22a); the floor and slope are not, and cannot
+ * be by any sweep run against a net that has an uncertainty head, because
+ * unc_scale() returns on the sigma branch before it reads them. E22 swept them
+ * against such a net and moved the slope on a random walk. They still bind in
+ * a classical build and under a headless net, where they are centred values
+ * with that walk on top. See E22a.
  */
 TUNABLE(UNC_SCALE_BASE, 89);
-TUNABLE(UNC_SCALE_SLOPE, 2);
-TUNABLE(UNC_SCALE_MAX, 140);
+TUNABLE(UNC_SCALE_SLOPE, 1);
+TUNABLE(UNC_SCALE_MAX, 144);
 
 /*
  * The same mapping for a net that carries the trained uncertainty head, whose
@@ -483,15 +490,18 @@ TUNABLE(UNC_SCALE_MAX, 140);
  * learned bias - a larger number with a different distribution, hence its own
  * floor and slope (the slope is sixteenths of a percent per cp).
  *
- * Centred on sigma over the d12 bench tree, measured with scaling held neutral
- * so the mapping could not shape the tree it was read from: median 47cp,
- * node-weighted mean ~72cp. That distribution is right-skewed and
- * UNC_SCALE_MAX truncates its tail, so more of this mapping's centring rides
- * on the cap than the corrhist pair's does - a sweep that moves the cap moves
- * the average margin with it. See E21.
+ * Originally centred on sigma over the d12 bench tree, measured with scaling
+ * held neutral so the mapping could not shape the tree it was read from:
+ * median 47cp, node-weighted mean ~72cp. That distribution is right-skewed and
+ * UNC_SCALE_MAX truncates its tail, so more of this mapping's centring rode
+ * on the cap than the corrhist pair's did - a sweep that moves the cap moves
+ * the average margin with it. E22's sweep did exactly that, raising the cap
+ * and the slope together; these are fitted values now, not centred ones. The
+ * slope was that run's largest coherent mover, and E22a's re-sweep moved both
+ * of these one unit and stopped - the mapping is converged. See E21, E22a.
  */
-TUNABLE(UNC_SIGMA_BASE, 72);
-TUNABLE(UNC_SIGMA_SLOPE, 8);
+TUNABLE(UNC_SIGMA_BASE, 73);
+TUNABLE(UNC_SIGMA_SLOPE, 13);
 
 /*
  * ---------------------------------------------------------------------------
@@ -510,20 +520,20 @@ TUNABLE(UNC_SIGMA_SLOPE, 8);
 /* Late move reduction curve. `Reductions[d][m]` is built from these once, so
  * search_tunable_set() rebuilds the table - see the note there. */
 TUNABLE(LMR_BASE, 14);
-TUNABLE(LMR_DIVISOR, 23);
+TUNABLE(LMR_DIVISOR, 22);
 
 /* How much history is allowed to pull a reduction back. Larger means less
  * influence, which is why these are divisors and not multipliers. */
-TUNABLE(LMR_HIST_DIVISOR, 7622);
-TUNABLE(LMR_CONT_DIVISOR, 7162);
+TUNABLE(LMR_HIST_DIVISOR, 7714);
+TUNABLE(LMR_CONT_DIVISOR, 6845);
 TUNABLE(CAPHIST_DIVISOR, 5);
 
 /* Null-move reduction: base, how fast it grows with depth, and how much of the
  * margin above beta is allowed to buy extra reduction before it is capped. */
 TUNABLE(NMP_BASE, 5);
-TUNABLE(NMP_DEPTH_DIVISOR, 3);
-TUNABLE(NMP_EVAL_DIVISOR, 189);
-TUNABLE(NMP_EVAL_MAX, 2);
+TUNABLE(NMP_DEPTH_DIVISOR, 5);
+TUNABLE(NMP_EVAL_DIVISOR, 187);
+TUNABLE(NMP_EVAL_MAX, 3);
 
 /* How much less a node that was on a principal variation, but is not one in
  * this tree, gets reduced. Zero disables the exemption. */
@@ -555,7 +565,7 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * is not real" is a statement about the search, and it is equally true of
  * evidence pointing either way.
  */
-TUNABLE(HIST_MALUS_MUL, 7);
+TUNABLE(HIST_MALUS_MUL, 9);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 11);

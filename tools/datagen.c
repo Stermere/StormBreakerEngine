@@ -829,6 +829,7 @@ typedef struct {
     const char *book;
     uint64_t bookEntries;
     int openingPlies;
+    int openingPliesMax;
     int openingMaxScore;
     int treeSamples;
     int treeMinDepth;
@@ -895,7 +896,11 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
             fprintf(f, "null");
         fprintf(f, ",\n");
         fprintf(f, "    \"book_entries\": %llu,\n", (unsigned long long)m->bookEntries);
+        /* Both bounds, always. The old key keeps its old meaning - the low one -
+         * so a reader that predates the range still gets a number it can trust,
+         * and one that reads only it is off by at most a ply. */
         fprintf(f, "    \"opening_plies\": %d,\n", m->openingPlies);
+        fprintf(f, "    \"opening_plies_max\": %d,\n", m->openingPliesMax);
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
         fprintf(f, "    \"tree_samples_per_move\": %d,\n", m->treeSamples);
         fprintf(f, "    \"tree_min_depth\": %d,\n", m->treeMinDepth);
@@ -1413,8 +1418,9 @@ typedef struct {
     int threads;
     uint64_t seed;
 
-    const char *book; /* EPD of start positions, or NULL for the start position */
-    int openingPlies;
+    const char *book;    /* EPD of start positions, or NULL for the start position */
+    int openingPlies;    /* random plies before the game starts, low bound, inclusive */
+    int openingPliesMax; /* high bound, inclusive; equal to the low one for a fixed count */
     int openingMaxScore;
 
     int treeSamples;  /* reservoir size per played move */
@@ -1532,6 +1538,15 @@ static int wdl_for(GameResult r, Color stm) {
  * games sharing a book line and differing by a couple of random plies then play
  * out deterministically from near-identical positions, and the difference in
  * their results is attributable to the perturbation rather than to noise.
+ *
+ * The count's PARITY is a separate matter, and it is why the caller draws it
+ * from a range rather than fixing it. A book extracted at one ply has one side
+ * to move on every line of it - `tuner extract -minply 20 -maxply 20` gives
+ * white on all of them - so a fixed EVEN count hands the engine white to move
+ * at the start of every game in a generation, and a fixed odd one hands it
+ * black. Alternating between two adjacent counts splits that evenly, and it is
+ * the only place the split can be fixed: the sampler keeps whichever positions
+ * the games walk through, and it cannot recover a parity the games never had.
  */
 static bool random_opening(Position *pos, int plies, Rng *rng) {
     for (int i = 0; i < plies; ++i) {
@@ -1615,7 +1630,15 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 board_set_startpos(&pos);
             }
 
-            if (!random_opening(&pos, o->openingPlies, &rng))
+            /* Drawn per attempt, not per game, so a rejected opening is retried
+             * with a fresh count as well as a fresh line. rng_below returns
+             * without consuming a draw when the range is one wide, so a fixed
+             * -opening N leaves the stream exactly where it was and reproduces
+             * every shard generated before the range existed. */
+            const int plies =
+                o->openingPlies +
+                (int)rng_below(&rng, (uint64_t)(o->openingPliesMax - o->openingPlies + 1));
+            if (!random_opening(&pos, plies, &rng))
                 continue;
 
             /* A fresh set of tables per game, so a game cannot be steered by
@@ -1665,8 +1688,14 @@ static int selfplay_worker(int index, int workers, void *ctx) {
 
                 /* A randomised opening that is already decided teaches the net
                  * nothing about the middlegame, so the game is thrown away
-                 * rather than played out. */
-                if (pos.gamePly == o->openingPlies && iabs(res.score) > o->openingMaxScore) {
+                 * rather than played out.
+                 *
+                 * Against `plies`, the count THIS game drew, and not against the
+                 * option: board_set_fen zeroes gamePly, so the post-opening
+                 * position is at gamePly == plies, and testing the low bound of
+                 * a range would silently stop screening every game that drew
+                 * anything else. */
+                if (pos.gamePly == plies && iabs(res.score) > o->openingMaxScore) {
                     ++rejected;
                     restart = true;
                     break;
@@ -1779,6 +1808,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.book            = o->book;
     man.bookEntries     = (uint64_t)book.count;
     man.openingPlies    = o->openingPlies;
+    man.openingPliesMax = o->openingPliesMax;
     man.openingMaxScore = o->openingMaxScore;
     man.treeSamples     = sampler.want;
     man.treeMinDepth    = o->treeMinDepth;
@@ -1801,6 +1831,35 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         fprintf(stdout, "[w%02d] wrote %llu records to %s\n", index,
                 (unsigned long long)writer.count, path);
     return 0;
+}
+
+/*
+ * `-opening N` is exactly N plies; `-opening MIN-MAX` draws uniformly from
+ * [MIN, MAX] per game. Parsed by hand rather than with atoi because atoi reads
+ * "2-3" as 2 and discards the rest without a word - and a range silently
+ * collapsed to its low bound is a generation whose games all start on one side
+ * to move, which is the exact thing the range exists to prevent.
+ */
+static bool parse_ply_range(const char *s, int *lo, int *hi) {
+    enum { PLY_CAP = 200 }; /* generous; -maxplies caps the game itself at 400 */
+    char *end;
+    const long a = strtol(s, &end, 10);
+    if (end == s || a < 0 || a > PLY_CAP)
+        return false;
+
+    long b = a;
+    if (*end == '-') {
+        const char *rest = end + 1;
+        b                = strtol(rest, &end, 10);
+        if (end == rest || b < a || b > PLY_CAP)
+            return false;
+    }
+    if (*end != '\0')
+        return false;
+
+    *lo = (int)a;
+    *hi = (int)b;
+    return true;
 }
 
 static void usage_selfplay(void) {
@@ -1833,10 +1892,14 @@ static void usage_selfplay(void) {
            "  -book <file.epd>   draw each game's start position uniformly from this EPD\n"
            "                     (a FEN per line, anything after it ignored - what\n"
            "                     `tuner extract` writes). Default: the start position.\n"
-           "  -opening N         random plies played before the game starts, and the only\n"
+           "  -opening N|MIN-MAX random plies played before the game starts, and the only\n"
            "                     variation there is: everything after them is\n"
            "                     deterministic. Out of a book this is a perturbation and\n"
-           "                     wants to be small.        (2 with -book, otherwise 8)\n"
+           "                     wants to be small. A RANGE alternates the side to move\n"
+           "                     at the start of the game - a book cut at one ply is all\n"
+           "                     one colour, so a fixed count makes every game in the\n"
+           "                     generation start on the same side; 2-3 splits it.\n"
+           "                                               (2 with -book, otherwise 8)\n"
            "  -openingscore N    discard the game if the opening is already decided by\n"
            "                     more than this many centipawns.          (800)\n"
            "\n"
@@ -1877,6 +1940,7 @@ static int cmd_selfplay(int argc, char **argv) {
      * are how a game from the start position gets anywhere at all, and are far
      * too many to play on top of a book line that was chosen for its depth. */
     o.openingPlies    = -1;
+    o.openingPliesMax = -1;
     o.openingMaxScore = 800;
     o.treeSamples     = 0;
     o.treeMinDepth    = 4;
@@ -1907,9 +1971,10 @@ static int cmd_selfplay(int argc, char **argv) {
             o.seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-book") && i + 1 < argc)
             o.book = argv[++i];
-        else if (!strcmp(argv[i], "-opening") && i + 1 < argc)
-            o.openingPlies = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-openingscore") && i + 1 < argc)
+        else if (!strcmp(argv[i], "-opening") && i + 1 < argc) {
+            if (!parse_ply_range(argv[++i], &o.openingPlies, &o.openingPliesMax))
+                dief("-opening wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
+        } else if (!strcmp(argv[i], "-openingscore") && i + 1 < argc)
             o.openingMaxScore = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-tree") && i + 1 < argc)
             o.treeSamples = atoi(argv[++i]);
@@ -1955,6 +2020,8 @@ static int cmd_selfplay(int argc, char **argv) {
         die("-dedupbits must be between 10 and 30");
     if (o.openingPlies < 0)
         o.openingPlies = o.book ? 2 : 8;
+    if (o.openingPliesMax < o.openingPlies)
+        o.openingPliesMax = o.openingPlies;
     /* Every worker opens the book for itself, so an unreadable one is N
      * identical deaths several seconds in. Say it once, here, first. */
     if (o.book) {

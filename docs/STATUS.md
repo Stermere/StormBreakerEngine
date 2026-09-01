@@ -43,7 +43,9 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Search: uncertainty-scaled margins (corrhist-magnitude probe) | **+25.61 ± 9.85** (E20) |
 | NNUE: uncertainty head (trainer, export, inference, search) | code complete, bit-exact |
 | NNUE: uncertainty-head net + σ-scaled margins | **+21.29 ± 9.22** (E21) |
-| **Uncertainty margins: LTC confirmation (E20 + E21 are STC-only)** | **TODO** |
+| Search: 28 parameters re-fitted by SPSA, `Unc*` seats included | **+14.24 ± 7.10** (E22) |
+| Search: same re-fit narrowed to nine seats (SEE, delta, σ mapping) | **+12.88 ± 6.71** (E22a) |
+| **Uncertainty margins: LTC confirmation (E20-E22a are STC-only)** | **TODO** |
 | **NNUE: the default evaluation switches to the network** | **TODO** |
 | Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
 | **Self-play data generation with deliberate variation** | **TODO** |
@@ -123,15 +125,25 @@ The open work, roughly in order of Elo per unit of effort:
    this loop gives each generation labels from the engine produced by the
    previous generation. New training runs include the uncertainty head.
 
-2. **Re-tune the search parameters against the current build.** The SPSA seats
-   in `search.c` (see `make TUNE_SEARCH=on`) include the five `Unc*` constants,
-   which were centred by measurement but never swept. E19c documents the
-   `tune.py` defect that made narrow parameters untunable, now fixed; the depth
-   thresholds still want a sweep of their own rather than SPSA seats.
+2. **Finish the SPSA re-fit.** E22 swept 28 of the 30 seats for +14.24 ± 7.10,
+   including the first gradient ever taken on the `Unc*` constants; E22a then
+   re-swept only the nine that still had one, for +12.88 ± 6.71. After two
+   passes the σ mapping is converged and just two seats are still climbing —
+   `SeeQuietMargin` (z −5.6) and `DeltaMargin` (+4.2), the same two on both
+   runs. Both states are intact — `external\tune\spsa.json` at 938/2500 for
+   the 28-seat run, `external\tune\spsa-unc.json` at 781/1500 for the
+   nine-seat one — and `python tools/tune.py --resume --state <file>` continues
+   either; a later checkpoint must be tested against the **E22a** defaults, not
+   the ones before them. Two groups remain unfitted, both for reasons SPSA at
+   STC cannot fix: the depth thresholds `ProbCutDepth` and `HistBonusDepthMax`,
+   which cannot bind at the depths STC reaches, and `UncScaleBase` /
+   `UncScaleSlope`, which `unc_scale()` never reads when the net has an
+   uncertainty head — no sweep against the shipped net can see them at all, so
+   fitting them needs a classical or headless-net run (E22a).
 
-3. **LTC confirmation of the uncertainty work.** E20 and E21 are both STC-only,
-   and the ~3300 blitz claim is provisional on the same grounds. A 40+0.4 SPRT
-   (or the 40+0.4 gauntlet) retires the debt.
+3. **LTC confirmation of the uncertainty work.** E20, E21, E22 and E22a are
+   all STC-only, and the ~3300 blitz claim is provisional on the same
+   grounds. A 40+0.4 SPRT (or the 40+0.4 gauntlet) retires the debt.
 
 4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
    and the accumulator stack in `src/nnue.c` are file-scope and must move into

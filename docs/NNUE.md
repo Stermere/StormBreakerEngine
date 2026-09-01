@@ -257,7 +257,7 @@ make datagen-test      # the gate above, on a few games. Seconds.
 ```
 
 ```
-datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2 -tree 0
+datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2-3 -tree 0
 datagen label <in.epd>... -o out.cnn -source human -nodes 10000 -resume
 datagen shuffle <in.cnn>... -o train.cnn -seed 1
 datagen verify <shard.cnn>... -relabel 500     # the gate; exits non-zero on failure
@@ -320,7 +320,7 @@ opening the entire coverage story.
 | Flag | Default | What it does |
 |---|---|---|
 | `-book <file.epd>` | none | draw each game's start uniformly from this EPD — a FEN per line, anything after it ignored, which is exactly what `tuner extract` writes |
-| `-opening N` | 2 with a book, 8 without | random legal plies played out of the start position |
+| `-opening N` or `MIN-MAX` | 2 with a book, 8 without | random legal plies played out of the start position; a range is drawn per game |
 | `-openingscore N` | 800 | throw the game away if the opening is already decided by more than this |
 
 Only the line offsets of a book are held in memory, so a 50 MB book costs ~6 MB
@@ -335,6 +335,22 @@ positions, so the difference in their *results* is attributable to the
 perturbation rather than to noise. That is the only thing that makes the
 trainer's game-result term (`--lambda-end` below 1) worth anything. Long random
 openings destroy it, because then no two games share a position to contrast.
+
+**The count's parity is a second decision, and it wants a range.** A book built
+the way the one below is — `-minply 20 -maxply 20`, a single ply — has the same
+side to move on every line of it: white on all 793,495 CCRL entries and all
+1,445,782 Lichess ones. A *fixed* even count therefore hands the engine white to
+move at the start of every game in the generation, and a fixed odd one hands it
+black. `-opening 2-3` draws the count per game and splits it: measured over 400
+games out of the ply-20 book, `-opening 2` starts 95.8% of them with white to
+move and `-opening 2-3` starts 50.5%.
+
+It has to be fixed here, at generation time. The sampler keeps the positions the
+games walked through, so a parity the games never had is not something a filter,
+a shuffle or a re-weighting downstream can put back — and the aggregate
+side-to-move share in the shard hides it, because a game alternates colours
+whichever side starts. The manifest records both bounds (`opening_plies`,
+`opening_plies_max`).
 
 The book decides which positions a generation ever sees, so it is pinned by
 hash in `job.env` (`BOOK_SHA`) exactly as the net is, and the shard manifest
