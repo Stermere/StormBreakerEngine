@@ -1,9 +1,8 @@
 # trainer
 
-The NNUE trainer. Python, its own virtualenv, not part of the C build and not
-subject to the C style rules. The plan it implements is
-[../docs/NNUE.md](../docs/NNUE.md) — read that first; this file is only how to
-run it.
+The NNUE trainer is a separate Python project with its own virtual environment.
+See [../docs/NNUE.md](../docs/NNUE.md) for the network design; this document
+covers setup and operation.
 
 ```
 nnue/format.py    the 32-byte record, and the features the network sees
@@ -23,10 +22,9 @@ pwsh tools\trainer-setup.ps1          # creates trainer\.venv, installs torch
 pwsh tools\trainer-setup.ps1 -CudaTag cpu     # no NVIDIA GPU
 ```
 
-The script picks an interpreter that has a PyTorch wheel and installs torch
-from a **CUDA index**, not from PyPI — the PyPI `torch` wheel for Windows is
-CPU-only, and installing it is a silent 50× slowdown rather than an error. It
-prints whether CUDA came out available; if it says otherwise, believe it.
+The script selects an interpreter with an available PyTorch wheel and installs
+PyTorch from a CUDA index. The PyPI `torch` wheel for Windows is CPU-only. The
+setup output reports whether CUDA is available.
 
 Run everything from this directory so `nnue` is importable:
 
@@ -319,8 +317,7 @@ be lived with. Record what each one scored in
 Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
 At `--hidden 1024 --workers 6` that is about **390k positions/s**.
 
-**The loader is not the bottleneck there, and the old advice in this file that
-it was is wrong.** Measured on the same machine, the loader alone delivers
+On the reference machine, the loader is not the bottleneck. It delivers
 **1.2M positions/s** — three times what training consumes — because 1.2M
 positions/s is only 38 MB/s of records, and the work is `unpack()` on the CPU
 rather than anything the drive does. So raise `--workers` until it stops

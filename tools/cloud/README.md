@@ -1,8 +1,8 @@
 # Distributed datagen
 
-Labelling the human corpus takes ~12 days on a 14-core desktop. This runs the
-same job across a Hetzner fleet in a few hours, and is built to be rerun once
-per training generation rather than driven by hand.
+These scripts distribute corpus labelling across a Hetzner fleet. A job that
+takes about 12 days on the reference 14-core desktop can complete in a few
+hours, depending on fleet size.
 
 The engine needs no changes to support any of this. `datagen label` is
 deterministic and already partitions its input by line, and `.cnn`/`.pol` are
@@ -26,7 +26,7 @@ and every unit drops a done-marker on the hub when it completes. So a rerun
 skips finished units, and a unit from a box that died can be re-dispatched
 anywhere without renaming a thing.
 
-## What you actually have to set
+## Configuration
 
 `job.env.template` is committed and holds working defaults; `job.env` is
 gitignored and holds yours. Start with:
@@ -35,8 +35,7 @@ gitignored and holds yours. Start with:
 Copy-Item tools\cloud\job.env.template tools\cloud\job.env
 ```
 
-Then exactly **two** things need your input. Everything else in the file is a
-default that works.
+Two values are required; the remaining settings have defaults.
 
 | What | Where | Value |
 |---|---|---|
@@ -63,8 +62,6 @@ silently mangling the value.
 - *Security → API Tokens*: create a read/write token, then locally
   `$env:HCLOUD_TOKEN = '...'`.
 
-**Request a quota increase now.** New projects cap out well below `4 × ccx63`
-(192 vCPU), and the support ticket is the long pole in this whole plan.
 
 **2. Storage Box** — order a BX11 (1 TB, ~€3.81/mo) from the storage section of
 the console. This is the hub. Put its user and host in `HUB`; the port is 23,

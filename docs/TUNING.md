@@ -1,12 +1,9 @@
 # Evaluation tuning
 
-How the evaluation's weights are fitted to real games, and why the procedure is
-shaped the way it is.
+How the classical evaluation weights are fitted to game results.
 
-Read [TESTING.md](TESTING.md) first. Nothing here replaces an SPRT: a tuning run
-that lowers its own loss has demonstrated that it fits the data better, which is
-not the same claim as "the engine is stronger", and the two come apart often
-enough that the difference is the whole reason the SPRT exists.
+See [TESTING.md](TESTING.md) for the testing process. Lower fitting loss does
+not by itself establish an Elo gain, so tuned weights still require an SPRT.
 
 ---
 

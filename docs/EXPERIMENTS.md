@@ -1,13 +1,8 @@
 # Experiment log
 
-Every behavioural change, what it was tested against, and what it measured.
-
-The point of this file is to make it impossible to lose track of *why* the
-engine is the way it is. An engine accumulates dozens of small decisions, and
-without a record of which ones were measured — and which were merely believed —
-there is no way to tell a tuned parameter from a guess that nobody ever
-revisited. When a change is later suspected of being wrong, the entry here is
-what says whether it was ever actually tested and at what time control.
+This log records behavioural changes, their baselines, test conditions, and
+measured results. It includes accepted, rejected, and inconclusive changes so
+past decisions can be reviewed against the evidence available at the time.
 
 Read [TESTING.md](TESTING.md) first for the methodology. The short version:
 behavioural changes need an SPRT, `bench` node counts are the fingerprint that

@@ -1,8 +1,7 @@
 # Releasing
 
-How a build gets from this repository to something a stranger can download and
-run. Two moving parts: the binaries, which GitHub Actions builds, and the net,
-which it cannot — that one you upload.
+Release instructions for engine binaries and the NNUE network. GitHub Actions
+builds the binaries; the network is published separately.
 
 ## What a release ships
 
@@ -19,11 +18,11 @@ each in both evaluations, named
 `stormbreaker-<version>-<platform>-<arch>[-nnue]`. A `-nnue` binary has the net
 compiled into it and needs no extra files.
 
-`avx512` is not published. It is rarely a win outside Skylake-X, and GitHub's
-runners cannot reliably execute it — a binary nobody can test is not one to
-hand out. `native` is never published: it is not portable, by definition.
+`avx512` is not published because GitHub's runners cannot test it reliably and
+it offers limited benefit outside Skylake-X. `native` is not published because
+it is not portable.
 
-## The net problem
+## Network distribution
 
 A net is 50 MB. The repository does not carry binaries, so `external/nets/` is
 gitignored, and a clean checkout has no net at all. But `EVAL=nnue` *embeds*
@@ -31,8 +30,7 @@ one with `.incbin` at build time, which means a CI runner, an OpenBench worker
 and anyone building from a fresh clone all need to obtain the exact net that
 commit expects, before the compiler runs.
 
-The answer is a second kind of release, holding one net, tagged by its own
-hash:
+Networks use a separate release tagged by file hash:
 
 ```
 net-1ee5325add50      net.nnue, net.nnue.vectors, net.nnue.sha256
@@ -46,10 +44,9 @@ NET_TAG    ?= net-1ee5325add50
 NET_SHA256 ?= 1ee5325add50950b3b8fb34c742988436664615895f02504dc5e2be9ea15c418
 ```
 
-and `make net-fetch` downloads it, checks the hash **before** putting it in
-place, and refuses a mismatch by name and by both values. A net that is
-silently the wrong one scores plausibly and loses Elo — invariant 8's failure
-mode, and the reason nothing here trusts a filename.
+`make net-fetch` downloads the network, verifies its hash before installation,
+and rejects a mismatch. The hash, rather than the filename, identifies the
+network used by a build.
 
 > These two lines say *which* net a build embeds.
 > [EXPERIMENTS.md](EXPERIMENTS.md) says *why* that one — beside the SPRT that
@@ -57,8 +54,7 @@ mode, and the reason nothing here trusts a filename.
 
 ## Publishing a net
 
-Once per net, from your machine, because a 50 MB upload is not something
-Actions can do for you:
+Publish each network once from a local machine:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\publish-net.ps1 -UpdateMakefile
@@ -73,16 +69,14 @@ It needs a token with `contents: write`, in `$env:GH_TOKEN` or
 `$env:GITHUB_TOKEN` (or an authenticated `gh`, whose token it will borrow).
 Use `-DryRun` to see what it would do without a token.
 
-**The vectors are not optional.** `net.nnue.vectors` is the 10,000
-`(FEN, expected_int)` pairs the exporter wrote, and it is what lets the release
-workflow prove — on each architecture, without a Python environment — that the
-binary it is about to publish reproduces the quantised reference *exactly*. The
-script refuses to publish a net without them.
+`net.nnue.vectors` is required. It contains 10,000 `(FEN, expected_int)` pairs
+used by the release workflow to verify each architecture against the quantised
+reference without a Python environment. The publishing script rejects a
+network without these vectors.
 
 ## Cutting a release
 
-Nothing here happens on a push. The workflow has no `push` trigger at all; it
-runs when you start it.
+The release workflow is manual and has no `push` trigger.
 
 1. **Publish the net** if it changed, as above, and commit the new pin.
 2. **Bump `ENGINE_VERSION`** in [`src/types.h`](../src/types.h) and commit. The
@@ -101,7 +95,7 @@ prerelease, so it never takes the "Latest release" slot.
 
 ## What the workflow checks before publishing
 
-None of these are ceremony. Each one has a failure it is there to catch.
+The workflow runs these checks before publishing:
 
 | Gate | Catches |
 |---|---|
@@ -112,7 +106,7 @@ None of these are ceremony. Each one has a failure it is there to catch.
 | Bench agrees across architectures | `-mbmi2` computing something *different*, not just faster |
 | Embedded net is the pinned one | The wrong net, shipped quietly |
 | `nnue verify` on 10,000 vectors, per architecture | A wrong SIMD path in `src/nnue.c` — plausible scores, lost Elo |
-| `SHA256SUMS.txt` over every asset | Nothing, yet; it is what lets a user check later |
+| `SHA256SUMS.txt` over every asset | Allows users to verify downloaded assets |
 
 The cross-architecture bench check deserves its own note. An `ARCH` profile may
 only change *how* an attack set is computed, never *what* it is. If two

@@ -29,27 +29,23 @@ are in [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) under *Absolute strength*.
 
 **Board and move generation.** Bitboards with magic/PEXT sliding-piece
 attacks, Zobrist hashing, and a move generator that is perft-exact against
-the standard test suites (`make perft`). All board mutation flows through
-three functions, so the bitboards, mailbox and piece counts can never drift
-apart.
+the standard test suites (`make perft`). Three helper functions handle board
+mutation and keep the bitboards, mailbox and piece counts synchronized.
 
 **Search.** A principal variation search with iterative deepening, aspiration
-windows and a lockless transposition table. Above that, the modern pruning
-and ordering stack: null move, late move reductions, reverse futility,
+windows and a lockless transposition table. Pruning and move ordering include
+null move, late move reductions, reverse futility,
 futility, razoring, ProbCut, SEE pruning, late move pruning, singular
 extensions with multi-cut, killers, counter-moves, butterfly / capture /
 continuation history, and a pawn-structure-keyed correction history. The
 search runs on a worker thread so the UCI loop never blocks.
 
-**Uncertainty-scaled margins.** Every margin-based prune is a claim that *k*
-centipawns cover the gap between the static evaluation and what a deeper
-search would say — with *k* traditionally a global constant. That residual is
-measurably heteroscedastic, so `unc_scale()` in [src/search.c](src/search.c)
-scales the five margin prunes per-position by the expected evaluation error:
-from the network's trained uncertainty head when the loaded net carries one,
-else from the correction-history magnitude. Both variants passed their SPRTs
-(E20, E21); the constants are centred so the *average* margin stays where the
-SPSA sweep fitted it.
+**Uncertainty-scaled margins.** `unc_scale()` in
+[src/search.c](src/search.c) adjusts five pruning margins using the expected
+evaluation error. It uses the network's uncertainty head when available and
+falls back to correction-history magnitude otherwise. Both variants passed
+their SPRTs (E20 and E21). The constants are centred to preserve the average
+margin fitted by SPSA.
 
 **Evaluation.** A HalfKA-style NNUE — 24576 features over 32 mirrored king
 squares, SCReLU activation, piece-count output buckets, plus the uncertainty
@@ -153,7 +149,7 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 |---|---|
 | `make nnue-export` | quantise `NET` (default `external/nets/net.pt`) into `EVALFILE` + test vectors |
 | `make net-fetch` | download the pinned net (`NET_SHA256` in the Makefile), hash-checked |
-| `make nnue-info` | which net a build is carrying, by hash — the only trustworthy answer |
+| `make nnue-info` | report the embedded net and its hash |
 | `make net-publish` | upload `EVALFILE` as a content-addressed release |
 
 Training itself runs from `trainer/` — see [trainer/README.md](trainer/README.md);
@@ -169,15 +165,15 @@ fast-chess -engine cmd=.\stormbreaker.exe name=dev `
            -each tc=10+0.1 -rounds 2 -pgnout file=external\games\quick.pgn
 ```
 
-For anything you intend to *measure* rather than watch, use `make sprt` /
-`make gauntlet` — they set the book, concurrency and PGN output correctly.
+For measured results, use `make sprt` or `make gauntlet`; these commands set
+the book, concurrency and PGN output consistently.
 
 ---
 
 ## Repository layout
 
 ```
-src/                engine sources (flat, as in most strong engines)
+src/                engine sources
 tests/perft/        move generation correctness suites (EPD)
 tools/              SPRT, SPSA tuning, gauntlet, baselines (Python,
                     stdlib only); setup / GUI / engine registration (PowerShell);
@@ -201,6 +197,7 @@ external/           gitignored: books, opponent engines, baselines, PGNs, nets
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) — every measured change and what it scored
 - [docs/UCI.md](docs/UCI.md) — supported commands and options
 - [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, and how the net gets published
+- [CREDITS.md](CREDITS.md) — prior art, attribution, training data provenance, and how this engine was built
 
 ---
 
@@ -219,7 +216,3 @@ external/           gitignored: books, opponent engines, baselines, PGNs, nets
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
-
-GPL is the norm for chess engines, and it is a deliberate choice here: it keeps
-the door open to studying and adapting ideas from the many strong GPL engines,
-which is standard practice in this field.

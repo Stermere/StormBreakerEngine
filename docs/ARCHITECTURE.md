@@ -30,9 +30,8 @@ move.h        16-bit packed move encoding
 tools/tuner.c   offline weight fitting; links everything above except main.c
 ```
 
-Dependencies point downward only. Nothing below `search.c` knows the UCI
-protocol exists, which is what lets perft and bench drive the same code the GUI
-does.
+Dependencies point downward only. Code below `search.c` does not depend on the
+UCI protocol, so perft, bench, and the GUI all use the same engine code.
 
 `tools/tuner.c` is the one thing outside that tree. It is not part of the engine
 binary - `make tuner` builds it separately, with `-DTUNE` - but it links the
@@ -51,11 +50,9 @@ A **hybrid**: bitboards plus a mailbox array.
 - `board[64]` — piece on each square. Answers "what is on e4?" with one load
   instead of scanning six bitboards.
 
-Both are maintained together by `board_put_piece` / `board_remove_piece` /
-`board_move_piece`, and **nothing else may touch them**. The most common
-representation bug in a young engine is these two views silently disagreeing;
-routing every mutation through three functions makes that impossible by
-construction. `board_is_consistent()` asserts they still agree.
+Both are maintained by `board_put_piece`, `board_remove_piece`, and
+`board_move_piece`. `board_is_consistent()` checks that the two representations
+agree.
 
 Squares are little-endian rank-file: `A1 = 0`, `H8 = 63`, `square = rank*8 +
 file`. This is the near-universal convention, so published bitboard techniques
@@ -84,11 +81,8 @@ the `e1g1` form GUIs expect unless `UCI_Chess960` is set.
 `search_start()` hands the search to a worker thread and returns immediately;
 the main thread goes straight back to reading stdin.
 
-This is not an optimisation, it is a correctness requirement. `stop` and
-`ponderhit` arrive *while the engine is thinking*. An engine that searches on
-its main thread cannot see them, overruns its clock, and loses games on time in
-every tournament it enters. Retrofitting this later means rewriting the search
-entry point, so it is built in from the start.
+This allows the main thread to process `stop` and `ponderhit` while a search is
+running, which is required for correct UCI time control and pondering.
 
 `thread.c` is a thin shim over Win32 threads and pthreads. C11 `<threads.h>` is
 deliberately avoided: MinGW-w64 does not ship it, and depending on winpthreads
@@ -105,9 +99,8 @@ search it must **not** send `bestmove` until the GUI sends `stop` or
 Zobrist keys are generated from a hard-coded seed with xorshift64*, never from
 `time()` or `rand()`.
 
-This matters more than it looks. A randomly seeded table changes which
-transposition entries collide, which changes the search tree, which changes the
-bench node count between runs. That makes:
+A random seed changes transposition-table collisions and can change the search
+tree and bench node count between runs. Fixed keys provide:
 
 - pure-speedup patches impossible to verify by node count,
 - test results irreproducible,
@@ -121,7 +114,7 @@ reset on `ucinewgame`, or a game's result depends on which games preceded it.
 
 ## Known performance work
 
-The bring-up placeholders are all gone. Sliding attacks go through magic
+Sliding attacks use magic
 bitboards (or PEXT where `USE_PEXT` is defined — it is behind its own flag
 because it is microcoded and very slow on AMD Zen 1/2); ray-walking survives
 only as the reference `slide()` that the magic tables are *built* from and

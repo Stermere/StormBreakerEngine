@@ -1,16 +1,13 @@
 # NNUE
 
-The plan for replacing the linear evaluation with a network, and for spending
-the network on move ordering afterwards.
+Design notes and implementation status for the neural-network evaluation.
 
-Read [TESTING.md](TESTING.md) first. Nothing here is exempt from it: a network
-that fits its data better has demonstrated that it fits its data better, and
-the number of NNUE patches that lower training loss while losing Elo is not
-small.
+See [TESTING.md](TESTING.md) for the testing process. Lower training loss does
+not by itself establish an Elo gain.
 
 ---
 
-## The bet, and its ceiling
+## Purpose and limits
 
 The evaluation today is 13,684 weights, linear, fitted to game results. It is
 worth roughly +270 Elo over the untuned term set. A network is worth more for
@@ -19,8 +16,7 @@ not given a term for, and every term it has was written by hand. "Knight on f5
 is good, *unless* the enemy has the light-squared bishop and a pawn on g6" is
 not a term anyone wrote, and there are thousands of them.
 
-**The ceiling is set by the label, not the architecture.** This is the single
-most important sentence in this document. A network trained to reproduce
+The label limits what the network can learn. A network trained to reproduce
 `eval_evaluate()` cannot beat `eval_evaluate()`; it can only approximate it
 more cheaply, which we do not need. The network gets stronger than the current
 evaluation only because it is trained on something stronger than the current
@@ -30,8 +26,7 @@ predict that search's output is distillation, and the distilled function
 inherits most of the gap. Then the search calls *it*, and the whole thing
 bootstraps: net *n+1* is trained on searches that used net *n*.
 
-So the pipeline is a loop, not a line, and the first turn of it is the one this
-document plans in detail.
+The training pipeline therefore repeats across generations.
 
 **One turn of that loop has now been run against the human corpus, and it
 returned much less than the turn before it.** `gen-003` re-labelled 178.8M

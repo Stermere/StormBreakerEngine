@@ -53,15 +53,10 @@ worth embedding. A load that fails leaves the previous net in place and says why
 on an `info string` — a typo in a GUI config must not leave the engine with no
 evaluation at all. `<internal>` is accepted and means "keep the embedded one".
 
-`Hash` and `Threads` are mandatory for OpenBench compliance. `Threads` honestly
-advertises `max 1` rather than accepting a value it cannot deliver — a test
-client that believes an engine is multi-threaded will schedule games wrongly.
+`Hash` and `Threads` are required for OpenBench compliance. `Threads` advertises
+`max 1` because the search is currently single-threaded.
 
-`MultiPV` is deliberately **not** advertised. The search reports one line, and
-an option that is accepted and then ignored is the same trap as an inflated
-`Threads` range: a GUI asking for four lines would silently get one, and an
-analysis session would draw conclusions from a list that was never computed.
-It returns when the search can actually produce it.
+`MultiPV` is not advertised because the search currently reports one line.
 
 ---
 
@@ -85,28 +80,12 @@ traces the *classical* model, in every build: it is the only evaluation with
 terms to name, and it stays in the tree as the reference the network is measured
 against.
 
-Every one of these also works as a command-line argument, dispatched through the
-exact same code path:
+Each command also works as a command-line argument through the same code path:
 
 ```sh
 ./stormbreaker bench
 ./stormbreaker perft suite tests/perft/standard.epd 4
 ```
-
----
-
-## Current behaviour
-
-Until move generation exists:
-
-- `go` returns `bestmove 0000` (the UCI null move) — the engine is visibly not
-  playing rather than illegally playing something wrong.
-- `position ... moves ...` cannot apply the moves and emits one
-  `info string` explaining why.
-- `bench` reports `0 nodes`, honestly.
-
-The handshake, options, threading and `stop` handling are complete and behave
-correctly today.
 
 ---
 

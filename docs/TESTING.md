@@ -1,11 +1,7 @@
 # Testing methodology
 
-The single thing that separates a chess engine that gets stronger from one that
-drifts sideways is testing discipline. Chess engine changes are famously
-counter-intuitive: roughly half of all "obviously better" patches measure as
-neutral or worse. Intuition is not evidence, and neither is winning a few games.
-
-There are three distinct kinds of test here, and they answer different questions.
+Engine changes are checked with three kinds of test, each answering a different
+question.
 
 | Test | Question | When |
 |---|---|---|
@@ -22,13 +18,9 @@ make perft         # standard positions to depth 4, plus all edge cases
 make perft-all     # full published depths (slow)
 ```
 
-Perft counts the leaf nodes of the legal move tree. The correct counts are
-published and exact, so any disagreement is a bug in your code — never in the
-reference.
-
-**Nothing else matters until perft is exact.** A movegen bug means the engine
-plays or accepts illegal moves, which surfaces as forfeited tournament games and
-as noise that makes every Elo measurement meaningless.
+Perft counts the leaf nodes of the legal move tree. The reference counts are
+published and exact. A mismatch indicates a move-generation or position-state
+bug and must be resolved before Elo testing.
 
 ### Debugging a mismatch
 
@@ -56,13 +48,12 @@ make bench
 Bench serves two purposes:
 
 - **Speed.** `nps` is the number to watch when optimising.
-- **Identity.** The node count is a fingerprint of the search. Two builds with
-  the same count search identically.
+- **Regression detection.** The deterministic node count is used as a search
+  fingerprint for the benchmark positions.
 
-That second property is what makes a **pure speedup** provable: if you rewrite
-something to be faster without intending to change what it searches, the node
-count must be *identical*. If it changed, you changed behaviour too — and now
-you need an SPRT, not a stopwatch.
+For a change intended only to improve speed, the node count must remain
+identical. A changed count indicates changed search behaviour and requires an
+SPRT rather than a timing comparison alone.
 
 **Determinism is a hard requirement.** The count must be identical across runs
 and machines. Zobrist keys use a fixed seed for exactly this reason. OpenBench
@@ -87,9 +78,8 @@ genuinely marginal ones cost tens of thousands.
 
 fastchess prints a running verdict:
 
-- **H1 accepted** — the patch gains Elo. Commit it.
-- **H0 accepted** — the patch does not gain Elo. Discard it, however good the
-  idea seemed. This will happen often. It is the system working.
+- **H1 accepted** — the result supports the configured Elo-gain hypothesis.
+- **H0 accepted** — the result does not support that hypothesis.
 - **continuing** — not enough evidence yet.
 
 Also watch `Ptnml(0-2)`, the pentanomial breakdown of game *pairs*. Pairing
@@ -133,9 +123,8 @@ make gauntlet ARGS="--field engines --games 200"
 make gauntlet ARGS="--field stockfish --games 200"
 ```
 
-Self-play SPRT answers "better than before". A gauntlet answers "how strong,
-really". It also catches regressions that self-play hides — an engine can beat
-its previous self while getting worse against different opponents.
+Self-play SPRT compares a change with its baseline. A gauntlet estimates
+strength against a broader field and can expose opponent-specific regressions.
 
 `--field stockfish` plays Stockfish and nothing else, at full strength — the
 engine is now close enough for that to be informative rather than a guaranteed
@@ -179,6 +168,5 @@ This repository already satisfies the compliance requirements:
 - runs an ASan/UBSan build
 - checks `clang-format`
 
-The perft and sanitizer-perft jobs are hard failures. They are the most
-valuable jobs in the file: a wrong count means the engine plays or accepts
-illegal moves, and nothing measured after that point means anything.
+The perft and sanitizer-perft jobs are hard failures because a wrong count can
+indicate illegal move generation and invalidate later measurements.

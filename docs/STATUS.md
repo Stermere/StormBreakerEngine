@@ -1,8 +1,7 @@
 # Status and roadmap
 
-What is built, what it measured, and what comes next — in that order, because
-the order is the discipline: nothing moves from the roadmap to the table
-without the measurement in [EXPERIMENTS.md](EXPERIMENTS.md) that earns the row.
+Current implementation status, measured results, and planned work. Supporting
+test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## Status
 
@@ -121,9 +120,8 @@ The open work, roughly in order of Elo per unit of effort:
    `-book`, and the generation is configured to start every game from one of
    793,495 unique ply-20 positions taken out of the CCRL 40/40 archive,
    perturb it by two random plies, and then play deterministically. Iterating
-   this loop — each generation labelled by the engine the previous one built —
-   is the compounding path every strong NNUE engine climbed, and every retrain
-   now carries the uncertainty head for free.
+   this loop gives each generation labels from the engine produced by the
+   previous generation. New training runs include the uncertainty head.
 
 2. **Re-tune the search parameters against the current build.** The SPSA seats
    in `search.c` (see `make TUNE_SEARCH=on`) include the five `Unc*` constants,
@@ -148,10 +146,9 @@ The open work, roughly in order of Elo per unit of effort:
    vs corrhist magnitude on an identical net, the attribution E21 deliberately
    did not buy), and combining the two signals — they are not exclusive.
 
-### Deliberately not on that list
+### Deferred or removed
 
-Two items that were on it and have been retired, so they do not get picked up
-again by accident:
+These items are not currently planned:
 
 - **A pawn hash table.** It accelerates `eval.c` and nothing else. With the
   network becoming the default evaluation, the code it speeds up is on its way
