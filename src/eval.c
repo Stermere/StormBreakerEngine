@@ -3,8 +3,7 @@
  *
  * Material, piece placement (both unconditional and conditioned on king
  * position), mobility, pawn structure, king safety and threats, every term
- * tapered between a midgame and an endgame weight. That is steps 3 and 4 of
- * the roadmap in eval.h.
+ * tapered between a midgame and an endgame weight.
  *
  * The tapering is the part that is easy to underrate. A single set of weights
  * cannot be right for both phases, because the same fact means opposite things

@@ -34,10 +34,6 @@ typedef struct {
  * rather than decays, and whatever it converges on has to cover the latency of
  * every move after this one too; reserving it up front is what keeps that
  * number off the floor. See the note in timeman.c.
- *
- * Every constant in here is a guess that has not been through an SPRT yet.
- * Time management is worth real Elo and is confined to this module, so it
- * tests cleanly - see docs/TESTING.md.
  */
 void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly);
 

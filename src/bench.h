@@ -20,18 +20,10 @@
 #define BENCH_H
 
 /*
- * Depth used when the caller does not specify one.
- *
- * Tuned to the engine as it stands: plain alpha-beta with a material-only
- * evaluation reaches this in about seven seconds across the position list
- * below. Depth 6 would take under two, which is too short for the nps figure
- * to settle.
- *
  * RAISE THIS, NEVER THE POSITION LIST. Adding or changing a position
  * invalidates every historical node count at a stroke; raising the depth also
  * changes the count, but leaves old numbers meaningful for the depth they were
- * measured at. Expect to raise it as soon as the transposition table lands -
- * that alone typically cuts the node count several-fold.
+ * measured at.
  */
 #define BENCH_DEFAULT_DEPTH 7
 

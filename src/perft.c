@@ -114,14 +114,12 @@ bool perft_run_suite(const char *path, int maxDepth) {
     const int64_t start = time_ms();
 
     while (fgets(line, sizeof(line), f)) {
-        /* Skip blanks and comments. */
         char *p = line;
         while (*p == ' ' || *p == '\t')
             ++p;
         if (*p == '\n' || *p == '\r' || *p == '\0' || *p == '#')
             continue;
 
-        /* Split "<fen> ;D1 n ;D2 n ..." at the first semicolon. */
         char *semi = strchr(p, ';');
         if (!semi)
             continue;

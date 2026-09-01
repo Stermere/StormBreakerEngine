@@ -15,14 +15,11 @@
 
 int main(int argc, char **argv) {
     /*
-     * Unbuffer stdout before anything is printed.
-     *
      * When a GUI or match runner launches the engine, stdout is a pipe, and C
      * makes pipes FULLY buffered - output sits in the buffer instead of
-     * reaching the GUI. The symptom is an engine that appears to hang during
-     * the handshake or never answers `isready`, and it is the single most
-     * common reason a new engine "does not work in Cute Chess". Every printf
-     * in the protocol layer also flushes, but this is the belt-and-braces fix.
+     * reaching the GUI, so the engine appears to hang during the handshake or
+     * never answers `isready`. Every printf in the protocol layer also
+     * flushes; this is the belt-and-braces fix.
      */
     setvbuf(stdout, NULL, _IONBF, 0);
 

@@ -65,7 +65,6 @@ static inline Bitboard shift_north_west(Bitboard b) { return (b & ~BB_FILE_A) <<
 static inline Bitboard shift_south_east(Bitboard b) { return (b & ~BB_FILE_H) >> 7; }
 static inline Bitboard shift_south_west(Bitboard b) { return (b & ~BB_FILE_A) >> 9; }
 
-/* Forward from `c`'s point of view: north for white, south for black. */
 static inline Bitboard shift_forward(Bitboard b, Color c) {
     return c == WHITE ? shift_north(b) : shift_south(b);
 }

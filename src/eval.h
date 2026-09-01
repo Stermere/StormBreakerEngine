@@ -26,19 +26,6 @@ void eval_init(void);
 extern const Value PieceValues[PIECE_TYPE_NB];
 
 /*
- * The progression this evaluation has followed (see docs/TESTING.md; every
- * step after the first is a behavioural change needing its own SPRT):
- *
- *   1. material only                        - DONE: gets you a playing engine
- *   2. piece-square tables, tapered between midgame and endgame  - DONE
- *   3. pawn structure, mobility, king safety, threats            - DONE
- *   4. weights fitted to real game data (logistic regression on
- *      win/draw/loss labels)                                     - DONE
- *   5. replace the lot with an NNUE network once the search is strong
- *
- * Steps 1-4 are worth several hundred Elo and teach you what the search
- * actually needs. Do not jump straight to step 5.
- *
  * Every weight lives in evalparams.c and is enumerated by evalparams.h, which
  * is what lets `make tuner` refit all of them. docs/TUNING.md is the procedure.
  */
@@ -61,28 +48,19 @@ void eval_trace(const Position *pos);
 /*
  * Evaluation state carried across make/unmake.
  *
- * The classical evaluation has none - it
- * reads the board and nothing else - so
- * in a classical build these are empty inline functions
- * and the search calls
- * them for free. The network has an accumulator whose entire purpose is
- * not
+ * The classical evaluation has none - it reads the board and nothing else - so
+ * in a classical build these are empty inline functions and the search calls
+ * them for free. The network has an accumulator whose entire purpose is not
  * being recomputed at every node, so it keeps a per-ply stack: push after the
- * move is
- * played, pop before it is retracted.
+ * move is played, pop before it is retracted.
  *
- * CORRECTNESS DOES NOT DEPEND ON THESE BEING CALLED.
- * Every level records the
- * Zobrist key it describes and rebuilds itself from the board when that
- * key
+ * CORRECTNESS DOES NOT DEPEND ON THESE BEING CALLED. Every level records the
+ * Zobrist key it describes and rebuilds itself from the board when that key
  * does not match, so a push that goes missing costs a full recomputation
- * rather than a
- * wrong score. Speed very much does depend on it.
+ * rather than a wrong score. Speed very much does depend on it.
  *
- * `eval_state_clear` belongs to invariant 7
- * in CLAUDE.md: search_clear() has
- * to reset everything that carries between searches, and this
- * now carries.
+ * `eval_state_clear` belongs to invariant 7 in CLAUDE.md: search_clear() has
+ * to reset everything that carries between searches, and this now carries.
  */
 #ifdef EVAL_NNUE
 

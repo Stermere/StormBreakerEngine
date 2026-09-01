@@ -22,7 +22,7 @@
 /* ------------------------------------------------------------------ meta -- */
 
 #define ENGINE_NAME    "StormBreaker"
-#define ENGINE_VERSION "0.2.0-dev"
+#define ENGINE_VERSION "0.3.0-dev"
 #define ENGINE_AUTHOR  "Collin Kees"
 
 /* --------------------------------------------------------------- limits -- */
@@ -112,7 +112,6 @@ static inline Square flip_rank(Square s) { return (Square)(s ^ 56); }
 /* Rank as seen by `c`, so relative_rank(BLACK, SQ_A7) == RANK_2. */
 static inline Rank relative_rank(Color c, Square s) { return (Rank)((s >> 3) ^ (c * 7)); }
 
-/* Square delta of a single pawn push for `c`: north for white, south for black. */
 static inline int pawn_push(Color c) { return c == WHITE ? 8 : -8; }
 
 /* -------------------------------------------------------------- castling -- */
@@ -150,7 +149,6 @@ static inline bool is_mate_score(Value v) {
 
 /* ------------------------------------------------------------ intrinsics -- */
 
-/* Population count. */
 static inline int popcount(Bitboard b) {
 #if defined(_MSC_VER) && defined(USE_POPCNT)
     return (int)_mm_popcnt_u64(b);
@@ -165,7 +163,7 @@ static inline int popcount(Bitboard b) {
 #endif
 }
 
-/* Index of the least significant set bit. Undefined for b == 0. */
+/* Undefined for b == 0. */
 static inline Square lsb(Bitboard b) {
 #if defined(_MSC_VER)
     unsigned long idx;
@@ -176,7 +174,7 @@ static inline Square lsb(Bitboard b) {
 #endif
 }
 
-/* Index of the most significant set bit. Undefined for b == 0. */
+/* Undefined for b == 0. */
 static inline Square msb(Bitboard b) {
 #if defined(_MSC_VER)
     unsigned long idx;
@@ -187,7 +185,7 @@ static inline Square msb(Bitboard b) {
 #endif
 }
 
-/* Remove and return the least significant set bit. The standard iteration idiom:
+/* The standard iteration idiom:
  *     while (bb) { Square s = pop_lsb(&bb); ... }
  */
 static inline Square pop_lsb(Bitboard *b) {

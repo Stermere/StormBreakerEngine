@@ -74,14 +74,12 @@ function Get-Stockfish {
     )
 }
 
-# The freshly built engine.
 function Get-EngineBinary {
     $exe = Join-Path $RepoRoot 'stormbreaker.exe'
     if (Test-Path $exe) { return $exe }
     return $null
 }
 
-# The opening book used for all testing.
 function Get-Book {
     $book = Join-Path $BooksDir 'UHO_Lichess_4852_v1.epd'
     if (Test-Path $book) { return $book }

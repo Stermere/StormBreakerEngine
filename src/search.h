@@ -1,7 +1,7 @@
 /*
  * search.h - search driver and its threading contract.
  *
- * THREADING MODEL (get this right once and never revisit it):
+ * THREADING MODEL:
  * `search_start` returns immediately, having handed the search to a worker
  * thread. The main thread goes straight back to reading stdin, which is the
  * only way `stop` and `ponderhit` can be honoured while thinking. An engine

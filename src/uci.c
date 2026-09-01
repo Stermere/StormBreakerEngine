@@ -1,5 +1,5 @@
 /*
- * uci.c - Universal Chess Interface protocol layer. Complete and functional.
+ * uci.c - Universal Chess Interface protocol layer.
  *
  * Two rules govern everything here:
  *
@@ -189,12 +189,11 @@ static void cmd_setoption(char *args) {
 
     char *value = strstr(name, " value ");
     if (value) {
-        *value = '\0'; /* terminate the name */
+        *value = '\0';
         value += 7;
         value = skip_spaces(value);
     }
 
-    /* Trim trailing whitespace from the name. */
     size_t len = strlen(name);
     while (len > 0 && (name[len - 1] == ' ' || name[len - 1] == '\t'))
         name[--len] = '\0';
@@ -217,12 +216,12 @@ static void cmd_setoption(char *args) {
         OptMoveOverhead = atoi(value);
 #ifdef EVAL_NNUE
     } else if (strcmp(name, "EvalFile") == 0 && value) {
+        /* A failed load leaves the previous net in place and says why: a typo in
+         * a GUI config must not leave the engine with no evaluation. */
         if (strcmp(value, "<internal>") == 0)
             printf("info string EvalFile: keeping the embedded net\n");
         else if (nnue_load_file(value))
             nnue_print_info();
-            /* A failed load leaves the previous net in place and says why: a typo
-             * in a GUI config must not leave the engine with no evaluation. */
 #endif
     } else if (strcmp(name, "UCI_Chess960") == 0 && value) {
         OptChess960  = strcmp(value, "true") == 0;
@@ -377,8 +376,9 @@ static void cmd_perft(char *args) {
 
 #ifdef EVAL_NNUE
 /*
- * `nnue verify <file>` is the Task 3 acceptance gate. It runs the shipped
- * inference vectors through the net and compares the output to the expected values.
+ * `nnue verify <file>` runs the shipped inference vectors through the net and
+ * compares the output against the expected values - the gate proving the C
+ * inference matches the quantised Python reference exactly.
  */
 static void cmd_nnue(char *args) {
     char *cursor = args;
@@ -420,14 +420,13 @@ bool uci_execute(const char *line) {
         (unsigned char)buf[2] == 0xBF)
         cursor = buf + 3;
 
-    /* Strip the trailing newline GUIs send. */
     size_t len = strlen(buf);
     while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
         buf[--len] = '\0';
 
     char *cmd = next_token(&cursor);
     if (!cmd)
-        return true; /* blank line */
+        return true;
 
     if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "stop") == 0) {
         search_stop();

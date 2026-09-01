@@ -111,10 +111,8 @@ static inline int piece_count(const Position *pos, Color c, PieceType pt) {
     return pos->pieceCount[make_piece(c, pt)];
 }
 
-/* Bitboard of enemy pieces giving check to `pos->sideToMove`. */
 static inline Bitboard board_checkers(const Position *pos) { return pos->checkers; }
 
-/* Pieces of `pos->sideToMove` pinned against their own king. */
 static inline Bitboard board_pinned(const Position *pos) { return pos->pinned; }
 
 /* ------------------------------------------------------- board mutation -- */
@@ -211,8 +209,7 @@ bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occ
  * count. Pass 0 outside the search. */
 bool board_is_draw(const Position *pos, int ply);
 
-/* Validates that all representations agree. Debug builds only - call it from
- * asserts inside do_move/undo_move while bringing move making up. */
+/* Validates that all representations agree. Debug builds only. */
 bool board_is_consistent(const Position *pos);
 
 #endif /* BOARD_H */

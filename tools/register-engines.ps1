@@ -72,7 +72,6 @@ if (Test-Path $enginesJson) {
     }
 }
 
-# Drop any previous registration under this name, then re-add.
 $engines = @($engines | Where-Object { $_.name -ne $Name })
 
 $entry = [pscustomobject]@{

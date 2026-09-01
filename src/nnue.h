@@ -194,9 +194,9 @@ const char *nnue_hash(void);
 void nnue_print_info(void);
 
 /*
- * The Task 3 acceptance gate. Reads the `<raw> <cp> <fen>` vectors written by
- * tools/export_net.py, recomputes both numbers here, and requires EXACT
- * equality on every line. Returns 0 on success.
+ * Reads the `<raw> <cp> <fen>` vectors written by tools/export_net.py,
+ * recomputes both numbers here, and requires EXACT equality on every line.
+ * Returns 0 on success.
  *
  * Exact, not close: the quantised network is integer arithmetic and integer
  * arithmetic is reproducible. A tolerance here is a bug generator - a

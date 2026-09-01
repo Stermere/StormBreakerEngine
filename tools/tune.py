@@ -172,7 +172,7 @@ class Param:
 
         # Sizes the step; c_end still sizes the perturbation. Equal for every
         # parameter wide enough that the floor does not bite, which is what
-        # keeps this change invisible to them. See STEP_C_FLOOR.
+        # keeps the floor invisible to them. See STEP_C_FLOOR.
         self.step_c = max(self.c_end, STEP_C_FLOOR)
 
     def clamp(self, v: float) -> float:

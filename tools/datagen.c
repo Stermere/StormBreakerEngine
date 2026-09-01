@@ -8,7 +8,7 @@
  *     datagen label <in.epd>... -o out.cnn         label positions that exist
  *     datagen shuffle <in.cnn>... -o out.cnn       on-disk shuffle
  *     datagen filter <in.cnn>... -o out.cnn        keep/drop by source tag
- *     datagen verify <shard.cnn>...                the Task 1 acceptance gate
+ *     datagen verify <shard.cnn>...                the acceptance gate
  *     datagen stats <shard.cnn>...                 histograms, to be eyeballed
  *     datagen dump <shard.cnn>                     records as text
  *
@@ -270,7 +270,7 @@ typedef struct {
 /*
  * Policy sidecar: 4 bytes per record, in the same order, in `shardNN.pol`.
  * Optional to read, cheap to write, and impossible to backfill - which is why
- * it is written now for a Task 5 that has not started.
+ * it is written now, before anything reads it.
  *
  *   best   the best move of THIS record's label search. Always present.
  *   cutoff the move that caused the beta cutoff at the tree node this position
@@ -2746,9 +2746,9 @@ static int cmd_filter(int argc, char **argv) {
 }
 
 /* ========================================================================== *
- *  Subcommand: verify - the Task 1 acceptance gate
+ *  Subcommand: verify - the acceptance gate
  *
- *  Two properties, and a shard that fails either is not usable:
+ *  Three properties, and a shard that fails any of them is not usable:
  *
  *    1. Every record round-trips. unpack -> FEN -> board_set_fen -> repack
  *       must give back the identical 32 bytes. That covers the occupancy, the

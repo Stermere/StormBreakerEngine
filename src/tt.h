@@ -61,7 +61,6 @@ static inline bool tt_entry_is_pv(const TTEntry *e) { return e->pv != 0; }
  * Driven by the Hash UCI option. Returns false if allocation failed. */
 bool tt_resize(size_t mb);
 
-/* Releases the table. Called at exit. */
 void tt_free(void);
 
 /* Zeroes every entry. Called on `ucinewgame` so results from the previous game
@@ -75,7 +74,6 @@ void tt_new_search(void);
 /* Permille of the table in use - reported to GUIs as `info hashfull`. */
 int tt_hashfull(void);
 
-/* Current size in megabytes. */
 size_t tt_size_mb(void);
 
 /*

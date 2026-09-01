@@ -41,10 +41,9 @@ int64_t time_ms(void) {
  * This bound only bites once the clock has fallen to somewhere around fifteen
  * times the increment - above that `MAX_NOMINAL_MULT` is the smaller of the
  * two and this one never applies - so it has exactly one job: leaving a clock
- * to play the next move from when this move went badly. It was 4/5, which is
- * to say it did not do that job: at the clock this allocator converges on,
- * four fifths of the remainder is the difference between a scramble and a
- * loss. */
+ * to play the next move from when this move went badly. At the clock this
+ * allocator converges on, anything looser is the difference between a scramble
+ * and a loss. */
 #define MAX_CLOCK_FRACTION_NUM 1
 #define MAX_CLOCK_FRACTION_DEN 2
 
@@ -164,26 +163,24 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
      * Charging it once is right for the move in hand and wrong for the game.
      * Spending `remaining / moves + 3/4 inc` and being paid `inc` back is a
      * contraction, so the clock does not decay - it converges, on five times
-     * the increment. That is the number this engine was living on: at 8+0.08,
-     * around 400ms in hand for the rest of the game, with the latency of every
-     * one of those moves still to come out of it. Nothing is left to absorb a
-     * slow GUI round trip or one search that overshoots, which is what running
-     * out of time on the last few moves actually looks like.
+     * the increment. At 8+0.08 that is around 400ms in hand for the rest of
+     * the game, with the latency of every one of those moves still to come out
+     * of it, and nothing left to absorb a slow GUI round trip or one search
+     * that overshoots.
      *
-     * Reserving the latency up front instead moves that convergence point up
-     * by the whole reserve, and does it in proportion to how much latency was
-     * declared - a network game with a 100ms overhead gets a wide margin
-     * without anyone having to ask for one. Capped at half the clock, so a
-     * large declared overhead cannot leave the allocator with no budget to
-     * divide.
+     * Reserving the latency up front moves that convergence point up by the
+     * whole reserve, in proportion to how much latency was declared - a
+     * network game with a 100ms overhead gets a wide margin without anyone
+     * having to ask for one. Capped at half the clock, so a large declared
+     * overhead cannot leave the allocator with no budget to divide.
      */
     const int64_t reserve = clamp64(overhead * (moves + 2), 0, clock / 2);
 
-    /* Two different questions, and conflating them is the other half of the
-     * bug. `spendable` is what this move can physically use without flagging;
-     * `budget` is what it may use given that the rest of the game comes out of
-     * the same clock. The allocation is divided out of the budget, and the
-     * hard ceiling is measured against what is really there. */
+    /* Two different questions. `spendable` is what this move can physically
+     * use without flagging; `budget` is what it may use given that the rest of
+     * the game comes out of the same clock. The allocation is divided out of
+     * the budget, and the hard ceiling is measured against what is really
+     * there. */
     const int64_t spendable = clamp64(clock - overhead, 1, INT64_MAX);
     const int64_t budget    = clamp64(clock - reserve, 1, INT64_MAX);
 

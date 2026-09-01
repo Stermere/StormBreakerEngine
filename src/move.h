@@ -56,7 +56,7 @@ static inline Move make_promotion(Square from, Square to, PieceType promo) {
     return (Move)(from | (to << 6) | ((promo - KNIGHT) << 12) | MT_PROMOTION);
 }
 
-/* A move is "ok" if it is neither sentinel. Note MOVE_NONE == 0 is falsy. */
+/* Neither sentinel. Note MOVE_NONE == 0 is falsy. */
 static inline bool is_ok_move(Move m) { return m != MOVE_NONE && m != MOVE_NULL; }
 
 /* A scored move. Move ordering is the single largest contributor to search

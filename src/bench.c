@@ -23,14 +23,11 @@
  * so old bench numbers stop being comparable to new ones.
  */
 static const char *BenchPositions[] = {
-    /* --- opening and early middlegame --- */
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
     "r1bqkb1r/pp3ppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP3PPP/RN1QK2R w KQkq - 0 7",
     "rnbqkb1r/pp2pppp/3p1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R b KQkq - 0 6",
     "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQK2R w KQkq - 0 5",
-
-    /* --- rich middlegames --- */
     "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
     "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
     "2kr3r/pppq1ppp/2n1bn2/1B2p3/4P3/2N2N2/PPP2PPP/R1BQ1RK1 w - - 4 10",
@@ -41,8 +38,6 @@ static const char *BenchPositions[] = {
     "4rrk1/pp1n1pp1/2pb1q1p/3p4/3P1B2/2NB1Q1P/PPP2PP1/3RR1K1 w - - 0 18",
     "r1bq1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 4 9",
     "2rq1rk1/pb1nbppp/1p2pn2/8/2BP4/2N1PN2/PPQ2PPP/R1B2RK1 w - - 6 12",
-
-    /* --- tactical positions --- */
     "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
     "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
     "1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B2/2K5 b - - 0 1",
@@ -51,9 +46,6 @@ static const char *BenchPositions[] = {
     "r3r1k1/2p2ppp/p1p1bn2/8/1q2P3/2NPQN2/PPP3PP/R4RK1 b - - 2 15",
     "q3k1nr/1pp1nQpp/3p4/1P2p3/4P3/B1PP1b2/B5PP/5K1R w k - 0 17",
     "3r3k/2r4p/1p1b3q/p4P2/P2Pp3/1B2P3/3BQ1RP/6K1 w - - 0 1",
-
-    /* --- endgames: a search that is only tested on middlegames will be
-           badly tuned here, and endgames decide close games --- */
     "8/8/8/8/8/6k1/6p1/6K1 w - - 0 1",
     "8/2k5/8/8/8/8/5PPP/6K1 w - - 0 1",
     "8/5k2/8/8/8/8/1P1P1P2/2K5 w - - 0 1",
@@ -69,8 +61,6 @@ static const char *BenchPositions[] = {
     "8/8/3P3k/8/1p6/8/1P6/1K3n2 b - - 0 1",
     "4k3/8/8/1p6/1P6/8/8/4K3 w - - 0 1",
     "8/p7/8/1P6/K1k3p1/6P1/8/8 w - - 0 1",
-
-    /* --- unusual structures that stress evaluation --- */
     "3k4/3p4/8/K1P4r/8/8/8/8 b - - 0 1",
     "8/8/4k3/3nn3/8/8/4K3/8 w - - 0 1",
     "rnbqkbnr/1ppppppp/p7/8/8/P7/1PPPPPPP/RNBQKBNR w KQkq - 0 2",

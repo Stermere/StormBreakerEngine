@@ -221,7 +221,6 @@ static CastlingRights supported_castling(const Position *p) {
     for (Color c = WHITE; c <= BLACK; ++c) {
         const Rank home = c == WHITE ? RANK_1 : RANK_8;
 
-        /* No king at home, no castling of either kind. */
         if (piece_on(p, make_square(FILE_E, home)) != make_piece(c, KING))
             continue;
 

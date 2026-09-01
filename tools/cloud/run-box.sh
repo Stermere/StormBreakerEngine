@@ -51,11 +51,11 @@ verify_and_push() {
     # and the hash size is one of them: search_clear() empties the table but
     # keeps its geometry, so a position collides differently in a 64 MB table
     # than in an 8 MB one and roughly one record in a thousand scores
-    # differently. `selfplay` labels with 64 MB and `verify` used to default to
-    # 8, which failed one sampled record in every few shards for no reason -
-    # after hours of selfplay that had produced perfectly good data.
+    # differently. `selfplay` labels with 64 MB, so a `verify` left to default
+    # to 8 fails roughly one sampled record in every few shards, on data that
+    # is perfectly good.
     #
-    # datagen reads the manifest itself now. The binary here was built at
+    # datagen reads the manifest itself. The binary here was built at
     # $COMMIT and may predate that, so pass the values explicitly; when both
     # know, they agree and nothing warns.
     _man="${_first%.cnn}.json"

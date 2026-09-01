@@ -360,8 +360,8 @@ TUNABLE(RFP_MARGIN, 64); /* reverse futility: how far above beta is "safely won"
 /*
  * Futility margin per ply of remaining depth.
  *
- * Much smaller than the "value of a quiet move" intuition suggests, and the
- * reason is worth recording: at a null-window node alpha tracks the search
+ * Much smaller than the "value of a quiet move" intuition suggests. At a
+ * null-window node alpha tracks the search
  * window, which tracks the evaluation, so staticEval sits very close to alpha
  * far more often than not. A margin of 100/ply asks for a full pawn of slack
  * at depth 1 and essentially never fires - measured at 0.008% of the bench
@@ -370,12 +370,12 @@ TUNABLE(RFP_MARGIN, 64); /* reverse futility: how far above beta is "safely won"
  */
 TUNABLE(FUTILITY_MARGIN, 57);
 
-/* Half-width of the first aspiration window, and the depth below which the
- * previous score is too unreliable to aim one at. */
-/* ASPIRATION_DELTA is a TUNABLE below. The depth floor stays a #define: it is
- * a small integer threshold, and SPSA perturbs continuously and then rounds, so
- * both sides of a gradient estimate land on the same value and the measurement
- * is noise. Thresholds like this want a sweep of their own, not a sweep seat. */
+/* The depth below which the previous score is too unreliable to aim an
+ * aspiration window at. ASPIRATION_DELTA, its half-width, is a TUNABLE below;
+ * this floor stays a #define because it is a small integer threshold, and SPSA
+ * perturbs continuously and then rounds, so both sides of a gradient estimate
+ * land on the same value and the measurement is noise. Thresholds like this
+ * want a sweep of their own, not a sweep seat. */
 #define ASPIRATION_MIN_DEPTH 5
 
 /*
@@ -423,9 +423,6 @@ TUNABLE(SEE_QUIET_MARGIN, 20);
  * The margin has to cover the noise a search this much shallower carries. The
  * depth floor is what keeps `depth - PROBCUT_REDUCTION` a real search rather
  * than a quiescence with extra steps.
- *
- * A pawn is a starting point and nothing more; see E19 for what the bench had
- * to say about the alternatives, which was mostly that it cannot tell.
  */
 /* The floor is a TUNABLE only so that an ablation has a switch: set it above
  * any depth the search reaches and ProbCut is off, with no rebuild. It is NOT
@@ -462,13 +459,10 @@ TUNABLE(DELTA_MARGIN, 361);
 TUNABLE(SINGULAR_MARGIN, 41);
 
 /*
- * How much the correction is believed, out of CORR_W_UNIT.
- *
- * At the default this is arithmetically identical to what E14 measured at
- * +17.25 on the network - 128/128 is one - so the shipped engine is unchanged
- * and the bench proves it. It is a TUNABLE because how far to trust a learned
- * evaluation bias is exactly the kind of question a sweep answers better than
- * a person, and it was never fitted, only chosen.
+ * How much the correction is believed, out of CORR_W_UNIT - so CORR_W_UNIT
+ * itself means "in full". A TUNABLE because how far to trust a learned
+ * evaluation bias is the kind of question a sweep answers better than a
+ * person; it was chosen rather than fitted. See E14.
  */
 #define CORR_W_UNIT 128
 TUNABLE(CORR_W_PAWN, 129);
@@ -488,6 +482,13 @@ TUNABLE(UNC_SCALE_MAX, 140);
  * signal is centipawns of predicted |eval error| rather than centipawns of
  * learned bias - a larger number with a different distribution, hence its own
  * floor and slope (the slope is sixteenths of a percent per cp).
+ *
+ * Centred on sigma over the d12 bench tree, measured with scaling held neutral
+ * so the mapping could not shape the tree it was read from: median 47cp,
+ * node-weighted mean ~72cp. That distribution is right-skewed and
+ * UNC_SCALE_MAX truncates its tail, so more of this mapping's centring rides
+ * on the cap than the corrhist pair's does - a sweep that moves the cap moves
+ * the average margin with it. See E21.
  */
 TUNABLE(UNC_SIGMA_BASE, 72);
 TUNABLE(UNC_SIGMA_SLOPE, 8);
@@ -495,11 +496,7 @@ TUNABLE(UNC_SIGMA_SLOPE, 8);
 /*
  * ---------------------------------------------------------------------------
  * The second tier: constants that shape a formula rather than sit in a
- * comparison.
- *
- * These were written as plain numbers and never fitted to anything. That is
- * not the same as being wrong, but it is not evidence of being right either,
- * and several of them predate the network entirely. Wrapping them costs the
+ * comparison. Wrapping them costs the
  * shipped engine nothing - TUNABLE folds to an enum constant in a normal build
  * and the compiler treats it exactly as it treated the literal, which the
  * unchanged bench node count is the proof of.
@@ -529,41 +526,30 @@ TUNABLE(NMP_EVAL_DIVISOR, 189);
 TUNABLE(NMP_EVAL_MAX, 2);
 
 /* How much less a node that was on a principal variation, but is not one in
- * this tree, gets reduced. Zero restores the pre-E19 rule exactly. */
+ * this tree, gets reduced. Zero disables the exemption. */
 TUNABLE(TTPV_REDUCTION, 2);
 
 /* History bonus curve: the multiplier on depth-squared, and the depth past
  * which extra confidence stops being real.
  *
- * A note on tuning the cap, because it looks like a parameter and at short time
- * controls it is not one. `history_bonus` takes `min(depth, cap)` and `depth`
- * is remaining depth, so the cap cannot bind unless the search reaches past it.
- * At STC this engine reaches depth 12-13, which makes a cap of 20 inert - not
- * weakly measurable, inert - and a sweep run there will random-walk it inside a
- * flat region and report the walk. E17 recorded it as "unchanged", which is
- * what a zero gradient looks like from the outside. Its range now reaches 32
- * for the sake of LTC sweeps, where depths do get there; at STC it should be
- * excluded from the fit rather than given room to wander. */
+ * The cap looks like a parameter and at short time controls is not one.
+ * `history_bonus` takes `min(depth, cap)` and `depth` is remaining depth, so
+ * the cap cannot bind unless the search reaches past it. At STC this engine
+ * reaches depth 12-13, which makes a cap of 20 inert, and a sweep run there
+ * random-walks it inside a flat region and reports the walk. Its range reaches
+ * 32 for the sake of LTC sweeps, where depths do get there; at STC exclude it
+ * from the fit rather than give it room to wander. */
 TUNABLE(HIST_BONUS_MUL, 8);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
 
 /*
  * The same curve for the moves that FAILED, on its own multiplier.
  *
- * One number served both directions here, which quietly asserted that "this
- * move caused a cutoff" and "this move was tried and did not" are claims of
- * equal strength. They are not the same claim at all - the first names one
- * move out of the list, the second is levelled at up to sixty-three of them at
- * once - and nothing says the answer to one should size the other.
- *
- * The default leans the malus heavier, which is where the engines that have
- * fitted the two separately have ended up, but only barely, and the bench is
- * the reason. Swept at depths 10-12 the tree is flat between 5 and 6 - 0.7%
- * apart, well inside the noise - and then degrades sharply: 7 costs 7%, 8
- * costs 14% at depth 12. So the useful claim this change makes is structural
- * rather than numeric. It gives the malus a seat of its own in the sweep,
- * which it never had; fitting it is the tuner's job, and 6 is only a starting
- * point chosen not to move the tree while the split gets measured.
+ * "This move caused a cutoff" and "this move was tried and did not" are not
+ * claims of equal strength - the first names one move out of the list, the
+ * second is levelled at up to sixty-three of them at once - so nothing says
+ * the answer to one should size the other. Hence a seat of its own in the
+ * sweep; fitting it is the tuner's job.
  *
  * The depth cap stays shared on purpose: "past this depth the extra confidence
  * is not real" is a statement about the search, and it is equally true of
@@ -661,9 +647,6 @@ bool search_tunable_set(const char *name, int value) {
 }
 #endif /* TUNE_SEARCH */
 
-/* Forward-declared far above, beside the comment explaining the curve. It lives
- * here because LMR_BASE and LMR_DIVISOR are declared with the other tunables
- * and an enum constant cannot be used before it is declared. */
 static void init_reductions(void) {
     for (int d = 0; d < 64; ++d)
         for (int m = 0; m < 64; ++m)
@@ -1140,20 +1123,17 @@ static void corrhist_update(const Position *pos, Value searched, Value staticEva
  *     prevent.
  *   - Otherwise, |correction| stands in: how far the evaluation has provably
  *     been wrong in this pawn structure before. A measure of bias standing in
- *     for the residual's spread - the bet that the two travel together. It
- *     was deliberately the crudest signal that could work, the probe built
- *     before the head existed, and E20 measured it at +25.6: the margin
- *     surface has real structure, which is what funded the head.
+ *     for the residual's spread - the bet that the two travel together. The
+ *     margin surface has real structure; see E20.
  *
  * The corrhist defaults are centred, not chosen: 89 + 2 * 6cp (the measured
- * mean) lands the node-weighted average scale at ~100%, so the shipped
- * margins are on average what E17 fitted and an SPRT on this change measures
- * the conditioning alone rather than a disguised global margin shift. A cold
- * entry reads as zero and lands on the floor, which is why the floor sits
- * just under 100 rather than lower: the floor is also the engine's posture in
- * structures it knows nothing about. The sigma mapping's constants are NOT
- * yet centred - see the note at their declaration before running the head's
- * SPRT.
+ * mean) lands the node-weighted average scale at ~100%, so the shipped margins
+ * are on average the ones that were fitted, and the conditioning is measured
+ * on its own rather than as a disguised global margin shift. A cold entry
+ * reads as zero and lands on the floor, which is why the floor sits just under
+ * 100 rather than lower: the floor is also the engine's posture in structures
+ * it knows nothing about. The sigma mapping is centred on its own distribution
+ * the same way - see the note at its declaration.
  */
 static inline int unc_scale(const Position *pos) {
 #ifdef EVAL_NNUE
@@ -1730,15 +1710,6 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                 continue;
 
             /*
-             * A continuation-history pruning rule sat here and was removed: it
-             * never fired. A quiet move whose continuation history is bad
-             * enough to trip a threshold of that shape also scores low enough
-             * to sort to the end of the list, where late move pruning has
-             * already discarded it - so LMP subsumes it entirely at these
-             * depths. See E9 in docs/EXPERIMENTS.md for the measurement.
-             */
-
-            /*
              * Futility pruning: the position is already so far below alpha
              * that a quiet move - which by definition wins no material - has
              * no realistic way of closing the gap in the depth remaining.
@@ -1898,13 +1869,11 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
              * and a position that was on one before is still that position,
              * whatever window this visit happens to be using.
              *
-             * Written as two arms rather than the one `if (ttPv) --r` they are
-             * equivalent to, because the second arm is the whole of what E19
-             * added and an ablation needs to be able to switch it off. At
-             * TTPV_REDUCTION = 1 this is exactly `if (ttPv) --r`, since ttPv is
-             * true wherever pvNode is; at 0 it is exactly the rule that stood
-             * before, with the table flag still written but nothing reading
-             * it. */
+             * Written as two arms rather than the equivalent `if (ttPv) --r` so
+             * that an ablation can switch the second off: at TTPV_REDUCTION = 1
+             * this is exactly `if (ttPv) --r`, since ttPv is true wherever
+             * pvNode is; at 0 the table flag is still written but nothing
+             * reads it. */
             if (pvNode)
                 --r;
             else if (ttPv)
@@ -1914,16 +1883,6 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
              * less to lose by looking at the tail more cheaply. */
             if (!improving)
                 ++r;
-
-            /*
-             * An extra two plies of reduction at cut nodes was tried here and
-             * measured WORSE - about 16 Elo worse over 1405 games (E6 in
-             * docs/EXPERIMENTS.md). It is standard practice in stronger
-             * engines, but they carry verification re-searches and much richer
-             * reduction curves to catch what it throws away; on this LMR
-             * formula it simply reduces too hard. `cutNode` still earns its
-             * place propagating the expectation to the child searches below.
-             */
 
             /* A quiet move the history tables like is not "late" in any sense
              * that matters, whatever its position in the list. Both tables get

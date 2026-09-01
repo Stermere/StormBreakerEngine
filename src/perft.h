@@ -1,22 +1,18 @@
 /*
  * perft.h - move generation correctness testing.
  *
- * Perft ("performance test") counts the leaf nodes of the legal move tree to a
- * fixed depth. The counts for well-known positions are published and exact, so
- * comparing against them detects essentially every move generation and
- * make/unmake bug there is.
- *
- * This is not optional. A single wrong perft number means the engine plays or
- * accepts illegal moves, which shows up in tournaments as forfeited games and
- * in testing as noise that makes every Elo measurement meaningless. Get perft
- * exact before writing a line of search.
+ * Perft counts the leaf nodes of the legal move tree to a fixed depth. The
+ * counts for well-known positions are published and exact, so comparing
+ * against them detects essentially every move generation and make/unmake bug
+ * there is. A single wrong number means the engine plays or accepts illegal
+ * moves, which surfaces as forfeited games and as noise that makes every Elo
+ * measurement meaningless.
  */
 #ifndef PERFT_H
 #define PERFT_H
 
 #include "board.h"
 
-/* Leaf node count for `pos` at `depth`. */
 uint64_t perft(Position *pos, int depth);
 
 /* Per-root-move breakdown, the standard way to bisect a wrong total: compare

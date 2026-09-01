@@ -106,7 +106,6 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
         }
     }
 
-    /* --- promotions, by push and by capture --- */
     if (onRank7) {
         Bitboard east = shift_up_east(onRank7, us) & enemies;
         Bitboard west = shift_up_west(onRank7, us) & enemies;
@@ -129,7 +128,6 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
         }
     }
 
-    /* --- ordinary captures --- */
     if (type != GEN_QUIETS) {
         Bitboard east = shift_up_east(rest, us) & enemies;
         Bitboard west = shift_up_west(rest, us) & enemies;
@@ -413,7 +411,6 @@ bool movegen_is_pseudo_legal(const Position *pos, Move m) {
                bb_test(pawn_attacks(us, from), to);
     }
 
-    /* Nothing may capture its own side, and only a pawn may promote. */
     if (bb_test(color_bb(pos, us), to))
         return false;
 
@@ -429,7 +426,7 @@ bool movegen_is_pseudo_legal(const Position *pos, Move m) {
     const int up = pawn_push(us);
 
     if (bb_test(pawn_attacks(us, from), to))
-        return bb_test(color_bb(pos, them), to); /* a capture needs something to take */
+        return bb_test(color_bb(pos, them), to);
     if (to == from + up)
         return is_empty(pos, to);
     if (to == from + 2 * up)

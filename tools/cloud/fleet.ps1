@@ -211,7 +211,7 @@ function Wait-ForSsh([string]$ip, [int]$TimeoutSec = 0) {
         if ($lines.Count -gt 0) { $last = $lines[-1].Trim() }
         Start-Sleep -Seconds 5
     }
-    # The last ssh error is the entire diagnosis and it used to be thrown away.
+    # The last ssh error is the entire diagnosis.
     # "Connection refused" is a box still booting - wait longer. "Connection
     # timed out" is nothing routing to it at all: a Hetzner firewall on the
     # project, or a server that is not really running, neither of which more
@@ -334,8 +334,8 @@ function Invoke-Up {
     }
 
     # Provision and launch one box at a time, and survive the ones that fail.
-    # A single unreachable box used to abort the run after the others were
-    # already provisioned and billing, which is the worst of both: paying for
+    # A single unreachable box must not abort a run whose other boxes are
+    # already provisioned and billing - that is the worst of both: paying for
     # boxes and getting no work out of them. Units are addressed by chunk with
     # done-markers on the hub, so a straggler's share is still there for a later
     # `up` to claim - nothing is lost by starting without it.

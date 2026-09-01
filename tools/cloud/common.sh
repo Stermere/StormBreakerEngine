@@ -26,12 +26,10 @@ log() {
 load_config() {
     _cfg="${1:?load_config needs a path}"
     # POSIX `.` searches PATH when its operand has no slash, and PATH does not
-    # include the current directory: `load_config job.env` looked for job.env in
-    # /usr/bin and friends and died with "job.env: not found" one line after
-    # [ -f ] had confirmed the file was right there. Callers that pass an
-    # absolute path never saw it, which is why provision.sh worked and
-    # run-box.sh - launched as `cd /root/cloud && ./run-box.sh 0 job.env` - did
-    # not.
+    # include the current directory, so a bare `job.env` is looked for in
+    # /usr/bin and friends and dies with "job.env: not found" one line after
+    # [ -f ] confirmed the file was right there. Only callers passing an
+    # absolute path escape it, hence the explicit "./" below.
     case "$_cfg" in
         */*) ;;
         *) _cfg="./$_cfg" ;;
