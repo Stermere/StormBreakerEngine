@@ -145,7 +145,12 @@ correct response is to implement movegen, not to relax the check.
 - Comments explain **why**, not what. Prefer one good comment on a non-obvious
   decision over narrating obvious code.
 - Mark unfinished work `TODO(engine):` with enough context to act on.
-- Keep `src/` flat — it matches how strong engines are organised.
+- Keep `src/` flat — it matches how strong engines are organised. The one
+  subdirectory is `src/test/`, and it exists because the files in it are not
+  engine code at all: they are acceptance gates that nothing reaches while
+  playing. Strong engines keep `src/` flat *and* keep their test code out of
+  it, so the split is the rule's intent rather than an exception to it. A new
+  file goes in `src/` unless it is a gate; do not add a third directory.
 - No new dependencies. The engine links only against libc and the platform
   threading API, and that is a feature: it builds anywhere OpenBench runs.
   `src/syzygy.c` is this engine's own Syzygy prober rather than a vendored
@@ -158,8 +163,10 @@ correct response is to implement movegen, not to relax the check.
 
 | Path | Contents |
 |---|---|
-| `src/` | engine sources |
-| `tests/perft/` | correctness suites (EPD) |
+| `src/` | engine sources — flat, and everything here can run during a game |
+| `src/test/` | acceptance gates compiled into the engine but never reached while playing: `chess960 selftest`, `syzygy verify`, `syzygy manifest`. In the binary on purpose, so `make chess960-test` and `make syzygy-test` cannot gate a different build than the one that plays |
+| `tests/perft/` | correctness suites (EPD) — data, no code |
+| `tests/syzygy/` | the sealed probe manifest — data, no code |
 | `tools/` | SPRT, SPSA tuning, gauntlet, baselines (Python, stdlib only). Setup, GUI launch and engine registration stay PowerShell - they are Windows integration. Invoke the Python ones through `make sprt` / `make tune` / `make gauntlet` / `make snapshot`, never by naming an interpreter |
 | `tools/tuner.c` | the evaluation fitter; **not** part of the engine binary |
 | `tools/export_net.py` | quantises a checkpoint into `.nnue` + the equivalence vectors |

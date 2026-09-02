@@ -76,6 +76,12 @@ anything.
 
 ### What perft cannot see
 
+The gates live in `src/test/`, compiled into the engine rather than into a
+separate binary — so `make chess960-test` and `make syzygy-test` always test
+the build that actually plays, and `engine bench` and the UCI `bench` command
+can never diverge.
+
+
 `make chess960-test` covers four things a node count is blind to, because each
 leaves every count correct:
 

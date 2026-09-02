@@ -185,11 +185,20 @@ endif
 
 DEFINES  := -DNDEBUG $(ARCHDEFS) $(NNUEDEFS) $(TUNEDEFS)
 
-CFLAGS ?=
-CFLAGS := $(CSTD) $(WARNINGS) $(OPTIMISE) $(ARCHFLAGS) $(DEFINES) $(CFLAGS)
+# src/test/ includes "board.h" and uci.c includes "test/syzygytest.h", so both
+# directions need src/ on the search path. A quoted include only searches the
+# INCLUDING file's directory, which was enough while every source sat in src/.
+INCLUDES := -Isrc
 
-SOURCES := $(wildcard src/*.c)
-HEADERS := $(wildcard src/*.h)
+CFLAGS ?=
+CFLAGS := $(CSTD) $(WARNINGS) $(OPTIMISE) $(ARCHFLAGS) $(DEFINES) $(INCLUDES) $(CFLAGS)
+
+# src/ is the engine; src/test/ is the acceptance gates it links in but never
+# reaches while playing (see the note in CLAUDE.md). Both are compiled into the
+# one binary on purpose: `make syzygy-test` and `make chess960-test` invoke the
+# engine itself, so a gate can never be testing a different build.
+SOURCES := $(wildcard src/*.c) $(wildcard src/test/*.c)
+HEADERS := $(wildcard src/*.h) $(wildcard src/test/*.h)
 
 # ------------------------------------------------------------ rebuilding --
 #  `make EVAL=nnue` and `make EVAL=classical` build the same file name from
@@ -249,7 +258,7 @@ native avx512 bmi2 avx2 popcnt legacy:
 # Assertions on, optimiser off. Sanitizers are POSIX-only: MinGW GCC ships no
 # ASan runtime, so on Windows this is a plain assert+debuginfo build.
 debug: CFLAGS := $(CSTD) $(WARNINGS) -O1 -g3 -fno-omit-frame-pointer $(ARCHFLAGS) \
-                 $(ARCHDEFS) $(NNUEDEFS)
+                 $(ARCHDEFS) $(NNUEDEFS) $(INCLUDES)
 ifneq ($(OS),Windows_NT)
 debug: CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all
 debug: LDFLAGS += -fsanitize=address,undefined

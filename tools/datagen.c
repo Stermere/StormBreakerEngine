@@ -66,7 +66,7 @@
 #include "nnue.h"
 #include "search.h"
 #include "syzygy.h"
-#include "syzygytest.h"
+#include "test/syzygytest.h"
 #include "thread.h"
 #include "timeman.h"
 #include "tt.h"

@@ -21,14 +21,14 @@
 
 #include "bench.h"
 #include "bitboard.h"
-#include "chess960test.h"
 #include "eval.h"
 #include "movegen.h"
 #include "nnue.h"
 #include "perft.h"
 #include "search.h"
 #include "syzygy.h"
-#include "syzygytest.h"
+#include "test/chess960test.h"
+#include "test/syzygytest.h"
 #include "timeman.h"
 #include "tt.h"
 
@@ -447,9 +447,8 @@ static void cmd_nnue(char *args) {
 }
 #endif
 
-/* `syzygy verify <path>` is the tablebase acceptance gate; see syzygytest.c.
- * It loads and releases its own tables, so it does not disturb whatever
- * SyzygyPath a running session had set. */
+/* `chess960 selftest` is the structural gate; see test/chess960test.c for what
+ * it checks that perft cannot. */
 static void cmd_chess960(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
@@ -469,6 +468,9 @@ static void cmd_chess960(char *args) {
     fflush(stdout);
 }
 
+/* `syzygy verify <path>` is the tablebase acceptance gate; see
+ * test/syzygytest.c. It loads and releases its own tables, so it does not
+ * disturb whatever SyzygyPath a running session had set. */
 static void cmd_syzygy(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);

@@ -1779,7 +1779,7 @@ fast-chess, which validates every move against its own board: 64 castles, no
 illegal moves, no protocol failures.
 
 **What survives.** `tools/chess960diff.py`, which sealed the counts and can
-re-earn them (`make chess960-campaign`), and `src/chess960test.c` for the four
+re-earn them (`make chess960-campaign`), and `src/test/chess960test.c` for the four
 things a node count is blind to — the SP numbering (perft cannot know the
 position it was given was the one asked for), FEN round-trips, notation
 ambiguity, and do/undo, which castling can break in exactly compensating ways.
