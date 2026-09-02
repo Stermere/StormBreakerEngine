@@ -3087,8 +3087,8 @@ static int cmd_verify(int argc, char **argv) {
                     if (policyBad < 10) {
                         char buf2[8];
                         fprintf(stderr, "datagen: %s:%llu policy move %s is not legal here: %s\n",
-                                inputs[f], (unsigned long long)index, move_to_str(moves[m], buf2),
-                                fen);
+                                inputs[f], (unsigned long long)index,
+                                move_to_str(moves[m], false, buf2), fen);
                     }
                     ++policyBad;
                 }
@@ -3414,8 +3414,9 @@ static int cmd_dump(int argc, char **argv) {
             if (fread(pbuf, 1, POL_BYTES, pol) == POL_BYTES)
                 policy_decode(pbuf, &p);
             char a[8], b[8];
-            printf(";%s;%s", p.best ? move_to_str((Move)p.best, a) : "-",
-                   p.cutoff ? move_to_str((Move)p.cutoff, b) : "-");
+            /* Standard chess throughout: datagen has never generated Chess960. */
+            printf(";%s;%s", p.best ? move_to_str((Move)p.best, false, a) : "-",
+                   p.cutoff ? move_to_str((Move)p.cutoff, false, b) : "-");
         }
         printf("\n");
     }

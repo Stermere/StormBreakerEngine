@@ -13,12 +13,12 @@
  *
  * Castling is encoded king-captures-own-rook (origin = king, destination =
  * rook). That looks odd but it is the only encoding that stays unambiguous in
- * Chess960, so the representation is ready for it.
+ * Chess960: there the king may start on b1, where the standard spelling of
+ * O-O-O is "b1c1" - which is also an ordinary king step.
  *
- * The RULES are not: move generation hard-codes standard castling geometry and
- * board_set_fen rejects Shredder-FEN. UCI_Chess960 currently switches how
- * castling is SPELLED to the GUI and nothing more. See the TODO(chess960) in
- * board.c for what is still missing.
+ * Chess960 is fully supported. The geometry a castling move refers to lives on
+ * the Position (board.h), so both variants share one generator, and the
+ * UCI_Chess960 option changes only how castling is SPELLED on the way out.
  */
 #ifndef MOVE_H
 #define MOVE_H
@@ -66,9 +66,23 @@ typedef struct {
     int score;
 } ScoredMove;
 
-/* Writes long algebraic notation ("e2e4", "e7e8q") into `buf`, which must hold
- * at least 6 bytes. Returns `buf`. Implemented in uci.c because the exact
- * spelling of castling depends on the UCI_Chess960 setting. */
-char *move_to_str(Move m, char *buf);
+/*
+ * Writes long algebraic notation ("e2e4", "e7e8q") into `buf`, which must hold
+ * at least 6 bytes. Returns `buf`.
+ *
+ * `chess960` selects how a CASTLING move is spelled, and it is a parameter
+ * rather than a setting read from somewhere because the answer belongs to the
+ * position the move came from, not to the process:
+ *
+ *   false   the king's destination, "e1g1" - what a standard GUI expects.
+ *   true    king-captures-own-rook, "e1h1" - the only unambiguous spelling on
+ *           a Chess960 board, where a king on f8 castling short and a king on
+ *           f8 stepping to g8 are both "f8g8".
+ *
+ * Pass `pos->chess960`. A global would let the two drift, and the drift is
+ * silent: every count and every score stays right, and the engine hands the
+ * GUI one string that names two legal moves.
+ */
+char *move_to_str(Move m, bool chess960, char *buf);
 
 #endif /* MOVE_H */

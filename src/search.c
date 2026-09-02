@@ -2184,7 +2184,7 @@ static int mate_in_moves(Value v) {
     return v > 0 ? (VALUE_MATE - v + 1) / 2 : -((VALUE_MATE + v + 1) / 2);
 }
 
-static void print_iteration(Depth depth, Value value, int64_t elapsed) {
+static void print_iteration(Depth depth, Value value, int64_t elapsed, bool chess960) {
     char buf[8];
 
     printf("info depth %d seldepth %d ", depth, SelDepth);
@@ -2204,7 +2204,7 @@ static void print_iteration(Depth depth, Value value, int64_t elapsed) {
     printf(" pv");
 
     for (int i = 0; i < PvLength[0]; ++i)
-        printf(" %s", move_to_str(PvTable[0][i], buf));
+        printf(" %s", move_to_str(PvTable[0][i], chess960, buf));
 
     printf("\n");
     fflush(stdout);
@@ -2353,7 +2353,7 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         *ponderMove = PvLength[0] > 1 ? PvTable[0][1] : MOVE_NONE;
 
         if (!Silent)
-            print_iteration(depth, reported, elapsed_ms());
+            print_iteration(depth, reported, elapsed_ms(), pos->chess960);
         sort_root_moves(roots, rootCount);
 
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)

@@ -236,7 +236,7 @@ endif
         bench perft perft-all openbench-check format format-check clean help \
         tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet snapshot \
         nnue nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
-        syzygy-fetch syzygy-test
+        syzygy-fetch syzygy-test chess960-test chess960-campaign
 
 all: $(TARGET)
 
@@ -278,15 +278,43 @@ bench: $(TARGET)
 	./$(TARGET) bench
 
 # Fast gate: standard positions capped at depth 4, plus every edge case.
+#
+# The Chess960 suites are part of the same gate rather than an optional extra.
+# Castling geometry is shared code now - board.c derives it for both variants -
+# so a change made for standard chess can break Chess960 and vice versa, and
+# only running one of them would let that through.
 perft: $(TARGET)
 	./$(TARGET) perft suite tests/perft/standard.epd 4
 	./$(TARGET) perft suite tests/perft/tricky.epd
+	./$(TARGET) perft suite tests/perft/chess960.epd 4
+	./$(TARGET) perft suite tests/perft/chess960-startpos.epd 4
 
-# Full published depths. Slow (hundreds of millions of nodes) - run before a
-# release, not on every commit.
+# Full published depths. Slow (billions of nodes) - run before a release, not
+# on every commit.
 perft-all: $(TARGET)
 	./$(TARGET) perft suite tests/perft/standard.epd
 	./$(TARGET) perft suite tests/perft/tricky.epd
+	./$(TARGET) perft suite tests/perft/chess960.epd
+	./$(TARGET) perft suite tests/perft/chess960-startpos.epd
+
+# The Chess960 checks a node count cannot make: the SP numbering, FEN
+# round-trips, castling notation being unambiguous, and do/undo restoring
+# everything. See src/chess960test.c for why each is here.
+chess960-test: $(TARGET)
+	./$(TARGET) chess960 selftest
+	./$(TARGET) perft suite tests/perft/chess960.epd
+	./$(TARGET) perft suite tests/perft/chess960-startpos.epd 4
+
+# Differential campaign against an independent engine, the way the Syzygy
+# prober was verified (docs/EXPERIMENTS.md E24). Needs a Chess960-capable UCI
+# engine on PATH; this is what SEALED the .epd counts, and re-running it is how
+# you re-earn them after changing castling.
+ORACLE ?= stockfish
+CAMPAIGN_GAMES ?= 400
+
+chess960-campaign: $(TARGET)
+	$(TOOLPY) tools/chess960diff.py campaign -engine ./$(TARGET) -oracle $(ORACLE) \
+	    -games $(CAMPAIGN_GAMES) -plies 12 -depth 4
 
 # Verifies the three OpenBench contract points listed at the top of this file.
 # Needs a POSIX shell (MSYS2/Git Bash on Windows); the build itself does not.
@@ -596,6 +624,8 @@ help:
 	@echo "make net-fetch          download the pinned net into EVALFILE"
 	@echo "make syzygy-fetch       download the 3-4-5-man Syzygy tablebases (~939 MB)"
 	@echo "make syzygy-test        probe known endgames against the fetched tables"
+	@echo "make chess960-test      Chess960 structural gate + its perft suites"
+	@echo "make chess960-campaign  differential perft vs ORACLE= (default stockfish)"
 	@echo "make net-publish        upload EVALFILE as a content-addressed release"
 	@echo "make format[-check]     apply / verify .clang-format"
 	@echo "make clean"

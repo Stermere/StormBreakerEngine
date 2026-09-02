@@ -8,7 +8,9 @@ A UCI chess engine in **C** (C17), built for competitive strength.
 
 Scaffolding, move generation, make/unmake, search and evaluation are all
 complete and verified. The search is a PVS with a transposition table, null
-move, LMR, singular extensions, SEE pruning and history heuristics. The
+move, LMR, singular extensions, SEE pruning and history heuristics. Chess960 is
+supported in full — castling geometry is derived per position, so both variants
+share one generator — though nothing in the *evaluation* has been tuned for it. The
 evaluation is a 13,684-parameter linear model — material, piece-square tables,
 king-relative placement, mobility, pawn structure, king safety and threats —
 fitted to 22.6M positions from human games by `tools/tuner.c`.
@@ -41,6 +43,9 @@ make trainer-test       # the trainer's pytest suite
 
 make syzygy-fetch       # 3-4-5-man tablebases (~939 MB into external/)
 make syzygy-test        # known endgames, plus the sealed probe manifest
+
+make chess960-test      # the Chess960 checks a node count cannot make
+make chess960-campaign  # differential perft vs ORACLE= (default stockfish)
 ```
 
 Tablebases are **off unless pointed at** — `SyzygyPath` over UCI, `-syzygy`
@@ -119,7 +124,9 @@ Read [docs/TESTING.md](docs/TESTING.md) for the method and
 record every new result there. The short version:
 
 - **Correctness changes** (movegen, make/unmake): must pass `make perft`
-  exactly. Not "close" — exactly.
+  exactly. Not "close" — exactly. That includes the two Chess960 suites: the
+  castling geometry is one code path for both variants, so a standard-chess
+  change can break Chess960 and the reverse.
 - **Pure speedups**: bench node count must be *unchanged*. If it changed, the
   change is behavioural and needs an SPRT.
 - **Behavioural changes** (search, eval, time management): require a passing

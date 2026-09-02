@@ -56,10 +56,12 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
-| **Chess960 (encoding ready; castling geometry is standard-only)** | **TODO** |
+| Chess960: per-position castling geometry, both FEN spellings, unambiguous notation | shipped; verified against an independent engine (E25) |
 
-`make perft` and `make perft-all` pass exactly; `make openbench-check` passes,
-so the engine can be registered with a distributed testing cluster.
+`make perft` and `make perft-all` pass exactly — standard chess and Chess960
+alike, since the 960 suites are part of the same gate. `make chess960-test`
+adds the structural checks a node count cannot make, and `make openbench-check`
+passes, so the engine can be registered with a distributed testing cluster.
 
 ## Notes on staged move generation
 

@@ -92,7 +92,8 @@ void perft_divide(Position *pos, int depth) {
         board_undo_move(pos, moves[i].m);
 
         total += nodes;
-        printf("%s: %llu\n", move_to_str(moves[i].m, buf), (unsigned long long)nodes);
+        printf("%s: %llu\n", move_to_str(moves[i].m, pos->chess960, buf),
+               (unsigned long long)nodes);
     }
 
     /* Blank line then "Nodes searched:" matches Stockfish's `go perft` output,

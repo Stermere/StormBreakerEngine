@@ -43,9 +43,33 @@ Stockfish's, so the two can be diffed directly.
 | `Threads` | spin | 1 | 1–1 | pinned to 1 until the search is parallel |
 | `Ponder` | check | false | | the GUI drives pondering with `go ponder` |
 | `Move Overhead` | spin | 10 | 0–5000 | ms reserved for GUI/network latency |
-| `UCI_Chess960` | check | false | | switches castling move notation |
+| `UCI_Chess960` | check | false | | Chess960 castling notation (see below) |
 | `SyzygyPath` | string | `<empty>` | | directory of Syzygy tablebases; empty disables probing |
 | `EvalFile` | string | `<internal>` | | **`EVAL=nnue` builds only** — load a net from disk |
+
+`UCI_Chess960` selects how castling is **spelled**, not which rules apply. The
+rules come from the position: `board_set_fen` derives the castling geometry
+from the diagram, so a Chess960 board is played correctly whether or not the
+option was ever sent. What the option changes is the notation —
+
+| | castling move | FEN castling field |
+|---|---|---|
+| off | `e1g1` — the king's destination | `KQkq` |
+| on | `e1h1` — king captures own rook | `HAha` — the rook's file |
+
+— and the king-takes-rook form is the only unambiguous one on a Chess960 board,
+where a king on b1 castling long and a king on b1 stepping to c1 are both
+`b1c1`. Because of that the engine also turns the option **on by itself** when
+it is given a FEN only Chess960 can describe (a king off the e-file, a castling
+rook off the a- or h-file, or rights spelled with file letters), and says so on
+an `info string`. It never turns itself off: guessing wrong in that direction
+would hand the GUI a move meaning two things, while guessing wrong the other
+way costs a GUI that already speaks Chess960 a spelling it also understands.
+
+Both FEN spellings are accepted on input regardless of the option. Shredder
+form (`AHah`) is required when one side has two rooks on the same side of its
+king — `KQkq` can only name the outermost rook, so it cannot describe such a
+position at all.
 
 `SyzygyPath` takes a directory (several, `;`-separated on Windows and `:`
 elsewhere) and loads what it finds; `make syzygy-fetch` downloads the 3-4-5-man

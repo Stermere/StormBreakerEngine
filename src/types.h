@@ -128,6 +128,24 @@ typedef enum {
     ANY_CASTLING = WHITE_ANY | BLACK_ANY
 } CastlingRights;
 
+enum { CASTLING_NB = 4 }; /* the four rights, and the width of the geometry tables */
+
+/*
+ * The right, and its index into the per-position castling geometry on
+ * Position, for one colour and one side of the king.
+ *
+ * "Kingside" means the rook that started on the HIGH side of the king, which
+ * is what O-O means in Chess960 too - the king still finishes on the g-file
+ * and the rook on the f-file, wherever the two of them began. Because a
+ * castling move is encoded king-captures-own-rook, comparing the two squares
+ * recovers the side, so nothing has to store it.
+ */
+static inline int castling_index(Color c, bool kingside) { return c * 2 + !kingside; }
+
+static inline CastlingRights castling_right(Color c, bool kingside) {
+    return (CastlingRights)(1 << castling_index(c, kingside));
+}
+
 /* ---------------------------------------------------------------- values -- */
 
 enum {

@@ -14,13 +14,27 @@ question.
 ## 1. perft — correctness
 
 ```sh
-make perft         # standard positions to depth 4, plus all edge cases
-make perft-all     # full published depths (slow)
+make perft         # standard + Chess960, depth-capped, plus all edge cases
+make perft-all     # full depths (slow: ~4.8 billion nodes)
+make chess960-test # the Chess960 checks a node count cannot make
 ```
 
 Perft counts the leaf nodes of the legal move tree. The reference counts are
-published and exact. A mismatch indicates a move-generation or position-state
-bug and must be resolved before Elo testing.
+exact. A mismatch indicates a move-generation or position-state bug and must be
+resolved before Elo testing.
+
+Four suites, and `make perft` runs all of them:
+
+| Suite | What it is for |
+|---|---|
+| `standard.epd` | the six positions everyone benchmarks against |
+| `tricky.epd` | one line per standard-chess rule that is easy to get wrong |
+| `chess960.epd` | one line per Chess960 castling rule, several as pairs |
+| `chess960-startpos.epd` | all 960 start positions - the broad net |
+
+The Chess960 suites are part of the same gate rather than an optional extra:
+castling geometry is shared code, derived per position for both variants, so a
+change made for standard chess can break Chess960 and the reverse.
 
 ### Debugging a mismatch
 
@@ -33,8 +47,74 @@ That prints a per-move breakdown. Run `go perft 4` on the same position in
 Stockfish, diff the two lists, then recurse into the first move whose subtotal
 differs. A few iterations isolates the exact position and move that is wrong.
 
-`tests/perft/tricky.epd` is organised so each line names the rule it tests —
-when one fails, the comment above it tells you what you broke.
+`tests/perft/tricky.epd` and `tests/perft/chess960.epd` are organised so each
+line names the rule it tests — when one fails, the comment above it tells you
+what you broke. Several Chess960 lines come in **pairs**: the same geometry with
+and without one enemy piece, or the same board in both FEN spellings. A pair
+says which of the two rules broke; a single count only says it broke.
+
+For Chess960, use `setoption name UCI_Chess960 value true` in Stockfish before
+comparing, or the two engines will spell castling differently and every divide
+will look wrong.
+
+### Where the Chess960 counts came from
+
+There are no published perft numbers for Chess960 beyond the standard array, so
+the counts were **sealed from an independent engine** rather than written from
+memory — the same method the Syzygy prober was verified with (E24), and for the
+same reason: a suite written from recollection certifies whatever the
+implementation happened to do.
+
+```sh
+make chess960-campaign                     # re-run the differential campaign
+python tools/chess960diff.py reseal tests/perft/chess960.epd
+```
+
+Re-seal after any deliberate change to castling, and only after the campaign
+passes. Re-sealing a suite to make it pass is how the numbers stop meaning
+anything.
+
+### What perft cannot see
+
+`make chess960-test` covers four things a node count is blind to, because each
+leaves every count correct:
+
+- **The SP numbering.** Perft proves the position it was handed is played
+  right; it cannot know that position was the one asked for. SP 518 being the
+  standard array is the external anchor.
+- **FEN round-trips.** A suite that only reads FENs never exercises the writer,
+  and `KQkq` provably cannot describe some Chess960 boards.
+- **Notation ambiguity.** On a board with the king on f8, castling short and
+  stepping to g8 are both `f8g8` in standard spelling. Perft counts two moves
+  and is content; a GUI plays the wrong one.
+- **do/undo.** Counts come out right if the two are wrong in exactly opposite
+  ways, which castling makes easy — it moves two pieces, and they can swap.
+
+### Playing actual Chess960 games
+
+Worth doing once after any castling change: perft proves the move list, a game
+proves the engine survives its own bestmove coming back through `position ...
+moves` for eighty moves. fast-chess validates every move against its own board,
+so an illegal one is reported rather than played.
+
+```sh
+# fast-chess refuses to start a 960 match without a book, and the engine
+# can emit one - all 960 arrays, in the spelling it will be sent them in.
+./stormbreaker chess960 sp | sed 's/^ *[0-9]* *//' \
+    > external/books/chess960-startpos.epd
+
+fast-chess -engine cmd=./stormbreaker name=A -engine cmd=./stormbreaker name=B \
+    -each tc=2+0.02 option.Hash=16 -variant fischerandom \
+    -openings file=external/books/chess960-startpos.epd format=epd order=random \
+    -rounds 40 -games 2 -concurrency 4 -pgnout file=external/games/c960.pgn
+```
+
+Then check the games actually castled, or the run proved nothing about the
+feature under test:
+
+```sh
+grep -c "O-O" external/games/c960.pgn
+```
 
 ---
 

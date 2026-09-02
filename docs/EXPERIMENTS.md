@@ -1694,3 +1694,100 @@ differs. Verified to fail: corrupting one line reports
 enumeration reaches it, but no six- or seven-man table has ever been probed by
 it - the review's finding 4 is exactly the kind of bug that lives there. Fetch a
 six-man set and re-seal before trusting one.
+
+---
+
+### E25 — Chess960
+
+**Date** 2026-09-02 · **Baseline** the E24 build · **Bench** classical 277139
+-> **277139** (unchanged, and that is the claim: for a standard position the
+derived geometry resolves to the squares the constant table held, so this is
+not a behavioural change to standard chess at all)
+
+The move encoding was already king-captures-own-rook. What was missing was the
+rules: `board_set_fen` rejected Shredder-FEN outright, and `movegen.c` held a
+`CastlingSpec` table of fixed squares. Both are replaced by geometry derived
+per position — rook origin, the squares that must be empty, the squares the
+king occupies or crosses — so there is one code path for both variants and no
+runtime variant switch below the FEN parser.
+
+**Why the bench number is the headline.** Standard chess is the thing that must
+not move. A castling rewrite that changed even one node count would mean the
+derived geometry disagreed with the table it replaced somewhere, and every Elo
+measurement taken since E24 would be against a different engine. It was checked
+by building HEAD and the patch side by side rather than by argument.
+
+**The three bugs Chess960 has that standard chess cannot.** Each is a real
+rule, not an edge case, and each has a line in `tests/perft/chess960.epd`:
+
+1. *The rook screens its own king.* King c1, its rook b1, an enemy queen a1.
+   Castling long does not move the king at all and drops it into check, because
+   the rook that was blocking the queen has just left. The king's path scans as
+   **safe** while the rook is still standing on the line. `movegen_is_legal`
+   therefore also rejects a castle whose rook is pinned. Standard chess never
+   trips this: a rook on a1 or h1 has no square behind it to be pinned from.
+2. *Either piece may not move, and they may swap.* King g1 with rook h1 leaves
+   the king where it is; king e1 with rook f1 leaves the rook where it is; king
+   f1 with rook g1 exchanges the two. So both pieces are lifted before either
+   is put down, and each piece's own square is exempt from the path-is-clear
+   test — otherwise a castle is generated as blocked by itself.
+3. *`KQkq` cannot describe every position.* With two rooks on one side of the
+   king, "the outermost rook" does not say which may castle. Shredder spelling
+   (the rook's file) is parsed on input and emitted for Chess960 positions.
+
+**Verification, against an independent engine.** Same method as E24 and for the
+same reason: there are no published perft numbers for Chess960 beyond the
+standard array, so the alternative to an oracle is numbers recalled at a
+keyboard, which is how a suite ends up certifying the bug it was written
+beside. Stockfish 18 was the oracle, compared **divide by divide** — a mismatch
+names the move, not just the total.
+
+| | |
+|---|---|
+| random-walk positions compared, divide by divide | **5,550** |
+| all 960 start positions, depth 4 | 181,106,056 nodes |
+| all 960 start positions, depth 5 | 4,614,154,886 nodes |
+| hand-built castling edge cases | 22 positions, 8,543,750 nodes |
+| self-test walk over all 960 arrays | 23,027 positions |
+| disagreements | **0** |
+
+**The cross-check that costs nothing.** SP 518 is the standard array. It is
+sealed in `chess960-startpos.epd` spelled `HAha` and appears in `standard.epd`
+spelled `KQkq`; both give D4 197281 and D5 4865609. The two suites reach one
+board down completely different parser paths, so agreeing there is worth more
+than either count alone.
+
+**One real bug, found by the test that exists for it.** `move_to_str` read a
+file-static `OptChess960` rather than the position it was spelling. The
+self-test's notation check caught it immediately at
+`1b1r1k1r/pnpppppb/1pqn3p/2N5/3P4/5PPP/PPP1PK2/QB1NR1BR b h - 2 8`, where a
+black king on f8 can both castle short and step to g8 — and both spelled
+`f8g8`. Every perft count stays correct through that bug; a GUI just plays the
+wrong move. The fix passes `pos->chess960` as a parameter, so the spelling
+cannot drift from the board.
+
+**Also fixed by the same reasoning.** A FEN that only Chess960 can describe now
+latches the notation on by itself, so a GUI that sends such a position without
+setting `UCI_Chess960` is not handed ambiguous moves.
+
+**Gates.** `bench` classical 277139, unchanged · `perft` now 4 suites, 1,003
+positions · `perft-all` at full depth, 4.8 billion nodes · `chess960-test` ·
+`openbench-check` · `format-check` · a debug build (assertions on:
+`board_is_consistent`, incremental key vs recomputed, evasions vs `GEN_ALL`)
+over all 960 arrays at depth 4 · **80 complete Chess960 games** under
+fast-chess, which validates every move against its own board: 64 castles, no
+illegal moves, no protocol failures.
+
+**What survives.** `tools/chess960diff.py`, which sealed the counts and can
+re-earn them (`make chess960-campaign`), and `src/chess960test.c` for the four
+things a node count is blind to — the SP numbering (perft cannot know the
+position it was given was the one asked for), FEN round-trips, notation
+ambiguity, and do/undo, which castling can break in exactly compensating ways.
+
+**Caveat, and it is not small.** This is the RULES only. Nothing in the
+evaluation knows about Chess960: the king-safety and pawn-shelter terms were
+fitted on standard games, and the NNUE king buckets were trained on positions
+where the king starts on e1. Both read the king's actual file rather than
+assuming e1, so they are not *wrong*, but they are untuned for the other 959
+arrays and no Chess960 SPRT has been run. The engine plays Chess960 legally and
+at unmeasured strength.

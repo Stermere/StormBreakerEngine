@@ -163,53 +163,42 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
 /* ------------------------------------------------------------- castling -- */
 
 /*
- * Standard-chess castling geometry. board_set_fen rejects Shredder-FEN, so the
- * king and rook home squares are fixed and this can be a constant table.
+ * Castling geometry is carried by the Position, built from the diagram by
+ * board.c, because Chess960 puts the king and both rooks on arbitrary files.
+ * For a standard position it resolves to exactly the squares this file used to
+ * hard-code, so nothing here needs to know which variant is being played.
  *
- * `kingPath` includes the king's ORIGIN square, which is what makes
+ * `castlingKingPath` includes the king's ORIGIN square, which is what makes
  * movegen_is_legal reject castling out of check without a separate test.
  */
-typedef struct {
-    CastlingRights right;
-    Square kingFrom;
-    Square rookFrom;
-    Bitboard emptyPath; /* every square that must be unoccupied */
-    Bitboard kingPath;  /* every square the king occupies or crosses */
-} CastlingSpec;
 
-#define BB_OF(s) (1ULL << (s))
-
-static const CastlingSpec Castlings[COLOR_NB][2] = {
-    {{WHITE_OO, SQ_E1, SQ_H1, BB_OF(SQ_F1) | BB_OF(SQ_G1),
-      BB_OF(SQ_E1) | BB_OF(SQ_F1) | BB_OF(SQ_G1)},
-     {WHITE_OOO, SQ_E1, SQ_A1, BB_OF(SQ_B1) | BB_OF(SQ_C1) | BB_OF(SQ_D1),
-      BB_OF(SQ_E1) | BB_OF(SQ_D1) | BB_OF(SQ_C1)}},
-    {{BLACK_OO, SQ_E8, SQ_H8, BB_OF(SQ_F8) | BB_OF(SQ_G8),
-      BB_OF(SQ_E8) | BB_OF(SQ_F8) | BB_OF(SQ_G8)},
-     {BLACK_OOO, SQ_E8, SQ_A8, BB_OF(SQ_B8) | BB_OF(SQ_C8) | BB_OF(SQ_D8),
-      BB_OF(SQ_E8) | BB_OF(SQ_D8) | BB_OF(SQ_C8)}}};
-
-#undef BB_OF
-
-/* Kingside is index 0, queenside index 1 - recoverable from a castling move
- * because it is encoded king-captures-own-rook. */
-static inline const CastlingSpec *castling_spec(Color us, Square kingFrom, Square rookFrom) {
-    return &Castlings[us][rookFrom > kingFrom ? 0 : 1];
+/* Which right a castling move is, recovered from the move itself: it is
+ * encoded king-captures-own-rook, and the h-side rook is the one on the high
+ * side of the king in Chess960 exactly as in standard chess. */
+static inline int castling_idx_of(Color us, Square kingFrom, Square rookFrom) {
+    return castling_index(us, rookFrom > kingFrom);
 }
 
 static ScoredMove *gen_castling(const Position *pos, Color us, ScoredMove *out) {
-    for (int i = 0; i < 2; ++i) {
-        const CastlingSpec *const cs = &Castlings[us][i];
+    for (int side = 0; side < 2; ++side) {
+        const int idx = castling_index(us, side == 0);
 
-        if (!(pos->castling & cs->right) || (occupied_bb(pos) & cs->emptyPath))
+        if (!(pos->castling & castling_right(us, side == 0)) ||
+            (occupied_bb(pos) & pos->castlingEmptyPath[idx]))
             continue;
 
-        assert(piece_on(pos, cs->kingFrom) == make_piece(us, KING));
-        assert(piece_on(pos, cs->rookFrom) == make_piece(us, ROOK));
+        /* A surviving right means neither piece has moved, so wherever the
+         * king stands now IS its castling origin - which is why the geometry
+         * does not store it. */
+        const Square kingFrom = king_square(pos, us);
+        const Square rookFrom = pos->castlingRook[idx];
+
+        assert(rookFrom != SQ_NONE);
+        assert(piece_on(pos, rookFrom) == make_piece(us, ROOK));
 
         /* Whether the king's path is attacked is settled by movegen_is_legal,
          * so generation stays free of attack scans. */
-        (out++)->m = make_move_typed(cs->kingFrom, cs->rookFrom, MT_CASTLING);
+        (out++)->m = make_move_typed(kingFrom, rookFrom, MT_CASTLING);
     }
     return out;
 }
@@ -348,13 +337,27 @@ bool movegen_is_legal(const Position *pos, Move m) {
 
     if (mt == MT_CASTLING) {
         /* kingPath includes the origin square, so this also rejects castling
-         * out of check. The king cannot screen its own path in standard chess:
-         * any attacker aligned through it would already be giving check. */
-        Bitboard path = castling_spec(us, from, to)->kingPath;
+         * out of check. The king cannot screen its own path: any attacker
+         * aligned through it would already be giving check, and the origin is
+         * one of the squares being scanned. */
+        Bitboard path = pos->castlingKingPath[castling_idx_of(us, from, to)];
         while (path)
             if (board_square_attacked(pos, pop_lsb(&path), them, occupied_bb(pos)))
                 return false;
-        return true;
+
+        /*
+         * The ROOK can screen, though, and only Chess960 can arrange it: there
+         * the rook may stand between its own king and an enemy slider on the
+         * back rank. The scan above ran with the rook still on the board, so
+         * it called a square safe that the rook was covering - and the rook is
+         * about to leave. King c1, rook b1, enemy queen a1: O-O-O does not
+         * move the king at all and drops it into check.
+         *
+         * Being pinned is exactly that condition, and it is free to test.
+         * Standard chess never trips it, because a castling rook on a1 or h1
+         * has no square behind it for a slider to pin from.
+         */
+        return !(pos->pinned & square_bb(to));
     }
 
     if (from == ksq) {
@@ -396,12 +399,15 @@ bool movegen_is_pseudo_legal(const Position *pos, Move m) {
         return false;
 
     if (mt == MT_CASTLING) {
+        /* `from` matching the king square is what makes the rest safe to
+         * trust: it establishes that the mover is the king AND that it is on
+         * its castling origin, since a right cannot outlive the king moving. */
         if (pos->checkers || from != king_square(pos, us))
             return false;
 
-        const CastlingSpec *const cs = castling_spec(us, from, to);
-        return cs->kingFrom == from && cs->rookFrom == to && (pos->castling & cs->right) &&
-               !(occupied_bb(pos) & cs->emptyPath);
+        const int idx = castling_idx_of(us, from, to);
+        return (pos->castling & castling_right(us, to > from)) && pos->castlingRook[idx] == to &&
+               !(occupied_bb(pos) & pos->castlingEmptyPath[idx]);
     }
 
     if (mt == MT_EN_PASSANT) {

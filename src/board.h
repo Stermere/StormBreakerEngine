@@ -78,11 +78,47 @@ typedef struct {
     Bitboard checkers;
     Bitboard pinned;
 
+    /*
+     * Castling geometry, indexed by castling_index(). Chess960 puts the king
+     * and both rooks on arbitrary files, so none of this can be the constant
+     * table it used to be - it is derived from the diagram by board_set_fen,
+     * and for a standard position it comes out as exactly the squares that
+     * table held.
+     *
+     * None of it is saved in Undo, because none of it changes: a right is only
+     * ever REMOVED as a game goes on, and a right that is gone never consults
+     * its geometry again.
+     *
+     * The king's castling origin is deliberately absent. A surviving right
+     * means the king has not moved, so king_square() already IS that square,
+     * and a second copy would be one more thing that could drift.
+     */
+    Square castlingRook[CASTLING_NB];        /* rook's origin; SQ_NONE without the right */
+    Bitboard castlingEmptyPath[CASTLING_NB]; /* must be clear; excludes the king and rook */
+    Bitboard castlingKingPath[CASTLING_NB];  /* the king's origin, crossings and destination */
+
+    /* Rights lost when a piece leaves or arrives on a square - the king's
+     * origin and the rooks'. One table covers both halves of the rule: the
+     * king or rook moving away, and a rook captured where it stands. */
+    uint8_t castlingLoss[SQUARE_NB];
+
     /* Plies played from the root of the *game*, used to index `history` and to
      * detect repetitions across the whole game rather than just the search. */
     int gamePly;
     Undo history[MAX_GAME_PLY];
 
+    /*
+     * Chess960 affects NOTATION only. Move generation and legality read the
+     * geometry above, which is correct for both variants, so a Chess960
+     * position is played correctly whether or not this is set; what it changes
+     * is how castling is SPELLED - king-captures-own-rook rather than the
+     * king's destination, and the rook's file rather than KQkq in a FEN.
+     *
+     * That is not cosmetic. On a board where the king starts on b1, the
+     * standard spelling of O-O-O is "b1c1", which is also the spelling of an
+     * ordinary king step - so on a Chess960 board the standard notation is
+     * genuinely ambiguous and must not be used.
+     */
     bool chess960;
 } Position;
 
@@ -115,6 +151,11 @@ static inline Bitboard board_checkers(const Position *pos) { return pos->checker
 
 static inline Bitboard board_pinned(const Position *pos) { return pos->pinned; }
 
+/* The rook a castling right belongs to, or SQ_NONE if the right is absent. */
+static inline Square castling_rook_square(const Position *pos, Color c, bool kingside) {
+    return pos->castlingRook[castling_index(c, kingside)];
+}
+
 /* ------------------------------------------------------- board mutation -- */
 
 /*
@@ -141,6 +182,16 @@ bool board_set_fen(Position *pos, const char *fen);
 
 void board_set_startpos(Position *pos);
 
+/*
+ * Sets up Chess960 start position `idx` under the Scharnagl "SP" numbering
+ * that tournaments, GUIs and every published table use. Returns false for an
+ * index outside 0..959.
+ *
+ * SP 518 is the standard array, which is the anchor the self-test asserts on:
+ * a numbering that is off by even one is otherwise very hard to notice.
+ */
+bool board_set_chess960_start(Position *pos, int idx);
+
 /* Writes the position's FEN into `buf` (at least FEN_MAX_LEN bytes). */
 void board_to_fen(const Position *pos, char *buf);
 
@@ -159,6 +210,13 @@ void board_print(const Position *pos);
 /*
  * Where the king and rook end up when castling. `rookFrom` doubles as the
  * move's destination square, because castling is encoded king-captures-own-rook.
+ *
+ * Correct for Chess960 unchanged, which is the whole reason the destinations
+ * are computed rather than looked up: the king always finishes on the g-file
+ * or the c-file and the rook beside it, however far either has to travel and
+ * whichever of them started closer. Either may also finish where it already
+ * stands, and either may finish on the other's origin square - see the note in
+ * board_do_move about why both pieces are lifted before either is put down.
  *
  * In the header rather than in board.c because the NNUE accumulator has to
  * derive the same two squares to know which features a castle changes. Two

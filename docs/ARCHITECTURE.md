@@ -71,8 +71,48 @@ table store a move in half a word.
 
 Castling is encoded **king-captures-own-rook**. This looks strange for standard
 chess, but it is the only encoding that remains unambiguous in Chess960, where
-the king and rook can start almost anywhere. `move_to_str` translates back to
-the `e1g1` form GUIs expect unless `UCI_Chess960` is set.
+the king and rook can start almost anywhere: a king that starts on b1 castles
+long to c1, and `b1c1` is also an ordinary king step. `move_to_str` translates
+back to the `e1g1` form GUIs expect for positions that cannot be Chess960, and
+takes the position's own `chess960` flag rather than reading a global — the two
+could otherwise drift, and the drift is silent, because every count and score
+stays correct while the engine hands the GUI a string naming two legal moves.
+
+---
+
+## Castling geometry
+
+Standard chess has two castling geometries per colour and Chess960 has
+hundreds, so the squares involved are **derived per position** rather than
+looked up in a constant table. `board_set_fen` resolves the castling field into
+four entries on `Position` — the rook's origin, the squares that must be empty,
+and the squares the king occupies or crosses — and move generation reads only
+those. Standard chess resolves to exactly the squares the old constant table
+held, so there is one code path and no variant switch anywhere below the FEN
+parser.
+
+Three consequences are worth knowing:
+
+- **The king's castling origin is not stored.** A surviving right means the
+  king has not moved, so `king_square()` already is that square. A second copy
+  would be one more thing that could drift.
+- **The geometry is never saved in `Undo`.** Rights are only ever removed, and
+  a removed right never consults its geometry again. The corollary is that the
+  entries for a *dead* right go stale, deliberately, and nothing may read them
+  without checking the right first.
+- **The castling rook can screen its own king.** With the king on c1, its rook
+  on b1 and an enemy queen on a1, castling long leaves the king exactly where
+  it stood — in check — because the rook that was blocking the queen has just
+  left. The king's path scans as safe while the rook is still on the board, so
+  `movegen_is_legal` additionally rejects a castle whose rook is pinned. This
+  is impossible in standard chess, where a rook on a1 or h1 has no square
+  behind it to be pinned from.
+
+Both FEN spellings are accepted: `KQkq` (X-FEN, naming the outermost rook on
+each side) and `AHah` (Shredder, naming the rook's file). Shredder is required
+when a colour has two rooks on one side of its king, because "the outermost
+one" cannot then say which may castle, and it is what `board_to_fen` emits for
+a Chess960 position for the same reason.
 
 ---
 
@@ -134,10 +174,6 @@ What is left is structural rather than incremental:
   generated only when reached — avoids that work.
 - **No correction history.** Nothing feeds the difference between the static
   evaluation and the searched score back into later static evaluations.
-- **Chess960 is representation-only.** Moves are encoded
-  king-captures-own-rook so the format is ready, but move generation hard-codes
-  standard castling geometry and `board_set_fen` rejects Shredder-FEN.
-  `UCI_Chess960` currently changes only how castling is spelled to the GUI.
 
 ---
 

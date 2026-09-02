@@ -1,0 +1,112 @@
+# Chess960 castling edge cases.
+#
+# Every line targets ONE bug class that standard chess cannot express, because
+# standard chess has exactly two castling geometries and Chess960 has hundreds.
+# The expected counts were sealed from an independent engine; regenerate with
+#   python tools/chess960diff.py reseal tests/perft/chess960.epd
+#
+# Run: ./stormbreaker perft suite tests/perft/chess960.epd
+#
+# Several lines come in PAIRS - the same geometry with and without one enemy
+# piece, or the same position in both FEN spellings. A pair pins down which of
+# the two rules is broken; a single position only says the total was wrong.
+#
+# When one fails, the comment above it tells you exactly which rule you broke.
+
+# --- degenerate travel ---------------------------------------------------------
+# The king does not move at all: it already stands on g1, so castling only
+# relocates the rook. A generator that assumes the king travels emits nothing.
+4k3/8/8/8/8/8/8/6KR w H - 0 1 ;D5 102638
+# The same on the queenside, king already on c1 with the rook out on a1.
+4k3/8/8/8/8/8/8/R1K5 w A - 0 1 ;D5 125686
+# The ROOK does not move: it already stands on f1 and the king walks PAST it
+# onto g1. The rook's own square has to be exempt from the path-is-clear test,
+# or this castle is generated as blocked by itself.
+4k3/8/8/8/8/8/8/4KR2 w F - 0 1 ;D5 82020
+# King and rook swap squares outright, f1/g1 becoming g1/f1. A make-move that
+# puts either piece down before both are lifted clobbers a square here.
+4k3/8/8/8/8/8/8/5KR1 w G - 0 1 ;D5 105989
+# Queenside where the king moves RIGHT, b1 to c1. Travel direction is not
+# fixed in Chess960, so an offset baked in for standard chess is wrong one way.
+4k3/8/8/8/8/8/8/RK6 w A - 0 1 ;D5 102165
+
+# --- the castling rook as a screen ----------------------------------------------
+# THE Chess960 castling bug, and the reason movegen_is_legal tests the rook for
+# a pin. The rook on b1 is the only thing between the enemy queen on a1 and the
+# white king on c1. Castling long moves that rook to d1 and leaves the king
+# exactly where it stood - in check. The king's path is the single square c1,
+# which scans as SAFE while the rook is still on the board, so nothing short of
+# a pin test on the ROOK rejects this.
+q3k3/8/8/8/8/8/8/1RK5 w B - 0 1 ;D4 78003
+# The control: identical geometry, no sniper. Castling here is legal, so a pin
+# test that over-rejects shows up as a shortfall against this line and not the
+# one above.
+4k3/8/8/8/8/8/8/1RK5 w B - 0 1 ;D4 6094
+
+# --- path and blocker rules -----------------------------------------------------
+# The rook's lane must be clear even where the king never treads: king b1 to
+# c1, rook a1 to d1, and d1 is occupied. Testing only the king's path here
+# generates an illegal castle.
+4k3/8/8/8/8/8/8/RK1B4 w A - 0 1 ;D4 10006
+# A piece between the king and its distant destination: king b1 wants g1 and a
+# knight stands on e1.
+4k3/8/8/8/8/8/8/1K2N2R w H - 0 1 ;D4 10722
+# Long king travel over an attacked square. The king crosses five files and
+# every one of them has to be tested, not the two standard chess needs.
+4k3/8/8/8/5q2/8/8/1K5R w H - 0 1 ;D4 144112
+# The king's destination alone is attacked, from off the back rank, so this
+# isolates the destination test from the crossing tests.
+4k1r1/8/8/8/8/8/8/1K5R w H - 0 1 ;D4 55042
+
+# --- two rooks on one side of the king -------------------------------------------
+# Only Shredder-FEN can express this: the castling rook is the INNER one on c1,
+# with an ordinary rook outside it on a1. X-FEN's "Q" names the outermost rook,
+# which here is the wrong one - so a parser that ignores the file letter plays
+# a different position entirely.
+4k3/8/8/8/8/8/8/R1R1K2R w CH - 0 1 ;D4 25505
+# The same board with the OUTER rook holding the right, which X-FEN's "Q"
+# could also have said. Differs from the line above only in which rook may
+# castle, so the two counts must not be equal.
+4k3/8/8/8/8/8/8/R1R1K2R w AH - 0 1 ;D4 24768
+
+# --- rights revocation on non-standard squares -----------------------------------
+# Rights follow the rook's actual origin, not a1/h1. Mirrored geometry for both
+# colours, so a revocation table written for white and reused for black shows
+# up as a divergence rather than as a plausible number.
+1rk4r/pppppppp/8/8/8/8/PPPPPPPP/1RK4R w HBhb - 0 1 ;D4 318333
+# Capturing the castling rook where it stands, on a square standard chess
+# would never think to look at. Black is to move and has no rights of its own:
+# what is being counted is white's tree AFTER Rxb1, which must have lost the
+# b-file right and kept the h-file one.
+1r2k3/8/8/8/8/8/8/1RK4R b HB - 0 1 ;D4 100937
+
+# --- castling into and out of check ----------------------------------------------
+# Castling out of check is illegal even when the king would not move. The
+# king's origin is part of its path for exactly this reason, and the evasion
+# generator must not offer a castle either.
+4k3/8/8/8/8/8/6r1/5RKR w HF - 0 1 ;D4 459
+# The rook's ARRIVAL gives check - a perfectly legal castle whose consequence
+# lands on the opponent, so it must appear in the tree rather than be pruned.
+5k2/8/8/8/8/8/8/RK5R w HA - 0 1 ;D5 427305
+
+# --- whole positions --------------------------------------------------------------
+# Bare-board geometry proves the rule; these prove it still holds with a full
+# board around it, where the castle has to survive move ordering, pin
+# detection and check evasion rather than sitting alone on rank 1. All three
+# were reached by random legal play from a real start position, so nothing
+# about them was arranged to suit the implementation.
+#
+# Both colours, full rights, and both castles live for the side to move.
+1rkr4/pppppppp/8/8/8/8/PPPPPPPP/1RKR4 w DBdb - 0 1 ;D4 237391
+# Rooks on f1 and d1 with the king on e1: BOTH castles leave the rook exactly
+# where it stands and move only the king. The degenerate case from the top of
+# this file, in a position with thirty pieces on the board.
+bnnrkrq1/1pp2p2/p6p/3pp1p1/1PPb2P1/3NP1Q1/P4P1P/BN1RKR1B w FDfd - 0 8 ;D4 1414081
+# King d1 with rooks on c1 and e1: castling long SWAPS the two pieces, and
+# castling short sends the king across its own rook's square.
+b1rkr1nb/pp1p3p/3q2p1/2p1ppN1/1n2PP2/N1PQ4/PP1P2PP/B1RKR2B w ECec - 0 10 ;D4 2235202
+# Mixed geometry - a standard kingside rook on h1 beside a queenside rook out
+# on c1 - so a bug that only fires off the standard squares still shows up.
+1nr1k1nr/2pqpp1p/1p1p2pb/p2b4/Q1P1P3/P2B2PN/1P1P1P1P/BNR1K2R w HChc - 7 9 ;D4 1027565
+# Black to move, so the whole thing runs once more with the colours reversed.
+bq2r1kr/1ppp1ppp/2n5/p2np3/1b1PPPP1/PPBQ4/7P/2NNRBKR b HEhe - 2 9 ;D4 1909727

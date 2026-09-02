@@ -21,6 +21,7 @@
 
 #include "bench.h"
 #include "bitboard.h"
+#include "chess960test.h"
 #include "eval.h"
 #include "movegen.h"
 #include "nnue.h"
@@ -39,7 +40,9 @@ static Position Pos;
 
 static int OptHash         = 16;
 static int OptMoveOverhead = 10;
-static bool OptChess960    = false;
+/* Purely so the notice below is printed once rather than on every `position`
+ * command. The notation itself is decided by Pos.chess960. */
+static bool announcedChess960 = false;
 
 int uci_move_overhead(void) { return OptMoveOverhead; }
 
@@ -85,7 +88,7 @@ static const char *next_or(char **cursor, const char *fallback) {
 
 /* ---------------------------------------------------------- move syntax -- */
 
-char *move_to_str(Move m, char *buf) {
+char *move_to_str(Move m, bool chess960, char *buf) {
     if (m == MOVE_NONE || m == MOVE_NULL) {
         strcpy(buf, "0000"); /* UCI's "no move" token */
         return buf;
@@ -96,8 +99,9 @@ char *move_to_str(Move m, char *buf) {
 
     /* Castling is stored internally as king-captures-own-rook so that Chess960
      * stays unambiguous. Standard chess GUIs expect the king's actual
-     * destination (e1g1 / e1c1), so translate on the way out. */
-    if (type_of_move(m) == MT_CASTLING && !OptChess960)
+     * destination (e1g1 / e1c1), so translate on the way out - but only for a
+     * position where that spelling cannot collide with an ordinary king move. */
+    if (type_of_move(m) == MT_CASTLING && !chess960)
         to = make_square(to > from ? FILE_G : FILE_C, rank_of(from));
 
     int n    = 0;
@@ -129,7 +133,7 @@ static Move move_from_str(const Position *pos, const char *str) {
     for (int i = 0; i < count; ++i) {
         if (!movegen_is_legal(pos, moves[i].m))
             continue;
-        if (strcmp(str, move_to_str(moves[i].m, buf)) == 0)
+        if (strcmp(str, move_to_str(moves[i].m, pos->chess960, buf)) == 0)
             return moves[i].m;
     }
     return MOVE_NONE;
@@ -139,9 +143,10 @@ void uci_print_bestmove(Move best, Move ponder) {
     char b[8], p[8];
 
     if (is_ok_move(ponder))
-        printf("bestmove %s ponder %s\n", move_to_str(best, b), move_to_str(ponder, p));
+        printf("bestmove %s ponder %s\n", move_to_str(best, Pos.chess960, b),
+               move_to_str(ponder, Pos.chess960, p));
     else
-        printf("bestmove %s\n", move_to_str(best, b));
+        printf("bestmove %s\n", move_to_str(best, Pos.chess960, b));
 
     fflush(stdout);
 }
@@ -243,8 +248,10 @@ static void cmd_setoption(char *args) {
             nnue_print_info();
 #endif
     } else if (strcmp(name, "UCI_Chess960") == 0 && value) {
-        OptChess960  = strcmp(value, "true") == 0;
-        Pos.chess960 = OptChess960;
+        /* Seeds the POSITION's flag, which is what every spelling decision
+         * actually reads. board_set_fen carries it across position changes and
+         * latches it on by itself for a FEN only Chess960 can describe. */
+        Pos.chess960 = strcmp(value, "true") == 0;
     } else {
 #ifdef TUNE_SEARCH
         if (value && search_tunable_set(name, atoi(value))) {
@@ -285,6 +292,24 @@ static void cmd_position(char *args) {
             printf("info string invalid fen: %s\n", fen);
             fflush(stdout);
             return;
+        }
+
+        /*
+         * board_set_fen latches Pos.chess960 on for a FEN that only a Chess960
+         * board can produce, even if the GUI never sent UCI_Chess960. Say so,
+         * because it changes how this engine will spell castling from here on.
+         *
+         * One-way on purpose. The standard spelling is genuinely ambiguous on
+         * such a board - a king on b1 castling long spells "b1c1", which is
+         * also a legal king step - so guessing wrong in that direction hands
+         * the GUI a move that means two things. Guessing wrong the other way
+         * only costs a GUI that has already proven it speaks Chess960 a
+         * spelling it also understands.
+         */
+        if (Pos.chess960 && !announcedChess960) {
+            announcedChess960 = true;
+            printf("info string Chess960 position detected; castling is now "
+                   "reported as king-takes-rook\n");
         }
     } else {
         return; /* neither `startpos` nor `fen`: ignore */
@@ -425,6 +450,25 @@ static void cmd_nnue(char *args) {
 /* `syzygy verify <path>` is the tablebase acceptance gate; see syzygytest.c.
  * It loads and releases its own tables, so it does not disturb whatever
  * SyzygyPath a running session had set. */
+static void cmd_chess960(char *args) {
+    char *cursor = args;
+    char *tok    = next_token(&cursor);
+
+    if (token_is(tok, "selftest")) {
+        if (chess960_selftest() != 0)
+            ExitCode = 1;
+    } else if (token_is(tok, "sp")) {
+        /* No argument prints all 960, which is what you diff against a
+         * published table when the numbering itself is in question. */
+        char *idx = next_token(&cursor);
+        if (chess960_print_startpos(idx ? atoi(idx) : -1) != 0)
+            ExitCode = 1;
+    } else {
+        printf("usage: chess960 [selftest | sp [0-959]]\n");
+    }
+    fflush(stdout);
+}
+
 static void cmd_syzygy(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
@@ -521,6 +565,8 @@ bool uci_execute(const char *line) {
         cmd_perft(cursor);
     } else if (strcmp(cmd, "syzygy") == 0) {
         cmd_syzygy(cursor);
+    } else if (strcmp(cmd, "chess960") == 0) {
+        cmd_chess960(cursor);
     } else if (strcmp(cmd, "d") == 0) {
         board_print(&Pos);
         fflush(stdout);

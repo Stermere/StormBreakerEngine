@@ -202,36 +202,149 @@ static void set_check_info(Position *pos) {
 }
 
 /*
- * The castling rights the diagram can actually support.
+ * Grants one castling right and derives everything movegen needs from it.
  *
- * A FEN is free to claim rights the pieces do not back, and GUIs send such
- * positions - an edited board, a truncated game, a position pasted by hand.
- * Trusting the claim is not a cosmetic error: gen_castling() consults
- * `castling` and nothing else, so an unbacked right emits a castling move,
- * and board_do_move then removes a piece from an empty square and puts a rook
- * down where none stood. The engine invents material out of nothing and every
- * search below that node is scoring a position that cannot exist.
+ * `rookSq` is where that side's castling rook stands; the king's origin is
+ * wherever the king stands, because a right can only exist if it has not
+ * moved. The two paths are what the standard-chess constant table used to
+ * hold, computed instead:
  *
- * Standard chess only, matching the rest of this file - see the
- * TODO(chess960) in the castling field parser.
+ *   kingPath   every square the king occupies or crosses, INCLUDING its
+ *              origin - which is what makes the attack scan in
+ *              movegen_is_legal reject castling out of check for free.
+ *   emptyPath  every square that must be unoccupied: both travel lanes MINUS
+ *              the king's and rook's own squares, which are allowed to be
+ *              occupied by the very two pieces that are moving.
+ *
+ * In Chess960 the lanes overlap in ways standard chess never shows - the king
+ * may not move at all, the rook may already stand where the king is going - so
+ * both are built as set unions rather than as spans, and the subtraction at
+ * the end is what stops a castle from blocking itself.
  */
-static CastlingRights supported_castling(const Position *p) {
-    CastlingRights rights = NO_CASTLING;
+static void grant_castling(Position *p, Color c, Square rookSq) {
+    const Square ksq    = king_square(p, c);
+    const bool kingside = rookSq > ksq;
+    const int idx       = castling_index(c, kingside);
 
+    /* A malformed field can name two rooks on the same side of the king
+     * ("BA"), which is not a position Chess960 can reach. First claim wins,
+     * rather than overwriting: a second grant would leave castlingLoss holding
+     * revocation bits for a square that is no longer the castling rook's. */
+    if (p->castlingRook[idx] != SQ_NONE)
+        return;
+
+    Square kingTo, rookTo;
+    castling_targets(ksq, rookSq, &kingTo, &rookTo);
+
+    p->castling |= castling_right(c, kingside);
+    p->castlingRook[idx]      = rookSq;
+    p->castlingKingPath[idx]  = SquaresBetween[ksq][kingTo] | square_bb(ksq) | square_bb(kingTo);
+    p->castlingEmptyPath[idx] = (SquaresBetween[ksq][kingTo] | square_bb(kingTo) |
+                                 SquaresBetween[rookSq][rookTo] | square_bb(rookTo)) &
+                                ~(square_bb(ksq) | square_bb(rookSq));
+
+    p->castlingLoss[ksq] |= (uint8_t)castling_right(c, kingside);
+    p->castlingLoss[rookSq] |= (uint8_t)castling_right(c, kingside);
+}
+
+/*
+ * The outermost rook of colour `c` on the given side of its king, or SQ_NONE.
+ *
+ * This is what X-FEN's KQkq mean on a Chess960 board: not the rook on h1, but
+ * the rook furthest from the king on that side. Scanning inward from the edge
+ * and stopping at the king's file returns exactly that, and on a standard
+ * board it returns h1 or a1 - the fixed lookup this replaces was the special
+ * case where the outermost rook is also the only one.
+ */
+static Square outermost_rook(const Position *p, Color c, Square ksq, bool kingside) {
+    const Rank home  = rank_of(ksq);
+    const Piece rook = make_piece(c, ROOK);
+    const int step   = kingside ? -1 : 1;
+
+    for (int f = kingside ? FILE_H : FILE_A; f != (int)file_of(ksq); f += step)
+        if (piece_on(p, make_square((File)f, home)) == rook)
+            return make_square((File)f, home);
+
+    return SQ_NONE;
+}
+
+/*
+ * Resolves the FEN castling field into rights and geometry.
+ *
+ * Two spellings arrive and they mean the same thing:
+ *
+ *   KQkq   X-FEN. Names the outermost rook on each side of the king. Every
+ *          standard-chess FEN is this, and so is most Chess960 output.
+ *   AHah   Shredder-FEN. Names the rook's file outright. Needed whenever a
+ *          colour has two rooks on one side of its king, where the outermost
+ *          one is not enough to say which of them may castle.
+ *
+ * A claimed right the diagram cannot back is DROPPED rather than rejected, for
+ * the reason spelled out at the call site - and it matters more here than in
+ * standard chess, because a Chess960 castling field that disagrees with the
+ * piece placement is routine output from position editors.
+ *
+ * Dropping is not cosmetic. gen_castling() consults `castling` and the
+ * geometry beside it and nothing else, so an unbacked right emits a castling
+ * move, and board_do_move then lifts a piece off an empty square and puts a
+ * rook down where none stood. The engine invents material out of nothing, and
+ * every search below that node scores a position that cannot exist.
+ */
+static void resolve_castling(Position *p, const char *field) {
+    for (const char *c = field; *c; ++c) {
+        const Color col  = islower((unsigned char)*c) ? BLACK : WHITE;
+        const char u     = (char)toupper((unsigned char)*c);
+        const Square ksq = king_square(p, col);
+
+        /* Every derivation below starts from where the king stands, so a king
+         * that is not on its back rank cannot hold a right at all. */
+        if (rank_of(ksq) != (col == WHITE ? RANK_1 : RANK_8))
+            continue;
+
+        Square rookSq;
+        if (u == 'K' || u == 'Q') {
+            rookSq = outermost_rook(p, col, ksq, u == 'K');
+        } else {
+            rookSq = make_square((File)(u - 'A'), rank_of(ksq));
+            if (piece_on(p, rookSq) != make_piece(col, ROOK))
+                rookSq = SQ_NONE;
+        }
+
+        if (rookSq != SQ_NONE)
+            grant_castling(p, col, rookSq);
+    }
+}
+
+/*
+ * Whether this position's castling can only be spelled the Chess960 way.
+ *
+ * A king off the e-file, or a castling rook off the a- or h-file, cannot be
+ * written as KQkq without losing information, and its castling moves cannot be
+ * written as king destinations without colliding with ordinary king steps.
+ * Latching `chess960` on when we see one means a GUI that sends such a FEN
+ * without having set UCI_Chess960 still gets moves it can read back.
+ *
+ * The converse is not detectable and is not attempted: a Chess960 game in
+ * which both sides have already castled leaves a diagram indistinguishable
+ * from a standard one, which is exactly why the UCI option exists at all.
+ */
+static bool castling_is_nonstandard(const Position *p) {
     for (Color c = WHITE; c <= BLACK; ++c) {
         const Rank home = c == WHITE ? RANK_1 : RANK_8;
 
-        if (piece_on(p, make_square(FILE_E, home)) != make_piece(c, KING))
+        if (!(p->castling & (c == WHITE ? WHITE_ANY : BLACK_ANY)))
             continue;
+        if (king_square(p, c) != make_square(FILE_E, home))
+            return true;
 
-        const Piece rook = make_piece(c, ROOK);
-
-        if (piece_on(p, make_square(FILE_H, home)) == rook)
-            rights |= c == WHITE ? WHITE_OO : BLACK_OO;
-        if (piece_on(p, make_square(FILE_A, home)) == rook)
-            rights |= c == WHITE ? WHITE_OOO : BLACK_OOO;
+        const Square oo  = castling_rook_square(p, c, true);
+        const Square ooo = castling_rook_square(p, c, false);
+        if (oo != SQ_NONE && oo != make_square(FILE_H, home))
+            return true;
+        if (ooo != SQ_NONE && ooo != make_square(FILE_A, home))
+            return true;
     }
-    return rights;
+    return false;
 }
 
 /*
@@ -310,38 +423,40 @@ bool board_set_fen(Position *pos, const char *fen) {
         return false;
     ++c;
 
-    /* --- field 3: castling rights --- */
+    /*
+     * --- field 3: castling rights ---
+     *
+     * Only copied out and validated as a character set here. Resolving it
+     * needs the kings located, and locating them needs the piece-count check
+     * further down to have passed - so the field is held until then rather
+     * than parsed in place.
+     */
     while (*c == ' ')
         ++c;
     p.castling = NO_CASTLING;
+    for (int i = 0; i < CASTLING_NB; ++i)
+        p.castlingRook[i] = SQ_NONE;
+
+    char castlingField[16] = {0};
+    size_t castlingLen     = 0;
+    bool shredderSpelling  = false;
+
     if (*c == '-') {
         ++c;
     } else {
         for (; *c && *c != ' '; ++c) {
-            switch (*c) {
-            case 'K': p.castling |= WHITE_OO; break;
-            case 'Q': p.castling |= WHITE_OOO; break;
-            case 'k': p.castling |= BLACK_OO; break;
-            case 'q': p.castling |= BLACK_OOO; break;
-            default:
-                /*
-                 * TODO(chess960): Shredder-FEN spells rights as the rook's
-                 * file (A-H/a-h) instead of KQkq. Rejecting them is the honest
-                 * answer for now, because accepting them would produce a
-                 * position this engine cannot legally play.
-                 *
-                 * Supporting Chess960 is three changes, in this order:
-                 *   1. store the castling rook's origin square per right on
-                 *      Position, parsed from either FEN spelling;
-                 *   2. build the CastlingSpec table in movegen.c per position
-                 *      from those squares, rather than from the fixed
-                 *      standard-chess geometry it hard-codes today;
-                 *   3. derive castling_targets() in board.h the same way.
-                 * The move encoding is already king-captures-own-rook, so
-                 * nothing above movegen has to change.
-                 */
+            const char u = (char)toupper((unsigned char)*c);
+
+            if (u >= 'A' && u <= 'H' && u != 'K' && u != 'Q')
+                shredderSpelling = true;
+            else if (u != 'K' && u != 'Q')
                 return false;
-            }
+
+            /* A field longer than the four real rights is malformed, and
+             * silently truncating it would accept a FEN we cannot describe. */
+            if (castlingLen + 1 >= sizeof(castlingField))
+                return false;
+            castlingField[castlingLen++] = *c;
         }
     }
 
@@ -381,11 +496,16 @@ bool board_set_fen(Position *pos, const char *fen) {
      * unsupportable claim is removed. Both must happen before the key is
      * computed - they are part of what it hashes.
      */
-    p.castling &= supported_castling(&p);
+    resolve_castling(&p, castlingField);
     if (p.epSquare != SQ_NONE && !ep_target_is_real(&p, p.epSquare))
         p.epSquare = SQ_NONE;
 
-    p.chess960 = pos->chess960; /* preserve the UCI option across position changes */
+    /* Sticky, never cleared here: the UCI option carries across position
+     * changes, and a FEN that proves the board is Chess960 - by its geometry,
+     * or just by spelling its rights the Shredder way - latches it on for a
+     * GUI that forgot to. Notation is the only thing this controls; the rules
+     * come from the geometry resolve_castling() just built either way. */
+    p.chess960 = pos->chess960 || shredderSpelling || castling_is_nonstandard(&p);
     p.gamePly  = 0;
     p.key      = board_compute_key(&p);
     set_check_info(&p);
@@ -399,6 +519,69 @@ bool board_set_fen(Position *pos, const char *fen) {
 
     *pos = p;
     return true;
+}
+
+/*
+ * The ten ways to arrange K, R, N on five squares with the king between the
+ * rooks - which is the whole of the Chess960 castling constraint, since the
+ * bishops and queen are placed before these five squares are chosen.
+ *
+ * Table order is Scharnagl's, and it is the numbering, not an implementation
+ * choice: permuting these rows renumbers all 960 positions and silently
+ * disagrees with every GUI and published table. board_set_chess960_start's
+ * SP 518 assertion in the self-test is what pins it down.
+ */
+static const char *const KrnPatterns[10] = {"NNRKR", "NRNKR", "NRKNR", "NRKRN", "RNNKR",
+                                            "RNKNR", "RNKRN", "RKNNR", "RKNRN", "RKRNN"};
+
+bool board_set_chess960_start(Position *pos, int idx) {
+    if (idx < 0 || idx >= 960)
+        return false;
+
+    char back[9];
+    memset(back, ' ', 8);
+    back[8] = '\0';
+
+    /* Scharnagl's derivation, in the order the numbering is defined:
+     * light-squared bishop, dark-squared bishop, queen into the n-th square
+     * still free, then the K/R/N pattern into the five that remain. The two
+     * bishop files are 2n+1 and 2n, which is what puts one on each colour. */
+    int n                 = idx;
+    back[2 * (n % 4) + 1] = 'B';
+    n /= 4;
+    back[2 * (n % 4)] = 'B';
+    n /= 4;
+
+    for (int f = 0, q = n % 6; f < 8; ++f)
+        if (back[f] == ' ' && q-- == 0) {
+            back[f] = 'Q';
+            break;
+        }
+    n /= 6;
+
+    for (int f = 0, k = 0; f < 8; ++f)
+        if (back[f] == ' ')
+            back[f] = KrnPatterns[n][k++];
+
+    char front[9];
+    for (int f = 0; f < 8; ++f)
+        front[f] = (char)tolower((unsigned char)back[f]);
+    front[8] = '\0';
+
+    /* Spelled the Shredder way even for SP 518, whose geometry is standard: a
+     * Chess960 game is being set up, and its castling should read back as one
+     * however ordinary the array happens to look. */
+    const char *const first = strchr(back, 'R');
+    const char *const last  = strrchr(back, 'R');
+    const char aSide        = (char)('A' + (first - back));
+    const char hSide        = (char)('A' + (last - back));
+
+    char fen[FEN_MAX_LEN];
+    snprintf(fen, sizeof(fen), "%s/pppppppp/8/8/8/8/PPPPPPPP/%s w %c%c%c%c - 0 1", front, back,
+             hSide, aSide, (char)tolower((unsigned char)hSide),
+             (char)tolower((unsigned char)aSide));
+
+    return board_set_fen(pos, fen);
 }
 
 void board_set_startpos(Position *pos) { board_set_fen(pos, FEN_STARTPOS); }
@@ -433,14 +616,24 @@ void board_to_fen(const Position *pos, char *buf) {
     if (pos->castling == NO_CASTLING) {
         *out++ = '-';
     } else {
-        if (pos->castling & WHITE_OO)
-            *out++ = 'K';
-        if (pos->castling & WHITE_OOO)
-            *out++ = 'Q';
-        if (pos->castling & BLACK_OO)
-            *out++ = 'k';
-        if (pos->castling & BLACK_OOO)
-            *out++ = 'q';
+        /* Shredder spelling - the castling rook's file - for a Chess960
+         * position, KQkq otherwise. KQkq can only name the OUTERMOST rook on
+         * each side, so on a board with two rooks on one side of the king it
+         * cannot describe the position at all; emitting it there would produce
+         * a FEN that does not read back as the position it was written from. */
+        static const char Standard[CASTLING_NB] = {'K', 'Q', 'k', 'q'};
+
+        for (int i = 0; i < CASTLING_NB; ++i) {
+            if (!(pos->castling & (CastlingRights)(1 << i)))
+                continue;
+
+            if (!pos->chess960) {
+                *out++ = Standard[i];
+            } else {
+                const char f = (char)('A' + file_of(pos->castlingRook[i]));
+                *out++       = i < 2 ? f : (char)(f - 'A' + 'a');
+            }
+        }
     }
 
     *out++ = ' ';
@@ -504,19 +697,6 @@ bool board_is_consistent(const Position *pos) {
 /* ========================================================================== *
  *  Move making
  * ========================================================================== */
-
-/*
- * Castling rights lost when a piece leaves or arrives on a square. A single
- * table handles both halves of the rule at once: the king or rook moving away,
- * and the rook being captured where it stands.
- *
- * Standard chess only - board_set_fen rejects Shredder-FEN, so the king and
- * rook home squares are fixed. Chess960 will need this built per position.
- */
-static const uint8_t CastlingLoss[SQUARE_NB] = {
-    [SQ_A1] = WHITE_OOO, [SQ_E1] = WHITE_ANY, [SQ_H1] = WHITE_OO,
-    [SQ_A8] = BLACK_OOO, [SQ_E8] = BLACK_ANY, [SQ_H8] = BLACK_OO,
-};
 
 void board_do_move(Position *pos, Move m) {
     assert(is_ok_move(m));
@@ -616,7 +796,14 @@ void board_do_move(Position *pos, Move m) {
         }
     }
 
-    const uint8_t lost = (uint8_t)(CastlingLoss[from] | CastlingLoss[to]);
+    /* pos->castlingLoss is per-position because Chess960 moves the king's and
+     * rooks' origins off their standard squares; grant_castling() fills it.
+     *
+     * Only the ORIGIN squares need consulting, never the destinations. The
+     * king moves in every castle and its square carries both of its colour's
+     * rights, so a Chess960 castle that lands a rook on the other rook's
+     * origin has already given up that right through `from`. */
+    const uint8_t lost = (uint8_t)(pos->castlingLoss[from] | pos->castlingLoss[to]);
     if (pos->castling & lost) {
         k ^= ZobristCastling[pos->castling];
         pos->castling = (CastlingRights)(pos->castling & ~lost);
