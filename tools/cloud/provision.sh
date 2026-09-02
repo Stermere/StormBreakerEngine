@@ -30,10 +30,14 @@ STAMP="$WORK/.provisioned"
 # built (a -dirty stamp becomes a clean one) without COMMIT moving at all.
 PROVISION_REV=2
 
-# Deliberately without BOOK_SHA: the book is a RUNTIME input that datagen opens
-# by path, not a build input the way the net is, and changing it must not cost
-# the fleet a rebuild. fetch_book below is what keeps it in step instead.
+# Deliberately without BOOK_SHA or SYZYGY: both are RUNTIME inputs that datagen
+# opens by path, not build inputs the way the net is, and changing either must
+# not cost the fleet a rebuild. fetch_book and fetch_syzygy below are what keep
+# them in step instead.
 BUILDID="$COMMIT $ARCH $EVAL ${NET_SHA:-} rev$PROVISION_REV"
+
+# Where the tablebases land, and where job.env's -syzygy will point.
+TB_DIR="$WORK/external/syzygy"
 
 # The opening book `selfplay -book` draws start positions from, by hash for the
 # same reason the net is: two books under one name are two datasets that nothing
@@ -62,12 +66,88 @@ fetch_book() {
     log "book $BOOK_SHA verified"
 }
 
+#
+# The Syzygy tablebases, fetched from a public mirror rather than from the hub.
+#
+# That is the opposite of the net and the book, deliberately. Those are local
+# artifacts that exist nowhere else, so the hub is the only way a box can get
+# them. The tablebases are canonical published data - there is exactly one
+# correct 5-man Syzygy set and it has not changed since 2013 - so routing them
+# through the hub would mean uploading a gigabyte from a home connection to
+# duplicate a file that is already served, faster, from a machine next door to
+# these boxes. SYZYGY_URL points somewhere else if you would rather it did.
+#
+# Verification is the point of doing this here rather than in run-box.sh. A box
+# with half a tablebase set does not fail: it silently labels low-piece
+# positions from the search instead, and those records are indistinguishable
+# from everyone else's in the same shard directory. So the size the mirror
+# publishes is checked per file, and then `datagen syzygy` probes known
+# endgames with the binary this box just built.
+#
+fetch_syzygy() {
+    [ -n "${SYZYGY:-}" ] || return 0
+
+    _url="${SYZYGY_URL:-https://tablebase.lichess.ovh/tables/standard}"
+    _dst="$TB_DIR/$SYZYGY"
+    mkdir -p "$_dst"
+
+    # WDL answers won/drawn/lost inside the search; DTZ is what converts at the
+    # root under the fifty-move rule, and without it a labelling search of a
+    # five-man position falls back to the evaluation - the exact bug the tables
+    # are here to fix. Both halves, always.
+    for _half in wdl dtz; do
+        _index="$_url/$SYZYGY-$_half/"
+        _listing=$(curl -fsS "$_index") || die "cannot read the tablebase index at $_index"
+
+        # nginx autoindex: `<a href="NAME">NAME</a>  DATE  SIZE`. The name and
+        # the size off the same line keep them in step.
+        printf '%s\n' "$_listing" \
+            | sed -n 's|.*href="\(K[A-Za-z]*vK[A-Za-z]*\.rtb[wz]\)".*[^0-9]\([0-9][0-9]*\)[[:space:]]*$|\1 \2|p' \
+            > /tmp/tb-$_half.list
+        _n=$(wc -l < /tmp/tb-$_half.list)
+        [ "$_n" -gt 0 ] || die "no tables listed at $_index (mirror layout changed?)"
+
+        _missing=0
+        while read -r _name _size; do
+            _f="$_dst/$_name"
+            # Size, not mere existence: an interrupted download leaves a short
+            # file that looks present forever otherwise.
+            if [ -f "$_f" ] && [ "$(wc -c < "$_f")" = "$_size" ]; then
+                continue
+            fi
+            _missing=$((_missing + 1))
+            # --fail so an HTML error page never lands as a table; -o to a
+            # .part first so an interrupted transfer cannot be mistaken for a
+            # complete one on the next run.
+            curl -fsS --retry 3 --retry-delay 2 -o "$_f.part" "$_index$_name" \
+                || die "cannot fetch $_name from $_index"
+            _got=$(wc -c < "$_f.part")
+            [ "$_got" = "$_size" ] || die "$_name is $_got bytes, the index says $_size"
+            mv "$_f.part" "$_f"
+        done < /tmp/tb-$_half.list
+
+        rm -f /tmp/tb-$_half.list
+        if [ "$_missing" -eq 0 ]; then
+            log "syzygy $SYZYGY-$_half: $_n tables already present"
+        else
+            log "syzygy $SYZYGY-$_half: fetched $_missing of $_n tables"
+        fi
+    done
+
+    # The functional gate. Wrong answers, a set that does not cover five men,
+    # and a position the prober declines to probe at all are each a non-zero
+    # exit here rather than a shard full of quietly search-only labels.
+    log "verifying the tablebases with this box's own datagen"
+    "$WORK/datagen" syzygy "$_dst" || die "the tablebases at $_dst did not pass the probe suite"
+}
+
 if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$BUILDID" ] && [ -x "$WORK/datagen" ]; then
     log "already provisioned for [$BUILDID]"
     # Before the early exit, not after it: a box provisioned for this build by an
-    # earlier generation still needs whatever book THIS one names, and skipping
-    # that is a run that dies on its first batch.
+    # earlier generation still needs whatever book and tablebases THIS one names,
+    # and skipping that is a run that dies on its first batch.
     fetch_book
+    fetch_syzygy
     sha256sum "$WORK/datagen"
     exit 0
 fi
@@ -173,9 +253,11 @@ log "running the datagen acceptance gate"
 make datagen-test "ARCH=$ARCH"
 
 # After the build, and after the dirty check above: external/ is gitignored, but
-# the order means a book download can never be what a "the build dirtied the
-# tree" failure is actually reporting.
+# the order means a book or tablebase download can never be what a "the build
+# dirtied the tree" failure is actually reporting. fetch_syzygy also needs the
+# datagen binary that the build above produced, to verify what it fetched.
 fetch_book
+fetch_syzygy
 
 printf '%s' "$BUILDID" > "$STAMP"
 log "provisioned"

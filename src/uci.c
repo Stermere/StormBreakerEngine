@@ -26,6 +26,8 @@
 #include "nnue.h"
 #include "perft.h"
 #include "search.h"
+#include "syzygy.h"
+#include "syzygytest.h"
 #include "timeman.h"
 #include "tt.h"
 
@@ -159,6 +161,10 @@ static void cmd_uci(void) {
     printf("option name Ponder type check default false\n");
     printf("option name Move Overhead type spin default 10 min 0 max 5000\n");
     printf("option name UCI_Chess960 type check default false\n");
+    /* Off until a GUI supplies a path, and `make bench` never does: with
+     * tablebases loaded the node count depends on which files are on the
+     * machine, and bench must not (CLAUDE.md invariant 1). */
+    printf("option name SyzygyPath type string default <empty>\n");
 #ifdef EVAL_NNUE
     /* The net is embedded, so the default is not a path. Setting this swaps
      * the evaluation without a rebuild, which is what makes a candidate net
@@ -214,6 +220,19 @@ static void cmd_setoption(char *args) {
          * there is no separate state for this flag to hold. */
     } else if (strcmp(name, "Move Overhead") == 0 && value) {
         OptMoveOverhead = atoi(value);
+    } else if (strcmp(name, "SyzygyPath") == 0 && value) {
+        /* `<empty>` is what a GUI sends to clear the option it advertised. */
+        if (*value == '\0' || strcmp(value, "<empty>") == 0) {
+            syzygy_free();
+            printf("info string syzygy: tablebases off\n");
+        } else if (syzygy_init(value)) {
+            printf("info string syzygy: %d-man tablebases at %s\n", syzygy_max_pieces(), value);
+        } else {
+            /* A path that yields no tables is a misconfiguration worth saying
+             * out loud: probing silently never firing looks identical to
+             * working tablebases from the outside. */
+            printf("info string syzygy: no usable tablebases at %s\n", value);
+        }
 #ifdef EVAL_NNUE
     } else if (strcmp(name, "EvalFile") == 0 && value) {
         /* A failed load leaves the previous net in place and says why: a typo in
@@ -403,6 +422,44 @@ static void cmd_nnue(char *args) {
 }
 #endif
 
+/* `syzygy verify <path>` is the tablebase acceptance gate; see syzygytest.c.
+ * It loads and releases its own tables, so it does not disturb whatever
+ * SyzygyPath a running session had set. */
+static void cmd_syzygy(char *args) {
+    char *cursor = args;
+    char *tok    = next_token(&cursor);
+
+    if (token_is(tok, "verify")) {
+        char *path = next_token(&cursor);
+        if (!path) {
+            printf("usage: syzygy verify <tablebase directory>\n");
+            ExitCode = 1;
+        } else if (syzygy_verify_suite(path) != 0) {
+            ExitCode = 1;
+        }
+    } else if (token_is(tok, "manifest")) {
+        /* The differential campaign's verdict, re-checked without the oracle
+         * that produced it. See syzygytest.h. */
+        char *path     = next_token(&cursor);
+        char *manifest = next_token(&cursor);
+        if (!path || !manifest) {
+            printf("usage: syzygy manifest <tablebase directory> <manifest file>\n");
+            ExitCode = 1;
+        } else if (syzygy_verify_manifest(path, manifest) != 0) {
+            ExitCode = 1;
+        }
+    } else if (!tok) {
+        const int men = syzygy_max_pieces();
+        if (men > 0)
+            printf("syzygy: %d-man tablebases loaded\n", men);
+        else
+            printf("syzygy: no tablebases loaded (set SyzygyPath)\n");
+    } else {
+        printf("usage: syzygy [verify <dir> | manifest <dir> <file>]\n");
+    }
+    fflush(stdout);
+}
+
 /* ---------------------------------------------------------- dispatcher --- */
 
 bool uci_execute(const char *line) {
@@ -462,6 +519,8 @@ bool uci_execute(const char *line) {
         bench_run(depth ? atoi(depth) : 0);
     } else if (strcmp(cmd, "perft") == 0) {
         cmd_perft(cursor);
+    } else if (strcmp(cmd, "syzygy") == 0) {
+        cmd_syzygy(cursor);
     } else if (strcmp(cmd, "d") == 0) {
         board_print(&Pos);
         fflush(stdout);

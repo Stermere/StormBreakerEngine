@@ -48,7 +48,10 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | **Uncertainty margins: LTC confirmation (E20-E22a are STC-only)** | **TODO** |
 | **NNUE: the default evaluation switches to the network** | **TODO** |
 | Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
+| Syzygy tablebases in search and datagen; all adjudication removed | built, off by default (E23) |
+| Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
 | **Self-play data generation with deliberate variation** | **TODO** |
+| **gen-5 data generated with tablebases and no adjudication** | **TODO** |
 | **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |

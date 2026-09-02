@@ -135,6 +135,26 @@ Cost is roughly flat in box count: Hetzner bills by the hour, so eight boxes
 finish in half the time for the same money. Box count buys wall time, not
 throughput per euro.
 
+That last point is exactly why `up` provisions boxes **concurrently**. Every box
+starts billing the moment it is created, and provisioning is the long pole —
+apt, a clone, a build, the acceptance gate, and with `SYZYGY` set a ~939 MB
+download. One at a time, box *N* sat idle and paid-for through everyone else's
+build. `PROVISION_PARALLEL` (default 8) caps how many run at once, because a
+whole fleet pulling from the Ubuntu and tablebase mirrors on the same second is
+both impolite and no faster than a queue.
+
+Waiting for a box to answer ssh and copying the scripts over stays serial, and
+the provisioning it kicks off overlaps that: box 0 is already building while
+box 1 is still being waited for. Hetzner addresses are sometimes unroutable for
+minutes after a create, and this is what makes that one box's wait cheap rather
+than blocking.
+
+Each box's build goes to its own log in `%TEMP%\fleet-<gen>-b<N>.provision.log`
+rather than to the console, because fourteen interleaved builds are unreadable.
+On failure the tail is printed and the path named. A box that still fails is
+retried once, serially, and then reported and skipped — its units keep their
+done-markers on the hub, so a later `up` claims them.
+
 ## Things that fail silently
 
 Each of these produces data that looks fine and is wrong. They are the reason
@@ -164,6 +184,18 @@ the scripts are shaped the way they are.
 - **A dirty tree poisons attribution.** The Makefile stamps `-dirty` into every
   manifest, and a dataset that cannot be tied to an exact build cannot be
   compared to the next generation's. `provision.sh` refuses to build one.
+- **Half a tablebase set is worse than none.** A box missing tables does not
+  error — it labels low-piece positions from the search instead, and those
+  records are indistinguishable from everyone else's in the same shard
+  directory. `provision.sh` size-checks every file against the mirror's index
+  and then runs `datagen syzygy`, which probes known endgames with that box's
+  own binary. See the tablebase section below.
+- **`SYZYGY` must match across every shard in a dataset**, for exactly the
+  reason `NODES` must: a label made with tablebases and one made without are
+  two different label definitions. Nothing enforces it — the manifest records
+  `syzygy_path` and `syzygy_men` for a human, and `verify -relabel` with a
+  mismatched setting fails on every low-piece record, loudly, which is the
+  warning that matters.
 
 ## Dedup gets weaker as the fleet grows
 
@@ -205,6 +237,55 @@ Unlike the net, the book is **not** part of the provisioning stamp — it is a
 runtime input, not a build input, so changing it does not cost the fleet a
 rebuild. `provision.sh` fetches it before its own early exit, so a box already
 provisioned for this commit still picks up a book the config gained later.
+
+## The tablebases (`SYZYGY`)
+
+`SYZYGY=3-4-5` makes every box fetch the 3-4-5-man Syzygy set (~939 MB) during
+provisioning and hands `-syzygy` to every `datagen` call it runs afterwards.
+Empty means no tablebases, which is what every generation up to `gen-004` did.
+Why this matters to data quality — endgames that the search scores as winning
+and are dead drawn — is E23 in [docs/EXPERIMENTS.md](../../docs/EXPERIMENTS.md).
+
+**It does not go through the hub, and it is not pinned by hash.** That is the
+opposite of the net and the book, deliberately. Those are local artifacts that
+exist nowhere else and whose *content* decides what a dataset is, so the hub is
+both the only way a box can get them and the reason they need a hash. Syzygy is
+canonical published data — there is one correct 5-man set and it has not
+changed since 2013 — so what a hash would establish is not in question, and
+routing it through the hub would mean a gigabyte of home upload to duplicate a
+file already served, faster, from a machine near these boxes. `SYZYGY_URL`
+points somewhere else if you would rather it did.
+
+What replaces the hash is a stronger check, because the failure being guarded
+against is worse than the wrong file. **A box with half a tablebase set does
+not fail.** It labels low-piece positions from the search instead, and those
+records land in the same shard directory as everybody else's, correct-looking
+and wrong. So:
+
+- every file is checked against the size the mirror's index publishes, and a
+  short one is re-fetched rather than trusted;
+- then `datagen syzygy <dir>` probes sixteen known endgames — each as given and
+  mirrored — with the binary that box just built. Wrong answers, a set that
+  does not reach five men, and a position the prober declines to probe at all
+  are each a provisioning failure.
+
+You can run that gate anywhere: `./datagen syzygy external/syzygy/3-4-5`, or
+`make syzygy-test` against the engine binary.
+
+Both halves are always fetched. WDL answers won/drawn/lost inside the search;
+DTZ is what converts at the root under the fifty-move rule, and without it a
+labelling search of a five-man position falls back to the evaluation — the
+exact bug the tables are there to fix.
+
+Like the book and unlike the net, `SYZYGY` is **not** part of the provisioning
+stamp, and `provision.sh` fetches before its early exit — so a box already
+provisioned for this commit picks up tablebases the config gained later without
+a rebuild.
+
+`run-box.sh` passes `-syzygy` to `label`, `selfplay`, `calibrate` **and** to the
+`verify -relabel` it runs before uploading. That last one is not decoration: a
+label made with tablebases does not reproduce without them, so a verify that
+omitted the flag would fail on every low-piece record of perfectly good data.
 
 ## Bootstrapping onto the net
 

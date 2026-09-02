@@ -65,6 +65,8 @@
 #include "movegen.h"
 #include "nnue.h"
 #include "search.h"
+#include "syzygy.h"
+#include "syzygytest.h"
 #include "thread.h"
 #include "timeman.h"
 #include "tt.h"
@@ -834,14 +836,15 @@ typedef struct {
     int treeSamples;
     int treeMinDepth;
     int maxPlies;
-    int winScore;
-    int winPlies;
-    int drawScore;
-    int drawPlies;
-    int drawMinMove;
     /* filters */
     int maxScore;
     bool quietFilter;
+    /* Tablebase provenance, purely informational: nothing reads these back.
+     * A shard labelled with tablebases and one labelled without are simply
+     * never mixed, and `verify -relabel` run with a different -syzygy setting
+     * fails loudly on its own because the labels stop reproducing. */
+    const char *syzygyPath;
+    int syzygyMen;
 } Manifest;
 
 static void manifest_write(const char *shardPath, const Manifest *m, uint64_t records,
@@ -882,6 +885,13 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     fprintf(f, "  \"dedup\": %s,\n", m->dedup ? "true" : "false");
     fprintf(f, "  \"max_score\": %d,\n", m->maxScore);
     fprintf(f, "  \"quiet_filter\": %s,\n", m->quietFilter ? "true" : "false");
+    fprintf(f, "  \"syzygy_men\": %d,\n", m->syzygyMen);
+    fprintf(f, "  \"syzygy_path\": ");
+    if (m->syzygyPath)
+        json_string(f, m->syzygyPath);
+    else
+        fprintf(f, "null");
+    fprintf(f, ",\n");
 
     if (m->games) {
         fprintf(f, "  \"selfplay\": {\n");
@@ -904,12 +914,7 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
         fprintf(f, "    \"tree_samples_per_move\": %d,\n", m->treeSamples);
         fprintf(f, "    \"tree_min_depth\": %d,\n", m->treeMinDepth);
-        fprintf(f, "    \"max_plies\": %d,\n", m->maxPlies);
-        fprintf(f, "    \"adjudicate_win_score\": %d,\n", m->winScore);
-        fprintf(f, "    \"adjudicate_win_plies\": %d,\n", m->winPlies);
-        fprintf(f, "    \"adjudicate_draw_score\": %d,\n", m->drawScore);
-        fprintf(f, "    \"adjudicate_draw_plies\": %d,\n", m->drawPlies);
-        fprintf(f, "    \"adjudicate_draw_from_move\": %d\n", m->drawMinMove);
+        fprintf(f, "    \"max_plies\": %d\n", m->maxPlies);
         fprintf(f, "  },\n");
     }
 
@@ -1406,6 +1411,31 @@ static int run_workers(int workers, WorkerFn fn, void *ctx) {
 #endif
 }
 
+/*
+ * Loads tablebases for this process, and says which world the run is in -
+ * loudly, once, because a shard labelled with tablebases and one labelled
+ * without mean different things by the same bytes and are never mixed. A path
+ * that yields no tables dies rather than degrading: a run that silently fell
+ * back to search-only labels would produce exactly the mix-up the message
+ * exists to prevent.
+ *
+ * Every worker process arrives here on its own: the Windows re-launch carries
+ * -syzygy on the command line it copies, and a POSIX fork inherits the
+ * parent's already-initialised tables.
+ */
+static void setup_syzygy(const char *path) {
+    if (path == NULL) {
+        if (WorkerOverride < 0)
+            fprintf(stderr,
+                    "syzygy: NONE - endgames are played and labelled from the search alone\n");
+        return;
+    }
+    if (!syzygy_init(path))
+        dief("syzygy: no usable tablebases at %s", path);
+    if (WorkerOverride < 0)
+        fprintf(stderr, "syzygy: %d-man tablebases at %s\n", syzygy_max_pieces(), path);
+}
+
 /* ========================================================================== *
  *  Subcommand: selfplay
  * ========================================================================== */
@@ -1427,8 +1457,7 @@ typedef struct {
     int treeMinDepth; /* remaining depth a sampled node must still have */
 
     int maxPlies;
-    int winScore, winPlies;
-    int drawScore, drawPlies, drawMinMove;
+    const char *syzygyPath; /* NULL plays and labels endgames from the search alone */
 
     int maxScore;
     bool quietFilter;
@@ -1518,10 +1547,18 @@ static void candidates_push(CandidateList *cl, const char *fen, Color stm, Sourc
     c->cutoff = cutoff;
 }
 
-/* Game result, always from white's point of view. */
-typedef enum { RES_WHITE, RES_DRAW, RES_BLACK } GameResult;
+/* Game result, always from white's point of view. RES_UNKNOWN is a game cut
+ * short - the ply cap, or a search that failed to produce a move - and it
+ * matters that it is NOT a draw: stamping WDL_DRAW on a game that was merely
+ * abandoned mid-grind teaches the net that unconverted advantages are draws,
+ * which is the exact feedback loop the adjudication removal exists to break.
+ * WDL_UNKNOWN records train on their search score alone (the trainer falls
+ * back to lambda = 1), so an unfinished game contributes no result at all. */
+typedef enum { RES_WHITE, RES_DRAW, RES_BLACK, RES_UNKNOWN } GameResult;
 
 static int wdl_for(GameResult r, Color stm) {
+    if (r == RES_UNKNOWN)
+        return WDL_UNKNOWN;
     if (r == RES_DRAW)
         return WDL_DRAW;
     const bool whiteWon = r == RES_WHITE;
@@ -1647,11 +1684,8 @@ static int selfplay_worker(int index, int workers, void *ctx) {
             search_clear();
             cands.count = 0;
 
-            bool restart   = false;
-            int winStreak  = 0;
-            int lossStreak = 0;
-            int drawStreak = 0;
-            result         = RES_DRAW;
+            bool restart = false;
+            result       = RES_UNKNOWN;
 
             for (;;) {
                 ScoredMove list[MAX_MOVES];
@@ -1663,12 +1697,23 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                         ++legalCount;
 
                 if (legalCount == 0) {
-                    if (board_checkers(&pos))
-                        result = pos.sideToMove == WHITE ? RES_BLACK : RES_WHITE;
+                    result = board_checkers(&pos)
+                                 ? (pos.sideToMove == WHITE ? RES_BLACK : RES_WHITE)
+                                 : RES_DRAW; /* stalemate */
                     break;
                 }
-                if (board_is_draw(&pos, 0) || pos.gamePly >= o->maxPlies)
+                /* The fifty-move rule, threefold repetition and insufficient
+                 * material are the ONLY draws: there is no adjudication. A
+                 * game the engine cannot finish is exactly the game whose
+                 * grind we want on the record - and whose result we must not
+                 * invent. The ply cap below therefore ends the game as
+                 * RES_UNKNOWN, never as a draw. */
+                if (board_is_draw(&pos, 0)) {
+                    result = RES_DRAW;
                     break;
+                }
+                if (pos.gamePly >= o->maxPlies)
+                    break; /* result stays RES_UNKNOWN */
 
                 sampler.seen  = 0;
                 sampler.count = 0;
@@ -1709,34 +1754,6 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 for (int s = 0; s < sampler.count; ++s)
                     candidates_push(&cands, sampler.slot[s].fen, stm_from_fen(sampler.slot[s].fen),
                                     SRC_TREE, sampler.slot[s].cutoff);
-
-                const int white = pos.sideToMove == WHITE ? res.score : -res.score;
-
-                if (white >= o->winScore) {
-                    ++winStreak;
-                    lossStreak = 0;
-                } else if (white <= -o->winScore) {
-                    ++lossStreak;
-                    winStreak = 0;
-                } else {
-                    winStreak = lossStreak = 0;
-                }
-                drawStreak = (pos.fullmoveNumber >= o->drawMinMove && iabs(white) <= o->drawScore)
-                                 ? drawStreak + 1
-                                 : 0;
-
-                if (winStreak >= o->winPlies) {
-                    result = RES_WHITE;
-                    break;
-                }
-                if (lossStreak >= o->winPlies) {
-                    result = RES_BLACK;
-                    break;
-                }
-                if (drawStreak >= o->drawPlies) {
-                    result = RES_DRAW;
-                    break;
-                }
 
                 board_do_move(&pos, res.best);
             }
@@ -1813,13 +1830,10 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.treeSamples     = sampler.want;
     man.treeMinDepth    = o->treeMinDepth;
     man.maxPlies        = o->maxPlies;
-    man.winScore        = o->winScore;
-    man.winPlies        = o->winPlies;
-    man.drawScore       = o->drawScore;
-    man.drawPlies       = o->drawPlies;
-    man.drawMinMove     = o->drawMinMove;
     man.maxScore        = o->maxScore;
     man.quietFilter     = o->quietFilter;
+    man.syzygyPath      = o->syzygyPath;
+    man.syzygyMen       = syzygy_max_pieces();
     shard_close(&writer, &man);
 
     if (o->dedup)
@@ -1903,16 +1917,19 @@ static void usage_selfplay(void) {
            "  -openingscore N    discard the game if the opening is already decided by\n"
            "                     more than this many centipawns.          (800)\n"
            "\n"
-           "adjudication  (endgame technique is not what we are training)\n"
-           "  -winscore N        |score| that counts as won.              (2000)\n"
-           "  -winplies N        consecutive plies it must hold.          (4)\n"
-           "  -drawscore N       |score| that counts as drawn.            (0)\n"
-           "  -drawplies N       consecutive plies it must hold.          (8)\n"
-           "  -drawmove N        first full move the draw rule applies from. (60)\n"
-           "  -maxplies N        hard cap on game length.                 (400)\n"
+           "endings  (there is NO adjudication: games end by mate, stalemate, the\n"
+           "          fifty-move rule, repetition or insufficient material. Endgame\n"
+           "          technique is being trained, so results are earned, not declared)\n"
+           "  -syzygy <path>     Syzygy tablebases (';'-separated dirs on Windows, ':'\n"
+           "                     on POSIX). The engine probes them in every search, so\n"
+           "                     low-piece endings are played and labelled with ground\n"
+           "                     truth. Label with them or without them, never mix the\n"
+           "                     two in one dataset.        (none: search labels only)\n"
+           "  -maxplies N        hard cap on game length; a capped game's result is\n"
+           "                     recorded as UNKNOWN, never invented.     (400)\n"
            "\n"
            "filters\n"
-           "  -maxscore N        drop records whose label exceeds this; 0 disables. (2000)\n"
+           "  -maxscore N        drop records whose label exceeds this; 0 disables. (0)\n"
            "  -noquiet           keep game-line positions whose best move is a capture\n"
            "                     or promotion. Tree samples are never quiet-filtered.\n"
            "  -nodedup           keep positions already seen in this shard.\n"
@@ -1945,16 +1962,15 @@ static int cmd_selfplay(int argc, char **argv) {
     o.treeSamples     = 0;
     o.treeMinDepth    = 4;
     o.maxPlies        = 400;
-    o.winScore        = 2000;
-    o.winPlies        = 4;
-    o.drawScore       = 0;
-    o.drawPlies       = 8;
-    o.drawMinMove     = 60;
-    o.maxScore        = 2000;
-    o.quietFilter     = true;
-    o.dedup           = true;
-    o.dedupBits       = 22;
-    o.policy          = true;
+    o.syzygyPath      = NULL;
+    /* 0: games are now played to their natural end, and the conversion of a
+     * decisive advantage is precisely the technique gen-5 onward trains -
+     * capping the label magnitude would drop every position of the grind. */
+    o.maxScore    = 0;
+    o.quietFilter = true;
+    o.dedup       = true;
+    o.dedupBits   = 22;
+    o.policy      = true;
 
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc)
@@ -1982,16 +1998,8 @@ static int cmd_selfplay(int argc, char **argv) {
             o.treeMinDepth = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-maxplies") && i + 1 < argc)
             o.maxPlies = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-winscore") && i + 1 < argc)
-            o.winScore = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-winplies") && i + 1 < argc)
-            o.winPlies = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-drawscore") && i + 1 < argc)
-            o.drawScore = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-drawplies") && i + 1 < argc)
-            o.drawPlies = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-drawmove") && i + 1 < argc)
-            o.drawMinMove = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-syzygy") && i + 1 < argc)
+            o.syzygyPath = argv[++i];
         else if (!strcmp(argv[i], "-maxscore") && i + 1 < argc)
             o.maxScore = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-dedupbits") && i + 1 < argc)
@@ -2034,6 +2042,8 @@ static int cmd_selfplay(int argc, char **argv) {
     expand_path(probe, sizeof(probe), o.out, 0, o.threads);
     ensure_parent_dir(probe);
 
+    setup_syzygy(o.syzygyPath);
+
     return run_workers(o.threads, selfplay_worker, &o);
 }
 
@@ -2056,6 +2066,7 @@ typedef struct {
     long max;
     long skip;
     SourceTag source;
+    const char *syzygyPath;
     int maxScore;
     bool quietFilter;
     bool dedup;
@@ -2206,6 +2217,8 @@ static int label_worker(int index, int workers, void *ctx) {
     man.dedup       = o->dedup;
     man.maxScore    = o->maxScore;
     man.quietFilter = o->quietFilter;
+    man.syzygyPath  = o->syzygyPath;
+    man.syzygyMen   = syzygy_max_pieces();
     shard_close(&writer, &man);
 
     if (o->dedup)
@@ -2238,6 +2251,9 @@ static void usage_label(void) {
            "  -skip N            skip the first N eligible lines.         (0)\n"
            "  -stride N          keep one line in N.                      (1)\n"
            "  -maxscore N        drop records whose label exceeds this; 0 disables. (0)\n"
+           "  -syzygy <path>     probe Syzygy tablebases while labelling, as for\n"
+           "                     selfplay - and as for selfplay, never mix shards\n"
+           "                     labelled with and without.  (none: search labels only)\n"
            "  -quiet-filter      drop positions whose best move is a capture or\n"
            "                     promotion. Off by default: the extractor already\n"
            "                     filtered the EPDs in external/training.\n"
@@ -2293,6 +2309,8 @@ static int cmd_label(int argc, char **argv) {
             o.skip = atol(argv[++i]);
         else if (!strcmp(argv[i], "-maxscore") && i + 1 < argc)
             o.maxScore = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-syzygy") && i + 1 < argc)
+            o.syzygyPath = argv[++i];
         else if (!strcmp(argv[i], "-dedupbits") && i + 1 < argc)
             o.dedupBits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-source") && i + 1 < argc) {
@@ -2329,6 +2347,8 @@ static int cmd_label(int argc, char **argv) {
     char probe[PATH_CAP];
     expand_path(probe, sizeof(probe), o.out, 0, o.threads);
     ensure_parent_dir(probe);
+
+    setup_syzygy(o.syzygyPath);
 
     const int rc = run_workers(o.threads, label_worker, &o);
     free(o.inputs);
@@ -2856,6 +2876,10 @@ static void usage_verify(void) {
            "  -relabel N         re-search N randomly chosen records.     (0, max 4096)\n"
            "  -nodes N           nodes for those re-searches.        (manifest, or 10000)\n"
            "  -hash MB           hash for those re-searches.             (manifest, or 8)\n"
+           "  -syzygy <path>     tablebases for those re-searches. The shard's manifest\n"
+           "                     records what the run used (syzygy_path); pass the same\n"
+           "                     setting, because a label made with tablebases does not\n"
+           "                     reproduce without them - loudly, which is the point.\n"
            "  -seed N            which records get sampled.               (1)\n"
            "  -quiet             progress lines off.\n");
 }
@@ -2867,11 +2891,12 @@ static int cmd_verify(int argc, char **argv) {
     }
 
     char *inputs[256];
-    int inputCount = 0;
-    int relabel    = 0;
-    int nodes      = 10000;
-    int hashMb     = 8;
-    uint64_t seed  = 1;
+    int inputCount         = 0;
+    int relabel            = 0;
+    int nodes              = 10000;
+    int hashMb             = 8;
+    const char *syzygyPath = NULL;
+    uint64_t seed          = 1;
     /* Both are read from the shard's manifest below unless the caller names
      * them, so the defaults above only survive for a shard with no .json. */
     bool nodesGiven = false;
@@ -2886,7 +2911,9 @@ static int cmd_verify(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-hash") && i + 1 < argc) {
             hashMb    = atoi(argv[++i]);
             hashGiven = true;
-        } else if (!strcmp(argv[i], "-seed") && i + 1 < argc)
+        } else if (!strcmp(argv[i], "-syzygy") && i + 1 < argc)
+            syzygyPath = argv[++i];
+        else if (!strcmp(argv[i], "-seed") && i + 1 < argc)
             seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-quiet"))
             Quiet = true;
@@ -2960,6 +2987,29 @@ static int cmd_verify(int argc, char **argv) {
                     "datagen: %s has no manifest to read the labelling conditions from - "
                     "relabelling at %d nodes, %d MB\n",
                     inputs[0], nodes, hashMb);
+
+        /* Tablebases are a labelling condition exactly like nodes and hash,
+         * but a path does not transplant between machines the way a number
+         * does, so the manifest is only consulted for a warning: the relabel
+         * itself will fail loudly on the mismatch, and this line says why
+         * before four hundred diffs do. */
+        for (int i = 0; i < inputCount; ++i) {
+            int men;
+            if (manifest_int(inputs[i], "syzygy_men", &men)) {
+                if (men > 0 && syzygyPath == NULL)
+                    fprintf(stderr,
+                            "datagen: %s was labelled with %d-man tablebases and -syzygy was "
+                            "not given - expect every low-piece record to mismatch\n",
+                            inputs[i], men);
+                else if (men == 0 && syzygyPath != NULL)
+                    fprintf(stderr,
+                            "datagen: %s was labelled without tablebases and -syzygy was "
+                            "given - expect every low-piece record to mismatch\n",
+                            inputs[i]);
+            }
+        }
+
+        setup_syzygy(syzygyPath);
     }
 
     RelabelSample *samples = relabel ? xmalloc((size_t)relabel * sizeof(RelabelSample)) : NULL;
@@ -3380,6 +3430,31 @@ static int cmd_dump(int argc, char **argv) {
  *  Entry point
  * ========================================================================== */
 
+/* ========================================================================== *
+ *  Subcommand: syzygy
+ * ========================================================================== */
+
+/*
+ * The tablebase acceptance gate, run with THIS binary rather than with the
+ * engine's - which is the whole point of it living here. A generation box
+ * builds `datagen` and nothing else, and a box whose tables are truncated or
+ * half-downloaded does not fail: it labels low-piece positions from the search
+ * instead, and those records land in the same shard directory as everybody
+ * else's, indistinguishable and wrong. This turns that into a provisioning
+ * failure. The suite itself is src/syzygytest.c.
+ */
+static int cmd_syzygy(int argc, char **argv) {
+    if (wants_help(argc, argv) || argc < 1) {
+        printf("datagen syzygy <tablebase dir>\n"
+               "\n"
+               "Probes known endgames against the tables in that directory and exits\n"
+               "non-zero on any wrong answer, any position it declines to probe, or\n"
+               "tables that do not cover five men. Takes the same path -syzygy does.\n");
+        return argc < 1 ? 1 : 0;
+    }
+    return syzygy_verify_suite(argv[0]) == 0 ? 0 : 1;
+}
+
 static void usage(void) {
     fprintf(stderr, "usage:\n"
                     "  datagen selfplay -o <shard%%02d.cnn> [-games N] [-nodes N] [-threads N]\n"
@@ -3390,6 +3465,7 @@ static void usage(void) {
                     "  datagen verify <shard.cnn>... [-relabel N] [-nodes N]\n"
                     "  datagen stats <shard.cnn>...\n"
                     "  datagen dump <shard.cnn> [-n N] [-skip N] [-pol]\n"
+                    "  datagen syzygy <tablebase dir>\n"
                     "\n"
                     "`datagen <subcommand> -help` lists every option and its default.\n"
                     "Every subcommand takes -quiet. The design is docs/NNUE.md.\n");
@@ -3449,6 +3525,8 @@ int main(int argc, char **argv) {
         rc = cmd_stats(argc - 2, argv + 2);
     else if (!strcmp(argv[1], "dump"))
         rc = cmd_dump(argc - 2, argv + 2);
+    else if (!strcmp(argv[1], "syzygy"))
+        rc = cmd_syzygy(argc - 2, argv + 2);
     else {
         fprintf(stderr, "datagen: unknown subcommand '%s'\n", argv[1]);
         usage();

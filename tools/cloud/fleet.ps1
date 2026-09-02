@@ -156,6 +156,17 @@ if ($cfg.ContainsKey('SSH_TIMEOUT') -and $cfg['SSH_TIMEOUT']) {
     $SshTimeout = [int]$cfg['SSH_TIMEOUT']
 }
 
+# How many boxes may provision at once. Not unlimited by default: provisioning
+# pulls a toolchain from the Ubuntu mirrors and, with SYZYGY set, ~939 MB of
+# tablebases from a public one, and a whole fleet doing that on the same second
+# is both rude and slower per box than a queue. Eight is enough that the wall
+# clock is dominated by the build rather than by waiting for a slot.
+$ProvisionParallel = 8
+if ($cfg.ContainsKey('PROVISION_PARALLEL') -and $cfg['PROVISION_PARALLEL']) {
+    $ProvisionParallel = [int]$cfg['PROVISION_PARALLEL']
+    if ($ProvisionParallel -lt 1) { $ProvisionParallel = 1 }
+}
+
 function Get-BoxName([int]$i) { return "$Gen-b$i" }
 
 # Windows PowerShell 5.1 does not discard a native command's stderr when you
@@ -317,10 +328,135 @@ function Initialize-Box([int]$i, [string]$ip) {
     Write-Ok "box $i provisioned"
 }
 
+# ------------------------------------------------------- parallel provision --
+#
+# Provisioning is the long pole: apt, a clone, a build, the acceptance gate,
+# and with SYZYGY set a ~939 MB download. Every box in the fleet is billing for
+# the whole of it, so doing them one at a time cost (N-1) x provision_time of
+# paid idling - on fourteen boxes, most of an hour of nothing.
+#
+# Each box's provision is a single ssh call, so it runs as a background PROCESS
+# with its own log rather than through PowerShell's job machinery: Start-Job
+# would need a fresh runspace and a copy of every helper in this file, and
+# ForEach-Object -Parallel is PowerShell 7 while this targets 5.1. Interleaving
+# fourteen builds on one console would be unreadable anyway, so per-box logs are
+# the better answer regardless of how the concurrency is spelled.
+
+function Get-ProvisionLog([int]$i) {
+    return (Join-Path ([System.IO.Path]::GetTempPath()) "fleet-$Gen-b$i.provision.log")
+}
+
+# Start-Process joins an argument array with spaces and quotes nothing, so an
+# option carrying a path with a space in it would arrive as two arguments. Every
+# other ssh call here splats instead and never had to care.
+function ConvertTo-ArgLine([string[]]$Arguments) {
+    return (($Arguments | ForEach-Object {
+        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+    }) -join ' ')
+}
+
+function Start-Provision([int]$i, [string]$ip) {
+    $log = Get-ProvisionLog $i
+    Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$log.err" -ErrorAction SilentlyContinue
+
+    # Two files because Start-Process refuses to point both streams at one.
+    $line = ConvertTo-ArgLine ($BoxSsh + @(
+        "root@$ip", '/root/cloud/provision.sh', '/root/cloud/job.env'))
+    $proc = Start-Process -FilePath 'ssh' -ArgumentList $line -NoNewWindow -PassThru `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+
+    return [pscustomobject]@{ Index = $i; Ip = $ip; Proc = $proc; Log = $log }
+}
+
+# The last few lines of a failed box's log, which is the whole diagnosis and is
+# otherwise sitting in a temp file nobody is going to look for.
+function Show-ProvisionFailure($job) {
+    $tail = @()
+    foreach ($f in @($job.Log, "$($job.Log).err")) {
+        if (Test-Path $f) {
+            $tail += @(Get-Content $f -Tail 12 | Where-Object { $_.Trim() })
+        }
+    }
+    foreach ($line in ($tail | Select-Object -Last 12)) { Write-Host "      $line" }
+    Write-Host "      full log: $($job.Log)"
+}
+
+# Reaps whatever has exited, records it, and returns the ones still going.
+function Update-Provisions($Running, $Results) {
+    $still = @()
+    foreach ($job in $Running) {
+        if (-not $job.Proc.HasExited) { $still += $job; continue }
+        if ($job.Proc.ExitCode -eq 0) {
+            Write-Ok "box $($job.Index) provisioned"
+            $Results[$job.Index] = $true
+        } else {
+            Write-Warn2 "box $($job.Index): provisioning failed (ssh exit $($job.Proc.ExitCode))"
+            Show-ProvisionFailure $job
+            $Results[$job.Index] = $false
+        }
+    }
+    if ($still.Count -eq $Running.Count -and $still.Count -gt 0) { Start-Sleep -Seconds 2 }
+    return ,$still
+}
+
+<#
+Brings every box up to a provisioned datagen, several at a time.
+
+The wait-and-push half stays serial and the provision half overlaps it: box 0
+is already building while box 1 is still being waited for. That ordering is
+what makes a slow box cheap rather than blocking - Wait-ForSsh can legitimately
+sit for minutes on a new address whose route has not propagated, and every
+other box spending that time building instead of idle is the entire point.
+
+Returns the indices that came up. Failures are reported, not thrown: a fleet
+that loses one box to a flaky transport should still run on the other thirteen,
+and the lost box's units stay claimable from the hub by a later `up`.
+#>
+function Initialize-Boxes([string[]]$ips) {
+    $results = @{}
+    $running = @()
+
+    for ($i = 0; $i -lt $Boxes; $i++) {
+        while ($running.Count -ge $ProvisionParallel) {
+            $running = Update-Provisions $running $results
+        }
+        try {
+            Wait-ForSsh $ips[$i]
+            Push-Scripts $ips[$i]
+            Write-Host "  provisioning box $i (clone, build, acceptance gate)..."
+            $running += Start-Provision $i $ips[$i]
+        } catch {
+            Write-Warn2 "box ${i}: $($_.Exception.Message)"
+            $results[$i] = $false
+        }
+    }
+
+    while ($running.Count -gt 0) { $running = Update-Provisions $running $results }
+
+    # provision.sh is idempotent by contract (see its header), so a retry after a
+    # dropped connection re-verifies and exits in seconds rather than rebuilding.
+    # Serial and through Initialize-Box, which already retries a transport
+    # failure three times: by this point there are usually none, and reusing the
+    # proven path beats a second scheduler for the rare case.
+    $retry = @($results.Keys | Where-Object { -not $results[$_] } | Sort-Object)
+    if ($retry.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  retrying $($retry.Count) box(es) that did not provision..."
+        foreach ($i in $retry) {
+            try { Initialize-Box $i $ips[$i]; $results[$i] = $true }
+            catch { Write-Warn2 "box ${i}: $($_.Exception.Message)" }
+        }
+    }
+
+    return @($results.Keys | Where-Object { $results[$_] } | Sort-Object)
+}
+
 function Invoke-Up {
     # Before the first create: a fleet that cannot provision should cost nothing.
     Assert-NetReady
     Assert-BookReady
+    Assert-SyzygyReady
 
     Write-Section "Fleet up: $Gen, $Boxes x $($cfg['SERVER_TYPE'])"
     $ips = @()
@@ -333,32 +469,21 @@ function Invoke-Up {
         throw
     }
 
-    # Provision and launch one box at a time, and survive the ones that fail.
-    # A single unreachable box must not abort a run whose other boxes are
-    # already provisioned and billing - that is the worst of both: paying for
+    # Provision the whole fleet, several boxes at a time, and survive the ones
+    # that fail. A single unreachable box must not abort a run whose other boxes
+    # are already provisioned and billing - that is the worst of both: paying for
     # boxes and getting no work out of them. Units are addressed by chunk with
     # done-markers on the hub, so a straggler's share is still there for a later
     # `up` to claim - nothing is lost by starting without it.
+    Write-Host "  provisioning $Boxes box(es), up to $ProvisionParallel at a time"
+    $provisioned = @(Initialize-Boxes $ips)
+
+    # Launching is a two-second ssh call, so it stays serial: the thing worth
+    # overlapping was the build, and it already has been.
     $launched = @()
-    $stalled = @()
-    for ($i = 0; $i -lt $Boxes; $i++) {
+    $stalled = @(0..($Boxes - 1) | Where-Object { $provisioned -notcontains $_ })
+    foreach ($i in $provisioned) {
         try {
-            # provision.sh is idempotent by contract (see its header), so a retry
-            # after a dropped connection re-verifies and exits rather than
-            # rebuilding. Losing a box to one flaky ssh is not worth an hour of
-            # billing.
-            for ($try = 1; ; $try++) {
-                try { Initialize-Box $i $ips[$i]; break }
-                catch {
-                    # Not for a Wait-ForSsh timeout: that already polled for
-                    # SSH_TIMEOUT seconds, so retrying it just triples the wait
-                    # before the box is called stalled. The transport failures
-                    # this is here for fail in seconds.
-                    if ($try -ge 3 -or $_.Exception.Message -match 'never became reachable') { throw }
-                    Write-Warn2 "box ${i}: $($_.Exception.Message)"
-                    Write-Host "  retrying box $i (attempt $($try + 1) of 3)"
-                }
-            }
             # systemd-run, not `setsid nohup ... &`. With the latter ssh never
             # gets EOF on the session channel and the launch call hangs forever -
             # measured, not guessed: 15s timeouts on every variant, including
@@ -497,6 +622,7 @@ function Invoke-Down {
 function Invoke-Calibrate {
     Assert-NetReady
     Assert-BookReady
+    Assert-SyzygyReady
 
     Write-Section "Calibration: one $($cfg['SERVER_TYPE'])"
     $name = "$Gen-calib"
@@ -733,6 +859,43 @@ function Assert-BookReady {
     if (-not $cfg.ContainsKey('JOB') -or $cfg['JOB'] -ne 'selfplay') { return }
     Write-Section 'Book -> hub'
     Publish-Book
+}
+
+<#
+Preflight for the tablebases.
+
+Unlike the net and the book there is nothing to publish: the boxes fetch from a
+public mirror, because Syzygy is canonical data that the hub has no reason to
+duplicate at the cost of a gigabyte of home upload (see SYZYGY in job.env). So
+all that is left to check is the thing that would otherwise be discovered by
+every box at once, ten minutes and one billing hour in: that SYZYGY names a set
+the mirror actually serves. A typo'd `3-4-5-6` fails here in a second.
+
+Only the index is fetched, not a table - this is a spelling check, not a
+download. What the boxes get is verified per file against the sizes in that
+index and then probed with `datagen syzygy`.
+#>
+function Assert-SyzygyReady {
+    if (-not $cfg.ContainsKey('SYZYGY') -or -not $cfg['SYZYGY']) { return }
+    $set = $cfg['SYZYGY']
+    $base = 'https://tablebase.lichess.ovh/tables/standard'
+    if ($cfg.ContainsKey('SYZYGY_URL') -and $cfg['SYZYGY_URL']) { $base = $cfg['SYZYGY_URL'] }
+
+    Write-Section "Syzygy $set"
+    foreach ($half in @('wdl', 'dtz')) {
+        $url = "$base/$set-$half/"
+        try {
+            $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
+        } catch {
+            throw "SYZYGY=$set is not served at $url`n" +
+                  "    $($_.Exception.Message)`n" +
+                  "    Check the set name, or point SYZYGY_URL at a mirror that has it."
+        }
+        $n = ([regex]::Matches($r.Content, 'href="K[A-Za-z]*vK[A-Za-z]*\.rtb[wz]"')).Count
+        if ($n -eq 0) { throw "$url lists no tablebase files - is that an index?" }
+        Write-Ok "$set-${half}: $n tables available"
+    }
+    Write-Host "  boxes fetch these themselves; nothing is uploaded from here."
 }
 
 function Invoke-PushBook {

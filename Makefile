@@ -235,7 +235,8 @@ endif
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
         tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet snapshot \
-        nnue nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch
+        nnue nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
+        syzygy-fetch syzygy-test
 
 all: $(TARGET)
 
@@ -404,6 +405,16 @@ datagen-test: datagen
 	    fi; \
 	    echo "PASS: -opening 2-3 splits the game start ($$n records over 40 games)"
 
+# And that a game stopped by the ply cap records NO result rather than a
+# fabricated draw. Every game in range.cnn was cut off by -maxplies 4, so
+# every record must carry WDL 3 (unknown) - the value the trainer treats as
+# "score only, no result term". A draw here would be the label-poisoning bug
+# the adjudication removal exists to prevent.
+	@./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/range.cnn -n 100 \
+	    | tail -n +2 | awk -F';' '$$3 != 3 { bad = 1 } END { exit bad }' \
+	    || { echo "FAIL: a ply-capped game was given a result instead of UNKNOWN"; exit 1; }
+	@echo "PASS: ply-capped games are labelled UNKNOWN, never draw"
+
 # ---------------------------------------------------------------- trainer --
 # PyTorch, its own virtualenv, not part of the C build and not subject to the C
 # style rules. See trainer/README.md.
@@ -452,6 +463,11 @@ gauntlet:
 engines-fetch:
 	@$(TOOLPY) tools/fetch-engines.py $(ARGS)
 
+# The 3-4-5-man Syzygy tablebases (~939 MB into external/, gitignored). Not a
+# build dependency: the engine probes them only when pointed at them.
+syzygy-fetch:
+	@$(TOOLPY) tools/fetch-syzygy.py $(ARGS)
+
 snapshot:
 	@$(TOOLPY) tools/snapshot-baseline.py $(ARGS)
 
@@ -476,6 +492,22 @@ nnue-test:
 	@$(MAKE) --no-print-directory nnue-export
 	@$(MAKE) --no-print-directory nnue
 	./$(EXE)-nnue$(SUFFIX) nnue verify $(EVALFILE).vectors
+
+# The tablebase acceptance gate: known endgames, each probed as given and
+# mirrored, against tables fetched by `make syzygy-fetch`. A probe that
+# silently never fires fails here rather than quietly mislabelling every
+# low-piece position the generator writes.
+SYZYGY_PATH ?= external/syzygy/3-4-5
+
+SYZYGY_MANIFEST ?= tests/syzygy/probe.manifest
+
+syzygy-test: $(TARGET)
+	./$(TARGET) syzygy verify $(SYZYGY_PATH)
+# And the differential campaign's verdict, re-checked. The manifest holds one
+# checksum per material configuration, sealed from Fathom while it was still in
+# the tree (docs/EXPERIMENTS.md E24), so this keeps comparing against an
+# independent implementation long after that implementation was deleted.
+	./$(TARGET) syzygy manifest $(SYZYGY_PATH) $(SYZYGY_MANIFEST)
 
 # Which net a build is actually carrying, by hash. `make bench EVAL=nnue`
 # prints the same hash in its header.
@@ -562,6 +594,8 @@ help:
 	@echo "make nnue-test          C inference == quantised Python reference"
 	@echo "make nnue-info          which net a build is carrying, by hash"
 	@echo "make net-fetch          download the pinned net into EVALFILE"
+	@echo "make syzygy-fetch       download the 3-4-5-man Syzygy tablebases (~939 MB)"
+	@echo "make syzygy-test        probe known endgames against the fetched tables"
 	@echo "make net-publish        upload EVALFILE as a content-addressed release"
 	@echo "make format[-check]     apply / verify .clang-format"
 	@echo "make clean"

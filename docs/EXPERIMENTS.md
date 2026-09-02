@@ -1372,6 +1372,66 @@ the point: 3914 games bought most of E22's gain from a third of the seats.
 
 ---
 
+### E23 — Syzygy tablebases, and the removal of every adjudication rule
+
+**Date** 2026-09-01 · **Baseline** the E22 build · **Bench** classical 277139
+-> **277139**, nnue 203047 -> **203047** (both unchanged, by construction)
+
+Both baselines were re-measured from a clean build of `HEAD` rather than taken
+from E22's entry above, which records 275123 and 204540. Those are the numbers
+from before `0a0e072` ("Update tunnables"), which moved search parameters again
+without restating the bench — worth knowing before comparing anything to E22's
+line.
+
+Preparation for gen-5 data, not an Elo patch. Two observations motivated it:
+the engine scores KNP-vs-KP as roughly +3 when it is dead drawn, and it draws
+far more against 3000-3200 opponents than engines of comparable strength do.
+
+**What changed.**
+
+1. **Syzygy probing in the engine** — Fathom vendored into `src/fathom/`
+   (MIT, see CREDITS.md), adapted by `src/syzygy.c`. WDL at interior nodes
+   where `halfmoveClock == 0`, DTZ at the root for both the move and the
+   score. `SyzygyPath` over UCI, `-syzygy` for datagen; **off by default**.
+2. **Both adjudication rules deleted** from `datagen selfplay`. Games end by
+   mate, stalemate, the fifty-move rule, repetition or insufficient material.
+3. **Ply-capped games are labelled WDL 3 (unknown)**, not draw.
+4. **`-maxscore` now defaults to 0**, so conversion positions are kept.
+
+**Why the root probe carries the score, not just the move.** Interior nodes
+can only probe at a zero halfmove clock, which is what WDL tables assume. The
+children of a five-man root have clock 1 after any piece move, so they are
+searched heuristically and the root's score comes back from the evaluation —
+the labelling bug would have survived the integration intact. DTZ is
+fifty-move-aware at any clock, so one root probe settles both. Verified: the
+KNP-vs-KP position now labels 0.
+
+**Why bench is unchanged.** Probing is gated on tablebases being loaded and
+`make bench` never loads them, so the benchmark is identical on a machine with
+tables and one without. This is invariant 1, not a convenience: a node count
+that depended on which files a machine happened to have would make every
+cross-machine comparison meaningless.
+
+**Gates.** `bench` byte-identical in both evaluations · `perft` 14/14 ·
+`openbench-check` · `format-check` · `datagen-test`, extended with an
+assertion that ply-capped games carry WDL 3 · new `make syzygy-test`, which
+probes known endgames — the drawn KNP-vs-KP among them — each as given and
+mirrored, and fails if a probe silently never fires.
+
+**No SPRT, and none needed for the default build**: with `SyzygyPath` unset
+the engine is bit-identical, which bench proves. Shipping tablebases on by
+default in match play would be a separate change and would need its own test.
+
+**Caveat.** The draw-rate observation against 3000-3200 engines is *not*
+established as a data problem. It could as easily be contempt, rule50 scaling
+of the evaluation, or pruning that is too aggressive to find a long grind.
+Classifying the drawn games by how they drew — repetition from a better
+position, fifty-move, dead-drawn material reached from a win — is the cheap
+diagnostic and has not been run. This entry fixes the label truth; whether
+that alone moves the draw rate is unmeasured.
+
+---
+
 
 ## Absolute strength
 
@@ -1532,3 +1592,105 @@ score above falls monotonically as the rung rises. `UCI_Elo` is ignored unless
 `UCI_LimitStrength` is also set, and setting one without the other fails
 silently - which is exactly the mistake that would make an engine look 400
 points weaker than it is.
+
+### E24 — An engine-specific Syzygy prober replaces Fathom
+
+**Date** 2026-09-02 · **Baseline** the E23 build · **Bench** classical 277139
+-> **277139**, nnue 203047 -> **203047** (unchanged; probing is off unless
+`SyzygyPath` is set, and bench never sets it)
+
+E23 vendored Fathom to read the tablebases. This replaces it with
+[`src/syzygy.c`](../src/syzygy.c), written against this engine rather than
+against a general-purpose board, and deletes the vendored copy. CREDITS.md
+records that the result is *derived* from Fathom and de Man's reference and
+retains the MIT notice - the constant index tables and the shape of the
+decompressor are the file format and could not be written differently.
+
+**What it drops.** Of Fathom's 3,783 lines: all of `tbchess.c` (1,050 - its own
+board, move generator and attack tables, all of which this engine already has),
+depth-to-mate support (~350 lines, for `.rtbm` files no distribution ships),
+the `TbRootMoves` helper API, and the `EncInfo` gaps those left behind.
+
+**Verification is the point of this entry.** A tablebase prober that is wrong
+does not crash: it returns a plausible number for a plausible position and
+every low-piece label the generator writes is quietly poisoned. So Fathom was
+kept in the tree as an oracle and the two were compared position by position.
+
+The oracle was kept in the tree while the new prober was written, and the two
+were linked side by side by a temporary `tools/tbdiff.c`. Material coverage is
+exhaustive **by construction** - the 286 configurations up to five men are
+enumerated, and only the placement within a configuration is sampled, because a
+prober that is wrong for one endgame is wrong for a whole table and uniform
+position sampling would find a small table only in proportion to its size.
+
+| | |
+|---|---|
+| positions compared | **4,111,419** (and 411,106 at a second seed) |
+| WDL probes agreeing | 4,111,419 / 4,111,419 |
+| DTZ root probes agreeing | 4,087,888, compared as **integers**, not as win/draw/loss |
+| chosen moves replayed and re-checked | 408,768 |
+| positions carrying an en passant square | 7,891 |
+| disagreements | **0** |
+
+**The harness was itself tested.** Agreement is worthless if the test cannot
+fail, so faults were injected and confirmed caught: treating a cursed win as a
+win (a 0.08% effect) produced 50 mismatches across 6 configurations, and the
+inverted root filter described below produced 5,948 across 218.
+
+**Four real bugs, and what found each.** Worth recording because they map onto
+what each check is actually for.
+
+1. *Table names were built in ascending piece order* (`KPNvK`, `KPvKQ`), and the
+   format names the strongest man first and one side first (`KNPvK`, `KQvKP`).
+   Every pawnful table silently failed to load. Found by the differential run;
+   fixed by generating both side orderings and letting the filesystem decide
+   which exists, rather than deriving a naming rule with exceptions in it.
+2. *The block index offset was read as signed.* It is unsigned in the format;
+   read as signed it goes negative, the block walk runs off the front of the
+   size table, and `--block` underflows a `uint32` into a four-billion-entry
+   read. Found as an access violation at a larger sample - the only bug here
+   that announced itself.
+3. *The root move chooser's draw branch had an inverted filter*, rejecting our
+   own winning moves and never rejecting a losing one, so it degenerated to
+   "play the first legal move" - which in a drawn position can lose outright,
+   and `search.c` cuts the root list down to whatever it picks. **The
+   differential test could not see this**: it compared value and distance, both
+   of which were perfect. Found by a code review, and the harness then grew a
+   check that plays the chosen move and asks the oracle what the child is
+   worth.
+4. *`TB_MAX_PIECE_TABLES`/`TB_MAX_PAWN_TABLES` were the six-man counts* while
+   `TB_PIECES` was 7, so a complete six-man set would fill both arrays exactly
+   and every seven-man table would be dropped by a silent `return`. Invisible
+   to a five-man test by construction. Found by the same review; the caps are
+   now the seven-man counts and the guard says so out loud.
+
+**Speed: the hypothesis did not survive contact.** The rewrite was motivated
+partly by expecting it to be faster - no marshalling into a second board
+representation, and capture resolution on our own generator and make/unmake.
+Measured over 205,576 positions:
+
+| | before | after `GEN_CAPTURES` |
+|---|---|---|
+| WDL probes | 0.74x Fathom | **0.86-0.96x** |
+| DTZ root probes | 1.03x | **1.12x** |
+
+The WDL figure varies ~10% run to run, so read it as *parity, possibly slightly
+behind*. Narrowing capture resolution from `GEN_ALL` to `GEN_CAPTURES` was worth
+a real step; a second pass adding a bare-king fast path measured neutral and was
+**not kept**. The honest summary is that this is a wash on speed, and its value
+is the dependency removed and the ~2,400 lines not carried.
+
+**Gates.** `bench` classical 277139 and nnue 203047, both unchanged · `perft`
+14/14 · `openbench-check` · `format-check` · `datagen-test` · `syzygy-test`,
+which now runs the sixteen-endgame suite **and** the manifest.
+
+**What survives.** `tests/syzygy/probe.manifest` - 8 KB, one checksum per
+material configuration, sealed from Fathom before it was deleted. `make
+syzygy-test` re-derives all 286 with this prober and names the endgame that
+differs. Verified to fail: corrupting one line reports
+`FAIL KQvKR expected 0000000000000000, got 390339f8b1d64cf6`.
+
+**Caveat.** Everything above is five-man. The prober claims seven and the
+enumeration reaches it, but no six- or seven-man table has ever been probed by
+it - the review's finding 4 is exactly the kind of bug that lives there. Fetch a
+six-man set and re-seal before trusting one.

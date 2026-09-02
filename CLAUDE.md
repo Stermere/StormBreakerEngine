@@ -38,7 +38,16 @@ make net-fetch          # fetch the pinned net; a clean clone has none
 make nnue-test          # C inference == the quantised reference, exactly
 make datagen-test       # datagen round-trips and its labels reproduce
 make trainer-test       # the trainer's pytest suite
+
+make syzygy-fetch       # 3-4-5-man tablebases (~939 MB into external/)
+make syzygy-test        # known endgames, plus the sealed probe manifest
 ```
+
+Tablebases are **off unless pointed at** — `SyzygyPath` over UCI, `-syzygy`
+for datagen — and `make bench` never points at them, so a build with tables on
+disk benches identically to one without. That is not a convenience: node
+counts that depended on which files a machine happened to have would break
+invariant 1 outright.
 
 `EVAL` picks the evaluation at compile time; `classical` is the default and
 there is no runtime switch. Switching `EVAL` or `ARCH` rebuilds correctly - a
@@ -132,6 +141,11 @@ correct response is to implement movegen, not to relax the check.
 - Keep `src/` flat — it matches how strong engines are organised.
 - No new dependencies. The engine links only against libc and the platform
   threading API, and that is a feature: it builds anywhere OpenBench runs.
+  `src/syzygy.c` is this engine's own Syzygy prober rather than a vendored
+  one for exactly that reason — but it is *derived* from Fathom and de Man's
+  reference, and CREDITS.md says so and retains the MIT notice. Treat the
+  constant index tables in it as the file format, not as code: they cannot be
+  written differently and must never be "tidied".
 
 ## Where things live
 

@@ -9,6 +9,7 @@
 #include "eval.h"
 #include "nnue.h"
 #include "search.h"
+#include "syzygy.h"
 #include "tt.h"
 #include "uci.h"
 #include "zobrist.h"
@@ -61,6 +62,7 @@ int main(int argc, char **argv) {
         uci_loop();
     }
 
+    syzygy_free();
     tt_free();
     return uci_exit_code();
 }

@@ -187,13 +187,65 @@ human, 10% CCRL.
 |---|---|---|
 | Opening | 8 random plies, or the existing book | Without randomisation every game is the same game |
 | Nodes per move | 10,000 | Fixed nodes, never fixed time — time makes labels machine-dependent |
-| Adjudication | win at ±2000 held 4 plies; draw at 0 held 8 plies after move 60 | Endgame technique is not what we are training |
-| Filter | not in check, best move not a capture, abs(score) < 2000 | Same quiet-position argument as the tuner's extractor |
+| Adjudication | **none** | See below |
+| Tablebases | `-syzygy external/syzygy/3-4-5` | Ground truth where it exists, both for play and for labels |
+| Filter | not in check, best move not a capture | Quiet positions, as in the tuner's extractor — but no score cap |
 | Hash | 8 MB per worker | Small, private, cleared between games |
 
-`board_is_draw`, the existing repetition and fifty-move handling, and the
-adjudication all have to agree, or self-play produces games that end in states
-the engine thinks are still going.
+### Why there is no adjudication any more
+
+Both rules were removed in the gen-5 preparation, and the reasoning is worth
+keeping because it applies to anything else that would declare a result the
+board has not reached.
+
+The draw rule — score 0 for 8 plies after move 60 — fired exactly when the
+engine's own evaluation said the position was level. That is precisely the
+number that cannot be trusted in an endgame: an ending the engine could not
+convert was stamped a draw, the whole game's WDL label went into the dataset
+as a draw, the next net learned that unconverted advantages are draws, and
+converted even fewer of them. The rule that was supposed to save time on
+endgame technique was teaching the net not to have any.
+
+The win rule had the mirror problem in a rarer form: a fortress the engine
+over-evaluated by 20 pawns was recorded as a win.
+
+Games now end the way games end — checkmate, stalemate, the fifty-move rule,
+threefold repetition, insufficient material — all of which `board_is_draw`
+already detected and none of which involve the evaluation. Two consequences:
+
+- **Games are longer**, and much more of the record is endgame. That is the
+  point; endgame technique is now something being trained rather than
+  something being skipped.
+- **`-maxplies` still caps a game**, but a capped game's result is recorded as
+  **WDL 3, unknown** — never a draw. The trainer already treats unknown as
+  "use the search score, no result term" (`known = wdl <= 2` in
+  `blended_target`), so an unfinished game contributes its positions without
+  contributing a result nobody established. `make datagen-test` asserts this.
+
+The score cap went with them. `-maxscore` now defaults to 0: with games played
+out, the positions between "winning" and "won" *are* the conversion technique,
+and a 2000cp cap dropped every one of them.
+
+### Tablebases
+
+`-syzygy <path>` loads Syzygy tablebases into the engine the generator plays
+and labels with (`make syzygy-fetch` downloads 3-4-5-man). It changes both
+halves of the pipeline at once, which is why it is one flag:
+
+- **Play.** The engine probes WDL in the search and DTZ at the root, so a
+  5-man ending is played out perfectly instead of being shuffled into a
+  fifty-move draw. The *game result* — the thing every position in that game
+  is labelled with — becomes true rather than a function of how well this
+  version happened to convert.
+- **Labels.** A labelling search of a ≤5-man position returns game-theoretic
+  truth, because it is the same engine with the same tables. The KNP-vs-KP
+  position that scored +3 now scores 0, for free, with no relabelling pass.
+
+A shard generated with tablebases and one generated without do not mean the
+same thing by the same bytes, so **do not mix them**. Nothing enforces this:
+the manifest records `syzygy_path` and `syzygy_men` for a human to read, and
+`verify -relabel` takes `-syzygy` and fails loudly on a mismatch, which is the
+warning that matters.
 
 ### Record format
 
@@ -208,7 +260,7 @@ offset size  field
 25     1     halfmove clock
 26     2     fullmove number
 28     2     score, centipawns, side-to-move relative (int16)
-30     1     WDL from the side to move: 0 loss, 1 draw, 2 win
+30     1     WDL from the side to move: 0 loss, 1 draw, 2 win, 3 unknown
 31     1     flags: bits 0-2 source tag, bit 3 in-check, bits 4-7 reserved
 ```
 
@@ -254,16 +306,23 @@ where consecutive records come from the same game is not a shuffle.
 ```sh
 make datagen           # builds ./datagen
 make datagen-test      # the gate above, on a few games. Seconds.
+make syzygy-fetch      # the tablebases, once (~939 MB into external/)
+make syzygy-test       # they probe known endgames to their known results
 ```
 
 ```
-datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2-3 -tree 0
-datagen label <in.epd>... -o out.cnn -source human -nodes 10000 -resume
+datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2-3 -tree 0 -syzygy external/syzygy/3-4-5
+datagen label <in.epd>... -o out.cnn -source human -nodes 10000 -resume -syzygy external/syzygy/3-4-5
 datagen shuffle <in.cnn>... -o train.cnn -seed 1
-datagen verify <shard.cnn>... -relabel 500     # the gate; exits non-zero on failure
+datagen verify <shard.cnn>... -relabel 500 -syzygy external/syzygy/3-4-5
 datagen stats <shard.cnn>...                   # the histograms to eyeball
 datagen dump <shard.cnn> -n 20 [-pol]          # records as text
 ```
+
+`-syzygy` must be the same across every command that produces or re-checks a
+label — generation, labelling and `verify -relabel` alike. A relabel run
+without it against a shard made with it will report a mismatch on every
+low-piece record, which is the intended behaviour and not a bug in either.
 
 **Labelling runs are long, so `label` takes `-resume`.** It checkpoints every
 30 seconds - a flush, plus a 64-byte `.resume` file beside the shard - and on a
@@ -419,7 +478,12 @@ that; see "Openings" above.
 
 ### What the first dataset looked like
 
-48 games, 10,000 nodes, defaults otherwise — 9,900 records:
+Historical: this is the shape of a shard from **before** adjudication was
+removed, kept because the last row is what motivated removing it. A shard
+generated today has longer games and a larger endgame share still, and its
+result column carries an `unknown` entry that this one had no way to produce.
+
+48 games, 10,000 nodes, defaults of the time — 9,900 records:
 
 | | |
 |---|---|
@@ -429,13 +493,17 @@ that; see "Openings" above.
 | source mix | 42.5% game line, 57.5% tree samples |
 | **pieces on the board** | **22.1% of records have seven or fewer** |
 
-The last row is the one to watch. The adjudication exists because endgame
-technique is not what we are training, but at `-winscore 2000` a fixed-node
+The last row is the one that aged into a decision. Even with adjudication on,
+22% of records had seven pieces or fewer: at `-winscore 2000` a fixed-node
 search does not reach ±2000 in K+R vs K until mate is nearly in sight, so those
-games grind on and every ply of the grind contributes two records. The
-documented defaults are kept because they are the documented defaults; if a
-trained net turns out weak in the middlegame, `-winscore 1200` is the first
-knob to reach for, and one `stats` run confirms what it did.
+games ground on anyway and every ply contributed two records. The dataset was
+already mostly-endgame at the margin — it was just endgame played badly, and
+labelled with a result the adjudicator had invented. Removing the rules and
+adding tablebases keeps the same positions and makes their labels true.
+
+If a trained net now turns out weak in the *middlegame*, the knob to reach for
+is the opening book and the source mixture, not a cap on how long a game may
+run.
 
 ---
 

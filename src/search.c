@@ -34,6 +34,7 @@
 #include "eval.h"
 #include "movegen.h"
 #include "nnue.h"
+#include "syzygy.h"
 #include "thread.h"
 #include "timeman.h"
 #include "tt.h"
@@ -69,6 +70,15 @@ static atomic_llong ClockOrigin;
  * the innermost loop of the search is a measurable cost for a counter nothing
  * reads at that granularity. */
 static uint64_t NodeCount;
+
+/* Syzygy state for this search: the piece-count gate, cached at search start
+ * so the per-node test is one comparison against a local, and the probe
+ * counter behind `info ... tbhits`. TbLimit is 0 whenever no tablebases are
+ * loaded, which short-circuits every probe - a build that never loads them
+ * searches bit-identically to one without the prober, and bench stays
+ * deterministic across machines. */
+static int TbLimit;
+static uint64_t TbHits;
 
 /* Triangular PV table. PvTable[ply] is the principal variation from `ply`
  * downwards; a child's line is copied up behind the move that produced it. */
@@ -1080,15 +1090,16 @@ static inline int16_t *corr_entry(const Position *pos) {
     return &PawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
 }
 
-/* Mate scores are clamped away deliberately: a correction is evidence about an
- * evaluation, and letting one push a score into mate range would have the
- * search report a mate that nothing proved. */
+/* Mate and tablebase scores are clamped away deliberately: a correction is
+ * evidence about an evaluation, and letting one push a score into a range
+ * reserved for proven results would have the search report a proof that
+ * nothing proved. */
 static Value corrected_eval(const Position *pos, Value raw) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
 
     const int v = raw + (CORR_W_PAWN * *corr_entry(pos) / CORR_W_UNIT) / CORRHIST_GRAIN;
-    return (Value)iclamp(v, VALUE_MATED_IN_MAX_PLY + 1, VALUE_MATE_IN_MAX_PLY - 1);
+    return (Value)iclamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 
 /*
@@ -1438,6 +1449,34 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         pos->halfmoveClock < 90 &&
         (tt_entry_bound(&tte) & (ttValue >= beta ? BOUND_LOWER : BOUND_UPPER)))
         return ttValue;
+
+    /*
+     * Syzygy WDL probe. The halfmove-clock gate keeps this off the hot path
+     * and is also a correctness condition: WDL tables assume a fresh
+     * fifty-move counter, so only the capture or pawn move that entered the
+     * tablebase region probes - everything behind it transposes through the
+     * table entry stored here.
+     *
+     * The value is game-theoretic truth, not a heuristic, so it is returned
+     * outright; at a PV node that truncates the printed line, which is
+     * cosmetic. A win is only a lower bound (a search might still prefer the
+     * faster mate score) and a loss only an upper one, and the entry records
+     * that. Stored a few plies deeper than asked so neighbouring nodes
+     * transpose into it rather than re-probing the disk.
+     */
+    if (TbLimit != 0 && !isExcluded && pos->halfmoveClock == 0 && pos->castling == NO_CASTLING &&
+        popcount(occupied_bb(pos)) <= TbLimit) {
+        const Value tbValue = syzygy_probe_wdl(pos, ply);
+        if (tbValue != VALUE_NONE) {
+            ++TbHits;
+            const Bound tbBound = tbValue > VALUE_DRAW   ? BOUND_LOWER
+                                  : tbValue < VALUE_DRAW ? BOUND_UPPER
+                                                         : BOUND_EXACT;
+            tt_store(key, MOVE_NONE, tbValue, VALUE_NONE, (Depth)imin(depth + 6, MAX_PLY - 1),
+                     tbBound, ttPv, ply);
+            return tbValue;
+        }
+    }
 
     const Color us     = pos->sideToMove;
     const bool inCheck = board_checkers(pos) != BB_EMPTY;
@@ -2157,9 +2196,12 @@ static void print_iteration(Depth depth, Value value, int64_t elapsed) {
 
     /* Clamped so a sub-millisecond iteration cannot divide by zero. */
     const int64_t ms = elapsed > 0 ? elapsed : 1;
-    printf("nodes %llu nps %llu time %lld hashfull %d pv", (unsigned long long)NodeCount,
+    printf("nodes %llu nps %llu time %lld hashfull %d", (unsigned long long)NodeCount,
            (unsigned long long)((NodeCount * 1000ULL) / (uint64_t)ms), (long long)elapsed,
            tt_hashfull());
+    if (TbLimit != 0)
+        printf(" tbhits %llu", (unsigned long long)TbHits);
+    printf(" pv");
 
     for (int i = 0; i < PvLength[0]; ++i)
         printf(" %s", move_to_str(PvTable[0][i], buf));
@@ -2178,12 +2220,48 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
     tt_new_search();
 
     ScoredMove roots[MAX_MOVES];
-    const int rootCount = collect_root_moves(pos, roots);
+    int rootCount = collect_root_moves(pos, roots);
 
     /* Checkmate, stalemate, or a `searchmoves` list with nothing legal in it.
      * MOVE_NONE prints as `bestmove 0000`, which is what GUIs expect. */
     if (rootCount == 0)
         return MOVE_NONE;
+
+    /*
+     * Syzygy at the root, which settles the move and the score together.
+     *
+     * The move: WDL alone cannot convert, because every winning move scores
+     * the same and a search free to choose among them can shuffle until the
+     * fifty-move rule takes the win away. DTZ names one that provably makes
+     * progress, and the root list is cut down to it. The search then runs
+     * normally over that one move, so the PV, the info lines and time
+     * management all still work.
+     *
+     * The score: interior nodes only probe at halfmoveClock == 0, so the
+     * children of a five-man root - clock 1 after any piece move - are
+     * searched heuristically and the tree would hand back an evaluation, not
+     * the result. `tbRootValue` is the tables' own answer, and it is what
+     * gets reported below. That is the difference between a labelled
+     * KNP-vs-KP position scoring 0 and scoring +3.
+     */
+    Value tbRootValue = VALUE_NONE;
+
+    if (TbLimit != 0 && Limits.searchmovesCount == 0) {
+        const SyzygyRoot tb = syzygy_probe_root(pos);
+        if (tb.value != VALUE_NONE) {
+            ++TbHits;
+            tbRootValue = tb.value;
+        }
+        if (tb.move != MOVE_NONE && rootCount > 1) {
+            for (int i = 0; i < rootCount; ++i) {
+                if (roots[i].m == tb.move) {
+                    roots[0]  = roots[i];
+                    rootCount = 1;
+                    break;
+                }
+            }
+        }
+    }
 
     Move best = roots[0].m;
 
@@ -2256,9 +2334,16 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         stability = (prevBest != MOVE_NONE && iterationBest == prevBest) ? stability + 1 : 0;
         prevBest  = iterationBest;
 
+        /* A proven result outranks the tree's opinion of it. `prevScore` keeps
+         * the tree's own number so the next iteration's aspiration window is
+         * centred on something the tree can actually return; everything
+         * outward-facing - the info line, and the score datagen writes into a
+         * label - reports the proof. */
+        const Value reported = tbRootValue != VALUE_NONE ? tbRootValue : value;
+
         prevScore      = value;
         best           = iterationBest;
-        RootScore      = value;
+        RootScore      = reported;
         CompletedDepth = depth;
 
         /* Cleared, not left alone, when this iteration has no second PV move:
@@ -2268,7 +2353,7 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         *ponderMove = PvLength[0] > 1 ? PvTable[0][1] : MOVE_NONE;
 
         if (!Silent)
-            print_iteration(depth, value, elapsed_ms());
+            print_iteration(depth, reported, elapsed_ms());
         sort_root_moves(roots, rootCount);
 
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)
@@ -2295,6 +2380,8 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
 static Move run_search(Move *ponderMove) {
     NodeCount = 0;
     SelDepth  = 0;
+    TbLimit   = syzygy_max_pieces(); /* cached: one comparison per node, not a call */
+    TbHits    = 0;
     atomic_store(&Nodes, 0);
 
     /* Per-search state, not per-game: a stale excluded move or a stale

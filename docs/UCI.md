@@ -44,7 +44,19 @@ Stockfish's, so the two can be diffed directly.
 | `Ponder` | check | false | | the GUI drives pondering with `go ponder` |
 | `Move Overhead` | spin | 10 | 0–5000 | ms reserved for GUI/network latency |
 | `UCI_Chess960` | check | false | | switches castling move notation |
+| `SyzygyPath` | string | `<empty>` | | directory of Syzygy tablebases; empty disables probing |
 | `EvalFile` | string | `<internal>` | | **`EVAL=nnue` builds only** — load a net from disk |
+
+`SyzygyPath` takes a directory (several, `;`-separated on Windows and `:`
+elsewhere) and loads what it finds; `make syzygy-fetch` downloads the 3-4-5-man
+set. Setting it reports the piece count found on an `info string`, and a path
+holding no usable tables says so rather than failing silently — probing that
+never fires looks exactly like probing that works.
+
+With tables loaded the search probes WDL at interior nodes and DTZ at the root,
+and `info` lines carry a `tbhits` field. **Leave it empty for `bench`**: node
+counts must not depend on which files a machine has, so the benchmark contract
+only holds with probing off. `<empty>` clears it again.
 
 `EvalFile` is advertised only by a build that has a network to replace. The net
 is embedded at compile time, so the default is not a path; setting one swaps the
@@ -74,6 +86,9 @@ Useful during development; GUIs ignore them.
 | `nnue` | which net is loaded: architecture, quantisation, hash, source |
 | `nnue eval` | the network's score for the current position, in centipawns |
 | `nnue verify <file>` | check the exported test vectors; exits non-zero on any mismatch |
+| `syzygy` | how many men the loaded tablebases cover, if any |
+| `syzygy verify <dir>` | probe known endgames against the tables in `dir`; exits non-zero on any wrong answer (`make syzygy-test`) |
+| `syzygy manifest <dir> <file>` | re-derive every material configuration's probe checksum and compare against a sealed manifest; names the endgame that differs |
 
 The three `nnue` commands exist only in an `EVAL=nnue` build. `eval` always
 traces the *classical* model, in every build: it is the only evaluation with

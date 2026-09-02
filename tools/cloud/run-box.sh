@@ -36,7 +36,19 @@ DATAGEN="$WORK/datagen"
 cd "$WORK"
 mkdir -p data corpus
 
+# The tablebases, resolved once because every datagen call below has to agree.
+# A label made with them does not reproduce without them - that is the whole
+# point of them - so a `verify` that omitted this flag would fail on every
+# low-piece record of perfectly good data and take the box down with it.
+TB_OPT=""
+if [ -n "${SYZYGY:-}" ]; then
+    _tb="$WORK/external/syzygy/$SYZYGY"
+    [ -d "$_tb" ] || die "SYZYGY is $SYZYGY but $_tb is missing - reprovision this box"
+    TB_OPT="-syzygy $_tb"
+fi
+
 log "box $BOX/$BOXES, job=$JOB gen=$GEN nodes=$NODES threads=$THREADS"
+log "tablebases:${TB_OPT:- none (endgames labelled from the search alone)}"
 
 # Every unit is verified on the box before it is uploaded. Relabelling a sample
 # from a cleared engine is the only check that catches a box whose build differs
@@ -65,7 +77,11 @@ verify_and_push() {
     [ -n "$_nodes" ] && [ -n "$_hash" ] || die "$_man records no nodes/hash_mb"
 
     log "verifying $_first at $_nodes nodes, $_hash MB"
-    "$DATAGEN" verify "$_first" -relabel 256 -nodes "$_nodes" -hash "$_hash"
+    # $TB_OPT unquoted: a built-up argument list, not one argument. Omitting it
+    # against a shard labelled WITH tablebases mismatches every low-piece
+    # record, so this is not optional decoration.
+    # shellcheck disable=SC2086
+    "$DATAGEN" verify "$_first" -relabel 256 -nodes "$_nodes" -hash "$_hash" $TB_OPT
 
     log "uploading $_glob"
     for _f in $_glob; do
@@ -105,8 +121,9 @@ run_label() {
                 # attempts on the same chunk: workers split the input by line, so
                 # a different count reads different lines and the resumed shard
                 # would hold records for lines it never labelled.
+                # shellcheck disable=SC2086
                 "$DATAGEN" label "corpus/chunk_$_n" -o "$_pat" \
-                    -source "$LABEL_SOURCE" -nodes "$NODES" -threads "$THREADS" -resume
+                    -source "$LABEL_SOURCE" -nodes "$NODES" -threads "$THREADS" -resume $TB_OPT
 
                 verify_and_push "data/${GEN}_${LABEL_SOURCE}_c${_n}_00.cnn" \
                     "data/${GEN}_${LABEL_SOURCE}_c${_n}_*" "$_marker"
@@ -132,6 +149,7 @@ run_selfplay() {
         [ -f "$_book" ] || die "BOOK_SHA is set but $_book is missing - reprovision"
         _sp_opts="$_sp_opts -book $_book"
     fi
+    _sp_opts="$_sp_opts $TB_OPT"
     [ -z "${SELFPLAY_TREE:-}" ] || _sp_opts="$_sp_opts -tree $SELFPLAY_TREE"
     [ -z "${SELFPLAY_OPENING:-}" ] || _sp_opts="$_sp_opts -opening $SELFPLAY_OPENING"
     [ -z "${SELFPLAY_OPENING_SCORE:-}" ] \
@@ -177,8 +195,11 @@ run_calibrate() {
     log "calibrating: $_max records per worker across $THREADS workers"
 
     _t0=$(date +%s)
+    # With the tablebases too: a calibration that measured a rate the real job
+    # will not hit is a fleet sized from the wrong number.
+    # shellcheck disable=SC2086
     "$DATAGEN" label corpus/chunk_00 -o 'data/calib_%02d.cnn' \
-        -source "$LABEL_SOURCE" -nodes "$NODES" -threads "$THREADS" -max "$_max" -quiet
+        -source "$LABEL_SOURCE" -nodes "$NODES" -threads "$THREADS" -max "$_max" -quiet $TB_OPT
     _t1=$(date +%s)
 
     _bytes=$(cat data/calib_*.cnn | wc -c)

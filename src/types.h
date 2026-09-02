@@ -138,7 +138,18 @@ enum {
     VALUE_MATE     = 32000,
     /* Scores at or beyond this are forced mates; used to detect and report them. */
     VALUE_MATE_IN_MAX_PLY  = VALUE_MATE - MAX_PLY,
-    VALUE_MATED_IN_MAX_PLY = -VALUE_MATE_IN_MAX_PLY
+    VALUE_MATED_IN_MAX_PLY = -VALUE_MATE_IN_MAX_PLY,
+
+    /* Tablebase scores get a band of their own directly below the mate band:
+     * "proven won, mate not yet in sight". A win probed at ply p scores
+     * VALUE_TB_WIN - p, so entering the won region sooner is worth more, the
+     * same gradient mate scores have. Everything at or beyond the band edge
+     * is ply-relative and needs the same TT adjustment as a mate score;
+     * everything below it - every heuristic evaluation - must stay out, which
+     * is what corrected_eval()'s clamp enforces. */
+    VALUE_TB_WIN             = VALUE_MATE_IN_MAX_PLY - 1,
+    VALUE_TB_WIN_IN_MAX_PLY  = VALUE_TB_WIN - MAX_PLY,
+    VALUE_TB_LOSS_IN_MAX_PLY = -VALUE_TB_WIN_IN_MAX_PLY
 };
 
 static inline Value mate_in(int ply) { return VALUE_MATE - ply; }

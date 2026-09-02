@@ -72,13 +72,17 @@ static inline uint16_t key_verifier(Key key) { return (uint16_t)(key >> 48); }
  * storing the absolute one makes the engine announce - and play for - mates
  * that are one transposition away from evaporating. Convert on the way in,
  * convert back on the way out.
+ *
+ * Tablebase scores (the band just below the mate band, see types.h) are
+ * ply-relative for the same reason and get the same conversion, which is why
+ * these tests run against the TB band edge rather than the mate one.
  */
 static Value value_to_tt(Value v, int ply) {
     if (v == VALUE_NONE)
         return VALUE_NONE;
-    if (v >= VALUE_MATE_IN_MAX_PLY)
+    if (v >= VALUE_TB_WIN_IN_MAX_PLY)
         return v + ply;
-    if (v <= VALUE_MATED_IN_MAX_PLY)
+    if (v <= VALUE_TB_LOSS_IN_MAX_PLY)
         return v - ply;
     return v;
 }
@@ -86,9 +90,9 @@ static Value value_to_tt(Value v, int ply) {
 Value tt_value_from_tt(Value v, int ply) {
     if (v == VALUE_NONE)
         return VALUE_NONE;
-    if (v >= VALUE_MATE_IN_MAX_PLY)
+    if (v >= VALUE_TB_WIN_IN_MAX_PLY)
         return v - ply;
-    if (v <= VALUE_MATED_IN_MAX_PLY)
+    if (v <= VALUE_TB_LOSS_IN_MAX_PLY)
         return v + ply;
     return v;
 }

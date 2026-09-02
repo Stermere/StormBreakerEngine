@@ -7,7 +7,50 @@ steps taken to check that the implementation is distinct from other engines.
 
 ## Direct reuse
 
-The only verbatim material currently known:
+### Syzygy tablebase probing — derived from Fathom
+
+[`src/syzygy.c`](src/syzygy.c) is StormBreaker's own Syzygy prober, but it is a
+**derivative work**, not an independent one. It was written by studying Jon
+Dart's [Fathom](https://github.com/jdart1/Fathom) at commit
+`c9c6fef0dddc05d2e242c183acf5833149ab676d`, itself derived from Ronald de Man's
+reference implementation. Copyright © 2013-2018 Ronald de Man, © 2015 basil00,
+© 2016-2025 Jon Dart, under the MIT licence, whose text is retained at
+[`LICENSE.fathom`](LICENSE.fathom). MIT is GPL-3.0 compatible, so the
+combined work remains distributable under StormBreaker's GPL-3.0.
+
+Calling it derived is not a formality. A file format is not something an
+implementation gets to choose: the constant index tables (`KKIdx`, `Triangle`,
+`Flap`, `PawnTwist`, `OffDiag`, `FlipDiag`, `Lower`, `Diag`), the material-key
+primes, and the shape of the index encoder and the re-pair decompressor could
+not be written differently and still read a Syzygy file. Those parts follow
+Fathom line for line in substance.
+
+What is StormBreaker's own is everything that touches a position. Fathom
+carries its own board representation, move generator and attack tables
+(`tbchess.c`, ~1,050 lines); this engine already has all three, so placement
+reads our bitboards directly, capture resolution uses our generator and our
+make/unmake on the caller's board, and no position is marshalled through a
+second representation on the way into a probe. Depth-to-mate support (~350
+lines, for `.rtbm` files no distribution ships) and the `TbRootMoves` helper
+API are gone, and the per-table `EncInfo` arrays are compacted accordingly.
+
+**Fathom was also the test oracle.** The two implementations were linked side
+by side and compared position by position across every material configuration —
+see docs/EXPERIMENTS.md E24 for the campaign and its result. Nothing about that
+verification survives in the shipped tree except its verdict, frozen as a
+checksum manifest that `make syzygy-test` re-checks without Fathom present.
+
+**On the no-new-dependencies rule.** The engine still links only libc and the
+platform threading API; the tablebase *files* are data, downloaded into
+gitignored `external/` and never redistributed. The reason this was worth
+writing rather than vendoring is the same reason it was worth verifying so
+heavily: the `.rtbw` format is re-pair-compressed with symbol tables and sparse
+block indices, and a decoder with a subtle bug does not crash — it returns a
+plausible result that the search believes and the data generator writes into
+every low-piece label.
+
+### Magic seeds
+
 `MagicSeeds` array in [`src/bitboard.c`](src/bitboard.c):
 
 ```c
@@ -129,8 +172,12 @@ tracker.
 | [OpenBench](https://github.com/AndyGrant/OpenBench) | distributed SPRT testing |
 | [Stockfish](https://stockfishchess.org/) | reference opponent and perft comparison |
 | Halogen, Berserk, Weiss, Clover, Ethereal | CCRL-rated gauntlet opponents |
+| [Fathom](https://github.com/jdart1/Fathom) | the Syzygy prober `src/syzygy.c` derives from it, and it was the oracle that verified it (see Direct reuse) |
+| [Syzygy tablebases](https://github.com/syzygy1/tb) | Ronald de Man's endgame tables; `make syzygy-fetch` pulls 3-4-5-man from the lichess.org mirror |
 
 The engine links against the C standard library and the platform threading API.
+The tablebase *files* are data, not a dependency: they are downloaded into
+gitignored `external/`, never redistributed, and the engine runs without them.
 The trainer uses PyTorch and NumPy. The repository's Python tools otherwise use
 the standard library.
 
