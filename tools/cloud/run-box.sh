@@ -53,6 +53,9 @@ log "tablebases:${TB_OPT:- none (endgames labelled from the search alone)}"
 # Every unit is verified on the box before it is uploaded. Relabelling a sample
 # from a cleared engine is the only check that catches a box whose build differs
 # from the rest of the fleet, and it is far cheaper here than after a download.
+# That check applies to search-labelled shards only - see the manifest test
+# below for why a game-labelled one cannot be relabelled at all, and note that
+# such a shard is left with the structural checks alone.
 verify_and_push() {
     _first="$1"
     _glob="$2"
@@ -76,12 +79,23 @@ verify_and_push() {
     _hash=$(sed -n 's/.*"hash_mb": *\([0-9][0-9]*\).*/\1/p' "$_man" | head -1)
     [ -n "$_nodes" ] && [ -n "$_hash" ] || die "$_man records no nodes/hash_mb"
 
-    log "verifying $_first at $_nodes nodes, $_hash MB"
+    # selfplay's label (E26) is the score the game's own search had already
+    # returned for the position - warm table, about 1.2 plies deeper - so a
+    # fresh search cannot reproduce it, and datagen refuses -relabel on such a
+    # shard rather than reporting a wall of mismatches. Read from the shard's
+    # own manifest rather than from which call site this is, so the two cannot
+    # drift: `label` shards say "search", `selfplay` says "game". Checks 1 and
+    # 2 - the 32-byte round-trip and .pol alignment - run either way.
+    _labels=$(sed -n 's/.*"labels": *"\([a-z]*\)".*/\1/p' "$_man" | head -1)
+    _relabel="-relabel 256"
+    [ "$_labels" != game ] || _relabel=""
+
+    log "verifying $_first at $_nodes nodes, $_hash MB${_relabel:+, relabelling 256}"
     # $TB_OPT unquoted: a built-up argument list, not one argument. Omitting it
     # against a shard labelled WITH tablebases mismatches every low-piece
-    # record, so this is not optional decoration.
+    # record, so this is not optional decoration. $_relabel likewise.
     # shellcheck disable=SC2086
-    "$DATAGEN" verify "$_first" -relabel 256 -nodes "$_nodes" -hash "$_hash" $TB_OPT
+    "$DATAGEN" verify "$_first" $_relabel -nodes "$_nodes" -hash "$_hash" $TB_OPT
 
     log "uploading $_glob"
     for _f in $_glob; do

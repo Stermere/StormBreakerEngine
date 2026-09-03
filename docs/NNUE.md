@@ -90,7 +90,6 @@ label positions that already exist.
 | Source | Where from | Why it is in the mix |
 |---|---|---|
 | Self-play game line | `datagen selfplay` | The distribution the engine actually plays into |
-| **Search-tree samples** | interior nodes of the same searches | The distribution the evaluation is actually *called on* — see below |
 | Human FENs | `external/training/human.epd`, 22.6M lines | Real positions, structurally unlike engine self-play, already on disk |
 | Strong-engine FENs | `external/training/ccrl_*.epd`, 7.2M + 45M lines | Positions from play far above our level, which self-play cannot reach |
 
@@ -105,81 +104,68 @@ net, and it is worth being pedantic about: a net trained on Stockfish's output
 is a derivative of Stockfish. A net trained on positions Stockfish happened to
 play, scored by us, is not.
 
-### Search-tree sampling, and why every sample gets a fresh search
+### The label is the game's own search
 
-The idea is to sample positions from inside the search tree rather than only
-from the game line. This is right, and for a better reason than diversity: **it
-is the correct training distribution.** The evaluation is called at the leaves
-of an alpha-beta tree, where one side has frequently just hung a piece, a
-capture sequence is half-finished, or a null move has just been passed. Those
-positions do not look like positions from a game line between two engines
-playing well. Training only on game-line positions trains the evaluation on a
-distribution it is never used on.
+A game-line position is searched once, by the game, and that search's root
+score is the label. It used to be searched twice — the game played the move,
+and then after the game every position was re-parsed from its own FEN and
+re-searched from a cleared engine, on the reasoning that a warm transposition
+table makes a label a function of the game that reached it rather than of the
+position.
 
-The tempting version of this is to also take the *scores* the search already
-computed at those nodes, for free. **Do not.** Almost every interior node in an
-alpha-beta tree returns a bound, not a score: a fail-low is an upper bound, a
-fail-high is a lower bound, and only PV nodes are exact. Worse, the bound is
-relative to a window inherited from the parent, so the error is not noise
-around the truth — it is a systematic, one-sided offset whose sign depends on
-where the node sat in its parent's move ordering. [TUNING.md](TUNING.md) argues
-that symmetric label noise is nearly free because a uniform attenuation is
-absorbed by `K`. That argument does not extend to asymmetric noise, and this
-noise is asymmetric by construction. Mixing exact labels with bounds also mixes
-labels of wildly different remaining depth, so the net learns the average of a
-depth-2 opinion and a depth-12 opinion.
+**That reasoning did not survive being measured.** `E26`: over 33,282
+positions, the re-search came back **+0.59 cp** from the game's own number —
+no bias to correct — while reaching **1.2 plies less depth**. The second search
+was paying double for the worse of the two estimates. It also cleared a 64 MB
+transposition table once per candidate, which is why removing it was worth
+**5.2×** rather than the 2× the search count alone suggests.
 
-So: **the tree is a position sampler, and every sampled position is re-searched
-from scratch at the same fixed node count as everything else.** Every record in
-the dataset then has an identical label definition, which is worth more than
-the searches the re-labelling costs.
+What the re-search did buy was reproducibility: a label that could be checked
+by running it again. That gate has moved rather than gone. A game is a function
+of `-seed` and its global ordinal, so **regenerating a shard with the same seed
+must produce the same bytes**, which `make datagen-test` asserts. It is a
+stronger check than the old one — it covers the filters, the writer and the
+ordering, not a sampled score — and it costs a rerun instead of doubling every
+run. `datagen label` still re-searches, because there is no game to take a
+score from, and `verify -relabel` still checks those shards. The manifest's
+`labels` field says which kind a shard holds, and `-relabel` refuses the other
+one by name rather than reporting a wall of mismatches.
 
-That does mean tree sampling is not free — a position costs a search, wherever
-it came from. The arithmetic says we can afford it comfortably:
+Two consequences worth stating:
 
-```
-bench on this machine        991,512 nps, single-threaded
-16 threads, own TT each      ~12M nps aggregate (memory-bound, not 16x)
-10,000 nodes per label       ~1,200 labels/second
-                             ~4.3M/hour, ~100M/day
-```
+- **The filters run before anything is stored.** The quiet filter needs a best
+  move, and the game's search has already produced one — so a position that is
+  about to be dropped is never paid for a second time. It decides the same way
+  the old post-hoc filter did on 95.1% of positions, and where it differs it is
+  deciding on a deeper search.
+- **A position's label can depend on its repetition history**, which the record
+  does not carry. Two occurrences of one FEN with different histories would get
+  different labels; the dedup drops the second one, so this shows up as *which*
+  of them survives rather than as contradictory supervision.
 
-100M positions is a comfortable first dataset, and it arrives in a day. There
-is no throughput pressure here at all, which is exactly why the budget should
-go on label quality rather than on squeezing free labels out of a tree.
+### What a game actually yields, measured
 
-The sampler itself:
+The sketch that used to sit here divided an aggregate nps by the node count and
+got ~100M records a day. That was wrong when every position cost two searches
+and a table clear; with one search it is about right.
 
-- **Reservoir-sample** a small fixed number (1–2) of interior nodes per played
-  move, over the whole tree. Not "every node", not "the first N": an alpha-beta
-  tree is overwhelmingly leaves, so any sampler that does not stratify returns
-  almost nothing but quiescence positions.
-- **Require a minimum remaining depth** (start at 4) so samples come from
-  interior nodes rather than the leaf shell.
-- **Never sample inside quiescence**, and never sample a position in check.
-- **Deduplicate by Zobrist key** across the whole shard. Siblings in a subtree
-  differ by one piece and are near-duplicates; without dedup a large fraction
-  of the dataset is the same position wearing a hat.
-- Re-search sampled positions **after the game**, with the TT cleared, so a
-  label does not depend on what the game search happened to leave in the table.
-  Reproducibility here is the same property `search_clear()` protects.
+Measured on this machine, `-nodes 10000 -threads 14 -book ccrl4040_ply20.epd
+-opening 2-3 -syzygy external/syzygy/3-4-5`, games played to their natural end:
 
-The tree also offers move-ordering labels for free — which move caused each
-cutoff. The policy head that would have consumed them was Task 5b and has been
-**cancelled**; the `.pol` sidecar machinery in datagen stays (see the record
-format below), but new generation runs may pass `-nopolicy` rather than paying
-4 bytes per record for a consumer that no longer exists.
+| | |
+|---|---|
+| **records per game** | **92** |
+| games / hour | 47,400 |
+| records / hour | 4.36M |
+| records / day | **105M** |
+| duplicates dropped by `shuffle` | 0.24% |
 
-### The mixture is an experiment, not a decision
+So 100M records is about a day, from 1.09M games. Scales with cores; this is a
+14-worker figure.
 
-How much of the dataset should be self-play line, tree samples, human FENs and
-CCRL FENs is an empirical question with a surprising answer more often than
-not. Generate the four sources into separate shards, train nets on different
-mixtures at a *fixed total position count*, and play them against each other.
-Record the result in [EXPERIMENTS.md](EXPERIMENTS.md) like anything else.
-
-Starting mixture, to be beaten: 50% self-play line, 25% tree samples, 15%
-human, 10% CCRL.
+Games are long now that nothing adjudicates: mean fullmove 48.7, so a typical
+game runs past move 90 from a ply-20 book start. That length is where the 92
+comes from, and it is also why the endgame share is high.
 
 ### Self-play settings
 
@@ -376,7 +362,7 @@ make syzygy-test       # they probe known endgames to their known results
 ```
 
 ```
-datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2-3 -tree 0 -syzygy external/syzygy/3-4-5 -resume
+datagen selfplay -o external/data/shard%02d.cnn -games N -nodes 10000 -threads 16 -book external/books/<book>.epd -opening 2-3 -syzygy external/syzygy/3-4-5 -resume
 datagen label <in.epd>... -o out.cnn -source human -nodes 10000 -resume -syzygy external/syzygy/3-4-5
 datagen shuffle <in.cnn>... -o train.cnn -seed 1          # dedups; -nodedup not to
 datagen verify <shard.cnn>... -relabel 500 -syzygy external/syzygy/3-4-5
@@ -417,32 +403,6 @@ complete; keep `-threads` the same, since workers split the input by line.
 **`datagen <subcommand> -help` is the option reference.** Every flag, with its
 default, in the same order the parser reads them; the list below only covers
 the parts that are surprising.
-
-### Tree sampling is off by default
-
-`selfplay` does not sample the search tree unless asked, which is worth stating
-plainly because the flag reads like a knob on something already running:
-
-| Flag | Default | What it does |
-|---|---|---|
-| `-tree N` | 0 | interior nodes reservoir-sampled per played move; `-tree 0` is a game-line-only shard |
-| `-treedepth N` | 4 | remaining depth a node must still have to be eligible. Lower reaches into the leaf shell, which is overwhelmingly quiescence positions — the thing the stratification exists to avoid |
-
-A tree sample is a full record: it is re-searched, deduplicated and written
-exactly like a game-line position, and it is tagged `tree` so a trainer can
-re-weight the mixture without regenerating anything. `datagen stats` prints the
-split, and it is the fastest way to see what a `-tree` setting actually did:
-
-```
--tree 0    selfplay 100.0%
--tree 1    selfplay  42.5%   tree 57.5%
--tree 2    selfplay  17.8%   tree 82.2%
-```
-
-Those shares are not the sample count divided by the move count: the quiet
-filter discards a fraction of the game-line positions and none of the tree
-ones, so the tree share always runs higher than `-tree` alone suggests. Set the
-mixture by generating the sources into separate shards and combining them.
 
 ### Openings: a book, and a deliberately tiny perturbation
 
@@ -520,29 +480,15 @@ contamination the label definition exists to prevent. POSIX forks; Windows
 re-launches its own command line with `--worker N`. Each worker writes its own
 shard, and shards concatenate, so nothing downstream notices.
 
-**Every record is re-searched, not only the tree samples.** The argument for
-re-searching a sampled position is that its label must not depend on what the
-game search left in the table — and that applies just as much to a position on
-the game line, whose search inherited a table warmed by every move before it.
-So the game is played with a warm table (that is play, and it should be
-strong), candidates are collected, and once the result is known **every one of
-them is re-parsed from its own FEN and re-searched from a cleared engine.**
-Re-parsing matters as much as clearing: a `Position` carried out of a game
-brings its repetition history with it, and `board_is_draw` would then score it
-differently from the same FEN standing alone. That is what `verify -relabel`
-checks, and it is the only reason a self-play record and a CCRL record can sit
-in the same batch.
+**Nothing is re-searched, and nothing samples the search tree.** Both were
+built, and both were removed once measured — see "The label is the game's own
+search" above and E26. The tree sampler took a `-DDATAGEN` node visitor in
+`negamax`; that hook is gone too, so `datagen` now compiles the same sources
+the engine does. The `tree` source tag stays in the record format, because
+removing a tag value would renumber the others and shards exist that use them.
 
-**The tree sampler is a compile-time hook.** `-DDATAGEN` switches on a node
-visitor at `negamax`'s normal exit, where the position is restored and the
-move that cut off is known. The shipped engine carries neither the hook nor the
-branch that tests it, and `make bench` gives the same node count either way.
-
-**The quiet filter applies to the game line only.** Filtering tree samples for
-quietness would defeat the entire purpose of taking them — they are wanted
-*because* they are mid-tactic. Promotions are excluded alongside captures,
-which the sketch above did not say: a promotion moves as much material as a
-capture does.
+**Promotions are excluded alongside captures** by the quiet filter, which the
+sketch above did not say: a promotion moves as much material as a capture does.
 
 **The start position became an input.** The sketch listed four position sources
 and started every game from the initial position with random plies for
@@ -565,7 +511,6 @@ result column carries an `unknown` entry that this one had no way to produce.
 | score histogram | a clean bell around zero, no spike at 0 |
 | result, side to move | 25.5% loss / 47.0% draw / 27.4% win |
 | side to move | 50.6% white |
-| source mix | 42.5% game line, 57.5% tree samples |
 | **pieces on the board** | **22.1% of records have seven or fewer** |
 
 The last row is the one that aged into a decision. Even with adjudication on,
@@ -702,8 +647,6 @@ average of prices that differ by a lot:
 - the search score's *systematic* errors — fortresses, long-term compensation,
   an ending it cannot convert — are exactly what the result term exists to
   correct, and they are concentrated in the endgame;
-- a **tree sample's** game result belongs to a game that never went through
-  that position — the only outright mislabel here;
 - a **`human` or `engine` record's** result is real, but it is someone else's
   continuation. A different question, not a worse answer.
 
@@ -728,15 +671,13 @@ lam = 1 wherever the game result is unknown                       (structural)
 | `--lambda-start` / `--lambda-end` | the base, annealed per epoch. Unchanged |
 | `--lambda-progress DELTA` | shift lambda by `DELTA` at the *end* of a game, tapering to zero 112+ plies away. Negative trusts the result more where it is nearly certain. Reads the game-progress nibble |
 | `--lambda-pieces DELTA` | shift lambda by `DELTA` at bare kings, tapering to zero at a full board |
-| `--lambda-source NAME=V` | override lambda outright for a source tag. **Defaults to `tree=1.0`** — a mislabel is not worth mixing in. Passing this replaces the default |
+| `--lambda-source NAME=V` | override lambda outright for a source tag, e.g. `human=1.0` |
 | `--score-clip CP` | clamp `\|score\|` before the sigmoid |
 | `--source-weight NAME=W` | per-record loss weight by source: set the mixture without regenerating |
 
-**Every one of them defaults to no effect except `--lambda-source`**, which
-defaults to `tree=1.0` — and that is itself a no-op on any shard generated with
-`-tree 0`, which is datagen's default. So a run that names none computes what a
-single-lambda run computed, and nets trained before these flags existed stay
-comparable unless they had tree samples in them. `train.py` prints the lambda the schedule asked for *and* the
+**Every one of them defaults to no effect**, so a run that names none computes
+exactly what a single-lambda run computed, and nets trained before they existed
+stay comparable. `train.py` prints the lambda the schedule asked for *and* the
 one the data actually got, per epoch; if the second is not where it was meant
 to be, that is a flag typo nothing else would report.
 

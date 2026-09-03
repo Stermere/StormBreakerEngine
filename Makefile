@@ -416,10 +416,10 @@ tuner: $(TUNER_SOURCES) $(HEADERS)
 # The NNUE training-data generator (tools/datagen.c). Links the engine exactly
 # as the tuner does, so a label is produced by the search in the working tree.
 #
-# -DDATAGEN switches on the node visitor in search.c that the tree sampler
-# needs. It is a compile-time hook on purpose: the shipped engine carries
-# neither the hook nor the branch that tests it, so the bench node count is
-# identical either way. Never build the engine itself with it.
+# It carries no extra defines. It used to build with -DDATAGEN, which switched
+# on a node visitor in search.c for the tree sampler; both went when self-play
+# stopped sampling the search tree (E26), so datagen now compiles the same
+# sources the engine does.
 #
 # GIT_COMMIT is stamped into every shard's .json sidecar. A dataset that cannot
 # be attributed to a specific engine build cannot be compared to another one.
@@ -434,7 +434,7 @@ endif
 # the pipeline bootstraps, since net n+1 trains on labels from searches that
 # used net n. `make datagen EVAL=classical` gets the pre-network labeller back.
 datagen: $(DATAGEN_SOURCES) $(HEADERS) $(EVALDEP) $(FLAGSTAMP)
-	$(CC) $(CFLAGS) -DDATAGEN -DDATAGEN_COMMIT='"$(GIT_COMMIT)"' -Isrc \
+	$(CC) $(CFLAGS) -DDATAGEN_COMMIT='"$(GIT_COMMIT)"' -Isrc \
 	    $(DATAGEN_SOURCES) -o datagen$(SUFFIX) $(LDFLAGS)
 	@echo "built datagen$(SUFFIX) - see docs/NNUE.md"
 
@@ -452,9 +452,37 @@ datagen-test: datagen
 	    -games 6 -nodes 2000 -threads 2 -seed 7 -quiet
 	./datagen$(SUFFIX) shuffle $(DATAGEN_TEST_DIR)/shard00.cnn \
 	    $(DATAGEN_TEST_DIR)/shard01.cnn -o $(DATAGEN_TEST_DIR)/all.cnn -seed 7 -quiet
-	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/all.cnn -relabel 32 -nodes 2000
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/all.cnn
 	./datagen$(SUFFIX) stats $(DATAGEN_TEST_DIR)/all.cnn | head -12
-	@echo "PASS: datagen round-trips and its labels reproduce"
+	@echo "PASS: datagen round-trips"
+
+# A self-play label is the score the game's own search returned, so it does not
+# reproduce from a cleared engine and `verify -relabel` refuses the shard. What
+# replaces that gate is regeneration: a game is a function of -seed and its
+# global ordinal, so the same command has to produce the same bytes. This
+# checks the whole pipeline the old relabel check did - the search, the filters
+# and the writer - against a stronger requirement than a sampled score.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/again%02d.cnn \
+	    -games 6 -nodes 2000 -threads 2 -seed 7 -quiet
+	@for w in 00 01; do \
+	    a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/shard$$w.cnn -n 100000); \
+	    b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/again$$w.cnn -n 100000); \
+	    [ "$$a" = "$$b" ] \
+	        || { echo "FAIL: seed 7 did not reproduce shard$$w"; exit 1; }; \
+	    done
+	@echo "PASS: a seed reproduces its shard byte for byte"
+
+# And that -relabel still guards the shards it CAN check - the ones `label`
+# writes, where the score really is a fixed-node search from a cleared engine.
+	@printf '%s\n' \
+	    'r1bq1rk1/pp2ppbp/2np1np1/8/2PNP3/2N1B3/PP2BPPP/R2QK2R w KQ - 0 9 [1.0]' \
+	    '8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1 [0.5]' \
+	    'r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1 [0.0]' \
+	    > $(DATAGEN_TEST_DIR)/label.epd
+	./datagen$(SUFFIX) label $(DATAGEN_TEST_DIR)/label.epd \
+	    -o $(DATAGEN_TEST_DIR)/label.cnn -source human -nodes 2000 -quiet
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/label.cnn -relabel 8
+	@echo "PASS: label's own labels still reproduce"
 
 # And that -book is actually where the games start. One book entry played with
 # -opening 0 makes the first record of the shard the book position itself,
@@ -465,7 +493,7 @@ datagen-test: datagen
 	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/book.cnn \
 	    -book $(DATAGEN_TEST_DIR)/book.epd -opening 0 -noquiet \
 	    -games 1 -nodes 2000 -seed 9 -quiet
-	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/book.cnn -relabel 16 -nodes 2000
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/book.cnn
 	@./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/book.cnn -n 1 \
 	    | grep -q '^r1bq1rk1/pp2ppbp/2np1np1/8/2PNP3/2N1B3/PP2BPPP/R2QK2R w KQ - 0 9;' \
 	    || { echo 'FAIL: -book did not supply the start position'; exit 1; }

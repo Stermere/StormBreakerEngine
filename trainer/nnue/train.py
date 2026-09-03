@@ -62,12 +62,6 @@ from .model import (DEFAULT_HIDDEN, NNUE, TargetPolicy, arch_from_checkpoint, bl
 # units the linear evaluation was fitted against, so the two are comparable.
 DEFAULT_SIGMOID_K = 400.0
 
-# A tree sample carries the result of the game whose search found it, and that
-# game never went through the position - the sampler reaches into lines nobody
-# played. So it trains on its search score alone unless told otherwise. It is a
-# no-op on any shard generated with `-tree 0`, which is datagen's default.
-DEFAULT_LAMBDA_SOURCE = "tree=1.0"
-
 # Optimiser, scheduler and RNG live beside the checkpoint rather than in it.
 # They are twice the size of the model and no downstream tool wants them: the
 # exporter reads {out}.pt, and a 300 MB .pt that is mostly Adam moments would
@@ -488,14 +482,11 @@ def parse_args(argv=None):
                              "score's SYSTEMATIC errors - fortresses, compensation, an "
                              "ending it cannot convert - are what the result term corrects, "
                              "and they live in the endgame")
-    parser.add_argument("--lambda-source", default=DEFAULT_LAMBDA_SOURCE,
-                        metavar="NAME=V,...",
-                        help=f"override lambda outright for a source tag. Default "
-                             f"{DEFAULT_LAMBDA_SOURCE!r}: a tree sample's game result "
-                             f"belongs to a game that never went through that position, so "
-                             f"it trains on its search score alone. This REPLACES the "
-                             f"default, so keep tree in the list unless you mean to drop "
-                             f"it; '' turns it off entirely")
+    parser.add_argument("--lambda-source", default=None, metavar="NAME=V,...",
+                        help="override lambda outright for a source tag, e.g. "
+                             "'human=1.0'. A human or engine record's result is real, but "
+                             "it is someone else's continuation - whether that is worth "
+                             "the same as our own is a measurement, not a discount")
     parser.add_argument("--lambda-min", type=float, default=0.0,
                         help="floor for the deltas above; overrides are not clipped")
     parser.add_argument("--lambda-max", type=float, default=1.0,

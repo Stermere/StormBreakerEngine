@@ -366,6 +366,14 @@ function Start-Provision([int]$i, [string]$ip) {
     $proc = Start-Process -FilePath 'ssh' -ArgumentList $line -NoNewWindow -PassThru `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
 
+    # Reading .Handle while the child is alive is what makes .ExitCode readable
+    # after it dies. Start-Process -PassThru hands back a Process object that
+    # does not otherwise retain the handle, and once the child is gone ExitCode
+    # reads back $null - which is never -eq 0, so every box that finished, a
+    # clean one included, was reported as "provisioning failed (ssh exit )"
+    # with an empty code. WaitForExit() does not help; only the handle does.
+    $null = $proc.Handle
+
     return [pscustomobject]@{ Index = $i; Ip = $ip; Proc = $proc; Log = $log }
 }
 

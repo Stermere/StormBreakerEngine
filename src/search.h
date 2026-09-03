@@ -97,48 +97,6 @@ uint64_t search_nodes(void);
  * The search polls this in its inner loop. */
 bool search_stopped(void);
 
-#ifdef DATAGEN
-/* --------------------------------------------------- data-generation hook -- */
-/*
- * Compiled in only by `make datagen`, which defines DATAGEN. The shipped
- * engine gets neither the hook nor the branch that tests it.
- *
- * docs/NNUE.md wants training positions sampled from INSIDE the search tree,
- * because the leaves of an alpha-beta tree are the distribution the evaluation
- * is actually called on and a game line is not. Nothing outside the search can
- * see those nodes, so the sampler has to be invited in - but the innermost
- * loop of the engine is not the place to pay for a feature no game ever uses,
- * hence the guard.
- *
- * The visitor runs at a node's EXIT, with every move already unmade and `pos`
- * restored to that node's position. That is the one moment where the position
- * and the move that cut off are both in hand.
- *
- * It must not mutate `pos` or touch any search state. A visitor that does
- * changes the labels, and datagen's whole contract is that a label is a
- * function of the position alone.
- */
-typedef enum {
-    NODE_FAIL_LOW, /* nothing reached alpha; `best` is a hint, not a label */
-    NODE_EXACT,    /* a move raised alpha without failing high: the PV move */
-    NODE_FAIL_HIGH /* `best` is the move that caused the beta cutoff */
-} SearchNodeKind;
-
-typedef struct {
-    Depth depth; /* remaining depth; quiescence never visits, so this is >= 1 */
-    int ply;
-    bool inCheck;
-    Move best;
-    SearchNodeKind kind;
-} SearchNodeInfo;
-
-typedef void (*SearchNodeVisitor)(const Position *pos, const SearchNodeInfo *info, void *ctx);
-
-/* Installs the visitor, or removes it when `fn` is NULL. Not thread-safe:
- * set it before the search starts. */
-void search_set_node_visitor(SearchNodeVisitor fn, void *ctx);
-#endif /* DATAGEN */
-
 #ifdef TUNE_SEARCH
 /*
  * The search's tunable pruning margins, exposed so uci.c can advertise them as

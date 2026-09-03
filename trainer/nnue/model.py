@@ -371,15 +371,12 @@ class TargetPolicy:
       * the search score's SYSTEMATIC errors - fortresses, compensation, an
         endgame it cannot convert - are what the result term exists to correct,
         and they are concentrated in the endgame;
-      * a tree sample's game result belongs to a game that never went through
-        that position - the only outright mislabel in this list;
       * a `human` or `engine` record's result is real, but it is someone
         else's continuation. A different question, not a worse answer.
 
-    Each of those is one dial here, and every dial on this class defaults to
-    zero, so a policy built with no arguments computes exactly what a single
-    lambda computed. (train.py's `--lambda-source` defaults to `tree=1.0`; the
-    default lives on the flag rather than here, so this class stays neutral.)
+    Each of those is one dial here, and every dial defaults to zero, so a
+    policy built with no arguments computes exactly what a single lambda
+    computed.
     The composition is deliberately additive and clipped rather than clever:
 
         lam = clip(base + progress_delta * closeness + pieces_delta * endgame,

@@ -69,6 +69,7 @@ $DataDir      = Ensure-Dir (Join-Path $ExternalDir 'data')
 $GenDir       = Ensure-Dir (Join-Path $DataDir $Gen)
 $MergeDir     = Ensure-Dir (Join-Path $GenDir 'merged')
 $ShardsRemote = "$HubDir/$Gen/shards"
+$DoneRemote   = "$HubDir/$Gen/done"
 
 $JobEval  = if ($cfg.ContainsKey('EVAL') -and $cfg['EVAL']) { $cfg['EVAL'] } else { 'nnue' }
 $JobArch  = if ($cfg.ContainsKey('ARCH') -and $cfg['ARCH']) { $cfg['ARCH'] } else { 'popcnt' }
@@ -182,6 +183,39 @@ function Get-RemoteShards {
     }
     if ($files.Count -eq 0) { throw "no .cnn/.pol files in ${HubUser}:$ShardsRemote" }
     return $files
+}
+
+# A unit is COMPLETE only once its done-marker exists. hub_put uploads with
+# rsync --partial --inplace, so a shard still being written sits at its FINAL
+# name with a partial size - and the download's length checks agree with that
+# size, having read it from the same listing. run-box.sh writes
+# $GEN/done/<unit>.done only after every file of a unit is up, so the marker is
+# the one thing separating "finished" from "in flight". Without consulting it,
+# a run against a live fleet quietly merges a fraction of the generation.
+function Get-DoneUnits {
+    $listing = & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser "ls $DoneRemote"
+    if ($LASTEXITCODE -ne 0) {
+        # A generation older than the markers. Refusing would be worse than
+        # merging: that data is genuinely finished, it just never said so.
+        Write-Warn2 "no $DoneRemote on the hub; merging every shard present"
+        return $null
+    }
+    $done = @{}
+    foreach ($line in $listing) {
+        $t = "$line".Trim()
+        if ($t -match '\.done$') { $done[($t -replace '\.done$', '')] = $true }
+    }
+    return $done
+}
+
+# Drops every file whose unit has no marker. The unit name uses the same
+# expression Group-ShardsIntoUnits does and matches the marker exactly:
+# run-box.sh builds the shard names and the marker from one stem.
+function Select-CompleteUnits([object[]]$Files, $Done) {
+    if ($null -eq $Done) { return $Files }
+    return @($Files | Where-Object {
+        $Done.ContainsKey(($_.Name -replace '_\d+\.(cnn|pol)$', ''))
+    })
 }
 
 # The unit - one labelled chunk or one selfplay batch - is the download's work
@@ -312,8 +346,28 @@ function Invoke-ParallelFetch {
 
 Write-Section "Aggregating $Gen"
 
+# Read once; both the download and the local merge filter on it.
+$DoneUnits = Get-DoneUnits
+if ($null -ne $DoneUnits) {
+    $expected = 0
+    if ($cfg.ContainsKey('JOB') -and $cfg['JOB'] -eq 'selfplay') {
+        if ($cfg.ContainsKey('SELFPLAY_BATCHES')) { $expected = [int]$cfg['SELFPLAY_BATCHES'] }
+    } elseif ($cfg.ContainsKey('CHUNKS')) {
+        $expected = [int]$cfg['CHUNKS']
+    }
+    $of = if ($expected -gt 0) { " of $expected" } else { '' }
+    Write-Host "  $($DoneUnits.Count) completed unit(s)$of on the hub"
+    if ($DoneUnits.Count -eq 0) {
+        throw "no completed units in $DoneRemote - the fleet has not finished one yet"
+    }
+    if ($expected -gt 0 -and $DoneUnits.Count -lt $expected) {
+        Write-Warn2 ("merging a PARTIAL generation: {0} of {1} units. The rest are still " +
+                     "in flight and are skipped, not truncated." -f $DoneUnits.Count, $expected)
+    }
+}
+
 if (-not $SkipDownload) {
-    $remote = @(Get-RemoteShards)
+    $remote = @(Select-CompleteUnits (Get-RemoteShards) $DoneUnits)
     $units  = @(Group-ShardsIntoUnits $remote $GenDir)
     $todo   = @($units | Where-Object { $_.Need })
     $have   = $units.Count - $todo.Count
@@ -358,6 +412,9 @@ if (-not $SkipDownload) {
 }
 
 $shards = @(Get-ChildItem -Path $GenDir -Filter '*.cnn' -File | Sort-Object Name)
+# -SkipDownload arrives here with whatever an earlier run left on disk, which
+# can include a unit that was in flight at the time. Filter locally as well.
+$shards = @(Select-CompleteUnits $shards $DoneUnits)
 if ($shards.Count -eq 0) { throw "no shards in $GenDir" }
 Write-Ok "$($shards.Count) shards on disk"
 

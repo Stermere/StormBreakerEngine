@@ -197,16 +197,6 @@ static int16_t PawnCorrHist[COLOR_NB][CORRHIST_SIZE];
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-#ifdef DATAGEN
-static SearchNodeVisitor NodeVisitor;
-static void *NodeVisitorCtx;
-
-void search_set_node_visitor(SearchNodeVisitor fn, void *ctx) {
-    NodeVisitor    = fn;
-    NodeVisitorCtx = ctx;
-}
-#endif
-
 /* Nodes between clock checks. Fine enough that a search cannot overrun its
  * budget by more than a millisecond or two, coarse enough that the clock read
  * does not show up in a profile. Must be a power of two. */
@@ -2051,19 +2041,6 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             !(bound == BOUND_UPPER && best >= staticEval))
             corrhist_update(pos, best, staticEval, depth);
     }
-
-#ifdef DATAGEN
-    /* A singular verification is skipped on purpose: its move list was missing
-     * a move, so neither the position's value nor its best move is a fact
-     * about the position, and a sampler must not learn from one. */
-    if (NodeVisitor && !isExcluded) {
-        const SearchNodeInfo info = {depth, ply, inCheck, bestMove,
-                                     best >= beta  ? NODE_FAIL_HIGH
-                                     : raisedAlpha ? NODE_EXACT
-                                                   : NODE_FAIL_LOW};
-        NodeVisitor(pos, &info, NodeVisitorCtx);
-    }
-#endif
 
     return best;
 }

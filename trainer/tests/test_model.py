@@ -691,19 +691,19 @@ def test_source_weights_reach_the_loss():
     assert lopsided == pytest.approx(float(only_first))
 
 
-def test_the_tree_default_is_only_a_default_of_the_flag():
-    """TargetPolicy itself stays neutral; train.py's flag carries the default.
+def test_source_overrides_come_only_from_the_flag():
+    """No dial is hidden inside TargetPolicy.
 
     Worth pinning: the class is what every other caller builds, and a default
-    hidden inside it would apply to nets exported, sanity-checked or re-scored
-    by tools that never parsed a command line.
+    living in it would apply to nets exported, sanity-checked or re-scored by
+    tools that never parsed a command line.
     """
-    from nnue.train import DEFAULT_LAMBDA_SOURCE, parse_source_map
+    from nnue.train import parse_source_map
 
-    batch = policy_batch([1], source=1)
+    batch = policy_batch([1], source=2)  # human
     assert TargetPolicy().lambdas(batch, 0.9)[0] == pytest.approx(0.9)
 
-    parsed = parse_source_map(DEFAULT_LAMBDA_SOURCE, "--lambda-source")
+    parsed = parse_source_map("human=1.0", "--lambda-source")
     assert TargetPolicy(source_lambda=parsed).lambdas(batch, 0.9)[0] == pytest.approx(1.0)
     # And it leaves every other source where it was.
     assert TargetPolicy(source_lambda=parsed).lambdas(

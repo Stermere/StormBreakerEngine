@@ -39,11 +39,9 @@ cd trainer
 
 ```powershell
 # 1. generate. One process per worker; each writes its own shard.
-#    Tree sampling is OFF by default: `-tree 1` makes roughly half the records
-#    interior search nodes rather than game-line positions, `-tree 2` more.
-#    -resume checkpoints every 30s at a game boundary and picks a killed run
-#    back up - a generation run is days, and it WILL be interrupted.
-#    See `datagen selfplay -help`.
+#    The label is the score the game's own search gave the position, so a
+#    position costs one search and not two. -resume checkpoints every 30s at a
+#    game boundary and picks a killed run back up. See `datagen selfplay -help`.
 .\datagen.exe selfplay -o external\data\shard%02d.cnn -games 20000 -nodes 100000 -threads 14 -resume
 
 # 2. label games that already exist. `tuner extract` turns PGNs into quiet
@@ -56,10 +54,11 @@ cd trainer
 .\datagen.exe label external\training\human.epd -o external\data\human.cnn `
     -source human -nodes 100000 -threads 14 -resume
 
-# 3. prove the data before training on it. -relabel re-searches from scratch,
-#    so it needs the SAME -nodes the shard was written with - every record
-#    looks wrong otherwise. The shard's .json says which.
-.\datagen.exe verify external\data\shard00.cnn -relabel 500 -nodes 100000
+# 3. prove the data before training on it. -relabel applies to `label` shards,
+#    whose scores really are a fresh fixed-node search; a self-play shard is
+#    checked by regenerating it with the same -seed instead, and verify refuses
+#    -relabel on one by name. The shard's .json `labels` field says which.
+.\datagen.exe verify external\data\shard00.cnn
 .\datagen.exe stats  external\data\shard00.cnn
 
 # 4. shuffle on disk, across every shard of every source. Not optional - see
@@ -99,8 +98,8 @@ make nnue-info          # which net the binary is actually carrying, by hash
 after every epoch.
 
 `datagen <subcommand> -help` lists every option with its default — the
-adjudication thresholds, the tree-sampling knobs, the filters and the dedup
-table size are all there, and none of them are in the one-line usage.
+opening knobs, the filters and the dedup table size are all there, and none of
+them are in the one-line usage.
 
 **The shuffle is not optional.** Positions from one game are correlated, and a
 batch drawn from one region of an unshuffled file is a batch of near-duplicates.
@@ -139,9 +138,8 @@ Two flags matter more than the rest:
 
 - **`-source`** — one of `selfplay tree human engine book other`. It is stored
   per record, and it is what lets `--sources` train a run on part of the
-  mixture (`--sources 0 1` is self-play line plus tree samples) without
-  regenerating anything. It defaults to `other`, which tells a later run
-  nothing; set it.
+  mixture (`--sources 0 2` is self-play plus human) without regenerating
+  anything. It defaults to `other`, which tells a later run nothing; set it.
 - **`-nodes`** — must match what the other shards were labelled at. A
   self-play position and a human one mean the same thing only if they were
   labelled the same way, which is why the label is a fixed-node search from a
@@ -317,9 +315,8 @@ not the same for every record**. A result twenty moves away is nearly a coin
 flip about the position in front of it; three plies away it is the truth. The
 search score's *systematic* errors — fortresses, compensation, an ending it
 cannot convert — are what the result term exists to correct, and they live in
-the endgame. A tree sample's game result belongs to a game that never went
-through it — the one outright mislabel. A `human` or `engine` record's result
-is real, but it is someone else's continuation.
+the endgame. A `human` or `engine` record's result is real, but it is someone
+else's continuation.
 
 One number for all of that pays the average of prices that differ by a lot. So
 the base lambda above is a starting point that per-record dials move:
@@ -328,17 +325,16 @@ the base lambda above is a starting point that per-record dials move:
 |---|---|---|
 | `--lambda-progress DELTA` | shift lambda by `DELTA` at the end of a game, tapering to zero 112+ plies away | `-0.2` |
 | `--lambda-pieces DELTA` | shift lambda by `DELTA` at bare kings, tapering to zero at a full board | `-0.1` |
-| `--lambda-source NAME=V` | override lambda outright for a source tag | `tree=1.0` (the default) |
+| `--lambda-source NAME=V` | override lambda outright for a source tag | `human=1.0` |
 | `--lambda-min` / `--lambda-max` | bounds the deltas are clipped to | |
 | `--score-clip CP` | clamp the label before the sigmoid | `3000` |
-| `--source-weight NAME=W` | per-record loss weight by source | `tree=0.5` |
+| `--source-weight NAME=W` | per-record loss weight by source | `human=0.5` |
 
 They compose additively on top of the epoch anneal and are then clipped; a
 source override replaces the result; an unknown game result is always
-`lambda = 1`, whatever the dials say. **Every dial defaults to no effect except
-`--lambda-source`**, which defaults to `tree=1.0` — and that is a no-op on any
-shard made with `-tree 0`, datagen's default. Passing `--lambda-source`
-replaces that default rather than adding to it; `''` turns it off.
+`lambda = 1`, whatever the dials say. **Every dial defaults to no effect**, so
+a run that names none is bit-for-bit the run it would have been before they
+existed.
 
 `--lambda-progress` reads the record's game-progress nibble, which
 `datagen selfplay` writes and `datagen label` cannot (an EPD line carries a
@@ -369,7 +365,7 @@ typo, and nothing else in the run would report it.
 | Flag | Why |
 |---|---|
 | `--limit-batches 20` | smoke-test the whole loop in seconds |
-| `--sources 0 1` | train on self-play line + tree samples only |
+| `--sources 0 2` | train on self-play + human only |
 | `--workers 6` | four to six saturates the loader; more does nothing |
 | `--batch-size 32768` | bigger batches keep the 3070 busier — worth ~7% |
 | `--hidden 512` | narrower and faster; what a small dataset wants |
@@ -381,9 +377,9 @@ typo, and nothing else in the run would report it.
 | `--resume` | continue an interrupted run from its last epoch |
 | `--chunk-records 0` | force memmap slices at any dataset size |
 | `--lambda-progress -0.2` | trust the game result more as the game's end approaches |
-| `--lambda-source tree=1.0` | train a source on its search score alone, without dropping it (default) |
+| `--lambda-source human=1.0` | train a source on its search score alone, without dropping it |
 | `--score-clip 3000` | stop mate and tablebase labels asking for infinite confidence |
-| `--source-weight tree=0.5` | set the mixture without regenerating |
+| `--source-weight human=0.5` | set the mixture without regenerating |
 
 Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
 At `--hidden 1024 --workers 6` that is about **390k positions/s**.

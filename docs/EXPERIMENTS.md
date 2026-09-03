@@ -1794,7 +1794,7 @@ at unmeasured strength.
 
 ---
 
-### E26 — gen-004 is ten copies of itself, and the gen-5 datagen hardening
+### E26 — gen-5 datagen hardening
 
 **Not an SPRT.** This is a measurement of the datasets on disk, made while
 preparing the gen-5 generation run, plus the changes it motivated. It is here
@@ -1865,6 +1865,61 @@ ten times the weight of a gen-5 one.
 it is worth: a per-record lambda keyed on game progress, phase and source
 tag, a score clip, and per-source loss weights. Every one defaults to no
 effect, so this changes no existing run. See [NNUE.md](NNUE.md), Task 2.
+
+**Yield, measured while sizing the run.** `-nodes 10000 -threads 14`, ply-20
+CCRL book, `-opening 2-3`, 3-4-5 tablebases, games played out: **92 records per
+game** over 700 games, 4.36M records per hour, so 100M records is about a day
+from 1.09M games. The shuffle dropped 0.24% of that run as duplicates, against
+90.43% of `gen-004`.
+
+**What the second search per position buys, measured.** Every game-line
+position is searched twice — once by the game, with a warm table, and once from
+a cleared engine to produce the label — and that is half the cost of a run.
+`selfplay -warmdiff` reports the difference. Over 33,282 positions, 280 games,
+`-nodes 10000`:
+
+| | |
+|---|---|
+| cold − warm, mean | **+0.59 cp** |
+| cold − warm, mean absolute / RMS | 74.3 / 272.7 cp (median ~25) |
+| depth reached, warm / cold | 16.05 / **14.84** |
+| the two disagree about who stands better | 2.08% |
+| the quiet filter would decide differently on the warm best move | 4.86% |
+
+So the cold re-search was **not correcting a bias** — there isn't one at 0.6 cp
+over 33k positions — and it was **1.2 plies shallower**, i.e. the worse of the
+two estimates. **It was removed**, along with the tree sampler, and the label is
+now the score the game's own search returned.
+
+The gain was **5.2×**, not the 2× the search count suggests, and the extra
+factor is worth naming: `label_position()` called `search_clear()` per
+candidate, which memsets the whole 64 MB transposition table — roughly 10 GB of
+memset per game per worker. Dropping the re-search also let the quiet filter
+move *before* the record is built, so the ~40% of positions it discards cost
+nothing at all now; the game's best move decides that filter the same way the
+label search's did on 95.1% of positions, from 1.2 plies deeper.
+
+| `-nodes 10000 -threads 14`, book, tablebases | before | after |
+|---|---|---|
+| records per game | 92.2 | 92.0 |
+| records / hour | 838k | **4.36M** |
+| records / day | ~20M | **~105M** |
+
+**What replaced the gate.** `verify -relabel` re-searches a stored position and
+requires the same score; that only means anything for a shard whose scores were
+a search from a cleared engine. It now reads the manifest's new `labels` field
+and refuses a game-labelled shard by name, rather than reporting a wall of
+mismatches — a gate that always fails is worse than no gate. What checks a
+self-play shard instead is **regeneration**: a game is a function of `-seed`
+and its global ordinal, so the same command must produce the same bytes.
+`make datagen-test` asserts that, and separately keeps `-relabel` alive on a
+three-line `label` shard where it still means something.
+
+**Tree sampling went with it**, including the `-DDATAGEN` node visitor in
+`negamax` — so `datagen` now compiles the same sources the engine does. Bench
+is unchanged at 203047 nodes, as it must be: the hook was never in an engine
+build. The `tree` source tag stays in the record format, because removing a tag
+value would renumber the others.
 
 **Gates.** `make datagen-test` (round-trip, label reproducibility, book start,
 opening parity, ply-capped results, progress pairing, seed/thread invariance,

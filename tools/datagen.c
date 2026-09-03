@@ -52,6 +52,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -89,10 +90,6 @@
 #define fseek64(f, o, w) fseeko((f), (o), (w))
 #define ftell64(f)       ftello(f)
 #define make_dir(p)      mkdir((p), 0777)
-#endif
-
-#ifndef DATAGEN
-#error "build with -DDATAGEN (use `make datagen`): the tree sampler needs the search hook"
 #endif
 
 /* Stamped in by the Makefile so a shard can name the engine that made it. A
@@ -955,13 +952,17 @@ typedef struct {
     int openingPlies;
     int openingPliesMax;
     int openingMaxScore;
-    int treeSamples;
-    int treeMinDepth;
     int maxPlies;
     /* Whether the shard's records carry the game-progress nibble. A reader
      * cannot tell from the records themselves: bucket 0 means "not recorded",
      * and a shard whose games were all cut short is legitimately all zeros. */
     bool gameProgress;
+    /* Where a label came from. "game" is the score the game's own search
+     * returned for that position; "search" is a fixed-node search from a
+     * cleared engine, which is what `label` does and the only kind that
+     * reproduces on its own. `verify -relabel` reads this before it offers to
+     * check anything. */
+    const char *labels;
     /* filters */
     int maxScore;
     bool quietFilter;
@@ -1009,6 +1010,12 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     fprintf(f, "  \"hash_mb\": %d,\n", m->hashMb);
     fprintf(f, "  \"seed\": %llu,\n", (unsigned long long)m->seed);
     fprintf(f, "  \"dedup\": %s,\n", m->dedup ? "true" : "false");
+    fprintf(f, "  \"labels\": ");
+    if (m->labels)
+        json_string(f, m->labels);
+    else
+        fprintf(f, "null"); /* a pass that only moved records and did not read them */
+    fprintf(f, ",\n");
     fprintf(f, "  \"max_score\": %d,\n", m->maxScore);
     fprintf(f, "  \"quiet_filter\": %s,\n", m->quietFilter ? "true" : "false");
     fprintf(f, "  \"syzygy_men\": %d,\n", m->syzygyMen);
@@ -1038,8 +1045,6 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
         fprintf(f, "    \"opening_plies\": %d,\n", m->openingPlies);
         fprintf(f, "    \"opening_plies_max\": %d,\n", m->openingPliesMax);
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
-        fprintf(f, "    \"tree_samples_per_move\": %d,\n", m->treeSamples);
-        fprintf(f, "    \"tree_min_depth\": %d,\n", m->treeMinDepth);
         fprintf(f, "    \"max_plies\": %d,\n", m->maxPlies);
         fprintf(f, "    \"game_progress\": %s\n", m->gameProgress ? "true" : "false");
         fprintf(f, "  },\n");
@@ -1072,6 +1077,42 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
  * shard from an older datagen, or one whose .json did not travel with it,
  * still verifies - just against the caller's defaults.
  */
+static bool manifest_int(const char *shardPath, const char *key, int *out);
+
+/* The same, for a string field. One key needs it - "labels", which says
+ * whether a shard's scores were produced by the games that played them or by a
+ * search that can be run again - and that one decides whether `verify
+ * -relabel` has anything it can check. */
+static bool manifest_str(const char *shardPath, const char *key, char *out, size_t cap) {
+    char path[PATH_CAP];
+    replace_ext(path, sizeof(path), shardPath, ".json");
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\": \"", key);
+
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        const char *at = strstr(line, pattern);
+        if (!at)
+            continue;
+        at += strlen(pattern);
+        const char *end = strchr(at, '"');
+        if (!end || (size_t)(end - at) >= cap)
+            continue;
+        memcpy(out, at, (size_t)(end - at));
+        out[end - at] = '\0';
+        found         = true;
+    }
+
+    fclose(f);
+    return found;
+}
+
 static bool manifest_int(const char *shardPath, const char *key, int *out) {
     char path[PATH_CAP];
     replace_ext(path, sizeof(path), shardPath, ".json");
@@ -1100,6 +1141,62 @@ static bool manifest_int(const char *shardPath, const char *key, int *out) {
 
     fclose(f);
     return found;
+}
+
+/* The same, for a boolean field - `true` or `false` as manifest_write emits
+ * them. manifest_int cannot stand in: strtol on " true" consumes nothing and
+ * the field would read as absent rather than as false. */
+static bool manifest_bool(const char *shardPath, const char *key, bool *out) {
+    char path[PATH_CAP];
+    replace_ext(path, sizeof(path), shardPath, ".json");
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\": ", key);
+
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        const char *at = strstr(line, pattern);
+        if (!at)
+            continue;
+        at += strlen(pattern);
+        if (!strncmp(at, "true", 4)) {
+            *out  = true;
+            found = true;
+        } else if (!strncmp(at, "false", 5)) {
+            *out  = false;
+            found = true;
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
+/*
+ * Whether a shard has a manifest beside it at all.
+ *
+ * "No manifest" and "a manifest without this field" are different failures and
+ * only the first is worth shouting about: a shard from an older datagen
+ * legitimately lacks fields that did not exist yet, but a shard with no .json
+ * has lost its provenance entirely, and anything built from it inherits
+ * nothing. Silently writing zeros for that case is how a merged dataset comes
+ * to claim it was labelled at 0 nodes with no tablebases - which is exactly
+ * what `verify -relabel` then tries to reproduce.
+ */
+static bool manifest_exists(const char *shardPath) {
+    char path[PATH_CAP];
+    replace_ext(path, sizeof(path), shardPath, ".json");
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    fclose(f);
+    return true;
 }
 
 /* ========================================================================== *
@@ -1411,13 +1508,6 @@ static bool label_fen(const char *fen, int nodes, Position *pos, SearchResult *o
     return out->score != VALUE_NONE && is_ok_move(out->best);
 }
 
-/* The side-to-move field of a FEN, without parsing the rest of it. A Position
- * carries its whole game history and is expensive to build for one bit. */
-static Color stm_from_fen(const char *fen) {
-    const char *space = strchr(fen, ' ');
-    return (space && space[1] == 'b') ? BLACK : WHITE;
-}
-
 /* Castling is encoded king-takes-own-rook, so its destination square is
  * occupied by our own rook and must not be read as a capture. */
 static bool move_is_tactical(const Position *pos, Move m) {
@@ -1580,9 +1670,6 @@ typedef struct {
     int openingPliesMax; /* high bound, inclusive; equal to the low one for a fixed count */
     int openingMaxScore;
 
-    int treeSamples;  /* reservoir size per played move */
-    int treeMinDepth; /* remaining depth a sampled node must still have */
-
     int maxPlies;
     const char *syzygyPath; /* NULL plays and labels endgames from the search alone */
 
@@ -1594,93 +1681,41 @@ typedef struct {
     bool resume;
 } SelfplayOpts;
 
-enum { MAX_RESERVOIR = 8 };
-
 /*
- * Reservoir sampler over the interior of one search tree.
+ * A record whose position, label and best move are all settled, waiting only
+ * for the game to end.
  *
- * An alpha-beta tree is overwhelmingly leaves, so any sampler that does not
- * stratify returns almost nothing but quiescence positions. Requiring a
- * minimum remaining depth is the stratification; Algorithm R over what is left
- * gives every eligible node the same chance without knowing how many there
- * will be.
+ * The label is the score the game's own search returned for this position, so
+ * there is nothing left to compute: the record is packed the moment the search
+ * that produced it finishes. What it cannot know yet is who won, and how many
+ * plies away that was - so `stm` and `ply` ride along, and the two result
+ * fields are patched in once the game is over.
  *
- * A candidate is materialised as a FEN only when it is actually selected -
- * about R * (1 + ln N) times per search rather than N - so the sampler costs
- * almost nothing in the node loop.
+ * This is why a game buffers records rather than positions. It used to buffer
+ * FENs and re-search every one from a cleared engine after the game, which
+ * doubled the cost of a generation run to buy a label that measured 1.2 plies
+ * SHALLOWER than the one already in hand and no less biased (E26).
  */
 typedef struct {
-    Rng *rng;
-    int minDepth;
-    int want;
-    int seen;
-    int count;
-    struct {
-        char fen[FEN_MAX_LEN];
-        Move cutoff;
-    } slot[MAX_RESERVOIR];
-} TreeSampler;
-
-static void tree_visitor(const Position *pos, const SearchNodeInfo *info, void *ctx) {
-    TreeSampler *ts = (TreeSampler *)ctx;
-
-    /* Never inside quiescence (which never calls this), never in check, and
-     * never from the leaf shell: those are not the positions a game-line
-     * dataset is missing. */
-    if (info->depth < ts->minDepth || info->inCheck)
-        return;
-
-    int slot;
-    if (ts->count < ts->want) {
-        slot = ts->count++;
-        ++ts->seen;
-    } else {
-        ++ts->seen;
-        const uint64_t j = rng_below(ts->rng, (uint64_t)ts->seen);
-        if (j >= (uint64_t)ts->want)
-            return;
-        slot = (int)j;
-    }
-
-    board_to_fen(pos, ts->slot[slot].fen);
-    /* A fail-low node proves only that nothing reached alpha, so its best move
-     * is a hint rather than a label and no policy target exists for it. */
-    ts->slot[slot].cutoff = info->kind == NODE_FAIL_LOW ? MOVE_NONE : info->best;
-}
-
-typedef struct {
-    char fen[FEN_MAX_LEN];
+    Record rec;
+    PolicyRecord pol;
     Color stm;
-    SourceTag src;
-    Move cutoff;
-    /* The gamePly of the GAME position this candidate belongs to, which for a
-     * tree sample is the root of the search it was taken from rather than the
-     * node's own depth. A tree node is not on the game line at all, so the
-     * plies between it and the game's end are not a distance anything travelled;
-     * the honest reading of a tree sample's progress is "as far into the game as
-     * the move being searched", and that is what this holds. */
     int ply;
-} Candidate;
+} Pending;
 
 typedef struct {
-    Candidate *items;
+    Pending *items;
     size_t count, cap;
-} CandidateList;
+} PendingList;
 
-static void candidates_push(CandidateList *cl, const char *fen, Color stm, SourceTag src,
-                            Move cutoff, int ply) {
-    if (cl->count == cl->cap) {
-        cl->cap   = cl->cap ? cl->cap * 2 : 256;
-        cl->items = realloc(cl->items, cl->cap * sizeof(Candidate));
-        if (!cl->items)
+static Pending *pending_push(PendingList *pl) {
+    if (pl->count == pl->cap) {
+        pl->cap   = pl->cap ? pl->cap * 2 : 256;
+        pl->items = realloc(pl->items, pl->cap * sizeof(Pending));
+        if (!pl->items)
             die("out of memory");
     }
-    Candidate *c = &cl->items[cl->count++];
-    snprintf(c->fen, sizeof(c->fen), "%s", fen);
-    c->stm    = stm;
-    c->src    = src;
-    c->cutoff = cutoff;
-    c->ply    = ply;
+    return &pl->items[pl->count++];
 }
 
 /* Game result, always from white's point of view. RES_UNKNOWN is a game cut
@@ -1792,13 +1827,8 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         shard_open(&writer, path, o->policy);
     }
 
-    CandidateList cands = {NULL, 0, 0};
+    PendingList pending = {NULL, 0, 0};
     Position pos;
-    TreeSampler sampler;
-    memset(&sampler, 0, sizeof(sampler));
-    sampler.rng      = &rng;
-    sampler.minDepth = o->treeMinDepth;
-    sampler.want     = o->treeSamples < MAX_RESERVOIR ? o->treeSamples : MAX_RESERVOIR;
 
     const double start    = now_seconds();
     uint64_t labelled     = 0;
@@ -1831,7 +1861,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         int attempts = 0;
         int finalPly = 0;
         GameResult result;
-        cands.count = 0;
+        pending.count = 0;
 
         for (;;) {
             /* Reached by a book line this build cannot set up, and by an
@@ -1867,7 +1897,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
              * the game before it. Inside the game the table stays warm: this
              * is play, not labelling. */
             search_clear();
-            cands.count = 0;
+            pending.count = 0;
 
             bool restart = false;
             result       = RES_UNKNOWN;
@@ -1900,18 +1930,12 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 if (pos.gamePly >= o->maxPlies)
                     break; /* result stays RES_UNKNOWN */
 
-                sampler.seen  = 0;
-                sampler.count = 0;
-                if (sampler.want > 0)
-                    search_set_node_visitor(tree_visitor, &sampler);
-
                 SearchLimits limits;
                 search_limits_clear(&limits);
                 limits.nodes = (uint64_t)o->nodes;
 
                 SearchResult res;
                 search_run_sync(&pos, &limits, &res);
-                search_set_node_visitor(NULL, NULL);
 
                 if (!is_ok_move(res.best) || res.score == VALUE_NONE)
                     break;
@@ -1931,15 +1955,30 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                     break;
                 }
 
-                char fen[FEN_MAX_LEN];
-                if (board_checkers(&pos) == BB_EMPTY) {
-                    board_to_fen(&pos, fen);
-                    candidates_push(&cands, fen, pos.sideToMove, SRC_SELFPLAY, MOVE_NONE,
-                                    pos.gamePly);
+                /*
+                 * THE LABEL IS THIS SEARCH. The record is built here, from the
+                 * position in hand, and only its result fields are filled in
+                 * once the game ends - see the note on `pending` above.
+                 *
+                 * Both filters run before anything is stored, because both can
+                 * be answered from a search that has already happened: nothing
+                 * downstream is paid for a position that is about to be
+                 * dropped. Promotions join captures in the quiet filter - a
+                 * promotion moves as much material as one does.
+                 */
+                if (board_checkers(&pos) == BB_EMPTY &&
+                    !(o->maxScore > 0 && iabs(res.score) > o->maxScore) &&
+                    !(o->quietFilter && move_is_tactical(&pos, res.best)) &&
+                    (!o->dedup || keyset_insert(&seen, pos.key))) {
+                    Pending *pd = pending_push(&pending);
+                    record_from_position(&pd->rec, &pos, res.score, WDL_UNKNOWN, SRC_SELFPLAY,
+                                         PROGRESS_UNKNOWN);
+                    pd->pol.best   = (uint16_t)res.best;
+                    pd->pol.cutoff = MOVE_NONE;
+                    pd->stm        = pos.sideToMove;
+                    pd->ply        = pos.gamePly;
+                    ++labelled;
                 }
-                for (int s = 0; s < sampler.count; ++s)
-                    candidates_push(&cands, sampler.slot[s].fen, stm_from_fen(sampler.slot[s].fen),
-                                    SRC_TREE, sampler.slot[s].cutoff, pos.gamePly);
 
                 board_do_move(&pos, res.best);
             }
@@ -1954,49 +1993,23 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         }
 
         /*
-         * Every candidate is re-searched from scratch, whether it came off the
-         * game line or out of the tree. Identical label definitions across the
-         * whole dataset are worth more than the searches this costs; see the
-         * header.
+         * The result is the only thing a record could not know while the game
+         * was still running, so it is the only thing patched in here.
          */
-        for (size_t i = 0; i < cands.count; ++i) {
-            const Candidate *c = &cands.items[i];
-
-            Position p;
-            if (!board_set_fen(&p, c->fen))
-                continue;
-            if (o->dedup && !keyset_insert(&seen, p.key))
-                continue;
-
-            SearchResult res;
-            label_position(&p, o->nodes, &res);
-            ++labelled;
-            if (res.score == VALUE_NONE || !is_ok_move(res.best))
-                continue;
-
-            if (o->maxScore > 0 && iabs(res.score) > o->maxScore)
-                continue;
-            /* NNUE.md's quiet filter, applied to the game line only: the whole
-             * point of a tree sample is that it is mid-tactic, and filtering
-             * that out would leave the sampler generating game-line positions
-             * by a slower route. Promotions join captures here - a promotion
-             * moves as much material as one does. */
-            if (o->quietFilter && c->src == SRC_SELFPLAY && move_is_tactical(&p, res.best))
-                continue;
+        for (size_t i = 0; i < pending.count; ++i) {
+            Pending *pd = &pending.items[i];
 
             /* No result, no distance to it: a game the ply cap stopped has an
              * end nobody reached, and inventing a distance to it would be the
              * same mistake as inventing the draw. */
-            const int pliesToEnd = result == RES_UNKNOWN ? -1 : finalPly - c->ply;
+            const int pliesToEnd = result == RES_UNKNOWN ? -1 : finalPly - pd->ply;
 
-            Record rec;
-            record_from_position(&rec, &p, res.score, wdl_for(result, c->stm), c->src,
-                                 progress_bucket(pliesToEnd));
+            pd->rec.wdl = (uint8_t)wdl_for(result, pd->stm);
+            pd->rec.flags &= (uint8_t)~REC_PROGRESS_MASK;
+            pd->rec.flags |=
+                (uint8_t)((progress_bucket(pliesToEnd) << REC_PROGRESS_SHIFT) & REC_PROGRESS_MASK);
 
-            PolicyRecord pol;
-            pol.best   = (uint16_t)res.best;
-            pol.cutoff = (uint16_t)c->cutoff;
-            shard_write(&writer, &rec, &pol);
+            shard_write(&writer, &pd->rec, &pd->pol);
         }
 
         ++played;
@@ -2029,19 +2042,19 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.openingPlies    = o->openingPlies;
     man.openingPliesMax = o->openingPliesMax;
     man.openingMaxScore = o->openingMaxScore;
-    man.treeSamples     = sampler.want;
-    man.treeMinDepth    = o->treeMinDepth;
     man.maxPlies        = o->maxPlies;
     man.gameProgress    = true;
-    man.maxScore        = o->maxScore;
-    man.quietFilter     = o->quietFilter;
-    man.syzygyPath      = o->syzygyPath;
-    man.syzygyMen       = syzygy_max_pieces();
+    /* The game's own search IS the label now; nothing is re-searched. */
+    man.labels      = "game";
+    man.maxScore    = o->maxScore;
+    man.quietFilter = o->quietFilter;
+    man.syzygyPath  = o->syzygyPath;
+    man.syzygyMen   = syzygy_max_pieces();
     shard_close(&writer, &man);
 
     if (o->dedup)
         keyset_free(&seen);
-    free(cands.items);
+    free(pending.items);
     book_close(&book);
 
     if (!Quiet)
@@ -2082,10 +2095,9 @@ static bool parse_ply_range(const char *s, int *lo, int *hi) {
 static void usage_selfplay(void) {
     printf("datagen selfplay -o <shard%%02d.cnn> [options]\n"
            "\n"
-           "Plays games from book or randomised openings, samples positions from the\n"
-           "game line AND from inside the search trees, then re-searches every one of\n"
-           "them from a cleared engine to produce the label. Writes <shard>.cnn,\n"
-           "<shard>.pol and <shard>.json.\n"
+           "Plays games from book or randomised openings and records every quiet\n"
+           "position on the game line, labelled with the score the game's own search\n"
+           "gave it. Writes <shard>.cnn, <shard>.pol and <shard>.json.\n"
            "\n"
            "output and scale\n"
            "  -o <pattern>       output shard. %%02d is replaced by the worker index; with\n"
@@ -2097,13 +2109,6 @@ static void usage_selfplay(void) {
            "  -threads N         worker PROCESSES, each with its own private hash. (1)\n"
            "  -hash MB           hash per worker.                        (64)\n"
            "  -seed N            base RNG seed; worker k derives its own.  (1)\n"
-           "\n"
-           "tree sampling  (off by default - when on, it is most of the dataset)\n"
-           "  -tree N            interior nodes reservoir-sampled per played move, 0 to\n"
-           "                     switch tree sampling off entirely.       (0, max 8)\n"
-           "  -treedepth N       remaining depth a node must still have to be eligible.\n"
-           "                     Lower reaches the leaf shell, which is mostly\n"
-           "                     quiescence positions.                    (4)\n"
            "\n"
            "openings\n"
            "  -book <file.epd>   draw each game's start position uniformly from this EPD\n"
@@ -2170,8 +2175,6 @@ static int cmd_selfplay(int argc, char **argv) {
     o.openingPlies    = -1;
     o.openingPliesMax = -1;
     o.openingMaxScore = 800;
-    o.treeSamples     = 0;
-    o.treeMinDepth    = 4;
     o.maxPlies        = 400;
     o.syzygyPath      = NULL;
     /* 0: games are now played to their natural end, and the conversion of a
@@ -2203,10 +2206,6 @@ static int cmd_selfplay(int argc, char **argv) {
                 dief("-opening wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
         } else if (!strcmp(argv[i], "-openingscore") && i + 1 < argc)
             o.openingMaxScore = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-tree") && i + 1 < argc)
-            o.treeSamples = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-treedepth") && i + 1 < argc)
-            o.treeMinDepth = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-maxplies") && i + 1 < argc)
             o.maxPlies = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-syzygy") && i + 1 < argc)
@@ -2239,10 +2238,6 @@ static int cmd_selfplay(int argc, char **argv) {
         die("-threads must be between 1 and 64");
     if (o.dedupBits < 10 || o.dedupBits > 30)
         die("-dedupbits must be between 10 and 30");
-    if (o.treeSamples < 0 || o.treeSamples > MAX_RESERVOIR)
-        dief("-tree must be between 0 and %d", MAX_RESERVOIR);
-    if (o.treeMinDepth < 1)
-        die("-treedepth must be at least 1: depth 0 is quiescence, which never samples");
     /*
      * A game and the searches inside it share one Position, so its history has
      * to hold the game's plies AND the deepest search's on top of them.
@@ -2441,6 +2436,7 @@ static int label_worker(int index, int workers, void *ctx) {
     Manifest man;
     memset(&man, 0, sizeof(man));
     man.command     = "label";
+    man.labels      = "search";
     man.inputs      = joined;
     man.nodes       = o->nodes;
     man.hashMb      = o->hashMb;
@@ -2901,20 +2897,73 @@ static int cmd_shuffle(int argc, char **argv) {
      * labelled at the same nodes and hash as its inputs - and `verify -relabel`
      * needs both to reproduce a score. Left at zero when the inputs disagree or
      * do not say, which readers take as "not recorded". */
+    char labels[32], firstLabels[32];
+    char syzygy[PATH_CAP], firstSyzygy[PATH_CAP];
+    bool labelsAgree = true, syzygyAgree = true;
+    int noManifest              = 0;
+    const char *noManifestFirst = NULL;
+
     for (int i = 0; i < inputCount; ++i) {
-        int n = 0, h = 0;
-        const bool haveNodes = manifest_int(inputs[i], "nodes", &n);
-        const bool haveHash  = manifest_int(inputs[i], "hash_mb", &h);
+        if (!manifest_exists(inputs[i])) {
+            if (!noManifestFirst)
+                noManifestFirst = inputs[i];
+            ++noManifest;
+        }
+
+        int n = 0, h = 0, ms = 0, men = 0;
+        bool quiet            = false;
+        const bool haveNodes  = manifest_int(inputs[i], "nodes", &n);
+        const bool haveHash   = manifest_int(inputs[i], "hash_mb", &h);
+        const bool haveLabels = manifest_str(inputs[i], "labels", labels, sizeof(labels));
+        const bool haveScore  = manifest_int(inputs[i], "max_score", &ms);
+        const bool haveQuiet  = manifest_bool(inputs[i], "quiet_filter", &quiet);
+        const bool haveMen    = manifest_int(inputs[i], "syzygy_men", &men);
+        const bool haveSyzygy = manifest_str(inputs[i], "syzygy_path", syzygy, sizeof(syzygy));
+
         if (i == 0) {
-            man.nodes  = haveNodes ? n : 0;
-            man.hashMb = haveHash ? h : 0;
+            man.nodes       = haveNodes ? n : 0;
+            man.hashMb      = haveHash ? h : 0;
+            man.maxScore    = haveScore ? ms : 0;
+            man.quietFilter = haveQuiet ? quiet : false;
+            man.syzygyMen   = haveMen ? men : 0;
+            labelsAgree     = haveLabels;
+            syzygyAgree     = haveSyzygy;
+            if (haveLabels)
+                snprintf(firstLabels, sizeof(firstLabels), "%s", labels);
+            if (haveSyzygy)
+                snprintf(firstSyzygy, sizeof(firstSyzygy), "%s", syzygy);
         } else {
             if (!haveNodes || n != man.nodes)
                 man.nodes = 0;
             if (!haveHash || h != man.hashMb)
                 man.hashMb = 0;
+            if (!haveScore || ms != man.maxScore)
+                man.maxScore = 0;
+            if (!haveQuiet || quiet != man.quietFilter)
+                man.quietFilter = false;
+            if (!haveMen || men != man.syzygyMen)
+                man.syzygyMen = 0;
+            if (!haveLabels || strcmp(labels, firstLabels))
+                labelsAgree = false;
+            if (!haveSyzygy || strcmp(syzygy, firstSyzygy))
+                syzygyAgree = false;
         }
     }
+
+    /* Loud, because the alternative is a dataset that describes itself wrongly.
+     * Not fatal: shuffling records with no manifest is a legitimate thing to
+     * do, and refusing would strand anyone merging shards by hand. */
+    if (noManifest)
+        fprintf(stderr,
+                "warning: %d of %d inputs have no manifest (first: %s)\n"
+                "         the output cannot inherit nodes, hash, tablebases or filters,\n"
+                "         and `verify -relabel` will read those as unset\n",
+                noManifest, inputCount, noManifestFirst);
+    /* Left null when the inputs disagree, which is the honest answer: a shard
+     * holding both kinds of label is not one kind, and `verify -relabel` has
+     * to be told that rather than shown a majority. */
+    man.labels     = labelsAgree ? firstLabels : NULL;
+    man.syzygyPath = syzygyAgree ? firstSyzygy : NULL;
 
     manifest_write(out, &man, written, bySource, policy);
 
@@ -3249,6 +3298,32 @@ static int cmd_verify(int argc, char **argv) {
      * makes the gate check the shard rather than the caller's memory of it.
      */
     if (relabel > 0) {
+        /*
+         * A relabel check re-searches a stored position from a cleared engine
+         * and requires the same score back. That only means something for a
+         * shard whose scores WERE a search from a cleared engine - which is
+         * what `label` produces and what `selfplay` used to, before its label
+         * became the score the game's own search had already returned for the
+         * position (E26). Re-searching one of those reproduces nothing: the
+         * game's search had a warm table and reached about 1.2 plies deeper.
+         *
+         * Refusing outright rather than reporting a wall of mismatches: a gate
+         * that always fails is worse than no gate, because the next person
+         * turns it off. What checks a game-labelled shard is regeneration -
+         * a game is a function of -seed and its ordinal, so the same command
+         * produces the same bytes.
+         */
+        for (int i = 0; i < inputCount; ++i) {
+            char labels[32];
+            if (manifest_str(inputs[i], "labels", labels, sizeof(labels)) &&
+                !strcmp(labels, "game"))
+                dief("%s carries labels the game's own searches produced, which a fresh "
+                     "search cannot reproduce - it had a warm table and went deeper. Drop "
+                     "-relabel; to check a shard like this, generate it again with the same "
+                     "-seed and compare the bytes.",
+                     inputs[i]);
+        }
+
         int manNodes = 0, manHash = 0;
         bool haveNodes = false, haveHash = false;
 

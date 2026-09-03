@@ -51,6 +51,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Syzygy tablebases in search and datagen; all adjudication removed | built, off by default (E23) |
 | Datagen: game progress per record, `selfplay -resume`, one seed = one dataset | built, gated by `make datagen-test` (E26) |
 | Datagen: cross-shard dedup in `shuffle` — `gen-004` was 10x redundant | built (E26); re-shuffle `gen-004` before mixing it into gen-5 |
+| Datagen: the game's own search is the label; the re-search and tree sampling removed | built, **5.2x** faster (E26) |
 | Trainer: per-record lambda (game progress, phase, source), score clip, source weights | built, every dial defaults to no effect |
 | Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
 | **Self-play data generation with deliberate variation** | **TODO** |
@@ -123,8 +124,8 @@ The open work, roughly in order of Elo per unit of effort:
    what it covers however good the labeller gets. Self-play has the opposite
    problem: it concentrates on the lines the engine already likes, so a corpus
    without variation teaches the net its own blind spots. The levers are
-   opening-book spread, randomised early plies and tree sampling (`-tree`, see
-   [NNUE.md](NNUE.md)).
+   opening-book spread and randomised early plies (see [NNUE.md](NNUE.md));
+   tree sampling was the third lever and has been removed (E26).
 
    `gen-004` is the first pass at the first two. `datagen selfplay` gained
    `-book`, and the generation is configured to start every game from one of
