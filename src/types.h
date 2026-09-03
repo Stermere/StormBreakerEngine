@@ -176,6 +176,19 @@ static inline bool is_mate_score(Value v) {
     return v >= VALUE_MATE_IN_MAX_PLY || v <= VALUE_MATED_IN_MAX_PLY;
 }
 
+/*
+ * A proven result: a mate score OR a tablebase score.
+ *
+ * Use this, not is_mate_score(), wherever the question is "is this a fact
+ * rather than an evaluation?". A tablebase score sits in the band directly
+ * BELOW the mate band, so is_mate_score() answers false for one - and any
+ * heuristic that then treats a proven win as an ordinary score is learning
+ * from, or pruning against, a number that has no evaluation error to teach.
+ */
+static inline bool is_decisive_score(Value v) {
+    return v >= VALUE_TB_WIN_IN_MAX_PLY || v <= VALUE_TB_LOSS_IN_MAX_PLY;
+}
+
 /* ------------------------------------------------------------ intrinsics -- */
 
 static inline int popcount(Bitboard b) {

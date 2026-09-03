@@ -687,6 +687,15 @@ typedef struct {
     float result;
 } Sample;
 
+/*
+ * `pool` for a line the loader could not use. MAX_THREADS is 64, so this can
+ * never be a real pool id, and it costs no extra byte in a struct there are
+ * tens of millions of. load_dataset() compacts these out before fitting - the
+ * slots would otherwise stay exactly as xmalloc left them, and fit_worker
+ * would index Pools[] with an uninitialised byte and walk a wild pointer.
+ */
+#define SAMPLE_POOL_INVALID 0xFF
+
 typedef struct {
     Feature *data;
     size_t len, cap;
@@ -777,6 +786,7 @@ static void load_worker(void *arg) {
         /* "<fen> [<result>]" */
         char *bracket = strrchr(line, '[');
         if (!bracket) {
+            Samples[i].pool = SAMPLE_POOL_INVALID;
             job->bad++;
             continue;
         }
@@ -784,6 +794,7 @@ static void load_worker(void *arg) {
         *bracket            = '\0';
 
         if (!board_set_fen(pos, line)) {
+            Samples[i].pool = SAMPLE_POOL_INVALID;
             job->bad++;
             continue;
         }
@@ -885,9 +896,24 @@ static void load_dataset(const char *path, size_t maxPositions) {
         features += Pools[i].len;
     }
 
+    /*
+     * Drop the lines nothing was written for. Every worker owns a disjoint
+     * slice, so this runs once here rather than needing coordination; the
+     * Feature pools are untouched and a Sample only ever moves, so `offset`
+     * and `pool` stay valid. Without it SampleCount counts unusable lines and
+     * the fitter reads whatever xmalloc left in them.
+     */
+    if (bad) {
+        size_t kept = 0;
+        for (size_t k = 0; k < count; ++k)
+            if (Samples[k].pool != SAMPLE_POOL_INVALID)
+                Samples[kept++] = Samples[k];
+        SampleCount = kept;
+    }
+
     printf("  %llu positions, %llu features (%.1f per position), %llu unusable, %.1fs\n",
-           (unsigned long long)count, (unsigned long long)features,
-           count ? (double)features / (double)count : 0.0, (unsigned long long)bad,
+           (unsigned long long)SampleCount, (unsigned long long)features,
+           SampleCount ? (double)features / (double)SampleCount : 0.0, (unsigned long long)bad,
            now_seconds() - t0);
     printf("  feature pool: %.2f GB\n", (double)(features * sizeof(Feature)) / 1e9);
 

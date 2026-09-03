@@ -38,8 +38,23 @@ static Position Pos;
 
 /* ------------------------------------------------------------- options --- */
 
-static int OptHash         = 16;
-static int OptMoveOverhead = 10;
+/*
+ * The advertised bounds live here rather than inside the `option` strings so
+ * that cmd_uci() and cmd_setoption() cannot drift apart. A GUI that is told
+ * `max 5000` and then has 100000 accepted anyway is being lied to by whichever
+ * of the two is wrong, and a Move Overhead outside this range is not a harmless
+ * oddity: timeman.c subtracts it from the clock, so a negative one hands the
+ * search time it does not have.
+ */
+#define OPT_HASH_MIN         1
+#define OPT_HASH_MAX         65536
+#define OPT_HASH_DEFAULT     16
+#define OPT_OVERHEAD_MIN     0
+#define OPT_OVERHEAD_MAX     5000
+#define OPT_OVERHEAD_DEFAULT 10
+
+static int OptHash         = OPT_HASH_DEFAULT;
+static int OptMoveOverhead = OPT_OVERHEAD_DEFAULT;
 /* Purely so the notice below is printed once rather than on every `position`
  * command. The notation itself is decided by Pos.chess960. */
 static bool announcedChess960 = false;
@@ -161,10 +176,12 @@ static void cmd_uci(void) {
      * pinned to max 1 until the search is actually parallel - advertising a
      * range the engine cannot honour makes test clients run games that are
      * silently single-threaded. */
-    printf("option name Hash type spin default 16 min 1 max 65536\n");
+    printf("option name Hash type spin default %d min %d max %d\n", OPT_HASH_DEFAULT, OPT_HASH_MIN,
+           OPT_HASH_MAX);
     printf("option name Threads type spin default 1 min 1 max 1\n");
     printf("option name Ponder type check default false\n");
-    printf("option name Move Overhead type spin default 10 min 0 max 5000\n");
+    printf("option name Move Overhead type spin default %d min %d max %d\n", OPT_OVERHEAD_DEFAULT,
+           OPT_OVERHEAD_MIN, OPT_OVERHEAD_MAX);
     printf("option name UCI_Chess960 type check default false\n");
     /* Off until a GUI supplies a path, and `make bench` never does: with
      * tablebases loaded the node count depends on which files are on the
@@ -191,6 +208,48 @@ static void cmd_uci(void) {
     fflush(stdout);
 }
 
+/*
+ * Ends a running search before an option replaces something the worker still
+ * holds a raw pointer into: the transposition table, the mapped tablebase
+ * files, the network blob. This is a use-after-free rather than a race that
+ * merely reads a stale value - `setoption name Hash` mid-search frees the
+ * table out from under tt_probe() and the process dies. A GUI has no business
+ * changing these while the engine thinks, but "no business" is not a memory
+ * barrier.
+ */
+static void end_search_for_option(const char *name) {
+    if (!search_running())
+        return;
+
+    printf("info string option '%s' changed during a search; ending the search first\n", name);
+    search_stop();
+    search_wait();
+}
+
+/*
+ * Parses a spin option, clamping to the range cmd_uci() advertised and saying
+ * so. Bare atoi() reports nothing for either failure mode: "abc" reads as 0
+ * and a value past INT_MAX saturates, so both arrive as a plausible-looking
+ * setting the GUI never asked for.
+ */
+static int spin_value(const char *name, const char *value, int min, int max, int fallback) {
+    char *end         = NULL;
+    const long long v = strtoll(value, &end, 10);
+
+    if (end == value) {
+        printf("info string option '%s': '%s' is not a number; keeping %d\n", name, value,
+               fallback);
+        return fallback;
+    }
+    if (v < min || v > max) {
+        const int clamped = v < min ? min : max;
+        printf("info string option '%s': %lld is outside %d..%d; using %d\n", name, v, min, max,
+               clamped);
+        return clamped;
+    }
+    return (int)v;
+}
+
 static void cmd_setoption(char *args) {
     /* Format: setoption name <name, may contain spaces> [value <value>] */
     char *name = strstr(args, "name ");
@@ -210,9 +269,9 @@ static void cmd_setoption(char *args) {
         name[--len] = '\0';
 
     if (strcmp(name, "Hash") == 0 && value) {
-        OptHash = atoi(value);
-        if (OptHash < 1)
-            OptHash = 1;
+        const int mb = spin_value(name, value, OPT_HASH_MIN, OPT_HASH_MAX, OptHash);
+        end_search_for_option(name);
+        OptHash = mb;
         if (!tt_resize((size_t)OptHash))
             printf("info string failed to allocate %d MB hash\n", OptHash);
     } else if (strcmp(name, "Threads") == 0 && value) {
@@ -224,8 +283,10 @@ static void cmd_setoption(char *args) {
          * will send `go ponder`, and it is that command the search acts on -
          * there is no separate state for this flag to hold. */
     } else if (strcmp(name, "Move Overhead") == 0 && value) {
-        OptMoveOverhead = atoi(value);
+        OptMoveOverhead =
+            spin_value(name, value, OPT_OVERHEAD_MIN, OPT_OVERHEAD_MAX, OptMoveOverhead);
     } else if (strcmp(name, "SyzygyPath") == 0 && value) {
+        end_search_for_option(name);
         /* `<empty>` is what a GUI sends to clear the option it advertised. */
         if (*value == '\0' || strcmp(value, "<empty>") == 0) {
             syzygy_free();
@@ -242,10 +303,23 @@ static void cmd_setoption(char *args) {
     } else if (strcmp(name, "EvalFile") == 0 && value) {
         /* A failed load leaves the previous net in place and says why: a typo in
          * a GUI config must not leave the engine with no evaluation. */
-        if (strcmp(value, "<internal>") == 0)
+        if (strcmp(value, "<internal>") == 0) {
             printf("info string EvalFile: keeping the embedded net\n");
-        else if (nnue_load_file(value))
-            nnue_print_info();
+        } else {
+            end_search_for_option(name);
+            if (nnue_load_file(value)) {
+                /* Everything cached from the previous net is now wrong: the
+                 * accumulator stack was built from its weights, and every TT
+                 * entry carries a static eval it produced (search.c reuses
+                 * that rather than re-evaluating). Without this, a search
+                 * after a swap is partly scored by the net that was replaced,
+                 * which quietly makes a net-vs-net comparison driven through
+                 * this option measure the wrong thing. */
+                eval_state_clear();
+                tt_clear();
+                nnue_print_info();
+            }
+        }
 #endif
     } else if (strcmp(name, "UCI_Chess960") == 0 && value) {
         /* Seeds the POSITION's flag, which is what every spelling decision

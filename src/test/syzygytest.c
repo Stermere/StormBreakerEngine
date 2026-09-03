@@ -566,16 +566,19 @@ static bool has_any_legal(Position *pos) {
 /* ====================================================================== *
  *  Checksum manifest
  *
- *  See syzygytest.h. This is the half that VERIFIES; tools/tbdiff.c holds
- *  the half that seals, because sealing needs the oracle and verifying must
- *  not.
+ *  See syzygytest.h. This is the half that VERIFIES. The half that SEALED
+ *  the manifest was a temporary tools/tbdiff.c that linked Fathom in as an
+ *  oracle; it went away with Fathom itself (docs/EXPERIMENTS.md E24), which
+ *  is the point - verifying must not need the oracle, only sealing did.
+ *  Re-earning the manifest from scratch would mean reinstating an
+ *  independent prober, not resurrecting that file.
  * ====================================================================== */
 
 /*
  * FNV-1a over the two numbers, in a fixed order.
  *
- * A checksum rather than the values themselves because 286 configurations of
- * 2000 positions is 572,000 answers and the point is a file a human can read
+ * A checksum rather than the values themselves because 286 configurations at
+ * the manifest's `per 200` is 57,200 answers and the point is a file a human reads
  * and git can diff. What is lost is which POSITION broke, which is why the
  * checksum is per configuration and the seed is recorded: a failing endgame
  * can be replayed exactly.

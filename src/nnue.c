@@ -370,6 +370,22 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
     if (h->qa == 0 || h->qb == 0 || h->scale == 0)
         REJECT("degenerate quantisation (qa %u, qb %u, scale %d)", h->qa, h->qb, h->scale);
 
+    /* qa is the SCReLU clamp ceiling, and the vectorised path materialises it
+     * with _mm256_set1_epi16 - so a qa above INT16_MAX truncates THERE and not
+     * in the scalar path, and the same net then evaluates differently on two
+     * builds of this engine. Reject by name rather than let the two disagree:
+     * `make nnue-test` only ever gates whichever one was compiled. */
+    if (h->qa > INT16_MAX)
+        REJECT("qa %u exceeds the int16 clamp ceiling %d that the vectorised accumulator "
+               "requires",
+               h->qa, (int)INT16_MAX);
+
+    /* scale is signed, and only its magnitude is ever the intent. A negative
+     * one loads cleanly, prints a normal-looking info line, and negates every
+     * evaluation - the engine then plays the worst move it can find. */
+    if (h->scale < 0)
+        REJECT("scale %d is negative, which would invert every evaluation", h->scale);
+
     /* reserved[0] is the uncertainty flag. The rest must still be zero: a
      * future exporter that uses one would otherwise have its field silently
      * ignored, which is the exact failure the reserved block exists to make

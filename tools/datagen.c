@@ -101,7 +101,14 @@
 #define DATAGEN_COMMIT "unknown"
 #endif
 
-enum { MAX_WORKERS = 64, PATH_CAP = 1024 };
+enum {
+    MAX_WORKERS = 64,
+    PATH_CAP    = 1024,
+    /* `shuffle` keeps one open file and one counter per bucket in fixed
+     * stack arrays, so this bounds a user-supplied -buckets as well as the
+     * auto-computed one. */
+    SHUFFLE_MAX_BUCKETS = 256
+};
 
 static void die(const char *msg) {
     fprintf(stderr, "datagen: %s\n", msg);
@@ -489,6 +496,24 @@ static uint64_t rng_next(Rng *s) {
     z          = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z          = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
+}
+
+/*
+ * An independent stream per worker.
+ *
+ * NOT `seed + index * GOLDEN`, which is what this used to be: rng_next
+ * advances the state by exactly that constant, so adding a multiple of it
+ * merely starts worker `index` `index` draws into worker 0's stream. Every
+ * worker then replays its neighbours' games - identical state gives an
+ * identical game, and the workers consume draws at the same rate, so once two
+ * of them line up they stay locked forever. Nothing detects it: dedup is
+ * per-process and each worker writes its own shard, so the net simply trains
+ * on the same positions N times. Running the index through the mixer puts the
+ * workers in unrelated places in the state space instead.
+ */
+static Rng worker_rng(uint64_t seed, int index) {
+    Rng s = seed + (uint64_t)(index + 1) * 0x9E3779B97F4A7C15ULL;
+    return (Rng)rng_next(&s);
 }
 
 /* Uniform on [0, n), rejecting the tail that modulo would over-represent. */
@@ -1614,7 +1639,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     /* Each worker gets a share of the games and a stream of its own. The
      * stride keeps a run with N workers reproducible for any N. */
     const int games = o->games / workers + (index < o->games % workers ? 1 : 0);
-    Rng rng         = o->seed + (uint64_t)index * 0x9E3779B97F4A7C15ULL;
+    Rng rng         = worker_rng(o->seed, index);
 
     tt_resize((size_t)o->hashMb);
 
@@ -1819,7 +1844,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.command         = "selfplay";
     man.nodes           = o->nodes;
     man.hashMb          = o->hashMb;
-    man.seed            = (uint64_t)(o->seed + (uint64_t)index * 0x9E3779B97F4A7C15ULL);
+    man.seed            = (uint64_t)worker_rng(o->seed, index);
     man.dedup           = o->dedup;
     man.games           = games;
     man.book            = o->book;
@@ -2460,17 +2485,31 @@ static int cmd_shuffle(int argc, char **argv) {
     if (total == 0)
         die("nothing to shuffle");
 
+    /*
+     * The clamp below used to live inside the auto-compute branch, which left
+     * a user-supplied -buckets unvalidated: bucketFile/bucketCount are fixed
+     * at SHUFFLE_MAX_BUCKETS entries on the stack, so `-buckets 1000` wrote
+     * past both. bucketPath is heap-sized from the same number, which only
+     * made the corruption quieter.
+     */
+    if (buckets > SHUFFLE_MAX_BUCKETS)
+        dief("-buckets %d exceeds the maximum of %d", buckets, SHUFFLE_MAX_BUCKETS);
+
     if (buckets <= 0) {
+        /* -memory 0 would divide by zero here. */
+        if (bucketCap == 0)
+            die("-memory must be at least 1 MB");
+
         buckets = (int)((total * unit + bucketCap - 1) / bucketCap);
         if (buckets < 1)
             buckets = 1;
-        if (buckets > 256)
-            buckets = 256;
+        if (buckets > SHUFFLE_MAX_BUCKETS)
+            buckets = SHUFFLE_MAX_BUCKETS;
     }
 
     char(*bucketPath)[PATH_CAP] = xmalloc((size_t)buckets * PATH_CAP);
-    FILE *bucketFile[256];
-    uint64_t bucketCount[256];
+    FILE *bucketFile[SHUFFLE_MAX_BUCKETS];
+    uint64_t bucketCount[SHUFFLE_MAX_BUCKETS];
 
     ensure_parent_dir(out);
 

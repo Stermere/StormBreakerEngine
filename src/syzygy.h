@@ -41,8 +41,13 @@ int syzygy_max_pieces(void);
  */
 Value syzygy_probe_wdl(Position *pos, int ply);
 
-/* What a root probe found. Both fields are the "not probable" sentinel
- * together: MOVE_NONE and VALUE_NONE. */
+/* What a root probe found.
+ *
+ * The two fields fail INDEPENDENTLY and callers must test them independently.
+ * A probe that could not answer at all reports MOVE_NONE and VALUE_NONE, but
+ * `value` can also be a real result while `move` stays MOVE_NONE - every
+ * child probe declining leaves the position's value known and no move
+ * selected. */
 typedef struct {
     Move move;   /* preserves the result; matched against the generator's list */
     Value value; /* the true result at ply 0, fifty-move rule included */

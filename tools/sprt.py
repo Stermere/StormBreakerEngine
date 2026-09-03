@@ -18,11 +18,39 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
 import common as c
+
+# The SPRT's error rates. Named once because both the fastchess arguments and
+# the verdict below are derived from them: hard-coding 0.05 in one place and
+# 2.944 in the other is how a test comes to report a bound it did not use.
+ALPHA = 0.05
+BETA = 0.05
+
+
+def llr_upper() -> float:
+    """Wald's upper stopping boundary - at or above it, H1 is accepted."""
+    return math.log((1.0 - BETA) / ALPHA)
+
+
+def llr_lower() -> float:
+    """Wald's lower stopping boundary - at or below it, H0 is accepted."""
+    return math.log(BETA / (1.0 - ALPHA))
+
+
+def sprt_verdict(llr):
+    """PASSED / REJECTED / INCONCLUSIVE, or None when there is no LLR to judge."""
+    if llr is None:
+        return None
+    if llr >= llr_upper():
+        return "PASSED"
+    if llr <= llr_lower():
+        return "REJECTED"
+    return "INCONCLUSIVE"
 
 
 def parse_options(text: str) -> dict:
@@ -128,7 +156,7 @@ def main() -> int:
     if not args.smoke:
         # model=normalized measures in normalised Elo, which makes results
         # comparable across time controls and books.
-        extra = ["-sprt", f"elo0={elo0}", f"elo1={elo1}", "alpha=0.05", "beta=0.05",
+        extra = ["-sprt", f"elo0={elo0}", f"elo1={elo1}", f"alpha={ALPHA}", f"beta={BETA}",
                  "model=normalized"]
 
     fc_args = c.match_args(
@@ -186,10 +214,30 @@ def main() -> int:
         if r.elo is not None:
             print(f"  Elo {r.elo:+.2f}")
         if r.llr is not None:
-            print(f"  LLR {r.llr:+.2f}  bounds [{elo0}, {elo1}]")
+            print(f"  LLR {r.llr:+.2f}  bounds [{elo0}, {elo1}]"
+                  f"  stop at [{llr_lower():+.3f}, {llr_upper():+.3f}]")
         print(f"  pgn {pgn}")
         print()
+
+        verdict = sprt_verdict(r.llr)
+        if verdict == "PASSED":
+            c.ok(f"H1 accepted: the patch is better than elo0={elo0}.")
+        elif verdict == "REJECTED":
+            c.fail(f"H0 accepted: the patch is NOT better than elo0={elo0}. Do not commit "
+                   f"an Elo claim for it.")
+        else:
+            c.warn("Inconclusive - neither bound was reached. The test needs more games; "
+                   "a point estimate from here has shown nothing.")
+
+        print()
         print("  Record it in docs/EXPERIMENTS.md - including if it failed.")
+
+        # fastchess exits 0 whether the test accepted H0 or H1, so returning its
+        # code unchanged made a REJECTED patch indistinguishable from a passing
+        # one - to `make sprt`, and to anyone reading the tail of the output.
+        # The verdict is the result; it belongs in the exit status.
+        if code == 0 and verdict == "REJECTED":
+            return 1
 
     return code
 

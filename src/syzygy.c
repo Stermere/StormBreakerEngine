@@ -469,6 +469,13 @@ typedef struct {
     uint8_t *data[2];
     TbMap mapping[2];
     bool ready[2];
+    /* Latched when init_table() rejects this table, so a corrupt file is
+     * mapped and parsed once rather than on every probe. It lives here rather
+     * than on the hash slot because hash_add() gives an endgame TWO slots (its
+     * key and the mirrored key2): a marker on one slot leaves the other able
+     * to re-enter init_table, which re-maps the file and leaks the first
+     * mapping along with the PairsData the failed attempt allocated. */
+    bool failed[2];
     uint8_t num;
     bool symmetric, hasPawns, hasDtz;
     union {
@@ -499,7 +506,6 @@ typedef struct {
 typedef struct {
     uint64_t key;
     BaseEntry *ptr;
-    bool error;
 } HashEntry;
 
 static PieceEntry *PieceEntries;
@@ -1040,9 +1046,8 @@ static void hash_add(BaseEntry *be, uint64_t key) {
     int idx = (int)(key >> (64 - TB_HASHBITS));
     while (TbHash[idx].ptr)
         idx = (idx + 1) & ((1 << TB_HASHBITS) - 1);
-    TbHash[idx].key   = key;
-    TbHash[idx].ptr   = be;
-    TbHash[idx].error = false;
+    TbHash[idx].key = key;
+    TbHash[idx].ptr = be;
 }
 
 /* Piece letters strongest first: within a side the format always names the
@@ -1158,10 +1163,12 @@ static void init_tb(const char *name) {
     for (int i = 0; i < 16; ++i)
         be->num = (uint8_t)(be->num + pcs[i]);
 
-    be->ready[TB_WDL] = false;
-    be->ready[TB_DTZ] = false;
-    be->data[TB_WDL]  = NULL;
-    be->data[TB_DTZ]  = NULL;
+    be->ready[TB_WDL]  = false;
+    be->ready[TB_DTZ]  = false;
+    be->failed[TB_WDL] = false;
+    be->failed[TB_DTZ] = false;
+    be->data[TB_WDL]   = NULL;
+    be->data[TB_DTZ]   = NULL;
 
     ++NumWdl;
     be->hasDtz = table_present(name, TbSuffix[TB_DTZ]);
@@ -1235,12 +1242,17 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
     int hashIdx = (int)(key >> (64 - TB_HASHBITS));
     while (TbHash[hashIdx].key && TbHash[hashIdx].key != key)
         hashIdx = (hashIdx + 1) & ((1 << TB_HASHBITS) - 1);
-    if (!TbHash[hashIdx].ptr || TbHash[hashIdx].error) {
+    if (!TbHash[hashIdx].ptr) {
         *success = 0;
         return 0;
     }
 
     BaseEntry *be = TbHash[hashIdx].ptr;
+    if (be->failed[type]) {
+        *success = 0;
+        return 0;
+    }
+
     if (type == TB_DTZ && !be->hasDtz) {
         *success = 0;
         return 0;
@@ -1253,8 +1265,17 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
         char name[16];
         table_name(pos, name, be->key != key);
         if (!init_table(be, name, type)) {
-            TbHash[hashIdx].error = true;
-            *success              = 0;
+            /*
+             * Every other rejection in this file names itself; this one used
+             * to be the exception, and a table that silently answers "not
+             * probable" forever is indistinguishable from one that is simply
+             * absent. `failed` latches, so this prints once per endgame.
+             */
+            printf("info string syzygy: %s%s is unusable and will not be probed again\n", name,
+                   TbSuffix[type]);
+            fflush(stdout);
+            be->failed[type] = true;
+            *success         = 0;
             return 0;
         }
         be->ready[type] = true;
@@ -1334,20 +1355,6 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
  * passant capture. A promotion counts only when it takes something. */
 static inline bool is_capture_move(const Position *pos, Move m) {
     return piece_on(pos, to_sq(m)) != NO_PIECE || type_of_move(m) == MT_EN_PASSANT;
-}
-
-/*
- * Whether any capture can exist at all.
- *
- * A bare enemy king cannot be taken, so a position whose opponent has nothing
- * else has no captures and needs no move list - and in three-to-five man
- * endgames that is a large share of every probe. Cheaper than generating and
- * discarding, and safe in check too: a lone king cannot give check, so this
- * can never skip an evasion that mattered.
- */
-static inline bool captures_possible(const Position *pos) {
-    const Color them = pos->sideToMove == WHITE ? BLACK : WHITE;
-    return (color_bb(pos, them) & ~pos->byType[KING]) != BB_EMPTY || pos->epSquare != SQ_NONE;
 }
 
 static bool has_legal_move(Position *pos) {
@@ -1562,6 +1569,19 @@ static int probe_dtz(Position *pos, int *success) {
             if (v - 1 < best)
                 best = v - 1;
         }
+    }
+
+    /*
+     * The winning seed is INT32_MAX, and every path that should replace it
+     * needs a quiet non-pawn move that preserves the win. That move must exist
+     * for a genuine win whose distance did not already come from the capture
+     * or pawn scan above - but "must" is an argument, not a check, and the
+     * caller does `dtz + halfmoveClock`, which overflows on the sentinel and
+     * reports a proven win for an undetermined position. Decline instead.
+     */
+    if (best == INT32_MAX) {
+        *success = 0;
+        return 0;
     }
 
     return best;

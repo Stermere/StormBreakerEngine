@@ -3,6 +3,8 @@
  */
 #include "timeman.h"
 
+#include <stdatomic.h>
+
 #include "uci.h"
 
 #if defined(_WIN32)
@@ -19,14 +21,27 @@ int64_t time_ms(void) {
     /* QueryPerformanceCounter rather than GetTickCount64: the latter has a
      * ~15ms granularity, which is coarse enough to distort nps readings and to
      * matter at the ultra-fast time controls used for SPRT testing. */
-    static LARGE_INTEGER frequency;
+    /*
+     * The frequency is fixed for the life of the process, so caching it is
+     * safe - but the cache is read by both the UCI thread and the search
+     * worker, and a plain lazily-initialised static would be a data race the
+     * sanitiser build reports. _Atomic makes the publication well defined;
+     * both threads racing to fill it store the identical value, so the
+     * unsynchronised check-then-set below needs nothing stronger.
+     */
+    static _Atomic int64_t frequency;
     LARGE_INTEGER counter;
 
-    if (frequency.QuadPart == 0)
-        QueryPerformanceFrequency(&frequency);
+    int64_t hz = atomic_load_explicit(&frequency, memory_order_relaxed);
+    if (hz == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        hz = (int64_t)f.QuadPart;
+        atomic_store_explicit(&frequency, hz, memory_order_relaxed);
+    }
 
     QueryPerformanceCounter(&counter);
-    return (int64_t)((counter.QuadPart * 1000) / frequency.QuadPart);
+    return (int64_t)((counter.QuadPart * 1000) / hz);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

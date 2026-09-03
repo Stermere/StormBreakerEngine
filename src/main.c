@@ -36,7 +36,13 @@ int main(int argc, char **argv) {
     nnue_init();
 #endif
     search_init();
-    tt_resize(16);
+
+    /* A failed allocation here is survivable - tt_probe/tt_store both check for
+     * a NULL table - but it is not silent: an engine playing a whole match with
+     * no transposition table is drastically weaker, and that has to be visible
+     * rather than showing up as an unexplained result. */
+    if (!tt_resize(16))
+        printf("info string failed to allocate the default 16 MB hash\n");
 
     if (argc > 1) {
         /* Re-join argv into a single command line and run it through exactly

@@ -2032,8 +2032,12 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
          * Learn from this node only where the search genuinely contradicted the
          * static evaluation, on the static evaluation's own terms.
          *
-         * In check there is no static evaluation to be wrong about. A mate
-         * score is not an evaluation error, it is a different kind of fact. A
+         * In check there is no static evaluation to be wrong about. A proven
+         * score - mate or tablebase - is not an evaluation error, it is a
+         * different kind of fact; the test has to be is_decisive_score()
+         * rather than is_mate_score(), because a tablebase score sits just
+         * below the mate band and would otherwise be fed to the table as an
+         * ~8,000,000cp "error" that saturates the entry on one observation. A
          * tactical best move means the gap was material that quiescence found
          * rather than a standing bias, and crediting it would teach the table
          * that every structure which once contained a hanging piece is worth a
@@ -2041,7 +2045,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
          * it bounds: a fail high proves the truth is at least `best`, which
          * says nothing at all if the evaluation was already above that.
          */
-        if (!inCheck && !is_mate_score(best) &&
+        if (!inCheck && !is_decisive_score(best) &&
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
             !(bound == BOUND_LOWER && best <= staticEval) &&
             !(bound == BOUND_UPPER && best >= staticEval))
@@ -2185,28 +2189,52 @@ static int mate_in_moves(Value v) {
 }
 
 static void print_iteration(Depth depth, Value value, int64_t elapsed, bool chess960) {
+    /*
+     * The line is assembled in full and written once.
+     *
+     * main.c makes stdout unbuffered and the UCI thread answers `isready`
+     * while this worker searches (invariant 4), so emitting the line as a
+     * sequence of printf calls lets another thread's output land in the middle
+     * of it: the GUI sees `info depth 12 seldepth 18 readyok`, which is
+     * neither a parsable info line nor a readyok, and reports the engine as
+     * unresponsive. One fputs of a complete line cannot be split that way.
+     *
+     * The buffer cannot be outgrown: the fixed prefix is under 200 characters
+     * and the PV is at most MAX_PLY moves of five characters plus a space.
+     */
+    char line[256 + MAX_PLY * 6];
     char buf[8];
+    size_t n = 0;
 
-    printf("info depth %d seldepth %d ", depth, SelDepth);
+    n +=
+        (size_t)snprintf(line + n, sizeof(line) - n, "info depth %d seldepth %d ", depth, SelDepth);
 
     if (is_mate_score(value))
-        printf("score mate %d ", mate_in_moves(value));
+        n += (size_t)snprintf(line + n, sizeof(line) - n, "score mate %d ", mate_in_moves(value));
     else
-        printf("score cp %d ", value);
+        n += (size_t)snprintf(line + n, sizeof(line) - n, "score cp %d ", value);
 
     /* Clamped so a sub-millisecond iteration cannot divide by zero. */
     const int64_t ms = elapsed > 0 ? elapsed : 1;
-    printf("nodes %llu nps %llu time %lld hashfull %d", (unsigned long long)NodeCount,
-           (unsigned long long)((NodeCount * 1000ULL) / (uint64_t)ms), (long long)elapsed,
-           tt_hashfull());
+    n += (size_t)snprintf(line + n, sizeof(line) - n, "nodes %llu nps %llu time %lld hashfull %d",
+                          (unsigned long long)NodeCount,
+                          (unsigned long long)((NodeCount * 1000ULL) / (uint64_t)ms),
+                          (long long)elapsed, tt_hashfull());
     if (TbLimit != 0)
-        printf(" tbhits %llu", (unsigned long long)TbHits);
-    printf(" pv");
+        n += (size_t)snprintf(line + n, sizeof(line) - n, " tbhits %llu",
+                              (unsigned long long)TbHits);
+
+    n += (size_t)snprintf(line + n, sizeof(line) - n, " pv");
 
     for (int i = 0; i < PvLength[0]; ++i)
-        printf(" %s", move_to_str(PvTable[0][i], chess960, buf));
+        n += (size_t)snprintf(line + n, sizeof(line) - n, " %s",
+                              move_to_str(PvTable[0][i], chess960, buf));
 
-    printf("\n");
+    assert(n < sizeof(line) - 1);
+    line[n++] = '\n';
+    line[n]   = '\0';
+
+    fputs(line, stdout);
     fflush(stdout);
 }
 
@@ -2412,7 +2440,17 @@ static void worker_entry(void *arg) {
 }
 
 void search_start(const Position *pos, const SearchLimits *limits) {
-    search_wait(); /* never run two searches at once */
+    /*
+     * Only one search at a time, so the previous worker has to be joined - but
+     * joining it is not enough on its own. A `go infinite` or `go ponder`
+     * worker parks in worker_entry() until StopFlag is set, so a bare join
+     * would block the UCI thread inside `go`, and the `stop` that would
+     * release it can only arrive on that same thread. That is a permanent
+     * deadlock and a direct breach of invariant 4, so ask the running search
+     * to stop first and make the wait bounded.
+     */
+    search_stop();
+    search_wait();
 
     RootPos = *pos;
     Limits  = *limits;
@@ -2425,14 +2463,27 @@ void search_start(const Position *pos, const SearchLimits *limits) {
 
     WorkerStarted = thread_create(&Worker, worker_entry, NULL);
     if (!WorkerStarted) {
-        /* Thread creation failed. Searching inline still produces a legal game
-         * - it just cannot be interrupted - which beats not moving at all. */
+        /*
+         * Thread creation failed. Searching inline still produces a legal game
+         * - it just cannot be interrupted - which beats not moving at all.
+         *
+         * The ponder/infinite hold has to be dropped along with it. That loop
+         * waits for a `stop` which only the UCI thread can deliver, and the
+         * UCI thread is the one about to run the search, so honouring it here
+         * would hang the process outright rather than merely finish
+         * uninterrupted. Clearing both makes worker_entry() return as soon as
+         * the search does.
+         */
+        Limits.infinite = false;
+        atomic_store(&Pondering, false);
         worker_entry(NULL);
     }
 }
 
 void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResult *out) {
-    search_wait(); /* never run two searches at once */
+    /* Same bounded-wait reasoning as search_start(). */
+    search_stop();
+    search_wait();
 
     RootPos = *pos;
     Limits  = *limits;
@@ -2460,6 +2511,15 @@ void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResu
 void search_stop(void) { atomic_store(&StopFlag, true); }
 
 void search_ponderhit(void) {
+    /*
+     * Only a pondering search may have its clock restarted. Without this
+     * guard a stray `ponderhit` during an ordinary timed search resets the
+     * origin every elapsed-time test is measured against, handing the search a
+     * second full budget and losing the game on time.
+     */
+    if (!atomic_load(&Pondering))
+        return;
+
     /* The opponent played our predicted move: the ponder search becomes a real
      * one and the clock is now ours. Time spent pondering was free, so the
      * allocation computed at `go` runs from this moment rather than from then.

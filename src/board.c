@@ -485,6 +485,19 @@ bool board_set_fen(Position *pos, const char *fen) {
         return false;
 
     /*
+     * At most sixteen men a side. The 8x8 placement grammar happily describes
+     * sixty-four, and consumers downstream are sized for a legal position
+     * rather than for a legal FEN string: nnue_accumulate() collects feature
+     * rows into a 32-entry array and nnue_output_bucket() indexes by
+     * (pieceCount - 2) / 8, so a 34-piece diagram from a GUI position editor,
+     * a corrupt book line or a hand-typed `position fen` overruns both and
+     * segfaults. Rejecting here fixes every consumer at once, and costs
+     * nothing real: no position reachable by legal play can exceed this.
+     */
+    if (popcount(color_bb(&p, WHITE)) > 16 || popcount(color_bb(&p, BLACK)) > 16)
+        return false;
+
+    /*
      * Discard castling rights and an en passant target the diagram does not
      * back, rather than rejecting the whole FEN.
      *

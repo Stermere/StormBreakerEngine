@@ -67,8 +67,9 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos);
  * exactly one definition of what is being compared. */
 uint64_t tbgen_checksum(uint64_t acc, int wdl, int dtz);
 
-/* One configuration's checksum, using THIS build's prober. The sealer in
- * tools/tbdiff.c computes the same thing with the oracle instead. */
+/* One configuration's checksum, using THIS build's prober. The sealer that
+ * produced the committed manifest computed the same thing against Fathom;
+ * see the note in syzygytest.c and docs/EXPERIMENTS.md E24. */
 uint64_t tbgen_config_checksum(int maxMen, int config, uint64_t seed, long per);
 
 /* Re-derives every configuration's checksum with THIS prober and compares
