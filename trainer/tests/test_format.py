@@ -13,10 +13,17 @@ from nnue.format import (
     MAX_PIECES,
     NUM_FEATURES,
     PAD_INDEX,
+    PROGRESS_MASK,
+    PROGRESS_MAX_BUCKET,
+    PROGRESS_PLIES_PER_BUCKET,
+    PROGRESS_SHIFT,
+    PROGRESS_UNKNOWN,
     RECORD_DTYPE,
     SOURCE_NAMES,
     SRC_MASK,
     pack_fen,
+    progress_closeness,
+    progress_plies,
     read_shard,
     record_to_fen,
     unpack,
@@ -42,6 +49,8 @@ def test_python_and_c_agree_on_every_field(shard_path, datagen_dump):
         assert int(record["wdl"]) == row["wdl"], f"record {i}"
         assert SOURCE_NAMES[int(record["flags"]) & SRC_MASK] == row["source"], f"record {i}"
         assert bool(int(record["flags"]) & IN_CHECK) is row["in_check"], f"record {i}"
+        got = (int(record["flags"]) & PROGRESS_MASK) >> PROGRESS_SHIFT
+        assert got == row["progress"], f"record {i}"
 
 
 def test_pack_fen_inverts_record_to_fen(shard_path):
@@ -57,6 +66,7 @@ def test_pack_fen_inverts_record_to_fen(shard_path):
             wdl=int(record["wdl"]),
             source=int(record["flags"]) & SRC_MASK,
             in_check=bool(int(record["flags"]) & IN_CHECK),
+            progress=(int(record["flags"]) & PROGRESS_MASK) >> PROGRESS_SHIFT,
         )
         assert repacked.tobytes() == record.tobytes(), f"record {i}: {fen}"
 
@@ -131,3 +141,61 @@ def test_unpack_matches_per_record_packing(shard_path):
 def test_unpack_handles_any_batch_size(shard_path, count):
     fields = unpack(read_shard(shard_path, count=count))
     assert fields["white"].shape[0] == count
+
+
+def test_progress_bucket_arithmetic_matches_datagen():
+    """`1 + pliesToEnd / 8`, capped at 15, and 0 for "not recorded".
+
+    Spelled out here against hand-written numbers rather than derived from the
+    same expression twice: progress_bucket() in tools/datagen.c is the only
+    other place this arithmetic exists, and a test that recomputed it would
+    agree with a typo.
+    """
+    assert PROGRESS_PLIES_PER_BUCKET == 8
+    for plies, bucket in ((0, 1), (7, 1), (8, 2), (15, 2), (16, 3), (111, 14),
+                          (112, 15), (400, 15)):
+        assert 1 + plies // PROGRESS_PLIES_PER_BUCKET == bucket or bucket == PROGRESS_MAX_BUCKET
+        assert min(1 + plies // PROGRESS_PLIES_PER_BUCKET, PROGRESS_MAX_BUCKET) == bucket
+
+
+def test_progress_helpers_read_the_bucket_the_way_a_schedule_needs():
+    # Unknown is not a distance and must not read as one - a schedule keyed on
+    # it has to be a no-op for those records, not a guess about them.
+    assert progress_plies(np.int64(PROGRESS_UNKNOWN)) == -1
+    assert progress_closeness(np.int64(PROGRESS_UNKNOWN)) == 0.0
+
+    # Nearest the end is 1.0, furthest is 0.0, and it is monotone in between.
+    closeness = progress_closeness(np.arange(1, PROGRESS_MAX_BUCKET + 1))
+    assert closeness[0] == pytest.approx(1.0)
+    assert closeness[-1] == pytest.approx(0.0)
+    assert np.all(np.diff(closeness) < 0)
+
+    # The plies estimate is the bucket's midpoint, and it increases with it.
+    plies = progress_plies(np.arange(1, PROGRESS_MAX_BUCKET + 1))
+    assert plies[0] == PROGRESS_PLIES_PER_BUCKET // 2
+    assert np.all(np.diff(plies) == PROGRESS_PLIES_PER_BUCKET)
+
+
+def test_progress_survives_pack_and_unpack():
+    for bucket in range(PROGRESS_MAX_BUCKET + 1):
+        record = pack_fen(START, progress=bucket)
+        assert (int(record["flags"]) & PROGRESS_MASK) >> PROGRESS_SHIFT == bucket
+        # And it does not disturb the fields sharing the byte.
+        assert int(record["flags"]) & SRC_MASK == 5
+        assert unpack(np.array([record]))["progress"][0] == bucket
+
+
+def test_shard_carries_game_progress(shard_path):
+    """A selfplay shard has to have the field populated, not merely allowed.
+
+    Every record reading "not recorded" is what a silently-dropped write looks
+    like, and it is also what a run whose games all hit the ply cap looks like -
+    so the assertion is that a real result comes with a real distance to it.
+    """
+    fields = unpack(read_shard(shard_path, count=4096))
+    assert fields["progress"].max() <= PROGRESS_MAX_BUCKET
+    known = fields["wdl"] <= 2
+    if known.any():
+        assert (fields["progress"][known] != PROGRESS_UNKNOWN).all()
+    # A game the ply cap stopped has no end, so it cannot have a distance to one.
+    assert (fields["progress"][~known] == PROGRESS_UNKNOWN).all()

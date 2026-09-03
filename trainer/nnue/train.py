@@ -53,14 +53,20 @@ import torch
 
 from . import sanity
 from .dataset import make_loader, set_epoch, to_device
-from .format import DEFAULT_OUTPUT_BUCKETS
-from .model import (DEFAULT_HIDDEN, NNUE, arch_from_checkpoint, blended_target, loss_fn,
-                    uncertainty_loss_fn)
+from .format import DEFAULT_OUTPUT_BUCKETS, SOURCE_NAMES
+from .model import (DEFAULT_HIDDEN, NNUE, TargetPolicy, arch_from_checkpoint, blended_target,
+                    loss_fn, uncertainty_loss_fn)
 
 # The evaluation's sigmoid scale, in centipawns. Keeping it equal to the value
 # tools/tuner.c fitted is what keeps the target in the same win-probability
 # units the linear evaluation was fitted against, so the two are comparable.
 DEFAULT_SIGMOID_K = 400.0
+
+# A tree sample carries the result of the game whose search found it, and that
+# game never went through the position - the sampler reaches into lines nobody
+# played. So it trains on its search score alone unless told otherwise. It is a
+# no-op on any shard generated with `-tree 0`, which is datagen's default.
+DEFAULT_LAMBDA_SOURCE = "tree=1.0"
 
 # Optimiser, scheduler and RNG live beside the checkpoint rather than in it.
 # They are twice the size of the model and no downstream tool wants them: the
@@ -82,6 +88,35 @@ def count(text: str) -> int:
     if value < 0 or value != int(value):
         raise argparse.ArgumentTypeError(f"not a whole non-negative count: {text!r}")
     return int(value)
+
+
+def parse_source_map(text, flag: str) -> dict:
+    """``selfplay=0.9,tree=1.0`` into ``{0: 0.9, 1: 1.0}``.
+
+    Sources are named rather than numbered because ``--lambda-source 1=1.0``
+    is a number nobody can check against the shard's stats output, and the
+    tags are already spelled out in ``datagen stats``. An unknown name is
+    fatal: a typo that silently applied to nothing would leave a run doing
+    something other than what its command line says, which is the whole class
+    of bug this policy exists to make visible.
+    """
+    if not text:
+        return {}
+    out = {}
+    for item in str(text).replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, _, value = item.partition("=")
+        name = name.strip().lower()
+        if name not in SOURCE_NAMES:
+            raise SystemExit(f"{flag}: '{name}' is not a source tag. "
+                             f"One of: {', '.join(SOURCE_NAMES)}")
+        try:
+            out[SOURCE_NAMES.index(name)] = float(value)
+        except ValueError:
+            raise SystemExit(f"{flag}: '{item}' is not NAME=NUMBER") from None
+    return out
 
 
 def save_atomically(obj, path: str) -> None:
@@ -170,7 +205,12 @@ def load_resume(args, model, optimiser, scheduler, device):
     return done + 1, history
 
 
-def evaluate(model, loader, device, sigmoid_k, lam, limit=None) -> float:
+def evaluate(model, loader, device, policy, lam, limit=None) -> float:
+    """Held-out loss under the SAME target policy the training loop used.
+
+    Scoring the validation set against a different target would make the two
+    curves incomparable, which is the only thing a validation curve is for.
+    """
     model.eval()
     # Accumulated on the device: see the note in train() on why a .item() per
     # batch is not free.
@@ -182,9 +222,9 @@ def evaluate(model, loader, device, sigmoid_k, lam, limit=None) -> float:
             batch = to_device(batch, device)
             prediction = model(batch["white"], batch["black"], batch["stm"],
                                batch["piece_count"])
-            target = blended_target(batch["score"], batch["wdl"], lam, sigmoid_k)
+            target = policy.target(batch, lam)
             n = prediction.numel()
-            total += loss_fn(prediction, target, sigmoid_k) * n
+            total += loss_fn(prediction, target, policy.sigmoid_k, policy.weights(batch)) * n
             seen += n
     model.train()
     return total.item() / max(seen, 1)
@@ -218,6 +258,18 @@ def train(args) -> None:
     optimiser, flavour = make_optimiser(model, args, device)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=args.lr_gamma)
     print(f"optim: AdamW ({flavour})")
+
+    policy = TargetPolicy(
+        sigmoid_k=args.sigmoid_k,
+        score_clip=args.score_clip,
+        progress_delta=args.lambda_progress,
+        pieces_delta=args.lambda_pieces,
+        source_lambda=parse_source_map(args.lambda_source, "--lambda-source"),
+        source_weight=parse_source_map(args.source_weight, "--source-weight"),
+        lambda_min=args.lambda_min,
+        lambda_max=args.lambda_max,
+    ).to(device)
+    print(f"target: {policy.describe()}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
 
@@ -258,6 +310,10 @@ def train(args) -> None:
         # stops being free exactly where the GPU is NOT saturated (--hidden
         # 512, a bigger batch, a faster card), and it costs nothing to avoid.
         running = torch.zeros((), device=device)
+        # The lambda that was actually applied, averaged over the epoch. With a
+        # schedule this is the only number that says what the run did: the flags
+        # say what was asked for, and the mixture decides what that came out as.
+        lam_sum = torch.zeros((), device=device)
         seen, batches = 0, 0
         arriving = endless if endless is not None else iter(train_loader)
 
@@ -272,17 +328,23 @@ def train(args) -> None:
                 break  # a plain epoch: the pass over the data ended
             batch = to_device(batch, device)
 
-            target = blended_target(batch["score"], batch["wdl"], lam, args.sigmoid_k)
+            lambdas = policy.lambdas(batch, lam)
+            score = policy.score(batch)
+            target = blended_target(score, batch["wdl"], lambdas, args.sigmoid_k)
+            weight = policy.weights(batch)
             if args.uncertainty:
                 prediction, unc = model.forward_heads(batch["white"], batch["black"],
                                                       batch["stm"], batch["piece_count"])
-                loss = loss_fn(prediction, target, args.sigmoid_k) \
-                    + args.unc_weight * uncertainty_loss_fn(unc, prediction,
-                                                            batch["score"].float())
+                # The clipped score, not the raw one: the value head is trained
+                # toward the clipped label, so its residual has to be measured
+                # against that same label or the head learns to predict an error
+                # the value head was never asked to avoid.
+                loss = loss_fn(prediction, target, args.sigmoid_k, weight) \
+                    + args.unc_weight * uncertainty_loss_fn(unc, prediction, score)
             else:
                 prediction = model(batch["white"], batch["black"], batch["stm"],
                                    batch["piece_count"])
-                loss = loss_fn(prediction, target, args.sigmoid_k)
+                loss = loss_fn(prediction, target, args.sigmoid_k, weight)
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
@@ -296,6 +358,7 @@ def train(args) -> None:
 
             n = prediction.numel()
             running += loss.detach() * n
+            lam_sum += lambdas.detach().sum()
             seen += n
             batches += 1
 
@@ -312,15 +375,22 @@ def train(args) -> None:
         scheduler.step()
         elapsed = time.time() - started
         train_loss = running.item() / max(seen, 1)
-        val_loss = (evaluate(model, val_loader, device, args.sigmoid_k, lam,
+        applied = lam_sum.item() / max(seen, 1)
+        val_loss = (evaluate(model, val_loader, device, policy, lam,
                              args.limit_batches) if val_loader else float("nan"))
 
-        print(f"epoch {epoch:>3}  lambda {lam:.2f}  lr {scheduler.get_last_lr()[0]:.2e}  "
+        # Both lambdas: the one the schedule asked for, and the one the data
+        # actually got. They differ by whatever the deltas and the overrides
+        # did, and a run whose applied lambda is not where it was meant to be
+        # is a flag typo that nothing else would report.
+        applied_note = "" if abs(applied - lam) < 5e-4 else f" (applied {applied:.3f})"
+        print(f"epoch {epoch:>3}  lambda {lam:.2f}{applied_note}  "
+              f"lr {scheduler.get_last_lr()[0]:.2e}  "
               f"train {train_loss:.6f}  val {val_loss:.6f}  "
               f"{seen / max(elapsed, 1e-6):,.0f} pos/s  {elapsed:.0f}s", flush=True)
 
-        history.append({"epoch": epoch, "lambda": lam, "train": train_loss,
-                        "val": val_loss, "positions": seen})
+        history.append({"epoch": epoch, "lambda": lam, "lambda_applied": applied,
+                        "train": train_loss, "val": val_loss, "positions": seen})
 
         print()
         sanity.report(model, device)
@@ -399,6 +469,48 @@ def parse_args(argv=None):
                         help="weight on the search score in the final epoch")
     parser.add_argument("--sigmoid-k", type=float, default=DEFAULT_SIGMOID_K,
                         help="centipawns per unit of the win-probability sigmoid")
+
+    # The per-record lambda dials. Every one of them defaults to no effect, so
+    # a run that names none computes exactly what a single-lambda run computed.
+    # See TargetPolicy in model.py for why one lambda over a whole dataset is
+    # paying the average of prices that are not the same.
+    parser.add_argument("--lambda-progress", type=float, default=0.0, metavar="DELTA",
+                        help="shift lambda by this much at the END of a game, tapering to "
+                             "zero 112+ plies away from it. NEGATIVE trusts the game "
+                             "result more where it is nearly certain and the search less: "
+                             "-0.2 with --lambda-start 0.95 runs 0.95 in the opening and "
+                             "0.75 on the last few plies. Needs the game-progress nibble, "
+                             "which datagen writes for selfplay shards and cannot write "
+                             "for `label` ones - those keep the base lambda")
+    parser.add_argument("--lambda-pieces", type=float, default=0.0, metavar="DELTA",
+                        help="shift lambda by this much at bare kings, tapering to zero at "
+                             "a full board. The other half of the same idea: the search "
+                             "score's SYSTEMATIC errors - fortresses, compensation, an "
+                             "ending it cannot convert - are what the result term corrects, "
+                             "and they live in the endgame")
+    parser.add_argument("--lambda-source", default=DEFAULT_LAMBDA_SOURCE,
+                        metavar="NAME=V,...",
+                        help=f"override lambda outright for a source tag. Default "
+                             f"{DEFAULT_LAMBDA_SOURCE!r}: a tree sample's game result "
+                             f"belongs to a game that never went through that position, so "
+                             f"it trains on its search score alone. This REPLACES the "
+                             f"default, so keep tree in the list unless you mean to drop "
+                             f"it; '' turns it off entirely")
+    parser.add_argument("--lambda-min", type=float, default=0.0,
+                        help="floor for the deltas above; overrides are not clipped")
+    parser.add_argument("--lambda-max", type=float, default=1.0,
+                        help="ceiling for the deltas above")
+    parser.add_argument("--score-clip", type=int, default=0, metavar="CP",
+                        help="clamp |score| to this many centipawns before the sigmoid. A "
+                             "mate or tablebase score is a proven result rather than an "
+                             "evaluation, and sigmoid(31500/400) is 1.0 to every digit a "
+                             "float carries - a target no clipped-weight net can reach. "
+                             "`datagen stats` prints what share of a shard is decisive. "
+                             "0 disables")
+    parser.add_argument("--source-weight", default=None, metavar="NAME=W,...",
+                        help="per-record loss weight by source, e.g. 'tree=0.5'. Sets the "
+                             "mixture without regenerating anything, where --sources can "
+                             "only drop a source entirely")
 
     parser.add_argument("--positions-per-epoch", type=count, default=0,
                         help="make an epoch this many positions rather than a whole pass, "

@@ -43,9 +43,12 @@ from .format import (
     NET_TO_CP,
     NUM_FEATURES,
     PAD_INDEX,
+    SOURCE_NAMES,
     WEIGHT_CLIP,
     check_output_buckets,
     output_bucket,
+    phase_endgameness,
+    progress_closeness,
 )
 
 DEFAULT_HIDDEN = 1024
@@ -283,36 +286,50 @@ def from_checkpoint(state: dict) -> NNUE:
     return model
 
 
-def blended_target(score: torch.Tensor, wdl: torch.Tensor, lam: float,
-                   sigmoid_k: float) -> torch.Tensor:
+def blended_target(score: torch.Tensor, wdl: torch.Tensor, lam, sigmoid_k: float
+                   ) -> torch.Tensor:
     """``lambda * sigmoid(score / K) + (1 - lambda) * wdl``.
 
     Mostly distilling the search, with enough game result mixed in to stop the
     net inheriting the teacher's systematic errors. A record whose game result
-    is unknown - a labelled EPD with no ``[x.x]`` on it - falls back to
-    lambda = 1 rather than being dropped: its search score is just as good as
-    any other record's, and pretending its result is a draw would be a lie the
-    net would learn.
+    is unknown - a labelled EPD with no ``[x.x]`` on it, or a game the ply cap
+    stopped - falls back to lambda = 1 rather than being dropped: its search
+    score is just as good as any other record's, and pretending its result is a
+    draw would be a lie the net would learn.
+
+    ``lam`` is a float or a per-record tensor. The tensor case is the whole
+    point of :class:`TargetPolicy`: one lambda over a dataset has to price the
+    result's informativeness in at the average, and the average is not where
+    any record lives.
     """
     outcome = torch.sigmoid(score / sigmoid_k)
     known = wdl <= 2
     result = torch.clamp(wdl.float(), max=2.0) / 2.0
-    lam_eff = torch.where(known, torch.full_like(outcome, lam),
-                          torch.ones_like(outcome))
+    if not torch.is_tensor(lam):
+        lam = torch.full_like(outcome, float(lam))
+    lam_eff = torch.where(known, lam.to(outcome.dtype), torch.ones_like(outcome))
     return lam_eff * outcome + (1.0 - lam_eff) * result
 
 
-def loss_fn(prediction: torch.Tensor, target: torch.Tensor,
-            sigmoid_k: float) -> torch.Tensor:
-    """MSE in win-probability space.
+def loss_fn(prediction: torch.Tensor, target: torch.Tensor, sigmoid_k: float,
+            weight: torch.Tensor | None = None) -> torch.Tensor:
+    """MSE in win-probability space, optionally weighted per record.
 
     The network's raw output is in NET_TO_CP units, so it goes through the same
     sigmoid the target did. Comparing centipawns directly would weight a
     2000cp position as heavily as the 30cp positions that actually decide
     games.
+
+    ``weight`` re-weights the mixture without regenerating anything: a run can
+    give tree samples half the pull of game-line positions and keep every
+    record in the batch. Normalised by the weights' own sum, so the loss stays
+    comparable to an unweighted run's rather than scaling with the mixture.
     """
     predicted = torch.sigmoid(prediction * NET_TO_CP / sigmoid_k)
-    return torch.nn.functional.mse_loss(predicted, target)
+    if weight is None:
+        return torch.nn.functional.mse_loss(predicted, target)
+    squared = (predicted - target) ** 2
+    return (squared * weight).sum() / weight.sum().clamp_min(1e-8)
 
 
 def uncertainty_loss_fn(unc_prediction: torch.Tensor, value_prediction: torch.Tensor,
@@ -333,3 +350,150 @@ def uncertainty_loss_fn(unc_prediction: torch.Tensor, value_prediction: torch.Te
     """
     residual = (score / NET_TO_CP - value_prediction).abs().detach()
     return torch.nn.functional.l1_loss(unc_prediction, residual)
+
+
+# ------------------------------------------------------------- the target ----
+
+
+class TargetPolicy:
+    """Everything between a record and the number the loss compares against.
+
+    WHY THIS IS NOT JUST A FLOAT. The target is
+
+        lambda * sigmoid(score / K) + (1 - lambda) * wdl
+
+    and lambda prices how much the GAME RESULT is worth against the search
+    score. That price is not the same for every record, and a single number for
+    the whole dataset has to pay the average of prices that differ by a lot:
+
+      * a result twenty moves away is nearly a coin flip about the position in
+        front of it; three plies away it is the truth;
+      * the search score's SYSTEMATIC errors - fortresses, compensation, an
+        endgame it cannot convert - are what the result term exists to correct,
+        and they are concentrated in the endgame;
+      * a tree sample's game result belongs to a game that never went through
+        that position - the only outright mislabel in this list;
+      * a `human` or `engine` record's result is real, but it is someone
+        else's continuation. A different question, not a worse answer.
+
+    Each of those is one dial here, and every dial on this class defaults to
+    zero, so a policy built with no arguments computes exactly what a single
+    lambda computed. (train.py's `--lambda-source` defaults to `tree=1.0`; the
+    default lives on the flag rather than here, so this class stays neutral.)
+    The composition is deliberately additive and clipped rather than clever:
+
+        lam = clip(base + progress_delta * closeness + pieces_delta * endgame,
+                   lambda_min, lambda_max)
+        lam = per-source override, where one is given
+        lam = 1 wherever the game result is unknown           (structural)
+
+    ``base`` is the epoch anneal the caller passes in, so the deltas ride on
+    top of it rather than replacing it.
+    """
+
+    def __init__(self, sigmoid_k: float = 400.0, score_clip: int = 0,
+                 progress_delta: float = 0.0, pieces_delta: float = 0.0,
+                 source_lambda: dict | None = None, source_weight: dict | None = None,
+                 lambda_min: float = 0.0, lambda_max: float = 1.0):
+        self.sigmoid_k = float(sigmoid_k)
+        self.score_clip = int(score_clip)
+        self.progress_delta = float(progress_delta)
+        self.pieces_delta = float(pieces_delta)
+        self.lambda_min = float(lambda_min)
+        self.lambda_max = float(lambda_max)
+
+        n = len(SOURCE_NAMES)
+        self.source_lambda = dict(source_lambda or {})
+        self.source_weight = dict(source_weight or {})
+
+        # Lookup tables rather than a dict walked per batch: source is an
+        # int64 column already, so this is one gather.
+        self._lam_by_source = torch.zeros(n)
+        self._lam_given = torch.zeros(n, dtype=torch.bool)
+        for src, value in self.source_lambda.items():
+            self._lam_by_source[src] = float(value)
+            self._lam_given[src] = True
+
+        self._weight_by_source = torch.ones(n)
+        for src, value in self.source_weight.items():
+            self._weight_by_source[src] = float(value)
+        self.weighted = bool(self.source_weight)
+
+        self._device = None
+
+    def to(self, device):
+        if self._device != device:
+            self._lam_by_source = self._lam_by_source.to(device)
+            self._lam_given = self._lam_given.to(device)
+            self._weight_by_source = self._weight_by_source.to(device)
+            self._device = device
+        return self
+
+    # ------------------------------------------------------------ pieces ----
+
+    def score(self, batch: dict) -> torch.Tensor:
+        """The label, clipped if asked.
+
+        A mate or a tablebase score is a PROVEN result rather than an
+        evaluation, and ``sigmoid(31500 / 400)`` is 1.0 to every digit a float
+        carries - so those records train the net toward a target no bounded
+        network can reach, and the weight clip guarantees it is bounded. Before
+        gen-5 the question did not arise, because `-maxscore 2000` dropped
+        them; now that games are played to mate and tablebases label the
+        endings, they are a real share of the dataset (`datagen stats` prints
+        it). Clipping keeps the position and its sign and drops only the claim
+        that the net should be infinitely confident about it.
+        """
+        score = batch["score"].float()
+        if self.score_clip > 0:
+            score = score.clamp(-self.score_clip, self.score_clip)
+        return score
+
+    def lambdas(self, batch: dict, base: float) -> torch.Tensor:
+        """The per-record weight on the search score."""
+        progress = batch["progress"]
+        lam = torch.full_like(progress, float(base), dtype=torch.float32)
+
+        if self.progress_delta:
+            lam = lam + self.progress_delta * progress_closeness(progress).float()
+        if self.pieces_delta:
+            lam = lam + self.pieces_delta * phase_endgameness(batch["piece_count"]).float()
+
+        lam = lam.clamp(self.lambda_min, self.lambda_max)
+
+        if self.source_lambda:
+            self.to(lam.device)
+            source = batch["source"]
+            lam = torch.where(self._lam_given[source], self._lam_by_source[source], lam)
+
+        return lam
+
+    def target(self, batch: dict, base: float) -> torch.Tensor:
+        return blended_target(self.score(batch), batch["wdl"],
+                              self.lambdas(batch, base), self.sigmoid_k)
+
+    def weights(self, batch: dict) -> torch.Tensor | None:
+        """Per-record loss weights, or None when every source counts the same.
+
+        This is the mixture dial. `--sources` can only DROP a source, and
+        dropping is the wrong tool when the question is whether tree samples
+        want half the pull of game-line ones rather than none of it.
+        """
+        if not self.weighted:
+            return None
+        self.to(batch["source"].device)
+        return self._weight_by_source[batch["source"]]
+
+    def describe(self) -> str:
+        parts = []
+        if self.score_clip:
+            parts.append(f"score clipped to +-{self.score_clip}cp")
+        if self.progress_delta:
+            parts.append(f"lambda {self.progress_delta:+.2f} at the game's end")
+        if self.pieces_delta:
+            parts.append(f"lambda {self.pieces_delta:+.2f} at bare kings")
+        for src, value in sorted(self.source_lambda.items()):
+            parts.append(f"lambda {value:.2f} for {SOURCE_NAMES[src]}")
+        for src, value in sorted(self.source_weight.items()):
+            parts.append(f"weight {value:g} for {SOURCE_NAMES[src]}")
+        return ", ".join(parts) if parts else "flat lambda, no clip, no re-weighting"

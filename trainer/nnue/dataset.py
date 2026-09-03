@@ -111,6 +111,10 @@ def _tensors(records: np.ndarray, index_dtype) -> dict:
         # model, and a loader that baked it in would have to be rebuilt to
         # change it.
         "piece_count": torch.from_numpy(fields["piece_count"]),
+        # Both carried for the same reason: the lambda schedule is a property
+        # of the run, not of the file, and it reads these per record.
+        "source": torch.from_numpy(fields["source"]),
+        "progress": torch.from_numpy(fields["progress"]),
     }
 
 

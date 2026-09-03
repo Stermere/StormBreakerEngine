@@ -210,26 +210,46 @@ static int iabs(int v) { return v < 0 ? -v : v; }
  *      26     2     fullmove number
  *      28     2     score, centipawns, side-to-move relative (int16)
  *      30     1     WDL from the side to move: 0 loss, 1 draw, 2 win, 3 unknown
- *      31     1     flags: bits 0-2 source tag, bit 3 in check, 4-7 reserved
+ *      31     1     flags: bits 0-2 source tag, bit 3 in check,
+ *                          bits 4-7 game-progress bucket (0 = not recorded)
  *
  *  Castling rights ride in the nibbles rather than costing a byte: a piece code
  *  is `type | color << 3` with types 0-5, and a rook that still has a castling
  *  right is type 6. Three codes spare, and Chess960 castling encodes correctly
  *  for free - which matters, because a data format is expensive to change once
  *  a hundred million records exist.
+ *
+ *  THE GAME-PROGRESS NIBBLE is what the format's four reserved bits became, and
+ *  it is spent here rather than kept because it cannot be backfilled: how far a
+ *  position was from the end of the game it came from is knowable only while
+ *  that game is in hand. The trainer wants it because the WDL label's
+ *  INFORMATIVENESS varies over a game - a result twenty moves away says much
+ *  less about the position in front of it than one three plies away - and a
+ *  single lambda over the whole dataset has to price that in at the average.
+ *
+ *  Zero means "not recorded", so every shard written before this field existed
+ *  decodes as unknown rather than as bucket zero, and every reader that ignores
+ *  the nibble reads exactly what it read before.
  * ========================================================================== */
 
 enum {
-    REC_BYTES      = 32,
-    POL_BYTES      = 4,
-    REC_MAX_PIECES = 32,
-    REC_EP_NONE    = 127,
+    REC_BYTES = 32,
+    /* Bytes 0..24: occupied, the piece nibbles, and the side-to-move/en-passant
+     * byte. Everything that identifies the POSITION, and nothing that does not
+     * - the halfmove clock and the fullmove number sit after it, and the
+     * network never sees either. */
+    REC_POSITION_BYTES = 25,
+    POL_BYTES          = 4,
+    REC_MAX_PIECES     = 32,
+    REC_EP_NONE        = 127,
 
     NIB_ROOK_CASTLE = 6, /* a rook that still carries a castling right */
     NIB_BLACK       = 8,
 
-    REC_SRC_MASK = 7,
-    REC_IN_CHECK = 8,
+    REC_SRC_MASK       = 7,
+    REC_IN_CHECK       = 8,
+    REC_PROGRESS_MASK  = 0xF0, /* bits 4-7: how far this position is from the end of its game */
+    REC_PROGRESS_SHIFT = 4,
 
     WDL_LOSS    = 0,
     WDL_DRAW    = 1,
@@ -339,6 +359,33 @@ static void policy_decode(const uint8_t *in, PolicyRecord *p) {
 static SourceTag record_source(const Record *r) { return (SourceTag)(r->flags & REC_SRC_MASK); }
 
 /*
+ * Game progress: plies from this position to the end of the game it came from,
+ * in four bits.
+ *
+ * Bucket 0 is "not recorded" - a labelled EPD, whose game we never saw, and a
+ * game the ply cap cut short, whose end never happened. Buckets 1..15 are eight
+ * plies wide each, so 1 is "the game ended within four moves" and 15 is
+ * "112 plies or more still to play". Linear rather than logarithmic because the
+ * consumer is a lambda ramp and not a measurement: eight-ply resolution is finer
+ * than any schedule worth fitting, and a formula both this file and
+ * trainer/nnue/format.py can spell in one line cannot drift apart the way a
+ * shared table of bucket edges would.
+ */
+enum { PROGRESS_UNKNOWN = 0, PROGRESS_PLIES_PER_BUCKET = 8, PROGRESS_MAX_BUCKET = 15 };
+
+/* Negative plies mean the game's end is not known; see PROGRESS_UNKNOWN. */
+static unsigned progress_bucket(int pliesToEnd) {
+    if (pliesToEnd < 0)
+        return PROGRESS_UNKNOWN;
+    const unsigned b = 1u + (unsigned)pliesToEnd / PROGRESS_PLIES_PER_BUCKET;
+    return b > (unsigned)PROGRESS_MAX_BUCKET ? (unsigned)PROGRESS_MAX_BUCKET : b;
+}
+
+static unsigned record_progress(const Record *r) {
+    return (unsigned)(r->flags & REC_PROGRESS_MASK) >> REC_PROGRESS_SHIFT;
+}
+
+/*
  * The rook a castling right refers to: the outermost one on the king's side of
  * the king. That is what KQkq means, it is what board_set_fen assumes, and it
  * is the X-FEN disambiguation rule, so it stays correct if Chess960 lands.
@@ -361,9 +408,11 @@ static Square castling_rook(const Position *pos, Color c, bool kingside) {
 }
 
 /* Packs `pos` plus its label. Every writer in this file goes through here, so
- * if the encoding is wrong it is wrong in exactly one place. */
-static void record_from_position(Record *r, const Position *pos, int score, int wdl,
-                                 SourceTag src) {
+ * if the encoding is wrong it is wrong in exactly one place. `progress` is the
+ * bucket progress_bucket() returned, or PROGRESS_UNKNOWN where no game end is
+ * known - which is every `label` record and every game the ply cap stopped. */
+static void record_from_position(Record *r, const Position *pos, int score, int wdl, SourceTag src,
+                                 unsigned progress) {
     memset(r, 0, sizeof(*r));
 
     Square castleRooks[4] = {SQ_NONE, SQ_NONE, SQ_NONE, SQ_NONE};
@@ -405,6 +454,7 @@ static void record_from_position(Record *r, const Position *pos, int score, int 
     r->score          = (int16_t)clamped;
     r->wdl            = (uint8_t)wdl;
     r->flags          = (uint8_t)((unsigned)src & REC_SRC_MASK);
+    r->flags |= (uint8_t)((progress << REC_PROGRESS_SHIFT) & REC_PROGRESS_MASK);
     if (board_checkers(pos))
         r->flags |= REC_IN_CHECK;
 }
@@ -513,6 +563,24 @@ static uint64_t rng_next(Rng *s) {
  */
 static Rng worker_rng(uint64_t seed, int index) {
     Rng s = seed + (uint64_t)(index + 1) * 0x9E3779B97F4A7C15ULL;
+    return (Rng)rng_next(&s);
+}
+
+/*
+ * An independent stream per GAME, keyed on the game's global ordinal.
+ *
+ * A game is then a function of (seed, ordinal) and nothing else - not of how
+ * many games ran before it in this process, and not of how many workers the
+ * run was given. Two properties follow, and `selfplay -resume` needs both: an
+ * interrupted run can rejoin at a game boundary without replaying the draws
+ * that led there, and the same -seed produces the same dataset at any
+ * -threads. Mixed twice for the same reason worker_rng is: rng_next advances
+ * the state by the golden constant, so seeds a multiple of it apart merely
+ * start one draw into each other's streams.
+ */
+static Rng game_rng(uint64_t seed, int game) {
+    Rng s = seed + (uint64_t)(game + 1) * 0xD1B54A32D192ED03ULL;
+    s     = (Rng)rng_next(&s);
     return (Rng)rng_next(&s);
 }
 
@@ -709,6 +777,35 @@ static void keyset_grow(KeySet *ks) {
     ks->mask  = newCap - 1;
 }
 
+/*
+ * A key for the position an ENCODED record holds, without decoding it.
+ *
+ * `shuffle` dedups across shards, where the alternative is board_set_fen on
+ * every one of a hundred million records to recover a Zobrist key - and the
+ * bytes already identify the position exactly, so the decode would only be
+ * spelling the same thing more slowly. The set it feeds is the same set
+ * Zobrist keys would have produced: two records with these 25 bytes in common
+ * are the same position with the same rights and the same side to move, and
+ * they differ at most in a halfmove clock the network cannot see.
+ *
+ * FNV-1a, finished with splitmix64's mixer because FNV avalanches poorly in
+ * the high bits and keyset_place indexes on exactly those. A 64-bit key over
+ * 10^8 records collides about once every three runs, and a collision costs one
+ * dropped record.
+ */
+static uint64_t record_position_key(const uint8_t *raw) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int i = 0; i < REC_POSITION_BYTES; ++i) {
+        h ^= raw[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBULL;
+    return h ^ (h >> 31);
+}
+
 /* True if `k` was not already present. */
 static bool keyset_insert(KeySet *ks, Key k) {
     uint64_t v = k ? (uint64_t)k : 1;
@@ -861,6 +958,10 @@ typedef struct {
     int treeSamples;
     int treeMinDepth;
     int maxPlies;
+    /* Whether the shard's records carry the game-progress nibble. A reader
+     * cannot tell from the records themselves: bucket 0 means "not recorded",
+     * and a shard whose games were all cut short is legitimately all zeros. */
+    bool gameProgress;
     /* filters */
     int maxScore;
     bool quietFilter;
@@ -939,7 +1040,8 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
         fprintf(f, "    \"tree_samples_per_move\": %d,\n", m->treeSamples);
         fprintf(f, "    \"tree_min_depth\": %d,\n", m->treeMinDepth);
-        fprintf(f, "    \"max_plies\": %d\n", m->maxPlies);
+        fprintf(f, "    \"max_plies\": %d,\n", m->maxPlies);
+        fprintf(f, "    \"game_progress\": %s\n", m->gameProgress ? "true" : "false");
         fprintf(f, "  },\n");
     }
 
@@ -1489,6 +1591,7 @@ typedef struct {
     bool dedup;
     int dedupBits;
     bool policy;
+    bool resume;
 } SelfplayOpts;
 
 enum { MAX_RESERVOIR = 8 };
@@ -1550,6 +1653,13 @@ typedef struct {
     Color stm;
     SourceTag src;
     Move cutoff;
+    /* The gamePly of the GAME position this candidate belongs to, which for a
+     * tree sample is the root of the search it was taken from rather than the
+     * node's own depth. A tree node is not on the game line at all, so the
+     * plies between it and the game's end are not a distance anything travelled;
+     * the honest reading of a tree sample's progress is "as far into the game as
+     * the move being searched", and that is what this holds. */
+    int ply;
 } Candidate;
 
 typedef struct {
@@ -1558,7 +1668,7 @@ typedef struct {
 } CandidateList;
 
 static void candidates_push(CandidateList *cl, const char *fen, Color stm, SourceTag src,
-                            Move cutoff) {
+                            Move cutoff, int ply) {
     if (cl->count == cl->cap) {
         cl->cap   = cl->cap ? cl->cap * 2 : 256;
         cl->items = realloc(cl->items, cl->cap * sizeof(Candidate));
@@ -1570,6 +1680,7 @@ static void candidates_push(CandidateList *cl, const char *fen, Color stm, Sourc
     c->stm    = stm;
     c->src    = src;
     c->cutoff = cutoff;
+    c->ply    = ply;
 }
 
 /* Game result, always from white's point of view. RES_UNKNOWN is a game cut
@@ -1636,10 +1747,18 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     char path[PATH_CAP];
     expand_path(path, sizeof(path), o->out, index, workers);
 
-    /* Each worker gets a share of the games and a stream of its own. The
-     * stride keeps a run with N workers reproducible for any N. */
-    const int games = o->games / workers + (index < o->games % workers ? 1 : 0);
-    Rng rng         = worker_rng(o->seed, index);
+    /* Games are dealt out round-robin by GLOBAL ordinal, exactly as `label`
+     * splits its input by line, and each one is seeded from that ordinal
+     * alone - so game g is the same game whatever worker draws it and however
+     * many workers there are. That is what makes -resume possible at all: a
+     * stream advanced game by game could only be rejoined by replaying every
+     * draw before it, and the draws per game vary with rejected openings. */
+    int games = 0;
+    for (int g = index; g < o->games; g += workers)
+        ++games;
+    /* Overwritten per game below. It is seeded here at all so that the tree
+     * sampler's pointer never aims at an indeterminate value. */
+    Rng rng = worker_rng(o->seed, index);
 
     tt_resize((size_t)o->hashMb);
 
@@ -1648,12 +1767,30 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     if (o->book)
         book_open(&book, o->book);
 
-    ShardWriter writer;
-    shard_open(&writer, path, o->policy);
-
     KeySet seen;
     if (o->dedup)
         keyset_init(&seen, o->dedupBits);
+
+    ShardWriter writer;
+    long resumeFrom = 0;
+
+    if (o->resume) {
+        const ShardOpen state =
+            shard_open_resumable(&writer, path, o->policy, &resumeFrom, o->dedup ? &seen : NULL);
+        if (state == SHARD_COMPLETE) {
+            if (!Quiet)
+                fprintf(stdout, "[w%02d] %s is already complete\n", index, path);
+            if (o->dedup)
+                keyset_free(&seen);
+            book_close(&book);
+            return 0;
+        }
+        if (state == SHARD_RESUMED && !Quiet)
+            fprintf(stdout, "[w%02d] resuming %s at %llu records, game %ld\n", index, path,
+                    (unsigned long long)writer.count, resumeFrom);
+    } else {
+        shard_open(&writer, path, o->policy);
+    }
 
     CandidateList cands = {NULL, 0, 0};
     Position pos;
@@ -1663,13 +1800,36 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     sampler.minDepth = o->treeMinDepth;
     sampler.want     = o->treeSamples < MAX_RESERVOIR ? o->treeSamples : MAX_RESERVOIR;
 
-    const double start = now_seconds();
-    uint64_t labelled  = 0;
-    int rejected       = 0;
-    double lastReport  = start;
+    const double start    = now_seconds();
+    uint64_t labelled     = 0;
+    int rejected          = 0;
+    double lastReport     = start;
+    double lastCheckpoint = start;
+    int played            = 0;
 
-    for (int game = 0; game < games; ++game) {
+    for (int game = index; game < o->games; game += workers) {
+        if (game < resumeFrom) {
+            ++played;
+            continue;
+        }
+
+        /* Between games, never inside one: the checkpoint's contract is that
+         * everything before the recorded game is on disk and complete, and a
+         * game's records are all written after its result is known. */
+        if (o->resume) {
+            const double now = now_seconds();
+            if (now - lastCheckpoint > CHECKPOINT_SECONDS) {
+                shard_checkpoint(&writer, game);
+                lastCheckpoint = now;
+            }
+        }
+
+        /* Reseeded per game rather than carried, so that game g reproduces from
+         * (seed, g) alone. See the note on the game loop above. */
+        rng = game_rng(o->seed, game);
+
         int attempts = 0;
+        int finalPly = 0;
         GameResult result;
         cands.count = 0;
 
@@ -1774,14 +1934,20 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 char fen[FEN_MAX_LEN];
                 if (board_checkers(&pos) == BB_EMPTY) {
                     board_to_fen(&pos, fen);
-                    candidates_push(&cands, fen, pos.sideToMove, SRC_SELFPLAY, MOVE_NONE);
+                    candidates_push(&cands, fen, pos.sideToMove, SRC_SELFPLAY, MOVE_NONE,
+                                    pos.gamePly);
                 }
                 for (int s = 0; s < sampler.count; ++s)
                     candidates_push(&cands, sampler.slot[s].fen, stm_from_fen(sampler.slot[s].fen),
-                                    SRC_TREE, sampler.slot[s].cutoff);
+                                    SRC_TREE, sampler.slot[s].cutoff, pos.gamePly);
 
                 board_do_move(&pos, res.best);
             }
+
+            /* Where the game stopped, in the same gamePly units the candidates
+             * recorded - board_set_fen zeroed it at the start position, so the
+             * difference between the two is a ply count and nothing else. */
+            finalPly = pos.gamePly;
 
             if (!restart)
                 break;
@@ -1818,8 +1984,14 @@ static int selfplay_worker(int index, int workers, void *ctx) {
             if (o->quietFilter && c->src == SRC_SELFPLAY && move_is_tactical(&p, res.best))
                 continue;
 
+            /* No result, no distance to it: a game the ply cap stopped has an
+             * end nobody reached, and inventing a distance to it would be the
+             * same mistake as inventing the draw. */
+            const int pliesToEnd = result == RES_UNKNOWN ? -1 : finalPly - c->ply;
+
             Record rec;
-            record_from_position(&rec, &p, res.score, wdl_for(result, c->stm), c->src);
+            record_from_position(&rec, &p, res.score, wdl_for(result, c->stm), c->src,
+                                 progress_bucket(pliesToEnd));
 
             PolicyRecord pol;
             pol.best   = (uint16_t)res.best;
@@ -1827,11 +1999,13 @@ static int selfplay_worker(int index, int workers, void *ctx) {
             shard_write(&writer, &rec, &pol);
         }
 
+        ++played;
+
         const double now = now_seconds();
-        if (!Quiet && (now - lastReport > 5.0 || game + 1 == games)) {
+        if (!Quiet && (now - lastReport > 5.0 || played == games)) {
             const double elapsed = now - start > 0.001 ? now - start : 0.001;
             fprintf(stdout, "[w%02d] games %d/%d  records %llu  labels %llu  %.0f labels/s%s\n",
-                    index, game + 1, games, (unsigned long long)writer.count,
+                    index, played, games, (unsigned long long)writer.count,
                     (unsigned long long)labelled, (double)labelled / elapsed,
                     rejected ? "  (openings rejected)" : "");
             fflush(stdout);
@@ -1841,10 +2015,13 @@ static int selfplay_worker(int index, int workers, void *ctx) {
 
     Manifest man;
     memset(&man, 0, sizeof(man));
-    man.command         = "selfplay";
-    man.nodes           = o->nodes;
-    man.hashMb          = o->hashMb;
-    man.seed            = (uint64_t)worker_rng(o->seed, index);
+    man.command = "selfplay";
+    man.nodes   = o->nodes;
+    man.hashMb  = o->hashMb;
+    /* The base seed, not this worker's derived one: games are keyed on their
+     * global ordinal now, so base + ordinal is what reproduces one and the
+     * derived stream reproduces nothing. */
+    man.seed            = o->seed;
     man.dedup           = o->dedup;
     man.games           = games;
     man.book            = o->book;
@@ -1855,6 +2032,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.treeSamples     = sampler.want;
     man.treeMinDepth    = o->treeMinDepth;
     man.maxPlies        = o->maxPlies;
+    man.gameProgress    = true;
     man.maxScore        = o->maxScore;
     man.quietFilter     = o->quietFilter;
     man.syzygyPath      = o->syzygyPath;
@@ -1960,6 +2138,14 @@ static void usage_selfplay(void) {
            "  -nodedup           keep positions already seen in this shard.\n"
            "  -dedupbits N       initial log2 size of the dedup table; it grows. (22)\n"
            "  -nopolicy          do not write the .pol sidecar.\n"
+           "  -resume            checkpoint every 30s at a game boundary, and pick up\n"
+           "                     where an interrupted run of the SAME command stopped.\n"
+           "                     A game is a function of -seed and its global ordinal, so\n"
+           "                     a resumed shard is what an uninterrupted one would have\n"
+           "                     been. A finished shard is left alone, so the command is\n"
+           "                     safe to repeat until it says complete. Keep -threads and\n"
+           "                     -games the same: workers deal games round-robin, so a\n"
+           "                     different count plays a different set.\n"
            "  -quiet             progress lines off.\n");
 }
 
@@ -2035,6 +2221,8 @@ static int cmd_selfplay(int argc, char **argv) {
             o.dedup = false;
         else if (!strcmp(argv[i], "-nopolicy"))
             o.policy = false;
+        else if (!strcmp(argv[i], "-resume"))
+            o.resume = true;
         else if (!strcmp(argv[i], "-quiet"))
             Quiet = true;
         else {
@@ -2051,6 +2239,21 @@ static int cmd_selfplay(int argc, char **argv) {
         die("-threads must be between 1 and 64");
     if (o.dedupBits < 10 || o.dedupBits > 30)
         die("-dedupbits must be between 10 and 30");
+    if (o.treeSamples < 0 || o.treeSamples > MAX_RESERVOIR)
+        dief("-tree must be between 0 and %d", MAX_RESERVOIR);
+    if (o.treeMinDepth < 1)
+        die("-treedepth must be at least 1: depth 0 is quiescence, which never samples");
+    /*
+     * A game and the searches inside it share one Position, so its history has
+     * to hold the game's plies AND the deepest search's on top of them.
+     * board.h sizes that array at MAX_GAME_PLY; the cap used to be an
+     * unvalidated atoi, and `-maxplies 4000` wrote past the end of it several
+     * hours into a run rather than at the command line.
+     */
+    if (o.maxPlies < 2 || o.maxPlies > MAX_GAME_PLY - MAX_PLY - 1)
+        dief("-maxplies must be between 2 and %d - a game's plies and the deepest search's "
+             "share one %d-entry history",
+             MAX_GAME_PLY - MAX_PLY - 1, MAX_GAME_PLY);
     if (o.openingPlies < 0)
         o.openingPlies = o.book ? 2 : 8;
     if (o.openingPliesMax < o.openingPlies)
@@ -2203,7 +2406,9 @@ static int label_worker(int index, int workers, void *ctx) {
             }
 
             Record rec;
-            record_from_position(&rec, &p, res.score, wdl, o->source);
+            /* An EPD line carries a result but never the game it came from, so the
+             * distance to that result is unknown - not zero. */
+            record_from_position(&rec, &p, res.score, wdl, o->source, PROGRESS_UNKNOWN);
 
             PolicyRecord pol;
             pol.best   = (uint16_t)res.best;
@@ -2401,6 +2606,12 @@ static void usage_shuffle(void) {
            "shuffle buffer is not a substitute - a 100k-record window over a file whose\n"
            "consecutive records come from the same game is not a shuffle.\n"
            "\n"
+           "It also DEDUPLICATES, and this is the only stage that can. selfplay and\n"
+           "label dedup within a shard, but their workers are separate processes that\n"
+           "share nothing, so a position two of them both reach lands in the dataset\n"
+           "twice. gen-004 came out ten copies deep that way. A duplicate is dropped\n"
+           "with its policy bytes, and the count is reported.\n"
+           "\n"
            "Policy sidecars ride along: a record and its four policy bytes move as one\n"
            "unit. Either every input has a .pol or none may.\n"
            "\n"
@@ -2410,6 +2621,11 @@ static void usage_shuffle(void) {
            "  -memory MB         how much RAM one bucket may take.        (512)\n"
            "  -tmp <dir>         where bucket files go.                   (beside -o)\n"
            "  -seed N            RNG seed.                                (1)\n"
+           "  -nodedup           keep every record, duplicates included. The output is\n"
+           "                     then a pure permutation of the input.\n"
+           "  -dedupbits N       initial log2 size of the dedup table; it grows. Start it\n"
+           "                     near log2(distinct records) to avoid rehashing; 2^28\n"
+           "                     holds 150M and costs 2 GB.                       (24)\n"
            "  -quiet             progress lines off.\n");
 }
 
@@ -2426,6 +2642,8 @@ static int cmd_shuffle(int argc, char **argv) {
     int buckets      = 0;
     uint64_t seed    = 1;
     size_t bucketCap = 512u << 20; /* bytes of one in-memory bucket */
+    bool dedup       = true;
+    int dedupBits    = 24;
 
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc)
@@ -2438,6 +2656,10 @@ static int cmd_shuffle(int argc, char **argv) {
             tmp = argv[++i];
         else if (!strcmp(argv[i], "-memory") && i + 1 < argc)
             bucketCap = (size_t)atol(argv[++i]) << 20;
+        else if (!strcmp(argv[i], "-nodedup"))
+            dedup = false;
+        else if (!strcmp(argv[i], "-dedupbits") && i + 1 < argc)
+            dedupBits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-quiet"))
             Quiet = true;
         else if (argv[i][0] == '-') {
@@ -2451,6 +2673,10 @@ static int cmd_shuffle(int argc, char **argv) {
 
     if (!out || inputCount == 0)
         die("usage: datagen shuffle <in.cnn>... -o <out.cnn> [-buckets K] [-seed S]");
+    /* Same ceiling as everywhere else: 2^30 slots is 8 GB of table, and 2^28
+     * already holds 150M distinct positions at the growth threshold. */
+    if (dedupBits < 10 || dedupBits > 30)
+        die("-dedupbits must be between 10 and 30");
 
     /*
      * The policy sidecar has to survive the permutation, so a record and its
@@ -2526,11 +2752,34 @@ static int cmd_shuffle(int argc, char **argv) {
 
     Rng rng = seed;
 
+    /*
+     * THE ONLY PLACE CROSS-SHARD DUPLICATES CAN BE SEEN.
+     *
+     * `selfplay` and `label` dedup within a shard, and their workers are
+     * separate processes that share nothing on purpose - so a position two
+     * workers both reach survives into the dataset twice, and nothing
+     * downstream looks. That is not a small effect: gen-004 is 122.7M records
+     * over 11.7M distinct positions, ten copies of everything, because the
+     * build that produced it seeded its workers so that each replayed its
+     * neighbours' games. The loss curve of a ten-times-redundant dataset looks
+     * completely normal and the net is merely weak.
+     *
+     * Shuffle is the pass every record already goes through before training,
+     * so it is where the whole dataset is in one stream and the check costs a
+     * hash. On by default for the same reason it is on by default everywhere
+     * else, and it says how many it dropped rather than doing it quietly.
+     */
+    KeySet seen;
+    if (dedup)
+        keyset_init(&seen, dedupBits);
+
     if (!Quiet)
-        fprintf(stdout, "pass 1: scattering %llu records into %d buckets%s\n",
-                (unsigned long long)total, buckets, policy ? " (with policy sidecar)" : "");
+        fprintf(stdout, "pass 1: scattering %llu records into %d buckets%s%s\n",
+                (unsigned long long)total, buckets, policy ? " (with policy sidecar)" : "",
+                dedup ? ", deduplicating" : "");
 
     uint64_t scattered = 0;
+    uint64_t dropped   = 0;
     for (int i = 0; i < inputCount; ++i) {
         FILE *rf = xfopen(inputs[i], "rb");
         FILE *pf = NULL;
@@ -2542,8 +2791,15 @@ static int cmd_shuffle(int argc, char **argv) {
 
         uint8_t unitBuf[REC_BYTES + POL_BYTES];
         while (fread(unitBuf, 1, REC_BYTES, rf) == REC_BYTES) {
+            /* Read before the skip, always: the sidecar is positional, and a
+             * dropped record has to drop its four policy bytes with it. */
             if (pf && fread(unitBuf + REC_BYTES, 1, POL_BYTES, pf) != POL_BYTES)
                 die("policy sidecar is shorter than its shard");
+
+            if (dedup && !keyset_insert(&seen, (Key)record_position_key(unitBuf))) {
+                ++dropped;
+                continue;
+            }
 
             const int b = (int)rng_below(&rng, (uint64_t)buckets);
             if (fwrite(unitBuf, 1, unit, bucketFile[b]) != unit)
@@ -2560,8 +2816,16 @@ static int cmd_shuffle(int argc, char **argv) {
     for (int b = 0; b < buckets; ++b)
         fclose(bucketFile[b]);
 
-    if (scattered != total)
+    if (dedup)
+        keyset_free(&seen);
+
+    if (scattered + dropped != total)
         die("scattered a different number of records than the inputs contain");
+
+    if (dedup && !Quiet)
+        fprintf(stdout, "pass 1: dropped %llu duplicate positions of %llu (%.1f%%)\n",
+                (unsigned long long)dropped, (unsigned long long)total,
+                100.0 * (double)dropped / (double)total);
 
     char outPol[PATH_CAP];
     replace_ext(outPol, sizeof(outPol), out, ".pol");
@@ -2631,6 +2895,7 @@ static int cmd_shuffle(int argc, char **argv) {
     man.command = "shuffle";
     man.inputs  = joined;
     man.seed    = seed;
+    man.dedup   = dedup;
     /* Carry the labelling conditions forward when every input agrees on them.
      * Shuffling reorders records without relabelling any, so the output was
      * labelled at the same nodes and hash as its inputs - and `verify -relabel`
@@ -3094,9 +3359,13 @@ static int cmd_verify(int argc, char **argv) {
             uint8_t again[REC_BYTES];
             memset(&p, 0, sizeof(p));
 
-            if (rec.flags & 0xF0)
-                problem = "reserved flag bits are set";
-            else if (rec.wdl > WDL_UNKNOWN)
+            /* Bits 4-7 are the game-progress bucket now, and every one of the
+             * sixteen values is legal - 0 included, which is what a shard from
+             * before the field existed carries. There is nothing left in the
+             * flags byte to reject; the round-trip below still covers the bits,
+             * because record_from_position is handed the decoded bucket and has
+             * to put it back where it found it. */
+            if (rec.wdl > WDL_UNKNOWN)
                 problem = "WDL is out of range";
             else if (record_source(&rec) >= SRC_NB)
                 problem = "source tag is out of range";
@@ -3106,7 +3375,8 @@ static int cmd_verify(int argc, char **argv) {
                 problem = "decoded FEN does not parse";
             else {
                 Record repacked;
-                record_from_position(&repacked, &p, rec.score, rec.wdl, record_source(&rec));
+                record_from_position(&repacked, &p, rec.score, rec.wdl, record_source(&rec),
+                                     record_progress(&rec));
                 record_encode(&repacked, again);
                 if (memcmp(buf, again, REC_BYTES))
                     problem = "record does not round-trip to identical bytes";
@@ -3238,7 +3508,8 @@ static void bar(FILE *f, uint64_t value, uint64_t max, int width) {
 static void usage_stats(void) {
     printf("datagen stats <shard.cnn>...\n"
            "\n"
-           "Histograms of score, source, result, side to move and piece count, to be\n"
+           "Histograms of score, source, result, side to move, distance to the end of\n"
+           "the game and piece count, to be\n"
            "eyeballed. A dataset that is mostly endgames, or whose score histogram is\n"
            "spiked at zero, has a filter bug - and this is the last point where that is\n"
            "cheap to find.\n"
@@ -3271,12 +3542,15 @@ static int cmd_stats(int argc, char **argv) {
 
     uint64_t total = 0, inCheck = 0, blackToMove = 0;
     uint64_t bySource[SRC_NB], byWdl[WDL_NB], byPieces[33], byScore[SCORE_BINS];
+    uint64_t byProgress[PROGRESS_MAX_BUCKET + 1];
+    uint64_t decisive    = 0; /* proven scores: a tablebase or a mate, not an evaluation */
     uint64_t halfmoveSum = 0, fullmoveSum = 0;
     long long scoreSum = 0;
     memset(bySource, 0, sizeof(bySource));
     memset(byWdl, 0, sizeof(byWdl));
     memset(byPieces, 0, sizeof(byPieces));
     memset(byScore, 0, sizeof(byScore));
+    memset(byProgress, 0, sizeof(byProgress));
 
     for (int f = 0; f < inputCount; ++f) {
         FILE *in = xfopen(inputs[f], "rb");
@@ -3307,6 +3581,10 @@ static int cmd_stats(int argc, char **argv) {
                 bin = SCORE_BINS - 1;
             ++byScore[bin];
 
+            ++byProgress[record_progress(&rec)];
+            if (is_decisive_score(rec.score))
+                ++decisive;
+
             scoreSum += rec.score;
             halfmoveSum += rec.halfmove;
             fullmoveSum += rec.fullmove;
@@ -3323,6 +3601,13 @@ static int cmd_stats(int argc, char **argv) {
            100.0 * (double)blackToMove / (double)total);
     printf("in check         %llu (%.2f%%)\n", (unsigned long long)inCheck,
            100.0 * (double)inCheck / (double)total);
+    /* A mate or a tablebase score is a PROVEN result, not an evaluation, and
+     * sigmoid(31500/400) is 1.0 to every digit a float carries - so these
+     * records train against a target the net cannot represent and can only
+     * chase. The trainer's --score-clip is the dial; this line is how to know
+     * whether it is worth reaching for. */
+    printf("decisive scores  %llu (%.2f%%)  - mate or tablebase, see --score-clip\n",
+           (unsigned long long)decisive, 100.0 * (double)decisive / (double)total);
     printf("mean score       %.1f cp\n", (double)scoreSum / (double)total);
     printf("mean halfmove    %.1f\n", (double)halfmoveSum / (double)total);
     printf("mean fullmove    %.1f\n", (double)fullmoveSum / (double)total);
@@ -3353,6 +3638,38 @@ static int cmd_stats(int argc, char **argv) {
         printf("\n");
     }
 
+    /*
+     * How far each position was from the end of its game. This is the histogram
+     * that says whether the WDL label is worth anything: a dataset whose mass
+     * sits in the high buckets is one where every result is fifty plies away
+     * from the position it is attached to, and a lambda schedule keyed on this
+     * is the only thing that can price that in. All-unknown means either a
+     * `label` shard, whose games we never saw, or a selfplay run whose games
+     * the ply cap all cut short - which is a -maxplies problem, not a lambda
+     * one.
+     */
+    peak = 0;
+    for (int i = 0; i <= PROGRESS_MAX_BUCKET; ++i)
+        if (byProgress[i] > peak)
+            peak = byProgress[i];
+
+    printf("\nplies to the end of the game\n");
+    for (int i = 0; i <= PROGRESS_MAX_BUCKET; ++i) {
+        if (!byProgress[i])
+            continue;
+        char label[16];
+        if (i == PROGRESS_UNKNOWN)
+            snprintf(label, sizeof(label), "unknown");
+        else if (i == PROGRESS_MAX_BUCKET)
+            snprintf(label, sizeof(label), "%d+", (i - 1) * PROGRESS_PLIES_PER_BUCKET);
+        else
+            snprintf(label, sizeof(label), "%d-%d", (i - 1) * PROGRESS_PLIES_PER_BUCKET,
+                     i * PROGRESS_PLIES_PER_BUCKET - 1);
+        printf("  %-8s %10llu  ", label, (unsigned long long)byProgress[i]);
+        bar(stdout, byProgress[i], peak, 40);
+        printf("\n");
+    }
+
     peak = 0;
     for (int i = 2; i <= 32; ++i)
         if (byPieces[i] > peak)
@@ -3377,9 +3694,13 @@ static int cmd_stats(int argc, char **argv) {
 static void usage_dump(void) {
     printf("datagen dump <shard.cnn> [options]\n"
            "\n"
-           "Records as semicolon-separated text: fen;score;wdl;source;in_check, plus\n"
-           "best;cutoff with -pol. This is the C side of the format contract that\n"
-           "trainer/tests/test_format.py checks nnue/format.py against.\n"
+           "Records as semicolon-separated text:\n"
+           "fen;score;wdl;source;in_check;progress, plus best;cutoff with -pol. This is\n"
+           "the C side of the format contract that trainer/tests/test_format.py checks\n"
+           "nnue/format.py against.\n"
+           "\n"
+           "`progress` is the game-progress bucket: 0 when the distance to the end of\n"
+           "the game is not recorded, otherwise 1 + pliesToEnd/8, capped at 15.\n"
            "\n"
            "  -n N               records to print.                        (10)\n"
            "  -skip N            start at record N.                       (0)\n"
@@ -3430,7 +3751,7 @@ static int cmd_dump(int argc, char **argv) {
 
     /* Semicolon-separated so it round-trips through a spreadsheet or a python
      * split(';'), and the FEN keeps its own spaces. */
-    printf("fen;score;wdl;source;in_check%s\n", withPolicy ? ";best;cutoff" : "");
+    printf("fen;score;wdl;source;in_check;progress%s\n", withPolicy ? ";best;cutoff" : "");
 
     uint8_t buf[REC_BYTES];
     for (long i = 0; i < count && fread(buf, 1, REC_BYTES, in) == REC_BYTES; ++i) {
@@ -3439,13 +3760,14 @@ static int cmd_dump(int argc, char **argv) {
 
         char fen[FEN_MAX_LEN];
         if (!record_to_fen(&rec, fen)) {
-            printf("<undecodable>;%d;%u;%u;%u\n", rec.score, rec.wdl, (unsigned)record_source(&rec),
-                   (rec.flags & REC_IN_CHECK) ? 1u : 0u);
+            printf("<undecodable>;%d;%u;%u;%u;%u\n", rec.score, rec.wdl,
+                   (unsigned)record_source(&rec), (rec.flags & REC_IN_CHECK) ? 1u : 0u,
+                   record_progress(&rec));
             continue;
         }
 
-        printf("%s;%d;%u;%s;%u", fen, rec.score, rec.wdl, SourceNames[record_source(&rec)],
-               (rec.flags & REC_IN_CHECK) ? 1u : 0u);
+        printf("%s;%d;%u;%s;%u;%u", fen, rec.score, rec.wdl, SourceNames[record_source(&rec)],
+               (rec.flags & REC_IN_CHECK) ? 1u : 0u, record_progress(&rec));
 
         if (pol) {
             uint8_t pbuf[POL_BYTES];

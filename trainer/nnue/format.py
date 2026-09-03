@@ -15,11 +15,20 @@ labelled, the loss curve looks completely normal, and nothing else notices.
     26     2     fullmove number
     28     2     score, centipawns, side-to-move relative (int16)
     30     1     WDL from the side to move: 0 loss, 1 draw, 2 win, 3 unknown
-    31     1     flags: bits 0-2 source tag, bit 3 in check, 4-7 reserved
+    31     1     flags: bits 0-2 source tag, bit 3 in check,
+                        bits 4-7 game-progress bucket (0 = not recorded)
 
 Piece codes are ``type | color << 3`` with types 0-5 (pawn..king); type 6 is a
 rook that still carries a castling right, which is how castling rights ride in
 the nibbles instead of costing a byte.
+
+The game-progress nibble is how far the position was from the end of the game
+it came from, in eight-ply buckets. It is what makes a lambda that varies over
+a game possible at all: the WDL label of a position fifty plies from the result
+says much less about that position than one three plies from it, and a single
+lambda over the whole dataset has to price that difference in at the average.
+Bucket 0 means "not recorded", so shards written before the field existed read
+as unknown rather than as "the game ended here".
 """
 
 from __future__ import annotations
@@ -52,6 +61,53 @@ IN_CHECK = 0x08
 WDL_LOSS, WDL_DRAW, WDL_WIN, WDL_UNKNOWN = 0, 1, 2, 3
 
 SOURCE_NAMES = ("selfplay", "tree", "human", "engine", "book", "other")
+
+# ------------------------------------------------------------ game progress --
+#
+# Bits 4-7 of the flags byte, written by tools/datagen.c: 0 when the distance to
+# the end of the game is not recorded, otherwise ``1 + pliesToEnd // 8`` capped
+# at 15. progress_bucket() in datagen.c is the same line of arithmetic, and
+# tests/test_format.py checks the two against each other on a real shard.
+
+PROGRESS_SHIFT = 4
+PROGRESS_MASK = 0xF0
+PROGRESS_UNKNOWN = 0
+PROGRESS_PLIES_PER_BUCKET = 8
+PROGRESS_MAX_BUCKET = 15
+
+
+def progress_plies(bucket):
+    """Plies from the position to the end of its game, from the bucket.
+
+    The bucket's midpoint, since that is the least wrong single number for a
+    range - and -1 for "not recorded", which is not a distance and must not be
+    averaged in with ones that are. Works on ints, numpy arrays and tensors.
+    """
+    mid = (bucket - 1) * PROGRESS_PLIES_PER_BUCKET + PROGRESS_PLIES_PER_BUCKET // 2
+    return (bucket >= 1) * mid - (bucket < 1)
+
+
+def progress_closeness(bucket):
+    """How near the game's end this position was, in [0, 1].
+
+    1.0 is "the result came within a few plies", 0.0 is "at least 112 plies of
+    game still to play". A record whose progress was never recorded also scores
+    0.0, on purpose: it makes every schedule keyed on this a no-op for those
+    records rather than a guess about them, so a shard from before the field
+    existed trains exactly as it did before.
+    """
+    span = PROGRESS_MAX_BUCKET - 1
+    return (bucket >= 1) * (PROGRESS_MAX_BUCKET - bucket) / span
+
+
+def phase_endgameness(piece_count):
+    """How far into the endgame a position is, in [0, 1].
+
+    1.0 is bare kings, 0.0 is a full board. The same phase proxy the output
+    buckets use, for the same reason: the engine has the popcount in hand and
+    nothing else about a packed record is cheaper to read.
+    """
+    return (MAX_PIECES - piece_count) / (MAX_PIECES - 2)
 
 # ---------------------------------------------------------------- features --
 #
@@ -196,6 +252,7 @@ def unpack(records: np.ndarray, index_dtype=np.int64) -> dict:
         source      (B,)    int64 source tag
         in_check    (B,)    bool
         piece_count (B,)    int64
+        progress    (B,)    int64 game-progress bucket, 0 when not recorded
     """
     batch = len(records)
 
@@ -260,6 +317,10 @@ def unpack(records: np.ndarray, index_dtype=np.int64) -> dict:
     out["source"] = (flags & SRC_MASK).astype(np.int64)
     out["in_check"] = (flags & IN_CHECK) != 0
     out["piece_count"] = counts
+    # The bucket, not a distance: what a bucket MEANS is progress_plies() and
+    # progress_closeness(), and a loader that baked one of those in would have
+    # to be rebuilt to change a lambda schedule.
+    out["progress"] = ((flags & PROGRESS_MASK) >> PROGRESS_SHIFT).astype(np.int64)
     return out
 
 
@@ -361,7 +422,7 @@ def _ep_target_is_real(board: list, ep: int, black_to_move: bool) -> bool:
 
 
 def pack_fen(fen: str, score: int = 0, wdl: int = WDL_UNKNOWN, source: int = 5,
-             in_check: bool = False) -> np.void:
+             in_check: bool = False, progress: int = PROGRESS_UNKNOWN) -> np.void:
     """Pack a FEN into a record, the way ``datagen`` would have.
 
     This is how :mod:`nnue.sanity` gets features for a hand-written position
@@ -442,7 +503,8 @@ def pack_fen(fen: str, score: int = 0, wdl: int = WDL_UNKNOWN, source: int = 5,
     record["fullmove"] = min(fullmove, 65535)
     record["score"] = max(-32000, min(32000, score))
     record["wdl"] = wdl
-    record["flags"] = (source & SRC_MASK) | (IN_CHECK if in_check else 0)
+    record["flags"] = ((source & SRC_MASK) | (IN_CHECK if in_check else 0)
+                       | ((progress << PROGRESS_SHIFT) & PROGRESS_MASK))
     return record
 
 

@@ -61,13 +61,14 @@ def datagen_dump(datagen, shard_path):
         assert lines[0].startswith("fen;"), lines[:2]
         rows = []
         for line in lines[1:]:
-            fen, score, wdl, source, in_check = line.split(";")
+            fen, score, wdl, source, in_check, progress = line.split(";")
             rows.append({
                 "fen": fen,
                 "score": int(score),
                 "wdl": int(wdl),
                 "source": source,
                 "in_check": in_check == "1",
+                "progress": int(progress),
             })
         return rows
 

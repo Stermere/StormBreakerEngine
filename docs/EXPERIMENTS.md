@@ -1791,3 +1791,84 @@ where the king starts on e1. Both read the king's actual file rather than
 assuming e1, so they are not *wrong*, but they are untuned for the other 959
 arrays and no Chess960 SPRT has been run. The engine plays Chess960 legally and
 at unmeasured strength.
+
+---
+
+### E26 — gen-004 is ten copies of itself, and the gen-5 datagen hardening
+
+**Not an SPRT.** This is a measurement of the datasets on disk, made while
+preparing the gen-5 generation run, plus the changes it motivated. It is here
+because it changes how an existing result should be read.
+
+**The measurement.** Hash each record's first 25 bytes — occupied, the piece
+nibbles, and the side-to-move/en-passant byte, which is the whole position and
+nothing else — and count distinct values over the entire file:
+
+| dataset | records | distinct positions | mean copies |
+|---|---|---|---|
+| `gen-003`, labelled human corpus | 178,808,618 | 156,127,545 | 1.15 |
+| `gen-004`, self-play | 122,722,327 | **11,743,846** | **10.45** |
+
+`gen-004`'s redundancy is uniform across every piece count — 10.2× at 25-32
+pieces just as at 2-6 — which rules out the comfortable explanation. Endgame
+convergence would concentrate in the low buckets; a flat 10× across the opening
+means the *games* repeat.
+
+**The cause, and it is already fixed.** The manifests name their derived
+worker seeds. `gen-004_sp_b00_00` records 1000 and `b00_01` records
+11400714819323199485, which is exactly `1000 + 0x9E3779B97F4A7C15` — the
+pre-fix `worker_rng`, `seed + index * GOLDEN`. `rng_next` advances splitmix64's
+state by precisely that constant, so worker *k* started *k* draws into worker
+0's stream and replayed its neighbours' games. Measured directly: two shards
+from one batch of that run share **99.3%** of their positions, two shards from
+different batches share 0.5%, and 8 workers of the current build share 0.09%.
+
+`worker_rng` was fixed before this measurement, and the comment above it in
+`tools/datagen.c` describes this exact failure. What it did not have was
+anything that would *notice* — dedup is per shard, each worker writes its own
+file, and no stage held the whole dataset in one stream.
+
+**What it means for E18.** E18 recorded the `gen-003` re-labelling as
+"marginal, not a step change" and concluded that position *coverage*, not label
+quality, was the binding constraint. That conclusion survives, but the gen-004
+half of the evidence was taken on an effective 11.7M positions against 24,576
+feature rows. Any comparison involving `gen-004` is a comparison at a tenth of
+its nominal size, and the shards should be re-shuffled through the dedup below
+before being mixed into a gen-5 set — otherwise their positions arrive carrying
+ten times the weight of a gen-5 one.
+
+**What changed, all of it gated by `make datagen-test`.**
+
+- **`datagen shuffle` deduplicates**, by default, reporting the count. It is
+  the only stage that can see across shards, since the workers are separate
+  processes on purpose. `-nodedup` restores a pure permutation.
+- **A game is a function of `-seed` and its global ordinal.** Games are dealt
+  round-robin by ordinal and seeded from it, so `-threads` no longer changes
+  the dataset a seed produces — asserted by comparing a 1-worker run against a
+  4-worker one, record for record.
+- **`selfplay -resume`**, which follows from the above: a checkpoint every 30
+  seconds at a game boundary, and a rerun rejoins there. Verified by killing a
+  30-game run at 50 seconds and resuming: the shard and its policy sidecar came
+  back **byte-identical** to the uninterrupted one.
+- **Game progress per record**, in the format's four reserved bits: how far the
+  position was from the end of its game, in eight-ply buckets, 0 for "not
+  recorded". It cannot be backfilled, and it is what `--lambda-progress` reads.
+- **`-maxplies` is validated** against `MAX_GAME_PLY - MAX_PLY`. A game and the
+  deepest search inside it share one history array, and the cap used to be an
+  unchecked `atoi`.
+- **`datagen stats` reports `decisive scores`** — the share of labels that are
+  a mate or a tablebase result rather than an evaluation. On a tablebase run
+  with games played out it measures 4.6%, where the old `-maxscore 2000` used
+  to drop them entirely.
+
+**And on the trainer side**, the dials that let a gen-5 label be used for what
+it is worth: a per-record lambda keyed on game progress, phase and source
+tag, a score clip, and per-source loss weights. Every one defaults to no
+effect, so this changes no existing run. See [NNUE.md](NNUE.md), Task 2.
+
+**Gates.** `make datagen-test` (round-trip, label reproducibility, book start,
+opening parity, ply-capped results, progress pairing, seed/thread invariance,
+shuffle dedup with the sidecar in step) · `make trainer-test`, 100 passed ·
+`datagen verify` on a pre-change `gen-004` slice, 100,000 records, 0 failures,
+which is what makes the format change backwards compatible. No `src/` file was
+touched, so bench and perft are unaffected by construction.

@@ -37,6 +37,7 @@ from nnue.format import (  # noqa: E402
 )
 from nnue.model import (  # noqa: E402
     NNUE,
+    TargetPolicy,
     arch_from_checkpoint,
     blended_target,
     from_checkpoint,
@@ -579,3 +580,131 @@ def test_chunks_partition_across_workers(shard_path, monkeypatch, workers):
     monkeypatch.setattr(dataset_module, "get_worker_info", lambda: None)
     assert sorted(seen) == _records(ShuffledChunks(shard_path, batch_size=16,
                                                    chunk_records=64, seed=4))
+
+
+# ---------------------------------------------------------- target policy ----
+#
+# The dials that decide what the network is fitted TO. A bug in any of them
+# produces a net that trains perfectly happily against the wrong target, which
+# is the failure mode this whole file exists for.
+
+
+def policy_batch(progress, source=0, wdl=2, score=100, pieces=20):
+    """A batch of the columns TargetPolicy reads, and nothing else."""
+    progress = torch.as_tensor(progress, dtype=torch.int64)
+    n = progress.numel()
+
+    def column(value, dtype):
+        return torch.full((n,), value, dtype=dtype)
+
+    return {
+        "progress": progress,
+        "source": column(source, torch.int64),
+        "wdl": column(wdl, torch.int64),
+        "score": column(score, torch.float32),
+        "piece_count": column(pieces, torch.int64),
+    }
+
+
+def test_every_dial_off_reproduces_a_flat_lambda():
+    """A policy built with no arguments has to be the old behaviour exactly, or
+    every net trained before these flags stops being comparable to one after."""
+    batch = policy_batch([0, 1, 8, 15])
+    policy = TargetPolicy()
+
+    assert torch.equal(policy.lambdas(batch, 0.9), torch.full((4,), 0.9))
+    assert torch.allclose(policy.target(batch, 0.9),
+                          blended_target(batch["score"], batch["wdl"], 0.9, 400.0))
+    assert policy.weights(batch) is None
+
+
+def test_progress_delta_lands_at_the_end_of_the_game_and_nowhere_else():
+    batch = policy_batch([1, 15, 0])
+    lam = TargetPolicy(progress_delta=-0.2).lambdas(batch, 0.9)
+
+    assert lam[0] == pytest.approx(0.7)  # the game ended within a few plies
+    assert lam[1] == pytest.approx(0.9)  # 112+ plies still to play
+    # A record with no recorded distance keeps the base. Guessing here would
+    # silently apply a game-progress schedule to `label` shards, which have no
+    # game progress to speak of.
+    assert lam[2] == pytest.approx(0.9)
+
+
+def test_pieces_delta_runs_from_a_full_board_to_bare_kings():
+    lam = TargetPolicy(pieces_delta=-0.3).lambdas(policy_batch([1], pieces=32), 0.9)
+    assert lam[0] == pytest.approx(0.9)
+    lam = TargetPolicy(pieces_delta=-0.3).lambdas(policy_batch([1], pieces=2), 0.9)
+    assert lam[0] == pytest.approx(0.6)
+
+
+def test_source_override_beats_the_deltas():
+    """A tree sample's game result belongs to a game that never went through
+    it, so `tree=1.0` has to mean score-only wherever the ramps would have
+    pulled the result back in."""
+    batch = policy_batch([1], source=1)  # bucket 1: the ramp is at full strength
+    policy = TargetPolicy(progress_delta=-0.4, source_lambda={1: 1.0})
+    assert policy.lambdas(batch, 0.9)[0] == pytest.approx(1.0)
+
+
+def test_unknown_results_still_train_on_the_score_alone():
+    """Structural, and it outranks every dial: a record with no game result
+    cannot have one mixed in, whatever the schedule says."""
+    batch = policy_batch([1], wdl=3, score=0)
+    policy = TargetPolicy(progress_delta=-0.5, source_lambda={0: 0.2})
+    assert policy.target(batch, 0.9)[0] == pytest.approx(0.5)  # sigmoid(0) exactly
+
+
+def test_lambda_stays_inside_its_bounds():
+    batch = policy_batch([1])
+    assert TargetPolicy(progress_delta=-2.0).lambdas(batch, 0.9)[0] == pytest.approx(0.0)
+    assert TargetPolicy(progress_delta=+2.0).lambdas(batch, 0.9)[0] == pytest.approx(1.0)
+    assert TargetPolicy(progress_delta=-2.0,
+                        lambda_min=0.5).lambdas(batch, 0.9)[0] == pytest.approx(0.5)
+
+
+def test_score_clip_bounds_the_target_away_from_certainty():
+    """A mate score sigmoids to exactly 1.0, which no clipped-weight net can
+    reach. The clip is what stops the dataset asking it to."""
+    batch = policy_batch([1], score=31900, wdl=2)
+    assert TargetPolicy().score(batch)[0] == 31900
+    assert TargetPolicy(score_clip=3000).score(batch)[0] == 3000
+
+    assert TargetPolicy().target(batch, 1.0)[0] == pytest.approx(1.0)
+    assert TargetPolicy(score_clip=3000).target(batch, 1.0)[0] < 1.0
+
+
+def test_source_weights_reach_the_loss():
+    batch = policy_batch([1, 1], source=1)
+    policy = TargetPolicy(source_weight={1: 0.5})
+    assert torch.equal(policy.weights(batch), torch.full((2,), 0.5))
+
+    # A weight that is uniform cannot change the loss, whatever its value.
+    prediction = torch.tensor([0.4, -0.2])
+    target = torch.tensor([0.6, 0.3])
+    plain = loss_fn(prediction, target, 400.0)
+    weighted = loss_fn(prediction, target, 400.0, torch.tensor([0.5, 0.5]))
+    assert weighted == pytest.approx(float(plain))
+
+    # And one that is not has to move it toward the record it favours.
+    lopsided = loss_fn(prediction, target, 400.0, torch.tensor([1.0, 0.0]))
+    only_first = loss_fn(prediction[:1], target[:1], 400.0)
+    assert lopsided == pytest.approx(float(only_first))
+
+
+def test_the_tree_default_is_only_a_default_of_the_flag():
+    """TargetPolicy itself stays neutral; train.py's flag carries the default.
+
+    Worth pinning: the class is what every other caller builds, and a default
+    hidden inside it would apply to nets exported, sanity-checked or re-scored
+    by tools that never parsed a command line.
+    """
+    from nnue.train import DEFAULT_LAMBDA_SOURCE, parse_source_map
+
+    batch = policy_batch([1], source=1)
+    assert TargetPolicy().lambdas(batch, 0.9)[0] == pytest.approx(0.9)
+
+    parsed = parse_source_map(DEFAULT_LAMBDA_SOURCE, "--lambda-source")
+    assert TargetPolicy(source_lambda=parsed).lambdas(batch, 0.9)[0] == pytest.approx(1.0)
+    # And it leaves every other source where it was.
+    assert TargetPolicy(source_lambda=parsed).lambdas(
+        policy_batch([1], source=0), 0.9)[0] == pytest.approx(0.9)

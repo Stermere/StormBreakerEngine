@@ -49,6 +49,9 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | NNUE: the default evaluation is the network (`make`; `make classical` for the other one) | complete (E11) |
 | Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
 | Syzygy tablebases in search and datagen; all adjudication removed | built, off by default (E23) |
+| Datagen: game progress per record, `selfplay -resume`, one seed = one dataset | built, gated by `make datagen-test` (E26) |
+| Datagen: cross-shard dedup in `shuffle` — `gen-004` was 10x redundant | built (E26); re-shuffle `gen-004` before mixing it into gen-5 |
+| Trainer: per-record lambda (game progress, phase, source), score clip, source weights | built, every dial defaults to no effect |
 | Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
 | **Self-play data generation with deliberate variation** | **TODO** |
 | **gen-5 data generated with tablebases and no adjudication** | **TODO** |
@@ -129,6 +132,16 @@ The open work, roughly in order of Elo per unit of effort:
    perturb it by two random plies, and then play deterministically. Iterating
    this loop gives each generation labels from the engine produced by the
    previous generation. New training runs include the uncertainty head.
+
+   The gen-5 preparation added the parts of that loop a generation run cannot
+   be given afterwards. Each record now carries **how far it was from the end
+   of its game**, in the record format's four reserved bits, because the
+   trainer's lambda has to price the game result differently at move 12 and at
+   move 80 and cannot know which it is looking at otherwise. `selfplay` takes
+   **`-resume`**, which a multi-day run needs and only `label` had. And a game
+   is now a function of `-seed` and its global ordinal alone, so `-threads` no
+   longer changes the dataset a seed produces — which is what makes the resume
+   correct and is worth having on its own. See [NNUE.md](NNUE.md).
 
 2. **Finish the SPSA re-fit.** E22 swept 28 of the 30 seats for +14.24 ± 7.10,
    including the first gradient ever taken on the `Unc*` constants; E22a then

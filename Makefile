@@ -497,6 +497,54 @@ datagen-test: datagen
 	    || { echo "FAIL: a ply-capped game was given a result instead of UNKNOWN"; exit 1; }
 	@echo "PASS: ply-capped games are labelled UNKNOWN, never draw"
 
+# And that a result comes with a DISTANCE to it. The game-progress nibble is
+# what lets the trainer scale lambda over a game, it cannot be backfilled once a
+# generation has run, and a record whose write was silently dropped looks
+# exactly like one from a game that never finished - bucket 0 either way. So:
+# every record with a result must carry a bucket, and every record without one
+# must not.
+	@./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/all.cnn -n 100000 | tail -n +2 \
+	    | awk -F';' '$$3 <= 2 && $$6 == 0 { bad = 1 } $$3 == 3 && $$6 != 0 { bad = 1 } \
+	                 $$6 != 0 { seen = 1 } END { exit bad || !seen }' \
+	    || { echo 'FAIL: game progress missing, or attached to a game with no result'; exit 1; }
+	@echo "PASS: every result carries the distance to it"
+
+# And that -seed pins the DATA rather than the schedule. Games are dealt out by
+# global ordinal and seeded from it, so N workers play the same games one worker
+# does, split differently - which is also what lets `selfplay -resume` rejoin at
+# a game boundary without replaying the draws that led there. Sorting drops the
+# interleave and nothing else; -nodedup because the dedup table is per worker,
+# so one worker sees collisions four of them cannot.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/seed1.cnn \
+	    -games 8 -nodes 1500 -seed 11 -threads 1 -nodedup -nopolicy -quiet
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/seed4%02d.cnn \
+	    -games 8 -nodes 1500 -seed 11 -threads 4 -nodedup -nopolicy -quiet
+	@cat $(DATAGEN_TEST_DIR)/seed400.cnn $(DATAGEN_TEST_DIR)/seed401.cnn \
+	     $(DATAGEN_TEST_DIR)/seed402.cnn $(DATAGEN_TEST_DIR)/seed403.cnn \
+	     > $(DATAGEN_TEST_DIR)/seed4.cnn
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/seed1.cnn -n 100000 | tail -n +2 | sort); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/seed4.cnn -n 100000 | tail -n +2 | sort); \
+	 [ "$$a" = "$$b" ] \
+	    || { echo 'FAIL: -threads changed the games -seed produced'; exit 1; }
+	@echo "PASS: one seed, one dataset, at any -threads"
+
+# And that the shuffle drops cross-shard duplicates and takes the policy
+# sidecar with them. This is the only stage that CAN: selfplay and label dedup
+# inside a shard, and their workers are separate processes that share nothing,
+# so a position two of them reach survives. gen-004 came out at 122.7M records
+# over 11.7M distinct positions that way, and nothing downstream noticed.
+# Feeding the shuffle a file concatenated with itself makes the answer exact.
+	@cat $(DATAGEN_TEST_DIR)/all.cnn $(DATAGEN_TEST_DIR)/all.cnn > $(DATAGEN_TEST_DIR)/twice.cnn
+	@cat $(DATAGEN_TEST_DIR)/all.pol $(DATAGEN_TEST_DIR)/all.pol > $(DATAGEN_TEST_DIR)/twice.pol
+	./datagen$(SUFFIX) shuffle $(DATAGEN_TEST_DIR)/twice.cnn \
+	    -o $(DATAGEN_TEST_DIR)/once.cnn -seed 5 -quiet
+	@one=$$(wc -c < $(DATAGEN_TEST_DIR)/all.cnn); \
+	 two=$$(wc -c < $(DATAGEN_TEST_DIR)/once.cnn); \
+	 [ "$$one" = "$$two" ] \
+	    || { echo "FAIL: shuffle kept duplicates ($$one bytes in, $$two out)"; exit 1; }
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/once.cnn
+	@echo "PASS: shuffle drops cross-shard duplicates, sidecar in step"
+
 # ---------------------------------------------------------------- trainer --
 # PyTorch, its own virtualenv, not part of the C build and not subject to the C
 # style rules. See trainer/README.md.

@@ -39,10 +39,12 @@ cd trainer
 
 ```powershell
 # 1. generate. One process per worker; each writes its own shard.
-#    Tree sampling is ON by default (-tree 1): roughly half the records come
-#    from inside the search trees rather than from the game line. `-tree 0`
-#    turns it off, `-tree 2` doubles it. See `datagen selfplay -help`.
-.\datagen.exe selfplay -o external\data\shard%02d.cnn -games 20000 -nodes 100000 -threads 14
+#    Tree sampling is OFF by default: `-tree 1` makes roughly half the records
+#    interior search nodes rather than game-line positions, `-tree 2` more.
+#    -resume checkpoints every 30s at a game boundary and picks a killed run
+#    back up - a generation run is days, and it WILL be interrupted.
+#    See `datagen selfplay -help`.
+.\datagen.exe selfplay -o external\data\shard%02d.cnn -games 20000 -nodes 100000 -threads 14 -resume
 
 # 2. label games that already exist. `tuner extract` turns PGNs into quiet
 #    FENs carrying the game result; `datagen label` searches each one.
@@ -60,8 +62,10 @@ cd trainer
 .\datagen.exe verify external\data\shard00.cnn -relabel 500 -nodes 100000
 .\datagen.exe stats  external\data\shard00.cnn
 
-# 4. shuffle on disk, across every shard of every source.
-#    Not optional - see below.
+# 4. shuffle on disk, across every shard of every source. Not optional - see
+#    below. This pass also DEDUPLICATES, and it is the only one that can:
+#    workers are separate processes, so a position two of them reach is in
+#    the dataset twice until they meet here. It reports how many it dropped.
 .\datagen.exe shuffle external\data\shard*.cnn external\data\human*.cnn `
     -o external\data\train.cnn -seed 1
 
@@ -105,6 +109,16 @@ whose consecutive records come from the same game is not a shuffle. Glob every
 source into it, too: `shard*.cnn` on its own quietly trains on self-play only,
 and the loss curve of a run missing half its data looks exactly like the loss
 curve of a run that has it.
+
+**It is also where duplicates die.** `selfplay` and `label` dedup within a
+shard, but their workers are separate processes that share nothing, so a
+position two of them reach is written twice and nothing downstream looks.
+`gen-004` is 122.7M records over **11.7M distinct positions** - ten copies of
+everything - because the build that made it seeded workers so that each
+replayed its neighbours' games. Its loss curve looked completely normal.
+Shuffle now drops duplicates by default and says how many; `-nodedup` makes it
+a pure permutation again. Read the number it prints: a large one on a fresh
+generation means the workers are not playing different games.
 
 ---
 
@@ -247,7 +261,7 @@ file, so changing either is a retrain and an export with no C change:
 | Flag | Values | Default |
 |---|---|---|
 | `--hidden` | a multiple of 16, up to 2048 | 1024 |
-| `--output-buckets` | any divisor of 32 | 8 |
+| `--output-buckets` | any divisor of 32 | 4 |
 
 24576 feature rows is a lot to fit. On a few million positions most rows are
 seen a handful of times, and `--hidden 512` is what to trade down first.
@@ -286,14 +300,67 @@ target = lambda * sigmoid(score / K) + (1 - lambda) * wdl
 ```
 
 with `K = --sigmoid-k` in centipawns (default 400, the scale the classical
-evaluation was fitted at) and `lambda` annealed from `--lambda-start` (0.9) to
-`--lambda-end` (0.7) across the run. Records whose game result is unknown —
-a labelled EPD with no `[x.x]` on it — use `lambda = 1` for that record rather
-than being dropped or being pretended into a draw.
+evaluation was fitted at) and `lambda` annealed from `--lambda-start` to
+`--lambda-end` (both 0.9) across the run. Records whose game result is unknown
+— a labelled EPD with no `[x.x]` on it, or a game the ply cap stopped — use
+`lambda = 1` for that record rather than being dropped or being pretended into
+a draw.
 
 `lambda` is a real hyperparameter and worth two or three runs, not a guess to
 be lived with. Record what each one scored in
 [../docs/EXPERIMENTS.md](../docs/EXPERIMENTS.md).
+
+### lambda per record, not per run
+
+`lambda` prices the game result against the search score, and **that price is
+not the same for every record**. A result twenty moves away is nearly a coin
+flip about the position in front of it; three plies away it is the truth. The
+search score's *systematic* errors — fortresses, compensation, an ending it
+cannot convert — are what the result term exists to correct, and they live in
+the endgame. A tree sample's game result belongs to a game that never went
+through it — the one outright mislabel. A `human` or `engine` record's result
+is real, but it is someone else's continuation.
+
+One number for all of that pays the average of prices that differ by a lot. So
+the base lambda above is a starting point that per-record dials move:
+
+| Flag | Effect | Try |
+|---|---|---|
+| `--lambda-progress DELTA` | shift lambda by `DELTA` at the end of a game, tapering to zero 112+ plies away | `-0.2` |
+| `--lambda-pieces DELTA` | shift lambda by `DELTA` at bare kings, tapering to zero at a full board | `-0.1` |
+| `--lambda-source NAME=V` | override lambda outright for a source tag | `tree=1.0` (the default) |
+| `--lambda-min` / `--lambda-max` | bounds the deltas are clipped to | |
+| `--score-clip CP` | clamp the label before the sigmoid | `3000` |
+| `--source-weight NAME=W` | per-record loss weight by source | `tree=0.5` |
+
+They compose additively on top of the epoch anneal and are then clipped; a
+source override replaces the result; an unknown game result is always
+`lambda = 1`, whatever the dials say. **Every dial defaults to no effect except
+`--lambda-source`**, which defaults to `tree=1.0` — and that is a no-op on any
+shard made with `-tree 0`, datagen's default. Passing `--lambda-source`
+replaces that default rather than adding to it; `''` turns it off.
+
+`--lambda-progress` reads the record's game-progress nibble, which
+`datagen selfplay` writes and `datagen label` cannot (an EPD line carries a
+result but never the game it came from). Those records keep the base lambda
+rather than being guessed at, so mixing shard types is safe.
+
+`--score-clip` is the one to reach for on a gen-5 shard specifically. A mate or
+tablebase score is a **proven result**, not an evaluation, and
+`sigmoid(31500 / 400)` is 1.0 to every digit a float carries — a target no
+clipped-weight net can reach and can only chase. `-maxscore 2000` used to drop
+those records; now that games run to mate and tablebases label the endings they
+are a real share of the data. `datagen stats` prints it as `decisive scores`.
+
+Every epoch line reports the lambda the schedule asked for and, when they
+differ, the one the batches actually got:
+
+```
+epoch   3  lambda 0.93 (applied 0.812)  lr 5.12e-04  train 0.041  val 0.043
+```
+
+If the second number is not roughly where it was meant to be, that is a flag
+typo, and nothing else in the run would report it.
 
 ---
 
@@ -313,6 +380,10 @@ be lived with. Record what each one scored in
 | `--positions-per-epoch 50M` | see [Datasets too big for one epoch](#datasets-too-big-for-one-epoch) |
 | `--resume` | continue an interrupted run from its last epoch |
 | `--chunk-records 0` | force memmap slices at any dataset size |
+| `--lambda-progress -0.2` | trust the game result more as the game's end approaches |
+| `--lambda-source tree=1.0` | train a source on its search score alone, without dropping it (default) |
+| `--score-clip 3000` | stop mate and tablebase labels asking for infinite confidence |
+| `--source-weight tree=0.5` | set the mixture without regenerating |
 
 Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
 At `--hidden 1024 --workers 6` that is about **390k positions/s**.
