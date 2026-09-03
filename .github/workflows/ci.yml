@@ -36,8 +36,20 @@ jobs:
       # ARCH=popcnt (x86-64-v2), never `native`: CI runners vary, and a
       # -march=native binary built on one runner may not even run on another.
       # The Makefile ignores ARCH on non-x86, so macOS arm64 builds portably.
+      #
+      # The default evaluation is the network, which is embedded at compile
+      # time and is not in the repository, so this step also downloads the net
+      # the Makefile pins (hash-verified). That download is part of what is
+      # being tested: it is the same path a fresh clone and an OpenBench worker
+      # take, and a broken pin should fail here rather than at a release.
       - name: Build
         run: make ARCH=popcnt CC=${{ matrix.cc }}
+
+      # The classical evaluation still ships (docs/RELEASING.md) and is what
+      # tools/tuner.c fits, so it has to keep compiling even though `make` no
+      # longer builds it. Seconds, and it needs no net.
+      - name: Classical build
+        run: make classical ARCH=popcnt CC=${{ matrix.cc }}
 
       - name: UCI handshake
         run: |

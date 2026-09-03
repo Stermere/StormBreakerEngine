@@ -1,9 +1,9 @@
 """
 tune.py - SPSA tuning of the search parameters exposed by TUNE_SEARCH=on.
 
-    make nnue TUNE_SEARCH=on EXE=stormbreaker-tune   # -> stormbreaker-tune-nnue.exe
-    python tools/tune.py --engine ./stormbreaker-tune-nnue.exe --list
-    python tools/tune.py --engine ./stormbreaker-tune-nnue.exe --iterations 800
+    make TUNE_SEARCH=on EXE=stormbreaker-tune        # -> stormbreaker-tune.exe
+    python tools/tune.py --engine ./stormbreaker-tune.exe --list
+    python tools/tune.py --engine ./stormbreaker-tune.exe --iterations 800
     python tools/tune.py --resume
 
 WHAT THIS IS FOR. Every margin in search.c was fitted against the classical
@@ -425,8 +425,8 @@ def main() -> int:
         if not opts:
             c.fail("That engine exposes no tunable spin options.")
             print("  It was almost certainly built without TUNE_SEARCH. Rebuild with:")
-            print("    make nnue TUNE_SEARCH=on EXE=stormbreaker-tune")
-            print("  which writes stormbreaker-tune-nnue.exe - `make nnue` appends the suffix.")
+            print("    make TUNE_SEARCH=on EXE=stormbreaker-tune")
+            print("  which writes stormbreaker-tune.exe, carrying the default evaluation.")
             return 1
 
         if args.list:

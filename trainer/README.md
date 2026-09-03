@@ -86,7 +86,7 @@ make nnue-export        # net.pt -> net.nnue, plus .vectors and .sha256
 # 7. build the engine carrying it, and prove the C inference reproduces the
 #    reference. nnue-test re-exports and rebuilds first, so it is also the
 #    shortest way to do step 6 and this one in a single command.
-make nnue               # stormbreaker-nnue.exe, beside the classical binary
+make                    # stormbreaker.exe - the default build carries the net
 make nnue-test          # 10,000 positions, exact equality, non-zero on a diff
 make nnue-info          # which net the binary is actually carrying, by hash
 ```
@@ -157,7 +157,7 @@ variables carry into the sub-make:
 ```powershell
 make nnue-export NET=external/nets/run7.pt EVALFILE=external/nets/run7.nnue
 make nnue-test   NET=external/nets/run7.pt EVALFILE=external/nets/run7.nnue
-make nnue        EVALFILE=external/nets/run7.nnue    # stormbreaker-nnue.exe
+make             EVALFILE=external/nets/run7.nnue    # stormbreaker.exe
 ```
 
 Forward slashes and no spaces: `EVALFILE` is embedded as an assembler string
@@ -167,7 +167,7 @@ directory.
 **The net is linked in, not loaded at run time.** Re-exporting therefore does
 nothing at all to a binary that already exists. `make` gets this right —
 `EVALFILE` is a prerequisite of the engine — but nothing stops you from
-exporting and then benching yesterday's `stormbreaker-nnue.exe`. `make
+exporting and then benching yesterday's `stormbreaker.exe`. `make
 nnue-info` prints the hash the exporter printed; if those two disagree, the
 binary is stale and every number it produced is about a different net.
 
@@ -177,14 +177,14 @@ non-zero on a disagreement of one, which is why it works as a CI check. Run it
 after every export: it is the only thing that checks the net the engine plays
 with is the net that was trained.
 
-`make nnue` builds `stormbreaker-nnue.exe` beside the classical
-`stormbreaker.exe` rather than over it, because comparing the two is the whole
-point of Task 4 and that is hard to do when the second build overwrites the
-first. `make <target> EVAL=nnue` — `make bench EVAL=nnue`, say — does not get
-that second name: it builds the network engine as plain `stormbreaker.exe`,
-over the classical one. The rebuild itself is correct, since a `.buildflags`
-stamp sees the flags change, but the binary left sitting there afterwards is
-not the one its file name implies.
+`make` builds the network engine as `stormbreaker.exe`, and `make classical`
+puts the hand-written evaluation in `stormbreaker-classical.exe` beside it
+rather than over it — comparing the two is still worth doing, and that is hard
+when the second build overwrites the first. `make <target> EVAL=classical` —
+`make bench EVAL=classical`, say — does not get that second name: it builds the
+classical engine as plain `stormbreaker.exe`, over the network one. The rebuild
+itself is correct, since a `.buildflags` stamp sees the flags change, but the
+binary left sitting there afterwards is not the one its file name implies.
 
 ---
 

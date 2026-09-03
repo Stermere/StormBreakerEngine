@@ -189,7 +189,7 @@ function New-NetRelease([string]$Tag) {
         '',
         '```sh',
         "make net-fetch NET_TAG=$Tag NET_SHA256=$sha",
-        'make nnue',
+        'make            # the default evaluation is the network',
         '```',
         '',
         'The tag is the first twelve hex digits of the SHA-256 above, so it',

@@ -561,8 +561,8 @@ static uint64_t key_from_counts(const int *pcs, bool mirror) {
 
 /* The table's name, "KQPvKR", from the side the caller names. */
 static void table_name(const Position *pos, char *str, bool flip) {
-    static const char Chars[7] = " PNBRQK";
-    Color c                    = flip ? BLACK : WHITE;
+    static const char Chars[] = " PNBRQK";
+    Color c                   = flip ? BLACK : WHITE;
 
     for (int side = 0; side < 2; ++side) {
         for (int pt = KING; pt >= PAWN; --pt)

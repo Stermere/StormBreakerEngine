@@ -46,7 +46,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Search: 28 parameters re-fitted by SPSA, `Unc*` seats included | **+14.24 ± 7.10** (E22) |
 | Search: same re-fit narrowed to nine seats (SEE, delta, σ mapping) | **+12.88 ± 6.71** (E22a) |
 | **Uncertainty margins: LTC confirmation (E20-E22a are STC-only)** | **TODO** |
-| **NNUE: the default evaluation switches to the network** | **TODO** |
+| NNUE: the default evaluation is the network (`make`; `make classical` for the other one) | complete (E11) |
 | Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
 | Syzygy tablebases in search and datagen; all adjudication removed | built, off by default (E23) |
 | Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
@@ -168,7 +168,7 @@ The open work, roughly in order of Elo per unit of effort:
 These items are not currently planned:
 
 - **A pawn hash table.** It accelerates `eval.c` and nothing else. With the
-  network becoming the default evaluation, the code it speeds up is on its way
+  network now the default evaluation, the code it speeds up is on its way
   out of the hot path, and the work would be spent the day before it stopped
   mattering.
 - **Ablating the E1 and E10 batches.** Both went in as batches and neither

@@ -14,9 +14,16 @@ powershell tools\fetch-training-data.ps1 -Months 10   # human games (CC0)
 make tuner
 .\tuner.exe extract external\training\*.pgn -o external\training\human.epd
 .\tuner.exe tune external\training\human.epd -o src\evalparams.c
-make && make perft && make bench                     # rebuild and re-verify
-make sprt                                           # and only now, measure
+make classical                                      # rebuild the fitted engine
+.\stormbreaker-classical.exe perft suite tests\perft\standard.epd 4
+.\stormbreaker-classical.exe bench                   # re-verify
+make sprt ARGS="--dev .\stormbreaker-classical.exe" # and only now, measure
 ```
+
+**`make classical`, not `make`.** A fit rewrites `src/evalparams.c`, which only
+the classical build compiles — the default build carries the network and would
+not show the change at all. Measure the fit against a classical baseline for
+the same reason: against the network it is not the fitted weights being tested.
 
 | Stage | Input | Output |
 |---|---|---|

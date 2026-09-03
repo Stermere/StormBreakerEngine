@@ -57,7 +57,7 @@ no symptom for any of them except "the net is a bit weak".
 | 1 | **Data generation** — `tools/datagen.c`, the record format, the shuffler | Regenerated positions round-trip to identical FENs; label reproducible across runs | **built** — `make datagen-test` |
 | 2 | **Trainer** — `trainer/`, PyTorch, its own venv | Loss curve on held-out shard; sanity scores on known positions | **built** — `make trainer-test` |
 | 3 | **Export + inference** — `tools/export_net.py`, `src/nnue.c` | C inference matches the quantised Python reference **exactly** on 10k positions | **built** — `make nnue-test` |
-| 4 | **Integration** — NNUE replaces `eval_evaluate`, margins re-tuned | SPRT vs the current build | TODO |
+| 4 | **Integration** — NNUE replaces `eval_evaluate`, margins re-tuned | SPRT vs the current build | **shipped** — E11 (+238.05 ± 35.48 Elo at STC), margins re-fitted in E17 and E22a. It is what `make` builds |
 | 5 | **Search integration** — correction history, then an uncertainty head for the margins | SPRT each | corrhist **shipped** (E14); head TODO |
 
 Tasks 1–3 produce no Elo and cannot be SPRT'd. That is normal and it is why
@@ -761,9 +761,13 @@ NET_SHA256 ?= 1ee5325add50950b3b8fb34c742988436664615895f02504dc5e2be9ea15c418
 ```
 
 `make net-fetch` downloads that net and verifies the hash before putting it in
-place; `make net-publish` uploads one and prints the replacement pin. Neither
-is part of the engine build — `EVAL=nnue` still just embeds whatever is at
-`EVALFILE`. See [RELEASING.md](RELEASING.md).
+place; `make net-publish` uploads one and prints the replacement pin. The
+compiler still just embeds whatever is at `EVALFILE` — but the network is the
+default evaluation now, so a build that finds no `EVALFILE` runs `net-fetch`
+itself instead of failing, and a fresh clone builds with no extra step. A net
+named explicitly (`EVALFILE=...`) is never fetched over: that case is
+diagnosed, because downloading the pinned net over a name someone chose would
+answer a question nobody asked. See [RELEASING.md](RELEASING.md).
 
 A content-addressed tag cannot come to mean a different file, which is what
 makes pinning it safe. The pin says **which** net a build embeds; the hash of a
@@ -791,7 +795,7 @@ a position that matters.
 
 ```sh
 make nnue-export    # quantise NET into EVALFILE, + vectors + .sha256 + manifest
-make nnue           # the engine with the network, as stormbreaker-nnue
+make                # the engine with the network - this IS the default build
 make nnue-test      # export, build, and require exact equality on every vector
 make nnue-info      # which net a build is carrying, by hash
 make net-fetch      # download the pinned net - no trainer, no torch, no venv
@@ -799,17 +803,18 @@ make net-publish    # upload this net, and print the pin that names it
 ```
 
 ```
-make EVAL=nnue                                  # any target, with the network
-make EVAL=nnue EVALFILE=external/nets/cand.nnue # a specific net
+make EVAL=classical                             # any target, without the network
+make EVALFILE=external/nets/cand.nnue           # a specific net
 make nnue-export NET=external/nets/run7.pt      # a specific checkpoint
 python tools/export_net.py --help               # QA, QB, SCALE, vector count
 ```
 
-`EVAL=classical` is the default and produces the engine that existed before the
-network did — same bench node count, no net, none of `src/nnue.c` compiled. The
-default stays there until Task 4's SPRT says otherwise: the switch exists so
-the two can be compared, and a default flipped ahead of the measurement is how
-an untested change ships.
+`EVAL=classical` produces the engine that existed before the network did — no
+net, none of `src/nnue.c` compiled — and `make classical` builds it as
+`stormbreaker-classical`, beside the default binary rather than over it. It is
+no longer the default: Task 4's SPRT is E11, which measured the network at
++238.05 ± 35.48 Elo at STC, and the default moved once — and only once — that
+measurement existed.
 
 ### Upgrading the net, which is the point of most of the above
 
@@ -877,9 +882,10 @@ constant offset would have made look like a scale problem.
 is compiled for this build defines `eval_evaluate()` as a one-line forward to
 its own. `search.c` is untouched, the classical model stays reachable by name
 in every build, and `tools/tuner.c` calls `eval_classical()` explicitly — the
-Makefile also filters the NNUE defines out of the tuner build, so `make tuner
-EVAL=nnue` still fits the model it is supposed to be fitting rather than
-quietly optimising against the network.
+Makefile also filters the NNUE defines out of the tuner build - which matters
+more now that they are the default - so `make tuner` still fits the model it is
+supposed to be fitting rather than quietly optimising against the network, and
+still builds on a machine with no net.
 
 **Switching `EVAL` (or `ARCH`) now actually rebuilds.** Both produce the same
 file name from the same sources, so make compared timestamps, found nothing

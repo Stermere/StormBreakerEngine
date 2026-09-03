@@ -70,7 +70,7 @@ $GenDir       = Ensure-Dir (Join-Path $DataDir $Gen)
 $MergeDir     = Ensure-Dir (Join-Path $GenDir 'merged')
 $ShardsRemote = "$HubDir/$Gen/shards"
 
-$JobEval  = if ($cfg.ContainsKey('EVAL') -and $cfg['EVAL']) { $cfg['EVAL'] } else { 'classical' }
+$JobEval  = if ($cfg.ContainsKey('EVAL') -and $cfg['EVAL']) { $cfg['EVAL'] } else { 'nnue' }
 $JobArch  = if ($cfg.ContainsKey('ARCH') -and $cfg['ARCH']) { $cfg['ARCH'] } else { 'popcnt' }
 $MakeLine = "make datagen EVAL=$JobEval ARCH=$JobArch"
 
@@ -78,22 +78,29 @@ if (-not (Test-Path $Datagen)) { throw "no datagen.exe at $Datagen - run: $MakeL
 
 # The label check below re-searches sampled positions with THIS binary and
 # expects the fleet's scores back, which only holds if this binary evaluates the
-# way the fleet's did. Plain `make datagen` builds the CLASSICAL eval, so a
-# generation labelled by an EVAL=nnue fleet and checked by a stock local build
-# mismatches on essentially every sampled record - a failure that says nothing
-# whatsoever about the data. An nnue build embeds its net with .incbin and so
-# cannot be smaller than the net; a classical one is a few hundred KB. That is
-# the whole difference, and it is enough to tell them apart before the download.
-if ($JobEval -eq 'nnue') {
-    $LocalNet = Join-Path $ExternalDir 'nets\net.nnue'
-    if (-not (Test-Path $LocalNet)) {
-        Write-Warn2 ("no net at $LocalNet to check datagen.exe against; if labels do not " +
-                     "reproduce below, suspect this build before you suspect the data")
-    } elseif ((Get-Item $Datagen).Length -lt (Get-Item $LocalNet).Length) {
+# way the fleet's did. Plain `make datagen` builds the DEFAULT eval, which is the
+# NETWORK - so the direction of the mistake has flipped: a stock local build now
+# reproduces an EVAL=nnue fleet and NOT an EVAL=classical one. Either way the
+# mismatch lands on essentially every sampled record, a failure that says
+# nothing whatsoever about the data. An nnue build embeds its net with .incbin
+# and so cannot be smaller than the net; a classical one is a few hundred KB.
+# That is the whole difference, and it is enough to tell them apart before the
+# download.
+$LocalNet = Join-Path $ExternalDir 'nets\net.nnue'
+if (-not (Test-Path $LocalNet)) {
+    Write-Warn2 ("no net at $LocalNet to size datagen.exe against; if labels do not " +
+                 "reproduce below, suspect this build before you suspect the data")
+} else {
+    $CarriesNet = (Get-Item $Datagen).Length -ge (Get-Item $LocalNet).Length
+    if ($JobEval -eq 'nnue' -and -not $CarriesNet) {
         Write-Warn2 ("datagen.exe carries no embedded net, but $Gen was labelled with " +
                      "EVAL=nnue - its labels cannot reproduce here. Rebuild: $MakeLine")
+    } elseif ($JobEval -ne 'nnue' -and $CarriesNet) {
+        Write-Warn2 ("datagen.exe embeds a net - the default build does - but $Gen was " +
+                     "labelled with EVAL=$JobEval. Its labels cannot reproduce here. " +
+                     "Rebuild: $MakeLine")
     } else {
-        Write-Ok "datagen.exe is an nnue build, matching EVAL=$JobEval"
+        Write-Ok "datagen.exe matches EVAL=$JobEval"
     }
 }
 

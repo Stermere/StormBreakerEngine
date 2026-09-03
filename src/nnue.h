@@ -1,9 +1,9 @@
 /*
  * nnue.h - the network evaluation, and the file format it loads.
  *
- * The engine is built with exactly ONE evaluation. `make EVAL=nnue` defines
- * EVAL_NNUE and this file's implementation supplies eval_evaluate();
- * `make EVAL=classical` (the default) does not compile any of it, and the
+ * The engine is built with exactly ONE evaluation. `make EVAL=nnue` - the
+ * default - defines EVAL_NNUE and this file's implementation supplies
+ * eval_evaluate(); `make EVAL=classical` does not compile any of it, and the
  * resulting binary is byte-for-byte the classical engine. Nothing here is a
  * runtime branch - an evaluation that tested a flag at every node would pay
  * for the flexibility in the only currency that matters.

@@ -45,7 +45,7 @@ Stockfish's, so the two can be diffed directly.
 | `Move Overhead` | spin | 10 | 0–5000 | ms reserved for GUI/network latency |
 | `UCI_Chess960` | check | false | | Chess960 castling notation (see below) |
 | `SyzygyPath` | string | `<empty>` | | directory of Syzygy tablebases; empty disables probing |
-| `EvalFile` | string | `<internal>` | | **`EVAL=nnue` builds only** — load a net from disk |
+| `EvalFile` | string | `<internal>` | | **nnue builds only**, which is the default — load a net from disk |
 
 `UCI_Chess960` selects how castling is **spelled**, not which rules apply. The
 rules come from the position: `board_set_fen` derives the castling geometry
@@ -114,7 +114,8 @@ Useful during development; GUIs ignore them.
 | `syzygy verify <dir>` | probe known endgames against the tables in `dir`; exits non-zero on any wrong answer (`make syzygy-test`) |
 | `syzygy manifest <dir> <file>` | re-derive every material configuration's probe checksum and compare against a sealed manifest; names the endgame that differs |
 
-The three `nnue` commands exist only in an `EVAL=nnue` build. `eval` always
+The three `nnue` commands exist only in an nnue build — the default one; a
+`make classical` binary answers `unknown command`. `eval` always
 traces the *classical* model, in every build: it is the only evaluation with
 terms to name, and it stays in the tree as the reference the network is measured
 against.

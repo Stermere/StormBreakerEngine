@@ -51,8 +51,8 @@ margin fitted by SPSA.
 squares, SCReLU activation, piece-count output buckets, plus the uncertainty
 head — run with an incremental int16 accumulator and AVX2. The net file
 describes its own architecture in its header, so a retrain at a different
-width or bucket count is a drop-in. The classical evaluation still builds
-(`make`, without `EVAL=nnue`) and remains the tuner's model.
+width or bucket count is a drop-in. It is what `make` builds. The classical
+evaluation still builds (`make classical`) and remains the tuner's model.
 
 **Training pipeline.** `tools/datagen.c` generates and labels positions with
 fixed-node searches into a packed 32-byte format; `trainer/` (PyTorch) fits
@@ -73,11 +73,16 @@ behavioural change and needs a passing SPRT before it ships — roughly half of
 ## Quick start
 
 ```sh
-make                     # build for this machine (classical eval)
-make nnue                # build with the network, as stormbreaker-nnue
+make                     # build for this machine (the network evaluation)
+make classical           # the hand-written eval, as stormbreaker-classical
 make bench               # deterministic node-count benchmark
 make perft               # move generation correctness suite
 ```
+
+The default build embeds a net, and a clean clone has none — `external/` is
+gitignored. The first `make` therefore downloads the net the Makefile pins
+(~25 MB, SHA-256 verified before it is used) and then builds. `make classical`
+needs no net and no network access.
 
 First-time environment setup (Windows):
 
@@ -110,9 +115,9 @@ searchmoves` list; anywhere else it is a bug.
 |---|---|
 | `make` | `-march=native`, fastest on this machine, **not portable** |
 | `make ARCH=avx512\|bmi2\|avx2\|popcnt\|legacy` | portable arch profiles (`popcnt` is what CI uses) |
-| `make EVAL=classical\|nnue` | pick the evaluation at compile time; classical is the default |
-| `make EVAL=nnue EVALFILE=<path.nnue>` | embed a specific net |
-| `make nnue` | the network build under its own name, `stormbreaker-nnue` |
+| `make EVAL=nnue\|classical` | pick the evaluation at compile time; **nnue is the default** |
+| `make EVALFILE=<path.nnue>` | embed a specific net instead of the pinned one |
+| `make classical` | the hand-written evaluation under its own name, `stormbreaker-classical` |
 | `make EXE=<name>` | name the output binary (OpenBench requirement); `CC=` is honoured too |
 | `make debug` | assertions on, sanitizers on POSIX |
 | `make release` | every distributable ARCH into `build/` |
@@ -129,7 +134,7 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 | `make bench` | deterministic node count; final line is the OpenBench contract |
 | `make perft` / `make perft-all` | movegen correctness, depth-capped / full depth |
 | `make openbench-check` | verify OpenBench compliance |
-| `make nnue-test` | C inference == quantised Python reference, exactly. **Re-exports `net.nnue` from the local checkpoint** — run `make net-fetch` afterwards if you want the pinned net back |
+| `make nnue-test` | C inference == quantised Python reference, exactly. **Re-exports `net.nnue` from the local checkpoint and rebuilds `stormbreaker`** — run `make net-fetch` and `make` afterwards if you want the pinned net back |
 | `make datagen-test` | datagen round-trip + label reproducibility gate |
 | `make trainer-test` | the trainer's pytest suite |
 
@@ -148,7 +153,7 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 | Command | Purpose |
 |---|---|
 | `make nnue-export` | quantise `NET` (default `external/nets/net.pt`) into `EVALFILE` + test vectors |
-| `make net-fetch` | download the pinned net (`NET_SHA256` in the Makefile), hash-checked |
+| `make net-fetch` | download the pinned net (`NET_SHA256` in the Makefile), hash-checked. The default build runs this for you when `EVALFILE` is missing |
 | `make nnue-info` | report the embedded net and its hash |
 | `make net-publish` | upload `EVALFILE` as a content-addressed release |
 

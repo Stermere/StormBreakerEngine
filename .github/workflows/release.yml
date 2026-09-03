@@ -148,8 +148,10 @@ jobs:
       - name: Name this binary
         id: name
         run: |
+          # The default evaluation takes no suffix, so an unsuffixed asset is
+          # always "what `make` builds" - the network, since E11.
           suffix=""
-          [ "${{ matrix.eval }}" = "nnue" ] && suffix="-nnue"
+          [ "${{ matrix.eval }}" = "classical" ] && suffix="-classical"
           base="stormbreaker-$VERSION-${{ matrix.target.platform }}-${{ matrix.target.arch }}$suffix"
           exe="$base"
           [ "${{ matrix.target.platform }}" = "windows" ] && exe="$base.exe"
@@ -165,6 +167,10 @@ jobs:
             exit 1
           fi
 
+      # Explicitly, one step before the build, even though the default build
+      # would fetch it too: a net release that was never published then fails
+      # with the message below rather than from inside a compile.
+      #
       # The equivalence vectors ship beside the net. They are what makes the
       # exactness check below possible without a Python environment.
       - name: Fetch the net's equivalence vectors
@@ -255,8 +261,8 @@ jobs:
             ref=""; first=""
             for f in *.nodes; do
               case "$f" in
-                *-nnue.nodes) this=nnue ;;
-                *)            this=classical ;;
+                *-classical.nodes) this=classical ;;
+                *)                 this=nnue ;;
               esac
               [ "$this" = "$eval" ] || continue
               n=$(cat "$f")
@@ -294,16 +300,17 @@ jobs:
             echo "| Anything older, or you are not sure | \`popcnt\` |"
             echo "| An Apple Silicon Mac | \`macos-arm64\` |"
             echo
-            echo "Files without a suffix use the classical evaluation. **The \`-nnue\`"
-            echo "files use the network and are the stronger engine** - +238 Elo at STC,"
-            echo "measured in \`docs/EXPERIMENTS.md\` (E11). The net is embedded, so an"
-            echo "\`-nnue\` binary is self-contained and needs no extra files."
+            echo "**Files without a suffix use the network and are the stronger"
+            echo "engine** - +238 Elo at STC, measured in \`docs/EXPERIMENTS.md\` (E11)."
+            echo "The net is embedded, so they are self-contained and need no extra"
+            echo "files. The \`-classical\` files carry the hand-written evaluation"
+            echo "instead; take one only if an embedded net is a problem for you."
             echo
             echo "On Linux and macOS, \`chmod +x <file>\` before running it."
             echo
             echo "## Net"
             echo
-            echo "The \`-nnue\` binaries embed [\`$NET_TAG\`](https://github.com/$REPO/releases/tag/$NET_TAG):"
+            echo "The unsuffixed binaries embed [\`$NET_TAG\`](https://github.com/$REPO/releases/tag/$NET_TAG):"
             echo
             echo '```'
             echo "$NET_SHA"
@@ -316,8 +323,8 @@ jobs:
             echo
             echo "| Evaluation | Nodes |"
             echo "|---|---|"
-            echo "| classical | ${{ steps.nodes.outputs.classical_nodes }} |"
-            echo "| nnue | ${{ steps.nodes.outputs.nnue_nodes }} |"
+            echo "| nnue (unsuffixed) | ${{ steps.nodes.outputs.nnue_nodes }} |"
+            echo "| classical (\`-classical\`) | ${{ steps.nodes.outputs.classical_nodes }} |"
             echo
             echo "Check with \`<binary> bench\`. \`SHA256SUMS.txt\` covers every asset here."
           } > notes.md

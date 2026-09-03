@@ -509,7 +509,7 @@ void nnue_init(void) {
     nnue_adopt(nnueEmbeddedStart, bytes, NULL, NNUE_EVALFILE " (embedded)");
 #else
     printf("info string this build embeds no net: rebuild with "
-           "'make EVAL=nnue EVALFILE=<path>'\n");
+           "'make EVALFILE=<path>'\n");
     fflush(stdout);
     exit(1);
 #endif

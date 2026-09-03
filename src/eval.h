@@ -34,8 +34,8 @@ Value eval_evaluate(const Position *pos);
 /*
  * The hand-written evaluation above, by name.
  *
- * eval_evaluate() IS this in a classical build and is the network in an
- * `EVAL=nnue` one, so anything that specifically wants the classical model -
+ * eval_evaluate() IS this in an `EVAL=classical` build and is the network in
+ * the default one, so anything that specifically wants the classical model -
  * tools/tuner.c, which fits it, and `eval`, which traces it - must ask for it
  * by this name or it will quietly measure whichever evaluation got linked.
  */

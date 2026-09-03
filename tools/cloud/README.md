@@ -180,7 +180,10 @@ the scripts are shaped the way they are.
 - **`EVAL=nnue` makes the net a build input.** It is embedded with `.incbin` at
   compile time, so two boxes that fetched different files produce labels that
   are individually plausible and mutually incomparable. `NET_SHA` pins it by
-  hash and `provision.sh` refuses to continue if the fetched net disagrees.
+  hash and `provision.sh` refuses to continue if the fetched net disagrees. It
+  is also the Makefile's default now, so a job that wants the pre-network
+  labeller has to say `EVAL=classical` — and `job.env` always says one or the
+  other, because `provision.sh` requires it.
 - **A dirty tree poisons attribution.** The Makefile stamps `-dirty` into every
   manifest, and a dataset that cannot be tied to an exact build cannot be
   compared to the next generation's. `provision.sh` refuses to build one.

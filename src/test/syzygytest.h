@@ -8,6 +8,7 @@
 #ifndef SYZYGYTEST_H
 #define SYZYGYTEST_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "board.h"

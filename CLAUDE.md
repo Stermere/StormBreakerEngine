@@ -11,17 +11,17 @@ complete and verified. The search is a PVS with a transposition table, null
 move, LMR, singular extensions, SEE pruning and history heuristics. Chess960 is
 supported in full — castling geometry is derived per position, so both variants
 share one generator — though nothing in the *evaluation* has been tuned for it. The
-evaluation is a 13,684-parameter linear model — material, piece-square tables,
+classical evaluation is a 13,684-parameter linear model — material, piece-square tables,
 king-relative placement, mobility, pawn structure, king safety and threats —
 fitted to 22.6M positions from human games by `tools/tuner.c`.
 
-A network exists alongside it: `trainer/` fits it, `tools/export_net.py`
-quantises it, and `src/nnue.c` runs it, bit-exactly against the Python
-reference. It is **not** the default evaluation — `make EVAL=nnue` builds it,
-`make` still builds the classical one, and it stays that way until the
-integration passes an SPRT (docs/NNUE.md, Task 4). What remains is ablating the
-eval batch, Lazy SMP, and NNUE Tasks 4-5 — see the status table in
-docs/STATUS.md.
+The network is the default evaluation: `trainer/` fits it, `tools/export_net.py`
+quantises it, `src/nnue.c` runs it bit-exactly against the Python reference, and
+`make` builds it. It became the default on the strength of E11 (+238.05 ± 35.48
+Elo at STC), which is Task 4's gate in docs/NNUE.md. The classical model is not
+retired by that: `make classical` still builds it, it needs no net, and it is
+what `tools/tuner.c` fits. What remains is ablating the eval batch, Lazy SMP,
+and NNUE Task 5 — see the status table in docs/STATUS.md.
 
 ## Build and test
 
@@ -35,8 +35,8 @@ make openbench-check    # verify OpenBench compliance
 make format             # apply .clang-format
 make tuner              # build the evaluation fitter (docs/TUNING.md)
 
-make EVAL=nnue          # any build, with the network instead of eval.c
-make net-fetch          # fetch the pinned net; a clean clone has none
+make classical          # any build, with eval.c instead of the network
+make net-fetch          # fetch the pinned net; the default build does this itself
 make nnue-test          # C inference == the quantised reference, exactly
 make datagen-test       # datagen round-trips and its labels reproduce
 make trainer-test       # the trainer's pytest suite
@@ -54,8 +54,11 @@ disk benches identically to one without. That is not a convenience: node
 counts that depended on which files a machine happened to have would break
 invariant 1 outright.
 
-`EVAL` picks the evaluation at compile time; `classical` is the default and
-there is no runtime switch. Switching `EVAL` or `ARCH` rebuilds correctly - a
+`EVAL` picks the evaluation at compile time; `nnue` is the default and there is
+no runtime switch. The default therefore has a build INPUT the repository does
+not carry — a net — so `make` fetches the pinned one (hash-verified) when
+`EVALFILE` is missing rather than failing on a clean clone; `EVAL=classical`
+never looks at it. Switching `EVAL` or `ARCH` rebuilds correctly - a
 `.buildflags` stamp is a prerequisite of every binary, because otherwise make
 sees the same sources and the same output name and hands back the binary built
 with the *other* flags.

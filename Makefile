@@ -12,8 +12,8 @@
 #    make                 optimised build for THIS machine (-march=native)
 #    make ARCH=avx2       portable build for a CPU class (see ARCH table below)
 #    make avx2            shorthand for the above
-#    make EVAL=nnue       build with the network instead of the classical eval
-#    make EVAL=classical  the hand-written evaluation (the default)
+#    make EVAL=classical  build with the hand-written eval instead of the net
+#    make classical       the same, under its own name, beside the default build
 #    make TUNE_SEARCH=on  expose the search margins as UCI spin options
 #    make debug           unoptimised + assertions (+ sanitizers on POSIX)
 #    make bench           build, then run the deterministic node-count benchmark
@@ -34,17 +34,24 @@ ARCH ?= native
 #  runtime switch, because an evaluation that tested a flag at every node
 #  would pay for the flexibility in the only currency that matters.
 #
+#    nnue       the network in src/nnue.c, embedded from EVALFILE (default)
 #    classical  the tuned 13,684-parameter linear model in src/eval.c
-#    nnue       the network in src/nnue.c, embedded from EVALFILE
 #
 #  Both build the same engine otherwise, and `make EVAL=classical` is
-#  byte-for-byte the engine that existed before the network did. The default
-#  stays classical until an NNUE build has passed its own SPRT (docs/NNUE.md,
-#  Task 4) - the switch exists so the two can be compared, and a default
-#  flipped ahead of the measurement is how an untested change ships.
-EVAL     ?= classical
-EVALFILE ?= external/nets/net.nnue
-NET      ?= external/nets/net.pt
+#  byte-for-byte the engine that existed before the network did. The default is
+#  the network because it was MEASURED to be: +238.05 +/- 35.48 Elo at STC,
+#  docs/EXPERIMENTS.md E11, which is Task 4's gate in docs/NNUE.md. Nothing in
+#  that deprecates the classical model - it is what tools/tuner.c fits, it
+#  needs no net, and keeping it buildable is what keeps the two comparable.
+#
+#  Because the default embeds a net, EVALFILE is a build INPUT now. A clean
+#  clone has none - external/ is gitignored, and a net is far too large to
+#  commit - so the $(EVALFILE) rule below fetches the pinned one rather than
+#  failing the build. `make EVAL=classical` never looks at it.
+EVAL             ?= nnue
+DEFAULT_EVALFILE := external/nets/net.nnue
+EVALFILE         ?= $(DEFAULT_EVALFILE)
+NET              ?= external/nets/net.pt
 
 # ------------------------------------------------------------- net pinning --
 #  Which net a build fetches when it has none. `make net-fetch` downloads
@@ -142,8 +149,10 @@ WARNINGS := -Wall -Wextra -Wshadow -Wcast-qual -Wstrict-prototypes \
 OPTIMISE := -O3 -funroll-loops -fno-math-errno -fomit-frame-pointer
 
 # Names a distributable binary after the evaluation it carries, so that
-# `make release EVAL=nnue` does not overwrite the classical build of the same
-# ARCH with a binary that plays differently.
+# `make release EVAL=classical` does not overwrite the default build of the
+# same ARCH with a binary that plays differently. The DEFAULT evaluation takes
+# no suffix: an unsuffixed name means "what `make` builds", and that is the
+# network now.
 EVALSUFFIX :=
 
 # EVAL_NNUE switches the evaluation; NNUE_EVALFILE is the path .incbin embeds,
@@ -155,15 +164,18 @@ NNUEDEFS :=
 ifeq ($(EVAL),nnue)
     NNUEDEFS := -DEVAL_NNUE -DNNUE_EVALFILE='"$(EVALFILE)"'
     EVALDEP  := $(EVALFILE)
-    EVALSUFFIX := -nnue
-    ifeq ($(wildcard $(EVALFILE)),)
-        $(error EVAL=nnue needs a net at '$(EVALFILE)'. Download the pinned \
-one with 'make net-fetch', export your own with 'make nnue-export', or point \
-EVALFILE somewhere else. Note that the path must not contain spaces - it is \
-embedded as an assembler string.)
+    # A missing net is fetched rather than diagnosed - see the $(EVALFILE) rule
+    # below. A net whose PATH holds a space can only be diagnosed: it is
+    # expanded into an assembler string, and no quoting survives the trip.
+    ifneq ($(words $(EVALFILE)),1)
+        $(error EVALFILE '$(EVALFILE)' contains a space. It is embedded with \
+.incbin as an assembler string, which cannot be quoted through the compiler \
+driver - put the net somewhere whose path has no spaces in it.)
     endif
-else ifneq ($(EVAL),classical)
-    $(error Unknown EVAL '$(EVAL)'. Valid: classical nnue)
+else ifeq ($(EVAL),classical)
+    EVALSUFFIX := -classical
+else
+    $(error Unknown EVAL '$(EVAL)'. Valid: nnue classical)
 endif
 
 # TUNE_SEARCH exposes every pruning margin in search.c as a UCI spin option, so
@@ -244,7 +256,7 @@ endif
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
         tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet snapshot \
-        nnue nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
+        classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
         syzygy-fetch syzygy-test chess960-test chess960-campaign
 
 all: $(TARGET)
@@ -252,8 +264,38 @@ all: $(TARGET)
 $(TARGET): $(SOURCES) $(HEADERS) $(EVALDEP) $(FLAGSTAMP)
 	$(CC) $(CFLAGS) $(SOURCES) -o $(TARGET) $(LDFLAGS)
 
+# The net the default evaluation embeds. It is a build input the repository
+# does not carry - external/ is gitignored - so a clean clone, a CI runner and an
+# OpenBench worker would all otherwise fail the default build on a file they had
+# no way to know about. Fetching the PINNED net instead keeps `make` working out
+# of a fresh clone without loosening anything:
+# net-fetch verifies the SHA-256 before the file is put in place, so this can
+# never quietly embed a different net than the one this commit names.
+#
+# Only the default path is fetched. If EVALFILE was pointed at a particular
+# net, downloading the pinned one over that name would answer a question nobody
+# asked - that case is diagnosed.
+$(EVALFILE):
+ifeq ($(EVALFILE),$(DEFAULT_EVALFILE))
+	@echo "no net at $(EVALFILE) - fetching the one this build pins"
+	@$(MAKE) --no-print-directory net-fetch
+else
+	@echo "EVALFILE '$(EVALFILE)' does not exist. Either:" >&2
+	@echo "  quantise one:   make nnue-export NET=<checkpoint> EVALFILE=$(EVALFILE)" >&2
+	@echo "  the pinned net: make net-fetch, and drop EVALFILE" >&2
+	@echo "  no net at all:  make EVAL=classical" >&2
+	@exit 1
+endif
+
 native avx512 bmi2 avx2 popcnt legacy:
 	@$(MAKE) --no-print-directory ARCH=$@ EXE=$(EXE) CC=$(CC)
+
+# The engine with the hand-written evaluation, under its own name. A separate
+# binary from the default one on purpose: comparing the two is the entire
+# point, and that is hard to do when the second build overwrites the first.
+classical:
+	@$(MAKE) --no-print-directory EVAL=classical EXE=$(EXE)-classical \
+	    ARCH=$(ARCH) CC=$(CC)
 
 # Assertions on, optimiser off. Sanitizers are POSIX-only: MinGW GCC ships no
 # ASan runtime, so on Windows this is a plain assert+debuginfo build.
@@ -263,15 +305,16 @@ ifneq ($(OS),Windows_NT)
 debug: CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all
 debug: LDFLAGS += -fsanitize=address,undefined
 endif
-debug:
+debug: $(EVALDEP)
 	$(CC) $(CFLAGS) $(SOURCES) -o $(EXE)-debug$(SUFFIX) $(LDFLAGS)
 	@echo "built $(EXE)-debug$(SUFFIX)"
 
 # Every binary a release would ship. `native` is deliberately excluded: it is
 # not portable and must never be published.
 #
-# Honours EVAL: `make release EVAL=nnue` needs a net (see net-fetch) and names
-# what it builds -nnue, because the two evaluations play differently.
+# Honours EVAL: `make release EVAL=classical` names what it builds -classical,
+# because the two evaluations play differently. The default needs a net, which
+# it fetches if the tree has none (see the $(EVALFILE) rule).
 #
 # The mkdir is not optional: the compiler is asked to write straight into
 # build/, and ld does not create the directory - it fails the link outright.
@@ -359,10 +402,11 @@ openbench-check:
 # tooling, it is not shipped, and the engine binary must not carry it.
 TUNER_SOURCES := $(filter-out src/main.c,$(SOURCES)) tools/tuner.c
 
-# The NNUE defines are filtered out rather than merely not added: `make tuner
-# EVAL=nnue` would otherwise link the network over eval_evaluate and fit a
-# model that is not the one being measured. tools/tuner.c calls
-# eval_classical() by name for the same reason.
+# The NNUE defines are filtered out rather than merely not added, which matters
+# more now that they are on by default: a plain `make tuner` would otherwise
+# link the network over eval_evaluate and fit a model that is not the one being
+# measured. tools/tuner.c calls eval_classical() by name for the same reason.
+# Filtering them out also means the tuner needs no net to build.
 tuner: $(TUNER_SOURCES) $(HEADERS)
 	$(CC) $(filter-out $(NNUEDEFS),$(CFLAGS)) -DTUNE -Isrc $(TUNER_SOURCES) \
 	    -o tuner$(SUFFIX) $(LDFLAGS)
@@ -386,8 +430,9 @@ ifneq ($(GIT_DIRTY),)
     GIT_COMMIT := $(GIT_COMMIT)-dirty
 endif
 
-# Deliberately honours EVAL: `make datagen EVAL=nnue` is how the pipeline
-# bootstraps, since net n+1 trains on labels from searches that used net n.
+# Deliberately honours EVAL, and the default carries the network: that is how
+# the pipeline bootstraps, since net n+1 trains on labels from searches that
+# used net n. `make datagen EVAL=classical` gets the pre-network labeller back.
 datagen: $(DATAGEN_SOURCES) $(HEADERS) $(EVALDEP) $(FLAGSTAMP)
 	$(CC) $(CFLAGS) -DDATAGEN -DDATAGEN_COMMIT='"$(GIT_COMMIT)"' -Isrc \
 	    $(DATAGEN_SOURCES) -o datagen$(SUFFIX) $(LDFLAGS)
@@ -515,20 +560,19 @@ snapshot:
 nnue-export:
 	$(PYTHON) tools/export_net.py $(NET) -o $(EVALFILE)
 
-# The engine, built with the network. A separate name from the classical
-# binary on purpose: comparing the two is the entire point, and that is hard
-# to do when the second build overwrites the first.
-nnue:
-	@$(MAKE) --no-print-directory EVAL=nnue EXE=$(EXE)-nnue ARCH=$(ARCH) CC=$(CC)
-
 # The Task 3 acceptance gate: export, then require the C inference to
 # reproduce the quantised Python reference EXACTLY on every vector. Exact,
 # not close - see the note at the top of tools/export_net.py. A mismatch
 # exits non-zero, so this works as a CI gate.
+#
+# EVAL=nnue explicitly, not just by default: this gate must test the network
+# even when it is invoked from a shell that has EVAL=classical in the
+# environment. It rebuilds $(TARGET), and it re-exports EVALFILE from NET - run
+# `make net-fetch` afterwards to put the pinned net back.
 nnue-test:
 	@$(MAKE) --no-print-directory nnue-export
-	@$(MAKE) --no-print-directory nnue
-	./$(EXE)-nnue$(SUFFIX) nnue verify $(EVALFILE).vectors
+	@$(MAKE) --no-print-directory all EVAL=nnue
+	./$(TARGET) nnue verify $(EVALFILE).vectors
 
 # The tablebase acceptance gate: known endgames, each probed as given and
 # mirrored, against tables fetched by `make syzygy-fetch`. A probe that
@@ -546,14 +590,17 @@ syzygy-test: $(TARGET)
 # independent implementation long after that implementation was deleted.
 	./$(TARGET) syzygy manifest $(SYZYGY_PATH) $(SYZYGY_MANIFEST)
 
-# Which net a build is actually carrying, by hash. `make bench EVAL=nnue`
-# prints the same hash in its header.
-nnue-info: nnue
-	@./$(EXE)-nnue$(SUFFIX) nnue
+# Which net a build is actually carrying, by hash. `make bench` prints the same
+# hash in its header.
+nnue-info:
+	@$(MAKE) --no-print-directory all EVAL=nnue
+	@./$(TARGET) nnue
 
 # Download the pinned net (NET_TAG / NET_SHA256 near the top of this file) into
 # EVALFILE. This is how a machine that cannot run the trainer - a CI runner, an
-# OpenBench worker, a fresh clone - gets a net: `make net-fetch && make nnue`.
+# OpenBench worker, a fresh clone - gets a net, and the default build runs it
+# for you when EVALFILE is missing. Run it by hand to refresh a net that
+# `make nnue-test` re-exported, or to pre-fetch before building offline.
 #
 # The hash is checked before the file is put in place, and a mismatch names
 # both values and leaves EVALFILE untouched. Re-running is free: a net that
@@ -605,12 +652,14 @@ format-check:
 clean:
 	rm -f $(EXE) $(EXE).exe $(EXE)-debug $(EXE)-debug.exe Engine-* *.o *.d .ob*.txt
 	rm -f tuner tuner.exe datagen datagen.exe
-	rm -f $(EXE)-nnue $(EXE)-nnue.exe $(FLAGSTAMP)
+	rm -f $(EXE)-classical $(EXE)-classical.exe $(FLAGSTAMP)
+	rm -f $(EXE)-nnue $(EXE)-nnue.exe
 	rm -rf build
 
 help:
 	@echo "make [ARCH=native|avx512|bmi2|avx2|popcnt|legacy]  optimised build"
-	@echo "make [EVAL=classical|nnue]                        pick the evaluation"
+	@echo "make [EVAL=nnue|classical]                        pick the evaluation"
+	@echo "make classical          the hand-written evaluation, under its own name"
 	@echo "make debug              assertions (+ sanitizers on POSIX)"
 	@echo "make bench              deterministic node-count benchmark"
 	@echo "make perft              movegen correctness suite (fast, depth-capped)"
@@ -627,7 +676,6 @@ help:
 	@echo "make gauntlet           play a field (or Stockfish alone), Elo table"
 	@echo "make snapshot           freeze this build as a baseline"
 	@echo "make nnue-export        quantise NET into EVALFILE (+ test vectors)"
-	@echo "make nnue               build the engine with the network evaluation"
 	@echo "make nnue-test          C inference == quantised Python reference"
 	@echo "make nnue-info          which net a build is carrying, by hash"
 	@echo "make net-fetch          download the pinned net into EVALFILE"

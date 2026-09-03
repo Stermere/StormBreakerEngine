@@ -7,7 +7,7 @@ field, a rated ladder or a Stockfish rung, see gauntlet.py.
     python tools/sprt.py --smoke
     python tools/sprt.py
     python tools/sprt.py --tc LTC
-    python tools/sprt.py --dev ./stormbreaker-nnue.exe --base external/baselines/v0.1.exe
+    python tools/sprt.py --dev ./stormbreaker.exe --base external/baselines/v0.1.exe
 
 Read docs/TESTING.md before trusting a result. The short version: one change
 per test, do not read the number early, and a result whose interval spans zero

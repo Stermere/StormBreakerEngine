@@ -15,8 +15,10 @@ Fourteen binaries, from
 | **macos** | | | | ✓ |
 
 each in both evaluations, named
-`stormbreaker-<version>-<platform>-<arch>[-nnue]`. A `-nnue` binary has the net
-compiled into it and needs no extra files.
+`stormbreaker-<version>-<platform>-<arch>[-classical]`. The unsuffixed binaries
+carry the network — the default evaluation, and the stronger engine — with the
+net compiled in, so they need no extra files. A `-classical` binary carries the
+hand-written evaluation instead.
 
 `avx512` is not published because GitHub's runners cannot test it reliably and
 it offers limited benefit outside Skylake-X. `native` is not published because
@@ -25,10 +27,15 @@ it is not portable.
 ## Network distribution
 
 A net is 50 MB. The repository does not carry binaries, so `external/nets/` is
-gitignored, and a clean checkout has no net at all. But `EVAL=nnue` *embeds*
-one with `.incbin` at build time, which means a CI runner, an OpenBench worker
-and anyone building from a fresh clone all need to obtain the exact net that
-commit expects, before the compiler runs.
+gitignored, and a clean checkout has no net at all. But the default evaluation
+*embeds* one with `.incbin` at build time, which means a CI runner, an OpenBench
+worker and anyone building from a fresh clone all need to obtain the exact net
+that commit expects, before the compiler runs.
+
+`make` therefore fetches the pinned net itself when `EVALFILE` is missing, so
+none of those three has to know it needed one. The release workflow still
+fetches explicitly, one step before the build: a net release that was never
+published then fails with its own message instead of from inside a compile.
 
 Networks use a separate release tagged by file hash:
 
@@ -133,7 +140,8 @@ retry it; find out which architecture is the odd one out and why.
 ## The classical binaries
 
 Both evaluations ship. The network is much the stronger engine — E11 measured
-+238 Elo at STC — and the release notes say so, but `EVAL=classical` remains
-the Makefile default and the classical binaries remain published. They are the
-only thing that runs where a 50 MB embedded net is unwelcome, they are what the
-tuner fits, and keeping them buildable is what keeps the two comparable.
++238 Elo at STC — which is why it is the Makefile default and why the
+unsuffixed downloads are the ones carrying it. The classical binaries remain
+published regardless. They are the only thing that runs where a 50 MB embedded
+net is unwelcome, they are what the tuner fits, and keeping them buildable is
+what keeps the two comparable.
