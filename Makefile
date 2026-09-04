@@ -65,8 +65,8 @@ NET              ?= external/nets/net.pt
 #  docs/EXPERIMENTS.md records WHY that one was adopted, beside the SPRT that
 #  adopted it. Bump them together. tools/publish-net.ps1 uploads a net and
 #  prints the replacement lines.
-NET_TAG    ?= net-0ba56166ba9c
-NET_SHA256 ?= 0ba56166ba9c49da7399eef3a8f6ed5e5e12c6faa9a84885dd4453cbd25a3cae
+NET_TAG    ?= net-34aaa009f3db
+NET_SHA256 ?= 34aaa009f3db86f2da0530b2829cc19ea1f2686bc98d3db6537e07814192b574
 NET_URL    ?= https://github.com/Stermere/StormBreakerEngine/releases/download/$(NET_TAG)/net.nnue
 
 # `CC ?= gcc` would NOT work here: make predefines CC as `cc`, so the variable
@@ -255,7 +255,8 @@ endif
 # ----------------------------------------------------------------- targets --
 .PHONY: all native avx512 bmi2 avx2 popcnt legacy debug release \
         bench perft perft-all openbench-check format format-check clean help \
-        tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet snapshot \
+        tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet \
+        ratings snapshot \
         classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
         syzygy-fetch syzygy-test chess960-test chess960-campaign
 
@@ -615,6 +616,15 @@ tune:
 gauntlet:
 	@$(TOOLPY) tools/gauntlet.py $(ARGS)
 
+# Re-reads a gauntlet PGN: the full cross-table, and every seat's rating on the
+# CCRL scale rather than relative to whoever else happened to be in the field.
+# `make gauntlet` runs this itself when its match finishes; the target is for
+# re-reading an older PGN, or one whose match was interrupted part-way.
+#
+#   make ratings ARGS="external/games/20260904-102939-gauntlet.pgn"
+ratings:
+	@$(TOOLPY) tools/ratings.py $(ARGS)
+
 # Downloads the rated opponent ladder into external/engines, which the gauntlet
 # then plays by default. external/ is gitignored, so a fresh clone has none of
 # them and this is how they come back. Re-running skips what is already there.
@@ -750,6 +760,7 @@ help:
 	@echo "make sprt               SPRT this build against a baseline"
 	@echo "make tune               SPSA-tune the TUNE_SEARCH=on parameters"
 	@echo "make gauntlet           play a field (or Stockfish alone), Elo table"
+	@echo "make ratings            re-read a gauntlet PGN onto the CCRL scale"
 	@echo "make snapshot           freeze this build as a baseline"
 	@echo "make nnue-export        quantise NET into EVALFILE (+ test vectors)"
 	@echo "make nnue-test          C inference == quantised Python reference"

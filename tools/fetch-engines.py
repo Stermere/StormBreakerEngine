@@ -9,22 +9,15 @@ gauntlet.py's problem is that every engine in external/baselines is a snapshot
 of THIS engine, so the table it prints is relative to a scale nobody outside
 this repository recognises. These opponents are third-party engines with
 published CCRL ratings, which turns the same table into an absolute reading:
-beating the 3256 rung and losing to the 3426 one says where the engine sits
+beating the 3256 rung and losing to the 3593 one says where the engine sits
 without going through Stockfish's UCI_Elo rungs and their caveats - a ladder
 this repository no longer keeps, now that `--field stockfish` plays the real
 thing.
 
-WHY THESE FIVE. They span 3008-3426 in ~100 Elo steps, which brackets the
-engine on both sides - a field entirely above or entirely below it produces
-near-0% or near-100% scores, which carry almost no information per game. They
-come from five different authors, so a quirk this engine happens to exploit in
-one of them cannot flatter the whole table. All are self-contained: no
-companion net file to place, no config to write.
-
-RATINGS ARE CCRL BLITZ (2+1), single CPU, as published for these exact
-versions. They are not this repository's scale and not FIDE's; a rating list
-is a pool, and ours is not CCRL's pool. Treat them as calibrated landmarks,
-not as a number to claim.
+The ladder itself - who is on it, what they are rated, and why those - lives in
+common.py as CCRL_LADDER, because `ratings.py` has to read the same ratings
+back when it anchors a gauntlet table. This file is only how the binaries
+arrive.
 
 STDLIB ONLY, like every tool here - see common.py.
 """
@@ -46,43 +39,6 @@ import common as c
 # a CDN that 403s urllib's default agent.
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-GH = "https://github.com"
-
-# `member` names the file to pull out of a .zip asset; None means the asset is
-# the executable itself. `ccrl` is CCRL Blitz, 1 CPU, for this exact version.
-LADDER = [
-    {
-        "name": "halogen-8.1",
-        "ccrl": 3008,
-        "url": f"{GH}/KierenP/Halogen/releases/download/v8.1/Halogen8.1-x64-pext-avx2.exe",
-        "member": None,
-    },
-    {
-        "name": "berserk-4.1.0",
-        "ccrl": 3133,
-        "url": f"{GH}/jhonnold/berserk/releases/download/4.1.0/berserk-4.1.0-x64-avx2-pext.exe",
-        "member": None,
-    },
-    {
-        "name": "weiss-1.4",
-        "ccrl": 3256,
-        "url": f"{GH}/TerjeKir/weiss/releases/download/v1.4/Weiss-1.4-windows-collection.zip",
-        "member": "weiss-pext.exe",
-    },
-    {
-        "name": "clover-3.0",
-        "ccrl": 3340,
-        "url": f"{GH}/lucametehau/CloverEngine/releases/download/v3.0/Clover.3.0-avx2.exe",
-        "member": None,
-    },
-    {
-        "name": "ethereal-12.75",
-        "ccrl": 3426,
-        "url": f"{GH}/AndyGrant/Ethereal/releases/download/v12.75/Ethereal12.75-x64-pext-avx2.exe",
-        "member": None,
-    },
-]
-
 
 def download(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -99,15 +55,16 @@ def main() -> int:
     dest_dir = c.ensure_dir(c.ENGINES_DIR)
 
     c.section("Opponent ladder (CCRL Blitz, 1 CPU)")
-    for e in LADDER:
+    for e in c.CCRL_LADDER:
         p = dest_dir / f"{e['name']}.exe"
-        print(f"  {e['ccrl']:>5}  {e['name']:<16} {'present' if p.exists() else 'missing'}")
+        print(f"  {e['ccrl']:>5} +-{e['err']:<3} {e['name']:<16}"
+              f" {'present' if p.exists() else 'missing'}")
     print()
     if args.list:
         return 0
 
     failed = []
-    for e in LADDER:
+    for e in c.CCRL_LADDER:
         dest = dest_dir / f"{e['name']}.exe"
         if dest.exists() and not args.force:
             print(f"  have  {e['name']}")

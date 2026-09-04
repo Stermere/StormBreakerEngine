@@ -77,10 +77,15 @@ cd trainer
 
 # Gen 1 net ~2800 -> ~3000 Elo
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-001.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.001 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
-# Gen 2 + 1 hybrid net ~3000 -> ~3050 Elo
+# Gen 2 + 1 hybrid net ~3000 -> ~3100 Elo
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-001.cnn ..\external\data\gen-002.cnn --val ..\external\data\val.cnn --epochs 3 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.9 --lambda-end 0.9 --hidden 1024
-# Gen 3 ~3100 -> ~3300 Elo
+# Gen 3 + 4 ~3100 -> ~3350 Elo (Additional search improvments contributed to this gain net-0ba56166ba9c)
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-003.cnn ..\external\data\gen-004.cnn --val ..\external\data\val.cnn --epochs 4 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty
+
+# Gen 5 ~3350 -> ~3450 (net-34aaa009f3db)
+.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.4 --lambda-pieces -0.2 --score-clip 2000
+
+
 
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..

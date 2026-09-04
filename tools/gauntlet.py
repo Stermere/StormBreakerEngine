@@ -32,7 +32,9 @@ one.
 
 For an absolute reading prefer `--field engines`, whose rungs are real engines
 at full strength carrying published ratings - see docs/EXPERIMENTS.md,
-"Absolute strength", for what that ladder can and cannot support.
+"Absolute strength", for what that ladder can and cannot support. When the
+match finishes this hands the PGN to ratings.py, which prints the cross-table
+and puts every seat on the CCRL scale; `make ratings` re-runs that alone.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ import sys
 from pathlib import Path
 
 import common as c
+import ratings
 
 
 def main() -> int:
@@ -163,6 +166,14 @@ def main() -> int:
         return 0
 
     code, _ = c.run_match(fastchess, fc_args, stream=True)
+
+    # The Elo column fastchess just printed is relative to THIS field's mean,
+    # so it moves when the field does and two gauntlets cannot be compared.
+    # Anchoring it on the rated seats is the entire reason the field has rated
+    # seats in it, and a step that has to be remembered afterwards is a step
+    # that stops happening. An interrupted match still leaves a readable PGN.
+    if pgn.exists() and pgn.stat().st_size:
+        ratings.main([str(pgn)])
     return code
 
 

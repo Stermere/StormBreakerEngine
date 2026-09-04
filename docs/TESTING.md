@@ -207,6 +207,7 @@ time control needs LTC evidence, not an argument.
 make gauntlet ARGS="--games 200"
 make gauntlet ARGS="--field engines --games 200"
 make gauntlet ARGS="--field stockfish --games 200"
+make ratings ARGS="external/games/<stamp>-gauntlet.pgn"
 ```
 
 Self-play SPRT compares a change with its baseline. A gauntlet estimates
@@ -219,6 +220,21 @@ handicapped Stockfish plays mostly full-strength moves with occasional
 deliberate errors, which is not how a genuinely weaker opponent errs, and the
 level is not an Elo scale. For an absolute reading, `--field engines` is the
 ladder to use — see "Absolute strength" in [EXPERIMENTS.md](EXPERIMENTS.md).
+
+The Elo column fastchess prints is relative to the field mean, so it moves when
+the field does and two gauntlets with different opponents cannot be compared.
+`make ratings` fixes that: it re-reads the PGN, prints the full W-L-D
+cross-table, and fits every seat against the seven rated rungs at once to put
+the whole table on the CCRL Blitz scale. `make gauntlet` runs it automatically
+when the match finishes; the target is for re-reading an older or interrupted
+PGN.
+
+Read the residual column before the estimate. A rung the engine sweeps locates
+almost nothing — 93% of the points against a 3008 engine pins its rating to
+about ± 126 — so an estimate above the top rung is an extrapolation off the
+least-constrained end of the ladder, however tight its bar looks. When the
+engine outgrows the top rung, add a rung, do not trust the extrapolation:
+the ladder lives in `CCRL_LADDER` in [tools/common.py](../tools/common.py).
 
 ---
 

@@ -1438,8 +1438,15 @@ that alone moves the draw rate is unmeasured.
 Every Elo figure above is relative to another build in `external\baselines`,
 none of which is itself rated. This anchors them: `make gauntlet` plays the
 third-party engines `make engines-fetch` puts in `external\engines`, each
-carrying a published CCRL rating, and the tables below fit one rating by
-inverse-variance weighting over those rungs.
+carrying a published CCRL rating, and `make ratings` reads the PGN back and
+fits one rating for every seat against all of them at once.
+
+Entries dated 2026-09-04 or later come from that joint Bradley-Terry fit, in
+which the rungs' games against EACH OTHER also constrain the answer, so a rung
+that underperforms shows up as its own residual instead of quietly moving the
+mean. Earlier entries averaged the per-rung implied ratings by inverse variance
+and have no residual column; the two agree to within a few Elo when the rungs
+do, and diverge exactly when it matters that they did not.
 
 Entries below dated before 2026-08-30 use a second ladder — Stockfish `UCI_Elo`
 rungs, run by `tools/rating.py`. Both the tool and the ladder are gone. They
@@ -1447,6 +1454,35 @@ were never the CCRL pool, and a strength-limited Stockfish is not a genuinely
 weaker engine, so those numbers do not difference against the CCRL tables. The
 engine is now strong enough to play Stockfish unlimited instead — `make gauntlet
 ARGS="--field stockfish"` — which is an honest opponent rather than a rung.
+
+**2026-09-04**, at STC 8+0.08, 16MB hash, on the network build, against the
+five-rung CCRL ladder. Round-robin, 1217 games, ~81 per pairing. Fitted with
+`make ratings`, which reads the PGN back and puts every seat on one scale:
+
+| CCRL rung | W-L-D | score | this rung alone | fitted estimate |
+|---|---|---|---|---|
+| halogen-8.1, 3008 | 74-3-5 | 93.3% | 3465 ± 126 | 3008 (resid -0) |
+| berserk-4.1.0, 3133 | 63-6-13 | 84.8% | 3431 ± 77 | 3122 (resid -11) |
+| weiss-1.4, 3256 | 57-12-13 | 77.4% | 3470 ± 71 | 3262 (resid +6) |
+| clover-3.0, 3340 | 51-10-21 | 75.0% | 3531 ± 65 | 3311 (resid -29) |
+| ethereal-12.75, 3426 | 34-23-25 | 56.7% | 3473 ± 52 | 3458 (resid +32) |
+
+**engine: 3483 ± 33** (95%) on the CCRL Blitz scale, residual rms 20 Elo over
+the five anchors, anchor slope 0.94. The five rungs' own games against each
+other are in the fit, which is why the rungs get an estimate of their own and a
+residual: this field ranks them in CCRL's order and spans 94% of CCRL's spread,
+so it is internally coherent, and the +32 on ethereal is the only rung more
+than one CCRL error bar out.
+
+**The number is an extrapolation, and that is why the ladder grew.** 3483 sits
+57 Elo above the top anchor. Every rung below it is a near-sweep - four of the
+five are 75% or more, and a 93.3% score locates a rating to ± 126 - so the fit
+is pinned from below and open above, exactly the direction it is least
+constrained in. Adding rungs the engine does NOT sweep is the fix, so
+`CCRL_LADDER` gained **carp-3.0.1 (3528 ± 9)** and **koivisto-8.0 (3593 ± 10)**,
+the two best-measured CCRL engines in that band (4855 and 2789 games there).
+Both bracket 3483 from above. Nothing above claims a rating on the strength of
+this event; re-run the gauntlet on the seven-rung field before quoting one.
 
 **2026-08-30**, after E19b, at STC 8+0.08, on the **network** build, against
 the CCRL ladder. 638 games round-robin, ~44 against each rung:

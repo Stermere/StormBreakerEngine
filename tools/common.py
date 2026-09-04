@@ -1,5 +1,5 @@
 """
-common.py - shared paths, discovery and match-running for the Python tools.
+common.py - shared paths, discovery, the rated ladder, and match-running.
 
 The PowerShell equivalent of this file is common.ps1, which still serves the
 Windows-integration scripts (setup, register-engines, gui). Anything with real
@@ -149,6 +149,92 @@ def default_concurrency() -> int:
     to get an SPRT verdict that does not reproduce."""
     return max(1, (os.cpu_count() or 4) - 2)
 
+
+# ---------------------------------------------------------------- ladder ----
+
+# The rated opponent ladder. `fetch-engines.py` downloads it into ENGINES_DIR
+# and `ratings.py` reads the ratings back off it, so the two cannot disagree
+# about which engine carries which number.
+#
+# WHY THESE SEVEN. They span 3008-3593 in roughly 100-Elo steps, which brackets
+# the engine on both sides - a field entirely above or entirely below it scores
+# near 0% or near 100%, which carries almost no information per game. They come
+# from seven different authors, so a quirk this engine happens to exploit in one
+# of them cannot flatter the whole table. All are self-contained: no companion
+# net file to place, no config to write.
+#
+# RATINGS ARE CCRL BLITZ (2+1), single CPU, as published for these exact
+# versions, with CCRL's own published error bar in `err`. They are not this
+# repository's scale and not FIDE's; a rating list is a pool, and ours is not
+# CCRL's pool. Treat them as calibrated landmarks, not as a number to claim.
+#
+# `member` names the file to pull out of a .zip asset; None means the asset is
+# the executable itself.
+GH = "https://github.com"
+
+CCRL_LADDER = [
+    {
+        "name": "halogen-8.1",
+        "ccrl": 3008,
+        "err": 18,
+        "url": f"{GH}/KierenP/Halogen/releases/download/v8.1/Halogen8.1-x64-pext-avx2.exe",
+        "member": None,
+    },
+    {
+        "name": "berserk-4.1.0",
+        "ccrl": 3133,
+        "err": 17,
+        "url": f"{GH}/jhonnold/berserk/releases/download/4.1.0/berserk-4.1.0-x64-avx2-pext.exe",
+        "member": None,
+    },
+    {
+        "name": "weiss-1.4",
+        "ccrl": 3256,
+        "err": 16,
+        "url": f"{GH}/TerjeKir/weiss/releases/download/v1.4/Weiss-1.4-windows-collection.zip",
+        "member": "weiss-pext.exe",
+    },
+    {
+        "name": "clover-3.0",
+        "ccrl": 3340,
+        "err": 16,
+        "url": f"{GH}/lucametehau/CloverEngine/releases/download/v3.0/Clover.3.0-avx2.exe",
+        "member": None,
+    },
+    {
+        "name": "ethereal-12.75",
+        "ccrl": 3426,
+        "err": 11,
+        "url": f"{GH}/AndyGrant/Ethereal/releases/download/v12.75/Ethereal12.75-x64-pext-avx2.exe",
+        "member": None,
+    },
+    {
+        "name": "carp-3.0.1",
+        "ccrl": 3528,
+        "err": 9,
+        "url": f"{GH}/dede1751/carp/releases/download/v3.0.1/carp-v3.0.1-win-x86_64-V3.exe",
+        "member": None,
+    },
+    {
+        "name": "koivisto-8.0",
+        "ccrl": 3593,
+        "err": 10,
+        "url": f"{GH}/Luecx/Koivisto/releases/download/v8.0/Koivisto_8.0-x64-windows-avx2.exe",
+        "member": None,
+    },
+]
+
+
+def ccrl_rating(name: str) -> tuple[int, int] | None:
+    """(rating, published error) for a ladder engine, or None if unrated here.
+
+    Matches on the stem the gauntlet names a seat after, so it works on a PGN
+    without needing the binaries to still be on disk.
+    """
+    for e in CCRL_LADDER:
+        if e["name"] == name:
+            return e["ccrl"], e["err"]
+    return None
 
 # ---------------------------------------------------------------- output ----
 

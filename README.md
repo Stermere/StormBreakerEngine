@@ -146,7 +146,8 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 | `make gauntlet` | Elo table vs a field. `--engine`, `--field all\|baselines\|engines\|stockfish`, `--games N`, `--tc`, `--include-stockfish`, `--skill-level N`, `--dry-run` |
 | `make tune` | SPSA over the `TUNE_SEARCH=on` parameters. `--params`, `--exclude`, `--iterations`, `--tc`, `--list` (inspect state; `--dry-run` rotates it), `--resume` |
 | `make snapshot ARGS="--name v0.x"` | freeze the current build into `external\baselines` |
-| `make engines-fetch` | download the CCRL-rated opponent ladder into `external\engines` |
+| `make ratings` | re-read a gauntlet PGN: cross-table, plus every seat on the CCRL scale. `<pgn>` (default: newest), `--focus <name>`, `--anchor NAME=ELO`, `--no-crosstable`. `make gauntlet` runs this itself when its match ends |
+| `make engines-fetch` | download the seven-rung CCRL-rated opponent ladder into `external\engines` (3008 to 3593) |
 
 ### The network
 
