@@ -27,9 +27,27 @@
 
 /* --------------------------------------------------------------- limits -- */
 
+/*
+ * MAX_MOVES bounds the move list, and what it has to cover is set by what
+ * board_set_fen accepts - which is any diagram with at most 32 men, not just
+ * the ones legal play can reach. A GUI position editor, a puzzle or a
+ * hand-typed FEN can hand the engine nine pawns or fifteen queens, and those
+ * generate far more moves than the 218 a legal position tops out at.
+ *
+ * 256 was sized for legal positions and is NOT enough: annealing over
+ * placement and piece type finds 270 pseudo-legal moves from a hollow ring of
+ * queens (BQQQQQQB/Q6Q/Q6Q/Q6Q/Q6Q/Q6Q/Q5RB/KQQQQQBk w - -). Raising the
+ * parser's cap to a full board does NOT raise this: the optimum sits near
+ * thirty men either way, because past that the pieces block each other faster
+ * than they add moves, so a crowded board generates FEWER moves than a
+ * half-empty one. Since NDEBUG deletes the generator's bounds assertion,
+ * overrunning this is a silent write past a stack array in the search - so it
+ * is sized with roughly a factor of two in hand rather than to the measured
+ * worst case.
+ */
 enum {
     MAX_PLY   = 246, /* deepest search ply; also sizes the PV and killer tables */
-    MAX_MOVES = 256, /* upper bound on legal moves in any legal position */
+    MAX_MOVES = 512, /* see above: covers any <=32-man diagram, not just legal ones */
     SQUARE_NB = 64,
     COLOR_NB  = 2,
     PIECE_NB  = 16 /* piece codes are sparse: see the Piece enum */

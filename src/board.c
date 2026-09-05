@@ -375,7 +375,18 @@ static bool ep_target_is_real(const Position *p, Square ep) {
            is_empty(p, fromSq);
 }
 
-bool board_set_fen(Position *pos, const char *fen) {
+/*
+ * Every rejection below names the field it rejected on, in terms of the
+ * diagram rather than of the parser: a user who typed nine pawns is helped by
+ * being told they typed nine pawns, and not at all by "invalid fen".
+ */
+static bool fen_reject(const char **why, const char *reason) {
+    if (why)
+        *why = reason;
+    return false;
+}
+
+bool board_set_fen_reason(Position *pos, const char *fen, const char **why) {
     /* Parse into scratch so a malformed FEN from a GUI leaves `pos` intact. */
     Position p;
     memset(&p, 0, sizeof(p));
@@ -393,24 +404,24 @@ bool board_set_fen(Position *pos, const char *fen) {
     for (; *c && *c != ' '; ++c) {
         if (*c == '/') {
             if (file != 8)
-                return false; /* short rank */
+                return fen_reject(why, "a rank of the diagram does not add up to eight squares");
             file = FILE_A;
             if (--rank < RANK_1)
-                return false; /* too many ranks */
+                return fen_reject(why, "the diagram has more than eight ranks");
         } else if (*c >= '1' && *c <= '8') {
             file += *c - '0';
             if (file > 8)
-                return false;
+                return fen_reject(why, "a run of empty squares overflows its rank");
         } else {
             const Piece pc = piece_from_char(*c);
             if (pc == NO_PIECE || file > 7 || rank < RANK_1)
-                return false;
+                return fen_reject(why, "the diagram contains a character that is not a piece");
             board_put_piece(&p, pc, make_square((File)file, (Rank)rank));
             ++file;
         }
     }
     if (rank != RANK_1 || file != 8)
-        return false;
+        return fen_reject(why, "the diagram stops short of all sixty-four squares");
 
     /* --- field 2: side to move --- */
     while (*c == ' ')
@@ -420,7 +431,7 @@ bool board_set_fen(Position *pos, const char *fen) {
     else if (*c == 'b')
         p.sideToMove = BLACK;
     else
-        return false;
+        return fen_reject(why, "the side to move is neither 'w' nor 'b'");
     ++c;
 
     /*
@@ -450,12 +461,13 @@ bool board_set_fen(Position *pos, const char *fen) {
             if (u >= 'A' && u <= 'H' && u != 'K' && u != 'Q')
                 shredderSpelling = true;
             else if (u != 'K' && u != 'Q')
-                return false;
+                return fen_reject(why,
+                                  "the castling field contains a character that is not a right");
 
             /* A field longer than the four real rights is malformed, and
              * silently truncating it would accept a FEN we cannot describe. */
             if (castlingLen + 1 >= sizeof(castlingField))
-                return false;
+                return fen_reject(why, "the castling field is longer than the rights it can spell");
             castlingField[castlingLen++] = *c;
         }
     }
@@ -467,7 +479,7 @@ bool board_set_fen(Position *pos, const char *fen) {
         ++c;
     } else {
         if (c[0] < 'a' || c[0] > 'h' || c[1] < '1' || c[1] > '8')
-            return false;
+            return fen_reject(why, "the en passant field is not a square");
         p.epSquare = make_square((File)(c[0] - 'a'), (Rank)(c[1] - '1'));
         c += 2;
     }
@@ -478,24 +490,46 @@ bool board_set_fen(Position *pos, const char *fen) {
     if (sscanf(c, " %d %d", &p.halfmoveClock, &p.fullmoveNumber) < 2)
         p.fullmoveNumber = 1;
     if (p.halfmoveClock < 0 || p.fullmoveNumber < 1)
-        return false;
+        return fen_reject(why, "the halfmove or fullmove clock is negative");
 
     /* --- sanity: exactly one king each, or nothing downstream is meaningful --- */
     if (p.pieceCount[W_KING] != 1 || p.pieceCount[B_KING] != 1)
-        return false;
+        return fen_reject(why, "the diagram does not have exactly one king a side");
 
     /*
-     * At most sixteen men a side. The 8x8 placement grammar happily describes
-     * sixty-four, and consumers downstream are sized for a legal position
-     * rather than for a legal FEN string: nnue_accumulate() collects feature
-     * rows into a 32-entry array and nnue_output_bucket() indexes by
-     * (pieceCount - 2) / 8, so a 34-piece diagram from a GUI position editor,
-     * a corrupt book line or a hand-typed `position fen` overruns both and
-     * segfaults. Rejecting here fixes every consumer at once, and costs
-     * nothing real: no position reachable by legal play can exceed this.
+     * At most a full board.
+     *
+     * This is a gate on what the ENGINE can represent, not on what chess
+     * allows, and the two are deliberately different. A position editor, a
+     * puzzle or a hand-typed FEN routinely produces a diagram no legal game
+     * could reach - nine pawns, five knights, a pawn on the seventh with the
+     * back rank still full - and every one of those is a position the engine
+     * can play perfectly well. Refusing them buys nothing and costs a user
+     * their analysis, so the only thing checked is that the diagram fits in
+     * what the consumers are sized for.
+     *
+     * Sixty-four is the whole of the 8x8 grammar, so this rejects nothing a
+     * FEN can actually spell; it is here because the things downstream are
+     * sized by it rather than by the board:
+     *
+     *   - nnue_accumulate() collects one feature row per occupied square, and
+     *     its array is sized to match this exactly.
+     *   - tools/export_net.py proves the int16 accumulator cannot wrap using
+     *     the same count. The pinned net reaches 29,143 of int16's 32,767 at
+     *     sixty-four men, so the proof holds - but it is a proof about THIS
+     *     many pieces, and lowering this number is the supported way out if a
+     *     future net cannot clear the bound.
+     *   - MAX_MOVES bounds the move list. Annealing over placement and piece
+     *     type tops out at 270 pseudo-legal moves anywhere in this range,
+     *     because past about thirty men the pieces block each other faster
+     *     than they add moves.
+     *
+     * Occupancy never grows during a search - a promotion swaps a piece and a
+     * capture removes one - so a diagram that passes here stays inside every
+     * one of those bounds for the whole tree.
      */
-    if (popcount(color_bb(&p, WHITE)) > 16 || popcount(color_bb(&p, BLACK)) > 16)
-        return false;
+    if (popcount(occupied_bb(&p)) > 64)
+        return fen_reject(why, "the diagram has more men than the board has squares");
 
     /*
      * Discard castling rights and an en passant target the diagram does not
@@ -528,11 +562,13 @@ bool board_set_fen(Position *pos, const char *fen) {
      * search "win" by capturing a king. */
     if (board_square_attacked(&p, king_square(&p, (Color)(p.sideToMove ^ 1)), p.sideToMove,
                               occupied_bb(&p)))
-        return false;
+        return fen_reject(why, "the side that just moved has left its own king in check");
 
     *pos = p;
     return true;
 }
+
+bool board_set_fen(Position *pos, const char *fen) { return board_set_fen_reason(pos, fen, NULL); }
 
 /*
  * The ten ways to arrange K, R, N on five squares with the king between the

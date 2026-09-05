@@ -53,7 +53,6 @@ from nnue.format import (  # noqa: E402
     ACTIVATION_TAG,
     FEATURE_SET_NAME,
     FEATURE_SET_TAG,
-    MAX_PIECES,
     NUM_FEATURES,
     PAD_INDEX,
     QA,
@@ -95,6 +94,15 @@ DEFAULT_SCALE = SCALE
 # mates that do not exist. The export prints the largest |cp| it actually saw,
 # so it is visible when a net starts creeping toward the clamp.
 EVAL_LIMIT = 20000
+
+# The most men src/board.c will accept on a board, which is NOT the trainer's
+# MAX_PIECES: that one is the widest a TRAINING position gets (32, a legal
+# game) and it also sets the phase blend and the feature-batch width, so it
+# cannot be reused as the engine's limit. The accumulator bound below is the
+# one place the two meet - the engine will evaluate any diagram its FEN parser
+# accepts, so the proof that int16 cannot wrap has to cover that many rows, not
+# the 32 a legal game reaches. Keep this equal to the cap in board_set_fen.
+ENGINE_MAX_PIECES = 64
 
 INT16_MAX = 32767
 INT32_MAX = 2**31 - 1
@@ -195,9 +203,10 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
 def check_ranges(q: dict, qa: int) -> dict:
     """Refuse to export a net whose arithmetic could overflow the engine's.
 
-    Every bound here is SOUND over all legal positions - derived from the
-    weights and from "a position has at most 32 pieces" - rather than measured
-    over the ten thousand positions the gate happens to cover. A bound that
+    Every bound here is SOUND over every position the engine will accept -
+    derived from the weights and from "a board holds at most ENGINE_MAX_PIECES
+    men" - rather than measured over the ten thousand positions the gate
+    happens to cover. A bound that
     holds on a sample and not in general produces a net that passes every test
     and blunders once a tournament.
 
@@ -208,8 +217,9 @@ def check_ranges(q: dict, qa: int) -> dict:
         src/nnue.c sums the accumulator in int16, because that is what puts
         sixteen lanes in an AVX2 register and halves the bytes moved - and the
         accumulator is the evaluation. Nothing there checks for overflow, so
-        this is the check. Bias plus the 32 largest positive weights in a
-        column bounds it over every legal position, not over a sample.
+        this is the check. Bias plus the ENGINE_MAX_PIECES largest positive
+        weights in a column bounds it over every position the ENGINE will
+        accept - a fuller board than legal play reaches - not over a sample.
 
     ``int16`` activation product
         The engine's SCReLU forms ``v * w`` as int16 before widening, so
@@ -237,14 +247,17 @@ def check_ranges(q: dict, qa: int) -> dict:
 
     ft_w, ft_b = q["ft_w"], q["ft_b"]
     top = np.sort(ft_w, axis=0)
-    hi = ft_b + np.clip(top[-MAX_PIECES:], 0, None).sum(axis=0, dtype=np.int64)
-    lo = ft_b + np.clip(top[:MAX_PIECES], None, 0).sum(axis=0, dtype=np.int64)
+    hi = ft_b + np.clip(top[-ENGINE_MAX_PIECES:], 0, None).sum(axis=0, dtype=np.int64)
+    lo = ft_b + np.clip(top[:ENGINE_MAX_PIECES], None, 0).sum(axis=0, dtype=np.int64)
     worst = int(max(np.abs(hi).max(), np.abs(lo).max()))
     limits["accumulator_bound"] = worst
     if worst > INT16_MAX:
         raise SystemExit(
-            f"the accumulator can reach {worst}, past int16. An incremental accumulator "
-            f"would wrap. Retrain with a smaller QA or with weight clipping."
+            f"the accumulator can reach {worst} on a {ENGINE_MAX_PIECES}-man board, past "
+            f"int16. An incremental accumulator would wrap. Retrain with a smaller QA or "
+            f"with weight clipping - or, if you would rather keep the net, lower "
+            f"ENGINE_MAX_PIECES here AND the matching cap in board_set_fen, which costs "
+            f"only the ability to load unusually crowded puzzles."
         )
 
     # The uncertainty head rides the same int16 SIMD multiply as the value

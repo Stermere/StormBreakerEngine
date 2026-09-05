@@ -180,6 +180,18 @@ void board_move_piece(Position *pos, Square from, Square to);
  * is malformed, so a bad `position fen ...` from a GUI cannot corrupt state. */
 bool board_set_fen(Position *pos, const char *fen);
 
+/*
+ * As board_set_fen, but names what was wrong.
+ *
+ * On failure `*why` is set to a static string describing the rejected field -
+ * "nine pawns" reads very differently from "malformed FEN", and the difference
+ * is the whole of whether a user can act on it. A rejected FEN is otherwise
+ * indistinguishable from an engine that simply disagrees about the position,
+ * which is the confusing half of the bug this exists to prevent. `why` may be
+ * NULL, and is untouched on success.
+ */
+bool board_set_fen_reason(Position *pos, const char *fen, const char **why);
+
 void board_set_startpos(Position *pos);
 
 /*

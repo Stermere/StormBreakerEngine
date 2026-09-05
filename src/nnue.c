@@ -34,8 +34,12 @@
  *   * The accumulator is int16, not int32. It halves the bytes moved, and it
  *     is what lets sixteen lanes fit in one AVX2 register instead of eight.
  *     Nothing wraps, and that is not hoped for: tools/export_net.py refuses to
- *     write a net whose bias plus 32 rows could leave int16, using a bound
- *     that holds over EVERY legal position rather than over a sample.
+ *     write a net whose bias plus ENGINE_MAX_PIECES rows could leave int16,
+ *     using a bound that holds over every diagram the FEN parser ACCEPTS -
+ *     which is a fuller board than legal play can reach, and so a stricter
+ *     bound than one over legal positions would be. That constant and the cap
+ *     in board_set_fen are one decision in two files; raising either alone is
+ *     how a crowded puzzle silently wraps the accumulator.
  *   * One activation and one feature set are implemented, so there is no
  *     branch per unit and none per piece.
  *   * AVX2 where the compiler says it is available, plain C otherwise. The two
@@ -602,7 +606,10 @@ static void nnue_accumulate(const Position *pos, const Perspective *p, int16_t *
      * way on every run. Anything much larger has to come from not recomputing
      * the accumulator at all, which is what an incremental update is for.
      */
-    const int16_t *rows[32];
+    /* One row per occupied square. Sized to a full board rather than to the 32
+     * of a legal position, because board_set_fen accepts any diagram that fits
+     * on the squares - see the cap there, which this must not be smaller than. */
+    const int16_t *rows[64];
     int count = 0;
 
     Bitboard occupied = occupied_bb(pos);
@@ -636,15 +643,24 @@ static void nnue_accumulate(const Position *pos, const Perspective *p, int16_t *
 
 /*
  * Which output row a position reads: piece count, folded onto the buckets the
- * net was trained with. The same expression as output_bucket() in
- * trainer/nnue/format.py, and both kings are always on the board, so the count
- * is 2..32 and the index cannot leave the table.
+ * net was trained with. The expression is output_bucket() in
+ * trainer/nnue/format.py and must stay bit-identical to it, so the divisor
+ * stays 32 whatever the engine's piece cap is - it is the net's own geometry,
+ * not ours to reinterpret.
+ *
+ * Which is exactly why the clamp is here rather than there. A legal position
+ * has 2..32 men and lands inside the table by construction; a 40-man puzzle
+ * does not, and would read off the end of outWeight. Such a position is past
+ * anything the net was trained on regardless, so the top bucket - the one for
+ * the most crowded boards it has seen - is the honest row to give it.
  */
 static inline int nnue_output_bucket(const Position *pos) {
     const uint32_t buckets = Loaded.hdr.outputBuckets;
     if (buckets == 1)
         return 0;
-    return (popcount(occupied_bb(pos)) - 2) / (int)(32u / buckets);
+
+    const int bucket = (popcount(occupied_bb(pos)) - 2) / (int)(32u / buckets);
+    return bucket < (int)buckets ? bucket : (int)buckets - 1;
 }
 
 #ifdef NNUE_AVX2

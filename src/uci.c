@@ -59,6 +59,23 @@ static int OptMoveOverhead = OPT_OVERHEAD_DEFAULT;
  * command. The notation itself is decided by Pos.chess960. */
 static bool announcedChess960 = false;
 
+/*
+ * False once a `position` command has been rejected, until one succeeds.
+ *
+ * A rejected FEN leaves `Pos` holding the LAST position that parsed, which is
+ * not the one the GUI believes is on the board. Searching it anyway is the
+ * worst of the available options: the engine answers confidently with a move
+ * belonging to a different game. On black's turn that move is White's, and the
+ * GUI - correctly - reports the engine as having crashed. The engine is then
+ * blamed for a protocol violation whose real cause is a FEN it printed one
+ * line about and then ignored.
+ *
+ * UCI has no "I cannot" reply, so the honest answer is the null move: it says
+ * "no move from me" without inventing a legal-looking one for a board nobody
+ * else has.
+ */
+static bool posValid = true;
+
 int uci_move_overhead(void) { return OptMoveOverhead; }
 
 /* ------------------------------------------------------------ tokenising -- */
@@ -344,7 +361,8 @@ static void cmd_position(char *args) {
 
     if (token_is(tok, "startpos")) {
         board_set_startpos(&Pos);
-        tok = next_token(&cursor);
+        posValid = true;
+        tok      = next_token(&cursor);
     } else if (token_is(tok, "fen")) {
         /* Reassemble the FEN: it is six space-separated fields, and the
          * optional clock fields may be missing, so scan up to `moves`. */
@@ -362,11 +380,19 @@ static void cmd_position(char *args) {
             fen[used] = '\0';
         }
 
-        if (!board_set_fen(&Pos, fen)) {
-            printf("info string invalid fen: %s\n", fen);
+        const char *why = "malformed";
+        if (!board_set_fen_reason(&Pos, fen, &why)) {
+            /* Both lines matter: the reason is what the user can act on, and the
+             * refusal is what stops the next `go` from answering out of whatever
+             * position happened to be loaded before this one. */
+            printf("info string invalid fen (%s): %s\n", why, fen);
+            printf("info string no position is loaded; `go` will not answer until a "
+                   "valid `position` command arrives\n");
             fflush(stdout);
+            posValid = false;
             return;
         }
+        posValid = true;
 
         /*
          * board_set_fen latches Pos.chess960 on for a FEN that only a Chess960
@@ -419,6 +445,16 @@ static void cmd_position(char *args) {
 }
 
 static void cmd_go(char *args) {
+    /* No position means no answer. Replying with a move from the stale board
+     * is what turns a rejected FEN into an "engine crashed" report in the GUI:
+     * the move is legal somewhere, just not here, and on the wrong turn it is
+     * the wrong colour entirely. */
+    if (!posValid) {
+        printf("info string ignoring `go`: the last `position` command was rejected\n");
+        uci_print_bestmove(MOVE_NONE, MOVE_NONE);
+        return;
+    }
+
     SearchLimits limits;
     search_limits_clear(&limits);
 
@@ -626,6 +662,7 @@ bool uci_execute(const char *line) {
         search_wait();
         search_clear();
         board_set_startpos(&Pos);
+        posValid = true; /* a new game is a known position again */
     } else if (strcmp(cmd, "setoption") == 0) {
         cmd_setoption(cursor);
     } else if (strcmp(cmd, "position") == 0) {
