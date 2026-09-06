@@ -97,6 +97,27 @@ uint64_t search_nodes(void);
  * The search polls this in its inner loop. */
 bool search_stopped(void);
 
+/*
+ * The live constants of the margin scaling in unc_scale(), for the probe that
+ * re-centres them onto a new net (src/test/uncprobe.h).
+ *
+ * They cannot be read directly from another translation unit: outside a
+ * TUNE_SEARCH build every TUNABLE is an enum private to search.c. And WHICH
+ * pair is live depends on the loaded net, a decision that belongs beside the
+ * mapping rather than duplicated at every caller that wants to report it.
+ */
+#ifdef UNC_PROBE
+typedef struct {
+    int base;   /* the mapping's floor, in percent */
+    int slope;  /* percent per `grain` units of signal */
+    int cap;    /* the ceiling, UncScaleMax */
+    int grain;  /* the divisor the mapping carries: 16 on the sigma branch, 1 on the other */
+    bool sigma; /* true when the net's uncertainty head is the signal */
+} UncMapping;
+
+void search_unc_mapping(UncMapping *out);
+#endif /* UNC_PROBE */
+
 #ifdef TUNE_SEARCH
 /*
  * The search's tunable pruning margins, exposed so uci.c can advertise them as

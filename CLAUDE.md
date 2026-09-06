@@ -38,6 +38,7 @@ make tuner              # build the evaluation fitter (docs/TUNING.md)
 make classical          # any build, with eval.c instead of the network
 make net-fetch          # fetch the pinned net; the default build does this itself
 make nnue-test          # C inference == the quantised reference, exactly
+make unc-probe          # its own build: what unc_scale() reads, and how to re-centre it
 make datagen-test       # datagen round-trips and its labels reproduce
 make trainer-test       # the trainer's pytest suite
 

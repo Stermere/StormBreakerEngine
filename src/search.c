@@ -35,6 +35,7 @@
 #include "movegen.h"
 #include "nnue.h"
 #include "syzygy.h"
+#include "test/uncprobe.h"
 #include "thread.h"
 #include "timeman.h"
 #include "tt.h"
@@ -504,6 +505,63 @@ TUNABLE(UNC_SIGMA_BASE, 73);
 TUNABLE(UNC_SIGMA_SLOPE, 13);
 
 /*
+ * How much of the mapping each margin actually wants.
+ *
+ * unc_scale() returns ONE number and every consumer multiplied by it, which
+ * asserts that reverse futility, razoring, ProbCut, delta and SEE all want
+ * their allowance conditioned on uncertainty by the same factor. Nothing ever
+ * measured that. It was an artifact of there being one mapping: the margins
+ * differ in what they claim, in the depths they claim it at, and in what a
+ * wrong answer costs, so there is no reason the same sigma should move them
+ * together. NNUE.md 5c measured the requirement curve and found the mapping
+ * two to three times too flat over half the tree - a diagnosis a single global
+ * factor cannot act on, because tightening it where it is too wide loosens it
+ * where it is already right.
+ *
+ * So each site gets a weight in UNC_W_UNIT-ths of the mapping DEVIATION:
+ *
+ *     scale_c = 100 + (scale - 100) * W / UNC_W_UNIT
+ *
+ * The deviation rather than the scale is what makes this orthogonal to the
+ * margin constant beside it. A weight on the scale itself would just be a
+ * second spelling of the margin, and a sweep holding both seats would walk
+ * them against each other and converge on nothing; a weight on the deviation
+ * moves only how hard this margin listens to uncertainty, and leaves what it
+ * charges at an average node exactly where the fit left it.
+ *
+ * UNC_W_UNIT reproduces today's behaviour and zero switches the conditioning
+ * off, so the defaults below - 16 where the scale was already applied, 0 where
+ * it was not - are the current engine to the node. That is the point: the
+ * patch is a no-op that a bench node count can prove, and the Elo, if there is
+ * any, comes from the sweep that follows rather than from the patch.
+ *
+ * The ceiling is 4x because 5c's requirement curve tracks sigma close to
+ * one-for-one in percent where the shipped mapping tracks it at roughly a
+ * third of that. If that measurement means anything, the answer for at least
+ * some of these seats is above UNC_W_UNIT, and a range that stopped there
+ * could only ever confirm the value it started from.
+ */
+#define UNC_W_UNIT 16
+TUNABLE(UNC_W_RFP, 16);
+TUNABLE(UNC_W_FUTILITY, 16);
+TUNABLE(UNC_W_RAZOR, 16);
+TUNABLE(UNC_W_PROBCUT, 16);
+TUNABLE(UNC_W_DELTA, 16);
+
+/* Zero, because these two never consulted the mapping at all. A SEE threshold
+ * is the same kind of claim as a futility margin - how much material this node
+ * can afford to be wrong about - so its exclusion was an omission rather than
+ * a decision, and a seat that starts at zero costs nothing to leave there. */
+TUNABLE(UNC_W_SEE_CAPTURE, 0);
+TUNABLE(UNC_W_SEE_QUIET, 0);
+
+/* Zero for the same reason, and one more: this margin sets a verification
+ * WINDOW rather than a pruning threshold, so a wider one extends more rather
+ * than prunes less. Whether uncertainty should buy extensions is a genuine
+ * question and not the one the other seats ask. */
+TUNABLE(UNC_W_SINGULAR, 0);
+
+/*
  * ---------------------------------------------------------------------------
  * The second tier: constants that shape a formula rather than sit in a
  * comparison. Wrapping them costs the
@@ -610,6 +668,14 @@ static const struct {
     {"UncScaleMax", &UNC_SCALE_MAX, 100, 200},
     {"UncSigmaBase", &UNC_SIGMA_BASE, 40, 120},
     {"UncSigmaSlope", &UNC_SIGMA_SLOPE, 0, 64},
+    {"UncWRfp", &UNC_W_RFP, 0, 64},
+    {"UncWFutility", &UNC_W_FUTILITY, 0, 64},
+    {"UncWRazor", &UNC_W_RAZOR, 0, 64},
+    {"UncWProbCut", &UNC_W_PROBCUT, 0, 64},
+    {"UncWDelta", &UNC_W_DELTA, 0, 64},
+    {"UncWSeeCapture", &UNC_W_SEE_CAPTURE, 0, 64},
+    {"UncWSeeQuiet", &UNC_W_SEE_QUIET, 0, 64},
+    {"UncWSingular", &UNC_W_SINGULAR, 0, 64},
     {"LmrBase", &LMR_BASE, 4, 24},
     {"LmrDivisor", &LMR_DIVISOR, 12, 48},
     {"LmrHistDivisor", &LMR_HIST_DIVISOR, 2048, 32768},
@@ -1111,6 +1177,21 @@ static void corrhist_update(const Position *pos, Value searched, Value staticEva
 }
 
 /*
+ * One consumer's share of the mapping. See the weights' declaration for why
+ * this scales the deviation from 100 rather than the scale itself.
+ *
+ * Clamped at zero because a sweep is allowed to walk a weight to its bound,
+ * and a large enough weight on a below-100 scale would otherwise produce a
+ * NEGATIVE margin - which is not a tighter margin but a different rule: a
+ * reverse futility test with one fires where the static evaluation is BELOW
+ * beta. Every seat here must stay a margin over its whole range.
+ */
+static inline int unc_apply(int scale, int weight) {
+    const int scaled = 100 + (scale - 100) * weight / UNC_W_UNIT;
+    return scaled < 0 ? 0 : scaled;
+}
+
+/*
  * How wide this node's margin-based prunes should be, as a percentage.
  *
  * Every margin above is the same claim wearing different clothes: that k
@@ -1150,13 +1231,73 @@ static inline int unc_scale(const Position *pos) {
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
         const int sigma = nnue_uncertainty(pos);
-        return imin(UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16, UNC_SCALE_MAX);
+        const int scale = imin(UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16, UNC_SCALE_MAX);
+        return unc_probe(sigma, scale);
     }
 #endif
-    const int c  = *corr_entry(pos);
-    const int ac = (c < 0 ? -c : c) / CORRHIST_GRAIN;
-    return imin(UNC_SCALE_BASE + ac * UNC_SCALE_SLOPE, UNC_SCALE_MAX);
+    const int c     = *corr_entry(pos);
+    const int ac    = (c < 0 ? -c : c) / CORRHIST_GRAIN;
+    const int scale = imin(UNC_SCALE_BASE + ac * UNC_SCALE_SLOPE, UNC_SCALE_MAX);
+    return unc_probe(ac, scale);
 }
+
+#ifdef UNC_PROBE
+/*
+ * The other half of what `probe err` pairs: this node's signal, and what the
+ * search ended up saying about the same node. Reading the signal again here
+ * rather than carrying it down from unc_scale() keeps the probe out of the
+ * search stack, and it is the same number - it is a function of the position.
+ */
+static void unc_probe_node(const Position *pos, Value searched, Value staticEval, Bound bound,
+                           Depth depth) {
+    if (staticEval == VALUE_NONE)
+        return;
+
+    int signal = 0;
+#ifdef EVAL_NNUE
+    if (nnue_has_uncertainty())
+        signal = nnue_uncertainty(pos);
+    else
+#endif
+    {
+        const int c = *corr_entry(pos);
+        signal      = (c < 0 ? -c : c) / CORRHIST_GRAIN;
+    }
+
+    unc_probe_residual(signal, searched - staticEval, bound == BOUND_EXACT,
+                       is_decisive_score(searched), depth);
+}
+
+/* Which constants the mapping above is running on, and on which signal. The
+ * branch is the same one unc_scale() takes, written once here so a report of
+ * the mapping cannot describe a branch the search is not taking. */
+void search_unc_mapping(UncMapping *out) {
+#ifdef EVAL_NNUE
+    if (nnue_has_uncertainty()) {
+        out->base  = UNC_SIGMA_BASE;
+        out->slope = UNC_SIGMA_SLOPE;
+        out->cap   = UNC_SCALE_MAX;
+        out->grain = 16;
+        out->sigma = true;
+        return;
+    }
+#endif
+    out->base  = UNC_SCALE_BASE;
+    out->slope = UNC_SCALE_SLOPE;
+    out->cap   = UNC_SCALE_MAX;
+    out->grain = 1;
+    out->sigma = false;
+}
+#else
+static inline void unc_probe_node(const Position *pos, Value searched, Value staticEval,
+                                  Bound bound, Depth depth) {
+    (void)pos;
+    (void)searched;
+    (void)staticEval;
+    (void)bound;
+    (void)depth;
+}
+#endif /* UNC_PROBE */
 
 /* ----------------------------------------------------------- quiescence -- */
 
@@ -1280,7 +1421,9 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
          * pat to fall back on and every reply must be searched.
          */
         if (!inCheck && type_of_move(m) != MT_PROMOTION && !is_mate_score(alpha) &&
-            staticEval + PieceValues[victim_of(pos, m)] + DELTA_MARGIN * uncScale / 100 <= alpha)
+            staticEval + PieceValues[victim_of(pos, m)] +
+                    DELTA_MARGIN * unc_apply(uncScale, UNC_W_DELTA) / 100 <=
+                alpha)
             continue;
 
         if (!movegen_is_legal(pos, m))
@@ -1535,7 +1678,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * was going to use.
      */
     if (!pvNode && !inCheck && depth <= RFP_DEPTH && !is_mate_score(beta) &&
-        staticEval - RFP_MARGIN * (depth - improving) * uncScale / 100 >= beta)
+        staticEval - RFP_MARGIN * (depth - improving) * unc_apply(uncScale, UNC_W_RFP) / 100 >=
+            beta)
         return staticEval;
 
     /*
@@ -1552,7 +1696,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * opinion, and the node is dropped only if that opinion agrees.
      */
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
-        staticEval + RAZOR_MARGIN * depth * uncScale / 100 < alpha) {
+        staticEval + RAZOR_MARGIN * depth * unc_apply(uncScale, UNC_W_RAZOR) / 100 < alpha) {
         const Value v = qsearch(pos, alpha - 1, alpha, ply);
         if (v < alpha)
             return v;
@@ -1620,7 +1764,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * here is 7, so without this the nodes between are exactly where ProbCut
      * spends the most and proves the least.
      */
-    const Value probCutBeta = beta + PROBCUT_MARGIN * uncScale / 100;
+    const Value probCutBeta = beta + PROBCUT_MARGIN * unc_apply(uncScale, UNC_W_PROBCUT) / 100;
 
     if (!pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta) &&
         !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
@@ -1760,7 +1904,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
              * move cannot produce and a capture can.
              */
             if (depth <= FUTILITY_DEPTH &&
-                staticEval + FUTILITY_MARGIN * depth * uncScale / 100 <= alpha)
+                staticEval + FUTILITY_MARGIN * depth * unc_apply(uncScale, UNC_W_FUTILITY) / 100 <=
+                    alpha)
                 continue;
         }
 
@@ -1785,11 +1930,25 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
          */
         if (!pvNode && !inCheck && best > VALUE_MATED_IN_MAX_PLY) {
             const Depth seeDepth = tactical ? SEE_CAPTURE_DEPTH : SEE_QUIET_DEPTH;
-            const Value seeMargin =
-                tactical ? -SEE_CAPTURE_MARGIN * depth : -SEE_QUIET_MARGIN * depth * depth;
 
-            if (depth <= seeDepth && !see_ge(pos, m, seeMargin))
-                continue;
+            /* The margin is computed under the depth guard rather than beside
+             * it, and that is a range check rather than a tidy-up. The quiet
+             * threshold is quadratic in depth, and both the uncertainty weight
+             * and UNC_SCALE_MAX are sweep seats: at their bounds unc_apply()
+             * returns 500, and 120 * 246 * 246 * 500 is 3.6e9, which does not
+             * fit in the int a Value is. Under the guard depth is at most
+             * SEE_QUIET_DEPTH and the product cannot approach it. Identical
+             * pruning either way - see_ge() was never reached when the guard
+             * was false. */
+            if (depth <= seeDepth) {
+                const Value seeMargin = tactical ? -SEE_CAPTURE_MARGIN * depth *
+                                                       unc_apply(uncScale, UNC_W_SEE_CAPTURE) / 100
+                                                 : -SEE_QUIET_MARGIN * depth * depth *
+                                                       unc_apply(uncScale, UNC_W_SEE_QUIET) / 100;
+
+                if (!see_ge(pos, m, seeMargin))
+                    continue;
+            }
         }
 
         if (!tactical) {
@@ -1832,7 +1991,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         if (!isExcluded && depth >= SINGULAR_DEPTH && m == ttMove && ttValue != VALUE_NONE &&
             !is_mate_score(ttValue) && (tt_entry_bound(&tte) & BOUND_LOWER) &&
             tt_entry_depth(&tte) >= depth - 3) {
-            const Value singularBeta  = ttValue - SINGULAR_MARGIN * depth / 16;
+            const Value singularBeta =
+                ttValue - SINGULAR_MARGIN * depth * unc_apply(uncScale, UNC_W_SINGULAR) / 100 / 16;
             const Depth singularDepth = (depth - 1) / 2;
 
             /* The verification searches this ply again and writes the PV table
@@ -2017,6 +2177,9 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     if (!isExcluded) {
         const Bound bound = best >= beta ? BOUND_LOWER : raisedAlpha ? BOUND_EXACT : BOUND_UPPER;
         tt_store(key, bestMove, best, rawEval, depth, bound, ttPv, ply);
+
+        /* Compiled out entirely unless UNC_PROBE; see test/uncprobe.h. */
+        unc_probe_node(pos, best, staticEval, bound, depth);
 
         /*
          * Learn from this node only where the search genuinely contradicted the

@@ -1963,3 +1963,86 @@ shuffle dedup with the sidecar in step) · `make trainer-test`, 100 passed ·
 `datagen verify` on a pre-change `gen-004` slice, 100,000 records, 0 failures,
 which is what makes the format change backwards compatible. No `src/` file was
 touched, so bench and perft are unaffected by construction.
+
+---
+
+### E27 - three candidates against the gen-5 net, all rejected
+
+**Date** 2026-09-05 · **Baseline** `606d1d4`, net `34aaa009f3db` · **Recorded
+after the fact**, from the run PGNs in `external/games` and the verdicts of
+whoever ran them. None of the three reached a commit, so this entry exists to
+stop them being proposed again - a rejected candidate that leaves no record is
+one the roadmap will re-derive in a month.
+
+**A caveat this entry cannot remove.** These runs were not written up as they
+happened, and a fastchess PGN records the seat names (`dev`, `sb-base`,
+`tuned`, `default`) rather than what was in them. The verdicts below are the
+runner's; the game counts and Elo are recomputed from the PGNs; the pairing of
+one to the other is certain only for the first, where the binaries are still on
+disk under their own names. Read the numbers as sound and the attributions as
+reported.
+
+#### 1. Sigma-scaled LMR - rejected
+
+Reductions conditioned on the uncertainty head the way the pruning margins
+already are, via two new seats `LmrSigmaLo` / `LmrSigmaHi`. The source was
+reverted; the build that carried it survives as `sb-lmrsigma.exe`, and
+`sb-tune.exe` still advertises both seats, which is what makes this attribution
+certain.
+
+| vs `sb-base`, STC 8+0.08 | |
+|---|---|
+| Games | 256 (230 + 26) |
+| W/L/D | 51 / 73 / 132 |
+| **Elo** | **-29.9 ± 29.6** |
+
+Stopped early and correctly: the point estimate is a full standard error below
+zero and the interval does not reach the [0, 5] bound the test was looking for.
+
+**Why it is worth having tried.** The margins are a claim about how much the
+static evaluation can be wrong by, and sigma answers exactly that. A reduction
+is a different claim - how much of the tree below a move can be skipped - and
+the uncertainty of the evaluation AT this node says little about it. The
+negative result is consistent with that reading rather than with a bug.
+
+#### 2. Re-centring `unc_scale()` on the gen-5 net - rejected
+
+Roadmap item 3 and [NNUE.md](NNUE.md) 5c: `UncSigmaBase` 73 -> 57,
+`UncSigmaSlope` 13 -> 12, the pair that reproduces on net `34aaa009f3db` the
+distribution E22a's fit saw on `0ba56166ba9c`. One `TUNE_SEARCH` build, both
+seats, no rebuild either side.
+
+| same binary, options only, STC 8+0.08 | |
+|---|---|
+| Games | 656 |
+| W/L/D (tuned) | 179 / 193 / 284 |
+| **Elo** | **-7.4 ± 20.0** |
+
+**This is the result that matters most, because 5c predicted it would pass.**
+The measurement behind it stands - the margins really do run ~13% wide on this
+net and a third of nodes really are pinned at the cap - but re-centring the
+distribution did not convert into Elo. The reading that survives is that
+matching the *fitted* distribution was the wrong target: it treats the mapping
+as correct-but-displaced, when 5c's own error table says the SHAPE is wrong
+over half the tree. Re-centring a curve of the wrong shape moves it from one
+kind of wrong to another.
+
+That is what motivated E28's split rather than another pass at the constants.
+
+#### 3. A wider net (h1024) on gen-005 - rejected
+
+The gen-5 corpus retrained at `--hidden 1024` against the shipped 512, same
+data, same schedule, same lambda. The checkpoint is still on disk as `external\nets\net.pt`
+(val 0.006623, tag `epoch4-h1024`), and `net.json` currently describes IT
+rather than the shipped net - the same trap E18 records, sprung again.
+
+| vs the shipped h512, STC 8+0.08 | |
+|---|---|
+| Games | 1986 |
+| **Elo** | **-7.0 ± 11.3** |
+
+Doubling the accumulator cost roughly its own nps and returned nothing
+measurable. **Coverage, not capacity, is still the binding constraint** - which
+is what E18 concluded from the other direction and what item 1 of the roadmap
+already says. A wider net is not the way to spend the next generation; more
+varied data is.

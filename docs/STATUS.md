@@ -46,6 +46,11 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Search: 28 parameters re-fitted by SPSA, `Unc*` seats included | **+14.24 ± 7.10** (E22) |
 | Search: same re-fit narrowed to nine seats (SEE, delta, σ mapping) | **+12.88 ± 6.71** (E22a) |
 | **Uncertainty margins: LTC confirmation (E20-E22a are STC-only)** | **TODO** |
+| `make unc-probe`: the sigma distribution the margin scaling is centred on | built (NNUE.md 5c) |
+| The mapping re-centred onto the gen-5 net (`UncSigmaBase` 57, `UncSigmaSlope` 12) | tried, **-7.4 ± 20.0** (E27), rejected |
+| Search: sigma-scaled LMR (`LmrSigmaLo` / `LmrSigmaHi`) | tried, **-29.9 ± 29.6** (E27), reverted |
+| NNUE: a wider net (h1024) on the gen-5 corpus | tried, **-7.0 ± 11.3** (E27), rejected |
+| **Uncertainty scaling split per margin (8 weights, no-op at defaults)** | **built, sweep running** |
 | NNUE: the default evaluation is the network (`make`; `make classical` for the other one) | complete (E11) |
 | Data re-labelled by the network (`gen-003`, human corpus) | shipped; marginal, not a step change (E18) |
 | Syzygy tablebases in search and datagen; all adjudication removed | built, off by default (E23) |
@@ -160,20 +165,34 @@ The open work, roughly in order of Elo per unit of effort:
    uncertainty head — no sweep against the shipped net can see them at all, so
    fitting them needs a classical or headless-net run (E22a).
 
-3. **LTC confirmation of the uncertainty work.** E20, E21, E22 and E22a are
+3. **Split the uncertainty scaling per margin, then sweep the weights.**
+   Re-centring the mapping was tried and rejected (E27, -7.4 +/- 20.0), and
+   that failure is the argument for this: the constants were not displaced,
+   the SHAPE was wrong, and one global factor cannot be the right shape for
+   five margins at once. `unc_scale()` returned one number and every consumer
+   multiplied by it - an artefact of there being one mapping rather than
+   anything measured. Each site now takes a weight in sixteenths of the
+   mapping's DEVIATION from 100, which is orthogonal to the margin constant
+   beside it, so the new seats measure conditioning strength and nothing else.
+   Eight weights, defaults reproducing today's engine to the node (bench
+   220800 either side), and the Elo, if any, comes out of the sweep rather
+   than the patch. See NNUE.md 5c for the error curve that says the answer
+   should be above `UNC_W_UNIT` for at least some of them.
+
+4. **LTC confirmation of the uncertainty work.** E20, E21, E22 and E22a are
    all STC-only, and the ~3300 blitz claim is provisional on the same
    grounds. A 40+0.4 SPRT (or the 40+0.4 gauntlet) retires the debt.
 
-4. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
+5. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
    and the accumulator stack in `src/nnue.c` are file-scope and must move into
    a per-thread block first. Worth nothing in a single-threaded SPRT and worth
    a great deal to anyone actually playing the engine — and it makes every
    future data generation run cheaper.
 
-5. **Staged move generation**, in the three steps the status table breaks it
+6. **Staged move generation**, in the three steps the status table breaks it
    into, each with its own SPRT — after reading the notes above.
 
-6. **Uncertainty follow-ups**, one SPRT each: the same-net signal A/B (σ head
+7. **Uncertainty follow-ups**, one SPRT each: the same-net signal A/B (σ head
    vs corrhist magnitude on an identical net, the attribution E21 deliberately
    did not buy), and combining the two signals — they are not exclusive.
 

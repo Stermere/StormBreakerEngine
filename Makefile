@@ -258,7 +258,7 @@ endif
         tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet \
         ratings snapshot \
         classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
-        syzygy-fetch syzygy-test chess960-test chess960-campaign
+        syzygy-fetch syzygy-test chess960-test chess960-campaign unc-probe
 
 all: $(TARGET)
 
@@ -353,6 +353,29 @@ perft-all: $(TARGET)
 # The Chess960 checks a node count cannot make: the SP numbering, FEN
 # round-trips, castling notation being unambiguous, and do/undo restoring
 # everything. See src/chess960test.c for why each is here.
+# The margin scaling in unc_scale() is CENTRED on the distribution of the
+# signal it reads, and that distribution belongs to a net. `probe unc` measures
+# it on the net this build carries and prints the constants that re-centre the
+# mapping onto it - see src/test/uncprobe.h and docs/NNUE.md 5c.
+#
+# It builds its OWN binary, and -DUNC_PROBE is what puts the command in it.
+# Two reasons, and the second is why this is not a gate like the others:
+# unc_scale() runs at every node, so the hook has no business existing in a
+# binary that plays; and the measurement answers every search neutrally, which
+# is the point of it and also makes the binary useless for playing. $(TARGET)
+# is untouched, so measuring never invalidates the build under test.
+#
+# Not a gate in the other sense either. It reports; re-centring the constants
+# it reports on is a behavioural change and needs its own SPRT.
+# PROBE_ARGS passes -ref / -o / -epd / -cap / -live through.
+PROBE_DEPTH ?= 12
+PROBE_ARGS  ?=
+
+unc-probe: CFLAGS += -DUNC_PROBE
+unc-probe: $(EVALDEP)
+	$(CC) $(CFLAGS) $(SOURCES) -o $(EXE)-uncprobe$(SUFFIX) $(LDFLAGS)
+	./$(EXE)-uncprobe$(SUFFIX) probe unc $(PROBE_DEPTH) $(PROBE_ARGS)
+
 chess960-test: $(TARGET)
 	./$(TARGET) chess960 selftest
 	./$(TARGET) perft suite tests/perft/chess960.epd
@@ -768,6 +791,7 @@ help:
 	@echo "make net-fetch          download the pinned net into EVALFILE"
 	@echo "make syzygy-fetch       download the 3-4-5-man Syzygy tablebases (~939 MB)"
 	@echo "make syzygy-test        probe known endgames against the fetched tables"
+	@echo "make unc-probe          build a probe binary; measure what unc_scale() reads"
 	@echo "make chess960-test      Chess960 structural gate + its perft suites"
 	@echo "make chess960-campaign  differential perft vs ORACLE= (default stockfish)"
 	@echo "make net-publish        upload EVALFILE as a content-addressed release"

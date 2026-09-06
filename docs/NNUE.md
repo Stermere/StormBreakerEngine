@@ -1135,6 +1135,153 @@ one-SPRT experiment.
 
 ---
 
+### 5c. Keeping the mapping centred when the net changes
+
+`unc_scale()`'s constants are not free parameters. They are CENTRED on the
+distribution of the signal they read: E20 chose them so the node-weighted
+average scale is ~100, which is what makes the conditioning a conditioning
+rather than a disguised global shift of every margin at once, and what makes
+the margins an SPSA sweep sees the ones it fitted.
+
+That distribution belongs to a net. Retrain, and the constants are centred on
+one that no longer exists - silently, because every score the mapping produces
+is still plausible and nothing fails. It has happened twice: E20 recorded its
+constants as centred on the net before gen-4, and E21's were centred on the net
+before gen-5. Both times it was noticed later than it happened.
+
+So the measurement is a command rather than an improvisation:
+
+```sh
+make unc-probe                                    # d12, the bench positions
+make unc-probe PROBE_ARGS="-o external/tune/unc-<net>.csv"
+make unc-probe PROBE_ARGS="-ref external/tune/unc-<oldnet>.csv"
+```
+
+It searches the corpus with the scaling **held neutral** - so the constants
+being measured cannot shape the tree they are measured on, which is what E21
+did by hand - records the signal at every node that consults the mapping, and
+reports the constants that re-centre it. `-o` writes the distribution;
+`-ref` reads one back and solves for the constants that reproduce, on the new
+net, the mean and spread the old constants produced on the old one. That is the
+version that carries an SPSA fit across a retrain: reproducing the *fitted*
+distribution rather than an idealised mean of 100 keeps the change to one thing.
+`-epd` takes another corpus, `-cap` another ceiling, and `-live` leaves the
+mapping in circuit, which measures the tree it shapes rather than the
+distribution it acts on.
+
+**The hook is compiled in by that target and nothing else.** `unc_scale()` runs
+at every node, so in a playing build `unc_probe()` is an inline identity - no
+flag, no branch, nothing in the binary. `make unc-probe` builds
+`stormbreaker-uncprobe` with `-DUNC_PROBE` and leaves `$(TARGET)` alone, so
+taking a measurement never invalidates the build under test. The probe binary
+is not one to play with either: it answers every search neutrally, which is
+what makes the measurement mean anything.
+
+**Measured 2026-09-05**, both runs at d12 on the bench positions, on today's
+search:
+
+| | net `0ba56166ba9c` (what E22a fitted) | net `34aaa009f3db` (gen-5, shipped) |
+|---|---|---|
+| sigma median / mean | 42 / 84.7 cp | **65 / 140.1 cp** |
+| sigma p90 / p99 | 131 / 427 | **269 / 1131** |
+| scale under 73/13/144, mean | 110.9 | **125.7** |
+| scale sd | 22.4 | **16.4** |
+| nodes pinned at the cap | 19.7% | **31.9%** |
+
+The tool reproduces E21's own number on E21's net - it recorded a sigma median
+of 47cp where this measures 42 on a search that has changed since - which is
+what makes the second column believable.
+
+Two things moved, and they are separate. The **margins run ~13% wider** than the
+fit ever saw (125.7 against 110.9), because a better net predicts smaller
+residuals for the positions it understands and larger ones where it does not,
+and the distribution's whole right tail moved past the cap. And the
+**conditioning has collapsed**: sd 22.4 -> 16.4 with a third of nodes at the
+ceiling and the p75 sitting exactly on it, so for a third of the tree the
+"scaled" margin is one constant again.
+
+Matching the fitted distribution on the gen-5 net gives **base 57, slope 12**
+(mean 111.1, sd 22.2, 21.3% capped). Strictly re-centring to a mean of 100 at
+the shipped slope gives base 39 - a bigger change, because it also removes the
++11% the fitted constants themselves carried, and that +11% is part of what
+E22a fitted. One change per test: the first is the re-centring, the second is a
+question about the centring rule.
+
+**Both are behavioural and neither ships without an SPRT.**
+
+**The first was run, and it failed: -7.4 +/- 20.0 over 656 games (E27).** The
+measurement above is not what failed - the margins really do run ~13% wide on
+this net, and a third of nodes really are pinned at the cap. What failed is the
+inference that re-centring recovers Elo, and the section below is why: if the
+SHAPE is wrong over half the tree, moving the curve sideways trades one kind of
+wrong for another. **Do not open the next net with a centring pass either** -
+measure with `probe err`, and spend the SPRT on the shape.
+
+#### Is the signal telling the truth? `probe err`
+
+Centring asks what the mapping READS. The other question is whether it should
+believe it: `probe err` pairs the signal at a node with the error the search
+went on to find there, `searched - staticEval`, signed, which is the quantity
+every margin insures against. It is the same measurement discipline - neutral
+scaling, the bench tree, node-weighted - and `-mindepth` / `-maxdepth` isolate
+a single depth, because deep nodes carry both a higher sigma and a larger true
+error and the correlation has to survive that control to mean anything.
+
+**Measured 2026-09-05**, net `34aaa009f3db`, d12, 657,469 paired nodes. What a
+1% error rate costs in each band, against what the mapping charges, 100 being
+the whole tree's own 1% margin (196cp on the downside):
+
+| sigma band | share of nodes | needs (down) | mapping charges |
+|---|---|---|---|
+| 0 - 31 | 2.8% | 38 - 49 | 73 - 95 |
+| 32 - 63 | **51.0%** | **35 - 49** | **106 - 116** |
+| 64 - 127 | 28.9% | 79 - 118 | 135 - 144 |
+| 128 - 255 | 6.0% | 159 - 222 | 144 (capped) |
+| 256+ | 11.2% | 205 - 272 | 144 (capped) |
+
+Three things follow, and the first is a negative result worth having.
+
+**The confident tail does not keep thinning.** Below sigma 64 the requirement
+is flat at 35-49 and does not fall further as sigma approaches zero - the most
+confident band needs 48, more than the 32-47 band's 35. So there is no
+exponential to exploit at the confident end: what the data asks for there is a
+FLOOR, not a collapse. Confidently wrong does happen - the sigma < 8 band's
+worst observation is -1110cp - it is just rare enough (0.90% beyond -100cp) to
+price, and pricing it lower than 73 is the whole of the available gain.
+
+**The mapping is far too flat, at both ends.** It charges 2-3x the empirical
+requirement across the half of the tree where sigma sits between 32 and 63, and
+`UncScaleMax` then pins it at 144 exactly where the requirement reaches 272 -
+the cap binds hardest where the errors are biggest, which is backwards.
+
+**And the shape is wrong, not just the constants.** Over the whole middle range
+the requirement tracks sigma almost exactly one-for-one in percent: 42 -> 35,
+54 -> 49, 77 -> 79, 109 -> 118, 152 -> 159, 218 -> 222. An affine
+`floor + sigma * k` cannot follow that and hold a floor at the same time; a
+`max(floor, min(sigma * k, cap))` can, and `max(45, min(sigma, 200))` reproduces
+the measured curve across three orders of magnitude. Its node-weighted mean is
+87 rather than 100, so it is also a 13% global tightening - which makes it two
+changes, and the centred version of the same shape,
+`max(45, min(sigma * 22 / 16, 160))`, is the one that tests the shape alone.
+
+All of it is a static analysis of one net on one tree, and the 1% quantile is a
+proxy for the optimal margin rather than the optimal margin. It says where to
+point an SPRT, and nothing more.
+
+**Where it was pointed.** Not at a new shape for the shared mapping, but at the
+assumption underneath it: that one mapping serves every margin. `unc_scale()`
+returned a single number and reverse futility, razoring, ProbCut, futility and
+delta all multiplied by it - a claim nothing here ever measured, and one that
+followed from there being one mapping rather than from any result. The table
+above cannot be acted on globally: the factor that tightens the 32-63 band -
+half the tree, charged two to three times its requirement - tightens the 256+
+band with it, where the cap already leaves the margin at 144 against a
+requirement of 272. So each site now carries its own weight on the mapping's
+deviation from 100, which is orthogonal to the margin constant beside it. See
+`UNC_W_UNIT` in `src/search.c`, and item 3 of [STATUS.md](STATUS.md).
+
+---
+
 ## What can go wrong
 
 | Failure | Symptom | Where it is caught |

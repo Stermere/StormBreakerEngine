@@ -32,4 +32,14 @@
  * Pass depth <= 0 for BENCH_DEFAULT_DEPTH. */
 void bench_run(int depth);
 
+/*
+ * The frozen list itself, for the one other thing that has to search exactly
+ * the tree bench searches: `probe unc` (src/test/uncprobe.h). Sharing it
+ * rather than copying it is the point - a probe taken on a corpus that had
+ * drifted from this one is not comparable to the measurements the constants it
+ * re-centres were taken on. Returns NULL past the end.
+ */
+int bench_position_count(void);
+const char *bench_position(int i);
+
 #endif /* BENCH_H */

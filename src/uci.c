@@ -29,6 +29,9 @@
 #include "syzygy.h"
 #include "test/chess960test.h"
 #include "test/syzygytest.h"
+#ifdef UNC_PROBE
+#include "test/uncprobe.h"
+#endif
 #include "timeman.h"
 #include "tt.h"
 
@@ -557,6 +560,31 @@ static void cmd_nnue(char *args) {
 }
 #endif
 
+#ifdef UNC_PROBE
+/*
+ * `probe unc` measures the distribution unc_scale()'s constants are centred on,
+ * so a retrain can be re-centred instead of quietly shifting every margin. See
+ * test/uncprobe.h. It is a measurement rather than a gate, but it ships in the
+ * binary for the same reason the gates do: the net and the search it has to
+ * measure are the ones this build plays with.
+ */
+static void cmd_probe(char *args) {
+    char *cursor = args;
+    char *tok    = next_token(&cursor);
+
+    if (token_is(tok, "unc")) {
+        if (unc_probe_command(cursor) != 0)
+            ExitCode = 1;
+    } else if (token_is(tok, "err")) {
+        if (unc_probe_err_command(cursor) != 0)
+            ExitCode = 1;
+    } else {
+        printf("usage: probe [unc | err] [options]   (each takes -help)\n");
+    }
+    fflush(stdout);
+}
+#endif /* UNC_PROBE */
+
 /* `chess960 selftest` is the structural gate; see test/chess960test.c for what
  * it checks that perft cannot. */
 static void cmd_chess960(char *args) {
@@ -680,6 +708,10 @@ bool uci_execute(const char *line) {
         cmd_syzygy(cursor);
     } else if (strcmp(cmd, "chess960") == 0) {
         cmd_chess960(cursor);
+#ifdef UNC_PROBE
+    } else if (strcmp(cmd, "probe") == 0) {
+        cmd_probe(cursor);
+#endif
     } else if (strcmp(cmd, "d") == 0) {
         board_print(&Pos);
         fflush(stdout);

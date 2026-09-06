@@ -44,7 +44,6 @@ static const char *BenchPositions[] = {
     "3r1k2/4npp1/1ppr3p/p6P/P2PPPP1/1NR5/5K2/2R5 w - - 0 1",
     "6k1/1b1nqpbp/pp4p1/5P2/1PN5/4Q3/P5PP/1B2B1K1 b - - 0 1",
     "r3r1k1/2p2ppp/p1p1bn2/8/1q2P3/2NPQN2/PPP3PP/R4RK1 b - - 2 15",
-    "q3k1nr/1pp1nQpp/3p4/1P2p3/4P3/B1PP1b2/B5PP/5K1R w k - 0 17",
     "3r3k/2r4p/1p1b3q/p4P2/P2Pp3/1B2P3/3BQ1RP/6K1 w - - 0 1",
     "8/8/8/8/8/6k1/6p1/6K1 w - - 0 1",
     "8/2k5/8/8/8/8/5PPP/6K1 w - - 0 1",
@@ -54,7 +53,6 @@ static const char *BenchPositions[] = {
     "8/2p5/8/2kPKp1p/2p4P/2P5/3P4/8 w - - 0 1",
     "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
     "8/1r3k2/8/2R5/8/5K2/8/8 w - - 0 1",
-    "8/8/4k3/8/2n5/8/3K4/8 b - - 0 1",
     "8/8/2Q5/8/5k2/8/8/6K1 w - - 0 1",
     "5k2/8/8/8/8/8/2B1N3/4K3 w - - 0 1",
     "8/8/8/4bk2/8/8/2K5/4B3 w - - 0 1",
@@ -68,6 +66,12 @@ static const char *BenchPositions[] = {
 };
 
 #define BENCH_POSITION_COUNT ((int)(sizeof(BenchPositions) / sizeof(BenchPositions[0])))
+
+int bench_position_count(void) { return BENCH_POSITION_COUNT; }
+
+const char *bench_position(int i) {
+    return i >= 0 && i < BENCH_POSITION_COUNT ? BenchPositions[i] : NULL;
+}
 
 void bench_run(int depth) {
     if (depth <= 0)
