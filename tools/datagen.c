@@ -1,9 +1,6 @@
 /*
  * datagen.c - training data for the network. Not part of the engine binary.
  *
- * Seven subcommands, which together are the whole pipeline from an empty
- * directory to a shard a trainer can memory-map:
- *
  *     datagen selfplay -o shard%02d.cnn -games N   play games, label positions
  *     datagen label <in.epd>... -o out.cnn         label positions that exist
  *     datagen shuffle <in.cnn>... -o out.cnn       on-disk shuffle
@@ -12,37 +9,25 @@
  *     datagen stats <shard.cnn>...                 histograms, to be eyeballed
  *     datagen dump <shard.cnn>                     records as text
  *
- * It links every engine source except main.c, exactly as tools/tuner.c does,
- * so it plays and searches with the engine in the working tree rather than
- * with a copy of it. docs/NNUE.md is why each choice below is the choice.
+ * It links every engine source except main.c, so it plays and searches with the engine in
+ * the working tree rather than with a copy of it.
  *
- * WHAT A LABEL IS, and why it is the only thing in here that matters.
+ * WHAT A LABEL IS. One record is one position, one score and one game result. The score is
+ * a fixed-NODE search - never fixed time, which would make labels depend on the machine -
+ * run from a position round-tripped through its own FEN with every table cleared, so the
+ * label is a function of the POSITION alone rather than of the game that reached it. That
+ * is what makes the four position sources mixable at all, and what `verify -relabel`
+ * proves.
  *
- * One record is one position, one score and one game result. The score is a
- * fixed-NODE search - never fixed time, which would make labels depend on the
- * machine - run from a position that has been round-tripped through its own
- * FEN, with the transposition table and every history table cleared first.
- *
- * That last part is not fastidiousness. A search inherits the tables left by
- * the searches before it, so the score of a position reached mid-game is a
- * function of the game that reached it. Label the same position tomorrow from
- * a different game and the number differs, and the network spends its capacity
- * learning the difference. Clearing everything and re-parsing the FEN makes the
- * label a function of the position ALONE. That is what `datagen verify
- * -relabel` proves, and it is what makes the four position sources mixable at
- * all: a self-play position and a CCRL position mean the same thing only if
- * they were labelled the same way.
- *
- * WHY WORKERS ARE PROCESSES, NOT THREADS. search.c's state is file-scope and
- * the transposition table is one global allocation. Two searches in one process
- * would share both, and a shared table is exactly the contamination the
- * paragraph above exists to prevent. `-threads N` therefore forks (POSIX) or
- * re-launches (Windows) N processes, each writing its own shard. Shards
- * concatenate, so this costs nothing downstream.
+ * WORKERS ARE PROCESSES, NOT THREADS. search.c's state is file-scope and the transposition
+ * table is one global allocation, so two searches in one process would share exactly the
+ * contamination above. `-threads N` forks (POSIX) or re-launches (Windows) N processes,
+ * each writing its own shard; shards concatenate, so this costs nothing downstream.
  */
+
+/* fork/waitpid and the 64-bit file offsets below are hidden by -std=c17's __STRICT_ANSI__
+ * unless the POSIX level is asked for explicitly. */
 #if !defined(_WIN32)
-/* fork/waitpid and the 64-bit file offsets below are hidden by -std=c17's
- * __STRICT_ANSI__ unless the POSIX level is asked for explicitly. */
 #define _POSIX_C_SOURCE   200809L
 #define _FILE_OFFSET_BITS 64
 #if defined(__APPLE__)
@@ -92,29 +77,28 @@
 #define make_dir(p)      mkdir((p), 0777)
 #endif
 
-/* Stamped in by the Makefile so a shard can name the engine that made it. A
- * dataset whose provenance is unknown cannot be compared to another one. */
 #ifndef DATAGEN_COMMIT
+/* Stamped in by the Makefile so a shard can name the engine that made it. A dataset whose
+ * provenance is unknown cannot be compared to another one. */
 #define DATAGEN_COMMIT "unknown"
 #endif
 
 enum {
     MAX_WORKERS = 64,
     PATH_CAP    = 1024,
-    /* `shuffle` keeps one open file and one counter per bucket in fixed
-     * stack arrays, so this bounds a user-supplied -buckets as well as the
-     * auto-computed one. */
+
+    /* `shuffle` keeps one open file and one counter per bucket in fixed stack arrays, so
+     * this bounds a user-supplied -buckets as well as the auto-computed one. */
     SHUFFLE_MAX_BUCKETS = 256
 };
 
+/* For the messages that have to name the file and the numbers: a failure that says which
+ * shard and how many bytes is a fix, where "bad shard" is an afternoon. */
 static void die(const char *msg) {
     fprintf(stderr, "datagen: %s\n", msg);
     exit(1);
 }
 
-/* die(), for the messages that have to name the file and the numbers. A
- * failure that says which shard and how many bytes is a fix; "bad shard" is an
- * afternoon. */
 #if defined(__GNUC__)
 __attribute__((format(printf, 1, 2)))
 #endif
@@ -145,19 +129,10 @@ static FILE *xfopen(const char *path, const char *mode) {
     return f;
 }
 
-/*
- * Creates the directory an output path lives in, and its parents.
- *
- * fopen(..., "wb") does not, and a run that fails on that fails once per
- * worker - fourteen identical lines, after the user has waited for the first
- * game to finish. Creating it is what every other tool in this repository's
- * pipeline already does by hand in the Makefile.
- *
- * A directory that already exists is not an error, which is also what makes
- * this safe against every worker racing to create the same one. Anything that
- * genuinely cannot be created is left for the fopen below to report, with the
- * errno that explains it.
- */
+/* fopen(..., "wb") does not create directories, and a run that fails on that fails once
+ * per worker after the user has waited for the first game. A directory that already exists
+ * is not an error, which is what makes this safe against every worker racing to create the
+ * same one; anything that genuinely cannot be created is left for fopen to report. */
 static void ensure_parent_dir(const char *path) {
     char dir[PATH_CAP];
     if (strlen(path) >= sizeof(dir))
@@ -169,12 +144,9 @@ static void ensure_parent_dir(const char *path) {
         if (*c == '/' || *c == '\\')
             cut = c;
     if (!cut)
-        return; /* writing into the current directory */
+        return;
     *cut = '\0';
 
-    /* Each component in turn, so a path several levels deep works. Starting at
-     * dir + 1 steps over a leading separator and over a drive letter's colon,
-     * neither of which is a directory to create. */
     for (char *c = dir + 1; *c; ++c) {
         if (*c != '/' && *c != '\\')
             continue;
@@ -191,61 +163,44 @@ static double now_seconds(void) { return (double)time_ms() / 1000.0; }
 
 static int iabs(int v) { return v < 0 ? -v : v; }
 
-/* ========================================================================== *
- *  The record format
+/*
+ * The record format: 32 bytes, little-endian, no file header. The absent header is
+ * deliberate - shards have to concatenate with `cat` - so everything a header would have
+ * carried lives in the .json sidecar, and a shard whose sidecar is missing is a shard that
+ * cannot be trusted.
  *
- *  32 bytes, little-endian, no file header. The absent header is deliberate:
- *  shards have to concatenate with `cat`, and a header breaks that. Everything
- *  a header would have carried lives in the .json sidecar instead, and a shard
- *  whose sidecar is missing is a shard that cannot be trusted.
+ *     offset size  field
+ *     0      8     occupied bitboard
+ *     8      16    piece nibbles, one per occupied square, LSB-first
+ *     24     1     bit 7 side to move; bits 0-6 en passant square (127 none)
+ *     25     1     halfmove clock
+ *     26     2     fullmove number
+ *     28     2     score, centipawns, side-to-move relative (int16)
+ *     30     1     WDL from the side to move: 0 loss, 1 draw, 2 win, 3 unknown
+ *     31     1     flags: bits 0-2 source tag, bit 3 in check,
+ *                         bits 4-7 game-progress bucket (0 = not recorded)
  *
- *      offset size  field
- *      0      8     occupied bitboard
- *      8      16    piece nibbles, one per occupied square, LSB-first
- *      24     1     bit 7 side to move; bits 0-6 en passant square (127 none)
- *      25     1     halfmove clock
- *      26     2     fullmove number
- *      28     2     score, centipawns, side-to-move relative (int16)
- *      30     1     WDL from the side to move: 0 loss, 1 draw, 2 win, 3 unknown
- *      31     1     flags: bits 0-2 source tag, bit 3 in check,
- *                          bits 4-7 game-progress bucket (0 = not recorded)
- *
- *  Castling rights ride in the nibbles rather than costing a byte: a piece code
- *  is `type | color << 3` with types 0-5, and a rook that still has a castling
- *  right is type 6. Three codes spare, and Chess960 castling encodes correctly
- *  for free - which matters, because a data format is expensive to change once
- *  a hundred million records exist.
- *
- *  THE GAME-PROGRESS NIBBLE is what the format's four reserved bits became, and
- *  it is spent here rather than kept because it cannot be backfilled: how far a
- *  position was from the end of the game it came from is knowable only while
- *  that game is in hand. The trainer wants it because the WDL label's
- *  INFORMATIVENESS varies over a game - a result twenty moves away says much
- *  less about the position in front of it than one three plies away - and a
- *  single lambda over the whole dataset has to price that in at the average.
- *
- *  Zero means "not recorded", so every shard written before this field existed
- *  decodes as unknown rather than as bucket zero, and every reader that ignores
- *  the nibble reads exactly what it read before.
- * ========================================================================== */
-
+ * Castling rights ride in the nibbles rather than costing a byte: a piece code is
+ * `type | color << 3` with types 0-5, and a rook that still has a right is type 6. Three
+ * codes spare, and Chess960 castling encodes correctly for free - which matters, because a
+ * data format is expensive to change once a hundred million records exist.
+ */
 enum {
     REC_BYTES = 32,
-    /* Bytes 0..24: occupied, the piece nibbles, and the side-to-move/en-passant
-     * byte. Everything that identifies the POSITION, and nothing that does not
-     * - the halfmove clock and the fullmove number sit after it, and the
-     * network never sees either. */
+
+    /* Bytes 0..24: everything that identifies the POSITION and nothing that does not - the
+     * halfmove clock and fullmove number sit after it, and the network sees neither. */
     REC_POSITION_BYTES = 25,
     POL_BYTES          = 4,
     REC_MAX_PIECES     = 32,
     REC_EP_NONE        = 127,
 
-    NIB_ROOK_CASTLE = 6, /* a rook that still carries a castling right */
+    NIB_ROOK_CASTLE = 6,
     NIB_BLACK       = 8,
 
     REC_SRC_MASK       = 7,
     REC_IN_CHECK       = 8,
-    REC_PROGRESS_MASK  = 0xF0, /* bits 4-7: how far this position is from the end of its game */
+    REC_PROGRESS_MASK  = 0xF0,
     REC_PROGRESS_SHIFT = 4,
 
     WDL_LOSS    = 0,
@@ -255,17 +210,15 @@ enum {
     WDL_NB      = 4
 };
 
-/*
- * Flags bits 0-2: where the position came from. The mixture of sources is an
- * experiment rather than a decision, and the tag is what lets a trainer
- * re-weight it without regenerating anything.
- */
+/* Flags bits 0-2: where the position came from. The mixture of sources is an experiment
+ * rather than a decision, and the tag is what lets a trainer re-weight it without
+ * regenerating anything. */
 typedef enum {
-    SRC_SELFPLAY = 0, /* a position the engine actually played into */
-    SRC_TREE     = 1, /* an interior node of one of those searches */
-    SRC_HUMAN    = 2, /* external/training/human.epd */
-    SRC_ENGINE   = 3, /* external/training/ccrl_*.epd */
-    SRC_BOOK     = 4, /* an opening book or randomised start position */
+    SRC_SELFPLAY = 0,
+    SRC_TREE     = 1,
+    SRC_HUMAN    = 2,
+    SRC_ENGINE   = 3,
+    SRC_BOOK     = 4,
     SRC_OTHER    = 5,
     SRC_NB       = 6
 } SourceTag;
@@ -293,16 +246,10 @@ typedef struct {
     uint8_t flags;
 } Record;
 
-/*
- * Policy sidecar: 4 bytes per record, in the same order, in `shardNN.pol`.
- * Optional to read, cheap to write, and impossible to backfill - which is why
- * it is written now, before anything reads it.
- *
- *   best   the best move of THIS record's label search. Always present.
- *   cutoff the move that caused the beta cutoff at the tree node this position
- *          was sampled from, or MOVE_NONE for a game-line record and for a
- *          node that failed low, where no move is a label.
- */
+/* Policy sidecar: 4 bytes per record, in the same order, in `shardNN.pol`. Optional to
+ * read, cheap to write, and impossible to backfill, which is why it is written now.
+ * `cutoff` is MOVE_NONE for a game-line record and for a node that failed low, where no
+ * move is a label. */
 typedef struct {
     uint16_t best;
     uint16_t cutoff;
@@ -322,8 +269,8 @@ static void record_encode(const Record *r, uint8_t *out) {
     out[31] = r->flags;
 }
 
-/* Two's complement spelled out rather than left to an implementation-defined
- * narrowing conversion: this format is on disk and outlives any one compiler. */
+/* Two's complement spelled out rather than left to an implementation-defined narrowing
+ * conversion: this format is on disk and outlives any one compiler. */
 static int16_t from_le16_signed(uint16_t v) {
     return v < 0x8000u ? (int16_t)v : (int16_t)((int32_t)v - 65536);
 }
@@ -356,17 +303,15 @@ static void policy_decode(const uint8_t *in, PolicyRecord *p) {
 static SourceTag record_source(const Record *r) { return (SourceTag)(r->flags & REC_SRC_MASK); }
 
 /*
- * Game progress: plies from this position to the end of the game it came from,
- * in four bits.
+ * Game progress: plies from this position to the end of its game, in four bits. Bucket 0
+ * is "not recorded" - a labelled EPD, or a game the ply cap cut short - and buckets 1..15
+ * are eight plies wide each.
  *
- * Bucket 0 is "not recorded" - a labelled EPD, whose game we never saw, and a
- * game the ply cap cut short, whose end never happened. Buckets 1..15 are eight
- * plies wide each, so 1 is "the game ended within four moves" and 15 is
- * "112 plies or more still to play". Linear rather than logarithmic because the
- * consumer is a lambda ramp and not a measurement: eight-ply resolution is finer
- * than any schedule worth fitting, and a formula both this file and
- * trainer/nnue/format.py can spell in one line cannot drift apart the way a
- * shared table of bucket edges would.
+ * It is spent here rather than kept because it cannot be backfilled: how far a position was
+ * from the end is knowable only while that game is in hand, and the trainer wants it
+ * because the WDL label's informativeness varies over a game. Linear rather than
+ * logarithmic because the consumer is a lambda ramp, and a formula both this file and
+ * trainer/nnue/format.py spell in one line cannot drift the way a shared table would.
  */
 enum { PROGRESS_UNKNOWN = 0, PROGRESS_PLIES_PER_BUCKET = 8, PROGRESS_MAX_BUCKET = 15 };
 
@@ -382,11 +327,9 @@ static unsigned record_progress(const Record *r) {
     return (unsigned)(r->flags & REC_PROGRESS_MASK) >> REC_PROGRESS_SHIFT;
 }
 
-/*
- * The rook a castling right refers to: the outermost one on the king's side of
- * the king. That is what KQkq means, it is what board_set_fen assumes, and it
- * is the X-FEN disambiguation rule, so it stays correct if Chess960 lands.
- */
+/* The rook a castling right refers to: the outermost one on the king's side of the king.
+ * That is what KQkq means, what board_set_fen assumes, and the X-FEN disambiguation rule,
+ * so it stays correct if Chess960 lands. */
 static Square castling_rook(const Position *pos, Color c, bool kingside) {
     const Square ksq = king_square(pos, c);
     Bitboard rooks   = pieces_bb(pos, c, ROOK) & rank_bb(rank_of(ksq));
@@ -395,8 +338,6 @@ static Square castling_rook(const Position *pos, Color c, bool kingside) {
     while (rooks) {
         const Square s = pop_lsb(&rooks);
         if (kingside ? file_of(s) > file_of(ksq) : file_of(s) < file_of(ksq)) {
-            /* pop_lsb ascends, so the LAST match is the outermost kingside rook
-             * and the FIRST is the outermost queenside one. */
             if (best == SQ_NONE || kingside)
                 best = s;
         }
@@ -404,10 +345,9 @@ static Square castling_rook(const Position *pos, Color c, bool kingside) {
     return best;
 }
 
-/* Packs `pos` plus its label. Every writer in this file goes through here, so
- * if the encoding is wrong it is wrong in exactly one place. `progress` is the
- * bucket progress_bucket() returned, or PROGRESS_UNKNOWN where no game end is
- * known - which is every `label` record and every game the ply cap stopped. */
+/* Packs `pos` plus its label. Every writer in this file goes through here, so if the
+ * encoding is wrong it is wrong in exactly one place. `progress` is PROGRESS_UNKNOWN where
+ * no game end is known - every `label` record, and every game the ply cap stopped. */
 static void record_from_position(Record *r, const Position *pos, int score, int wdl, SourceTag src,
                                  unsigned progress) {
     memset(r, 0, sizeof(*r));
@@ -431,7 +371,7 @@ static void record_from_position(Record *r, const Position *pos, int score, int 
         const Square s = pop_lsb(&occ);
         const Piece pc = piece_on(pos, s);
 
-        unsigned code = (unsigned)type_of(pc) - 1; /* PAWN..KING -> 0..5 */
+        unsigned code = (unsigned)type_of(pc) - 1;
         if (type_of(pc) == ROOK)
             for (int i = 0; i < rookCount; ++i)
                 if (castleRooks[i] == s)
@@ -456,18 +396,11 @@ static void record_from_position(Record *r, const Position *pos, int score, int 
         r->flags |= REC_IN_CHECK;
 }
 
-/*
- * Unpacks straight to a FEN.
- *
- * The scratch Position below is filled far enough for board_to_fen and NOT ONE
- * FIELD FURTHER - no key, no check info, no history - so it must never escape
- * this function. Going through board_to_fen rather than spelling out a FEN here
- * is the point: there is then exactly one FEN writer in the repository, and the
- * round-trip test in `verify` tests the format rather than a second
- * implementation of it.
- *
- * Returns false for a record that cannot be a position at all.
- */
+/* Unpacks straight to a FEN. The scratch Position below is filled far enough for
+ * board_to_fen and not one field further - no key, no check info, no history - so it must
+ * never escape this function. Going through board_to_fen is the point: there is then one
+ * FEN writer in the repository, and `verify` tests the format rather than a second
+ * implementation of it. */
 static bool record_to_fen(const Record *r, char *fen) {
     Position p;
     memset(&p, 0, sizeof(p));
@@ -487,7 +420,7 @@ static bool record_to_fen(const Record *r, char *fen) {
 
         const unsigned raw = code & 7;
         if (raw > NIB_ROOK_CASTLE)
-            return false; /* codes 7 and 15 are unused */
+            return false;
 
         const Color c      = (code & NIB_BLACK) ? BLACK : WHITE;
         const PieceType pt = raw == NIB_ROOK_CASTLE ? ROOK : (PieceType)(raw + 1);
@@ -527,17 +460,11 @@ static bool record_to_fen(const Record *r, char *fen) {
     return true;
 }
 
-/* ========================================================================== *
- *  Randomness
- *
- *  splitmix64: one multiply-xor chain, no state beyond a uint64, and good
- *  enough for uniform sampling. It is seeded from the command line and never
- *  from the clock, so a run is repeatable - which matters when a shard turns
- *  out to be wrong and the question is what produced it.
- * ========================================================================== */
-
 typedef uint64_t Rng;
 
+/* splitmix64: one multiply-xor chain, no state beyond a uint64, seeded from the command
+ * line and never from the clock - so a run is repeatable, which matters when a shard turns
+ * out to be wrong and the question is what produced it. */
 static uint64_t rng_next(Rng *s) {
     uint64_t z = (*s += 0x9E3779B97F4A7C15ULL);
     z          = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -545,36 +472,19 @@ static uint64_t rng_next(Rng *s) {
     return z ^ (z >> 31);
 }
 
-/*
- * An independent stream per worker.
- *
- * NOT `seed + index * GOLDEN`, which is what this used to be: rng_next
- * advances the state by exactly that constant, so adding a multiple of it
- * merely starts worker `index` `index` draws into worker 0's stream. Every
- * worker then replays its neighbours' games - identical state gives an
- * identical game, and the workers consume draws at the same rate, so once two
- * of them line up they stay locked forever. Nothing detects it: dedup is
- * per-process and each worker writes its own shard, so the net simply trains
- * on the same positions N times. Running the index through the mixer puts the
- * workers in unrelated places in the state space instead.
- */
+/* An independent stream per worker. NOT `seed + index * GOLDEN`, which is what this used to
+ * be: rng_next advances the state by exactly that constant, so every worker replayed its
+ * neighbours' games and the net trained on the same positions N times with nothing
+ * detecting it. Running the index through the mixer puts workers in unrelated places. */
 static Rng worker_rng(uint64_t seed, int index) {
     Rng s = seed + (uint64_t)(index + 1) * 0x9E3779B97F4A7C15ULL;
     return (Rng)rng_next(&s);
 }
 
-/*
- * An independent stream per GAME, keyed on the game's global ordinal.
- *
- * A game is then a function of (seed, ordinal) and nothing else - not of how
- * many games ran before it in this process, and not of how many workers the
- * run was given. Two properties follow, and `selfplay -resume` needs both: an
- * interrupted run can rejoin at a game boundary without replaying the draws
- * that led there, and the same -seed produces the same dataset at any
- * -threads. Mixed twice for the same reason worker_rng is: rng_next advances
- * the state by the golden constant, so seeds a multiple of it apart merely
- * start one draw into each other's streams.
- */
+/* An independent stream per GAME, keyed on its global ordinal, so a game is a function of
+ * (seed, ordinal) and of nothing else. `selfplay -resume` needs both consequences: an
+ * interrupted run rejoins at a game boundary without replaying draws, and the same -seed
+ * produces the same dataset at any -threads. */
 static Rng game_rng(uint64_t seed, int game) {
     Rng s = seed + (uint64_t)(game + 1) * 0xD1B54A32D192ED03ULL;
     s     = (Rng)rng_next(&s);
@@ -593,26 +503,15 @@ static uint64_t rng_below(Rng *s, uint64_t n) {
     return v % n;
 }
 
-/* ========================================================================== *
- *  EPD input, and the opening book
- *
- *  Both subcommands read the same line format, so it is parsed in one place:
- *  `label` consumes a corpus of them, and `selfplay` draws start positions
- *  from one.
- * ========================================================================== */
-
-/*
- * One line of a tuner-style EPD: a FEN, optionally followed by `[1.0]`,
- * `[0.5]` or `[0.0]` - the game result from WHITE's point of view, which is
- * what tools/tuner.c writes. A line without one still labels fine; its WDL is
- * simply unknown, and the trainer drops the game-result term for it.
- */
+/* One line of a tuner-style EPD: a FEN, optionally followed by `[1.0]`, `[0.5]` or `[0.0]`
+ * - the game result from WHITE's point of view, which is what tools/tuner.c writes. A line
+ * without one still labels fine; its WDL is simply unknown. */
 static bool parse_epd_line(char *line, char **fenOut, int *whiteResult) {
     char *bracket = strchr(line, '[');
     *whiteResult  = -1;
 
     if (bracket) {
-        *whiteResult = (int)(strtod(bracket + 1, NULL) * 2.0 + 0.5); /* 0, 1 or 2 */
+        *whiteResult = (int)(strtod(bracket + 1, NULL) * 2.0 + 0.5);
         if (*whiteResult < 0 || *whiteResult > 2)
             *whiteResult = -1;
         *bracket = '\0';
@@ -629,21 +528,15 @@ static bool parse_epd_line(char *line, char **fenOut, int *whiteResult) {
     return n > 0;
 }
 
-/*
- * An opening book is an EPD, so `tuner extract` writes one directly and the
- * usual test books need no conversion.
- *
- * Only the line offsets are held in memory. A deep book is a couple of hundred
- * MB of text, there is one worker PROCESS per core, and a game reads exactly
- * one line before spending seconds searching it - so holding the text would
- * cost gigabytes per box to save a seek nothing can measure.
- */
 typedef struct {
     FILE *f;
-    uint64_t *offset; /* start of every line that is not blank or a comment */
+    uint64_t *offset;
     size_t count;
 } Book;
 
+/* An opening book is an EPD, so `tuner extract` writes one directly. Only the line offsets
+ * are held in memory: a deep book is a couple of hundred MB of text, there is one worker
+ * process per core, and a game reads one line before spending seconds searching it. */
 static void book_open(Book *b, const char *path) {
     memset(b, 0, sizeof(*b));
     b->f = xfopen(path, "rb");
@@ -678,18 +571,15 @@ static void book_open(Book *b, const char *path) {
         dief("cannot read book '%s': %s", path, strerror(errno));
     if (!b->count)
         dief("book '%s' has no positions in it", path);
-    /* fseek takes a long, which is 32-bit on Windows. Refuse a book that
-     * cannot be seeked rather than silently drawing from its first 2 GB. */
+
     if (base > (uint64_t)LONG_MAX)
         dief("book '%s' is %llu bytes, past the %ld this build can seek", path,
              (unsigned long long)base, LONG_MAX);
 }
 
-/*
- * Entry `index` as a FEN. False for a line this build cannot use, which costs
- * the game that drew it and nothing else: a book is somebody else's file, and
- * one unreadable line in it is not a reason to throw away a fleet's work.
- */
+/* Entry `index` as a FEN. False for a line this build cannot use, which costs the game that
+ * drew it and nothing else: a book is somebody else's file, and one unreadable line is not
+ * a reason to throw away a fleet's work. */
 static bool book_fen(Book *b, size_t index, char *out, size_t cap) {
     if (fseek(b->f, (long)b->offset[index], SEEK_SET) != 0)
         return false;
@@ -717,25 +607,16 @@ static void book_close(Book *b) {
     memset(b, 0, sizeof(*b));
 }
 
-/* ========================================================================== *
- *  Deduplication
- *
- *  Siblings inside a subtree differ by one piece, and a game line repeats
- *  structure for dozens of plies. Without a dedup pass a large fraction of a
- *  shard is the same position wearing a hat: training loss looks excellent and
- *  Elo does not move, which is the single hardest failure here to notice.
- *
- *  Open addressing over Zobrist keys. Key 0 marks an empty slot, so the one
- *  position whose key really is zero is remapped; the cost of that collision is
- *  one dropped record every few billion.
- * ========================================================================== */
-
 typedef struct {
     uint64_t *slots;
     size_t mask;
     size_t used;
 } KeySet;
 
+/* Deduplication, by open addressing over Zobrist keys. A game line repeats structure for
+ * dozens of plies, so without this a large fraction of a shard is the same position wearing
+ * a hat - training loss looks excellent and Elo does not move. Key 0 marks an empty slot,
+ * so the one position whose key really is zero is remapped. */
 static void keyset_init(KeySet *ks, int bits) {
     const size_t cap = (size_t)1 << bits;
     ks->slots        = xmalloc(cap * sizeof(uint64_t));
@@ -775,20 +656,14 @@ static void keyset_grow(KeySet *ks) {
 }
 
 /*
- * A key for the position an ENCODED record holds, without decoding it.
+ * A key for the position an ENCODED record holds, without decoding it. `shuffle` dedups
+ * across shards, where the alternative is board_set_fen on every one of a hundred million
+ * records - and the bytes already identify the position exactly, so the decode would only
+ * spell the same thing more slowly.
  *
- * `shuffle` dedups across shards, where the alternative is board_set_fen on
- * every one of a hundred million records to recover a Zobrist key - and the
- * bytes already identify the position exactly, so the decode would only be
- * spelling the same thing more slowly. The set it feeds is the same set
- * Zobrist keys would have produced: two records with these 25 bytes in common
- * are the same position with the same rights and the same side to move, and
- * they differ at most in a halfmove clock the network cannot see.
- *
- * FNV-1a, finished with splitmix64's mixer because FNV avalanches poorly in
- * the high bits and keyset_place indexes on exactly those. A 64-bit key over
- * 10^8 records collides about once every three runs, and a collision costs one
- * dropped record.
+ * FNV-1a, finished with splitmix64's mixer because FNV avalanches poorly in the high bits
+ * and keyset_place indexes on exactly those. A 64-bit key over 10^8 records collides about
+ * once every three runs, and a collision costs one dropped record.
  */
 static uint64_t record_position_key(const uint8_t *raw) {
     uint64_t h = 14695981039346656037ULL;
@@ -821,20 +696,10 @@ static bool keyset_insert(KeySet *ks, Key k) {
     return true;
 }
 
-/* ========================================================================== *
- *  Paths and manifests
- * ========================================================================== */
-
-/*
- * Substitutes a worker index into an output pattern. At most one `%d` or
- * `%0Nd` is accepted and the number is formatted here rather than by handing a
- * command-line string to snprintf as a format - a pattern with two conversions
- * would otherwise read an argument that was never passed.
- *
- * With no conversion and more than one worker, `%02d` is inserted before the
- * extension, so `shard.cnn` becomes `shard00.cnn` without the caller having to
- * remember the syntax.
- */
+/* Substitutes a worker index into an output pattern. At most one `%d` or `%0Nd` is
+ * accepted and the number is formatted here rather than by handing a command-line string to
+ * snprintf as a format, which with two conversions would read an argument never passed.
+ * With no conversion and more than one worker, `%02d` is inserted before the extension. */
 static void expand_path(char *dst, size_t cap, const char *pattern, int index, int workers) {
     const char *pct = NULL;
     for (const char *c = pattern; *c; ++c)
@@ -846,7 +711,6 @@ static void expand_path(char *dst, size_t cap, const char *pattern, int index, i
 
     char pattern2[PATH_CAP];
     if (!pct && workers > 1) {
-        /* Insert %02d before the extension of the last path component. */
         const char *slash = strrchr(pattern, '/');
         const char *back  = strrchr(pattern, '\\');
         if (back && (!slash || back > slash))
@@ -874,7 +738,6 @@ static void expand_path(char *dst, size_t cap, const char *pattern, int index, i
         return;
     }
 
-    /* Parse %0<width>d, the only form allowed. */
     const char *c = pct + 1;
     int width     = 0;
     bool zeroPad  = false;
@@ -932,20 +795,14 @@ static void json_string(FILE *f, const char *s) {
     fputc('"', f);
 }
 
-/*
- * Everything a file header would have carried. NNUE.md: a shard whose manifest
- * is missing is a shard that cannot be trusted, and that is the correct
- * default - a node count, a loss curve or an Elo result that cannot be
- * attributed to a specific dataset is not a measurement.
- */
 typedef struct {
     const char *command;
-    const char *inputs; /* space-joined source files, or NULL */
+    const char *inputs;
     int nodes;
     int hashMb;
     uint64_t seed;
     bool dedup;
-    /* selfplay only; ignored when `games` is zero */
+
     int games;
     const char *book;
     uint64_t bookEntries;
@@ -953,27 +810,21 @@ typedef struct {
     int openingPliesMax;
     int openingMaxScore;
     int maxPlies;
-    /* Whether the shard's records carry the game-progress nibble. A reader
-     * cannot tell from the records themselves: bucket 0 means "not recorded",
-     * and a shard whose games were all cut short is legitimately all zeros. */
+
     bool gameProgress;
-    /* Where a label came from. "game" is the score the game's own search
-     * returned for that position; "search" is a fixed-node search from a
-     * cleared engine, which is what `label` does and the only kind that
-     * reproduces on its own. `verify -relabel` reads this before it offers to
-     * check anything. */
+
     const char *labels;
-    /* filters */
+
     int maxScore;
     bool quietFilter;
-    /* Tablebase provenance, purely informational: nothing reads these back.
-     * A shard labelled with tablebases and one labelled without are simply
-     * never mixed, and `verify -relabel` run with a different -syzygy setting
-     * fails loudly on its own because the labels stop reproducing. */
+
     const char *syzygyPath;
     int syzygyMen;
 } Manifest;
 
+/* Everything a file header would have carried. A node count, a loss curve or an Elo result
+ * that cannot be attributed to a specific dataset is not a measurement, so a shard whose
+ * manifest is missing is a shard that cannot be trusted. */
 static void manifest_write(const char *shardPath, const Manifest *m, uint64_t records,
                            const uint64_t *bySource, bool policy) {
     char path[PATH_CAP];
@@ -1014,7 +865,7 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     if (m->labels)
         json_string(f, m->labels);
     else
-        fprintf(f, "null"); /* a pass that only moved records and did not read them */
+        fprintf(f, "null");
     fprintf(f, ",\n");
     fprintf(f, "  \"max_score\": %d,\n", m->maxScore);
     fprintf(f, "  \"quiet_filter\": %s,\n", m->quietFilter ? "true" : "false");
@@ -1029,9 +880,7 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     if (m->games) {
         fprintf(f, "  \"selfplay\": {\n");
         fprintf(f, "    \"games\": %d,\n", m->games);
-        /* Which book, and how many entries it indexed. The name alone does not
-         * pin a dataset: a book that grew between two generations is a
-         * different sampler wearing the same filename. */
+
         fprintf(f, "    \"book\": ");
         if (m->book)
             json_string(f, m->book);
@@ -1039,9 +888,7 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
             fprintf(f, "null");
         fprintf(f, ",\n");
         fprintf(f, "    \"book_entries\": %llu,\n", (unsigned long long)m->bookEntries);
-        /* Both bounds, always. The old key keeps its old meaning - the low one -
-         * so a reader that predates the range still gets a number it can trust,
-         * and one that reads only it is off by at most a ply. */
+
         fprintf(f, "    \"opening_plies\": %d,\n", m->openingPlies);
         fprintf(f, "    \"opening_plies_max\": %d,\n", m->openingPliesMax);
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
@@ -1064,25 +911,8 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
     fclose(f);
 }
 
-/*
- * Reads one integer field back out of a shard's manifest.
- *
- * Deliberately a scanner and not a parser: the fields `verify` needs are the
- * flat integers manifest_write emits one per line, and a JSON parser here
- * would be a dependency earned by two call sites. The pattern matched is
- * exactly what is written above - `"key": <int>` - so a nested key of the same
- * name is unreachable, which is the one ambiguity worth caring about.
- *
- * False when there is no manifest or no such field. That is not an error: a
- * shard from an older datagen, or one whose .json did not travel with it,
- * still verifies - just against the caller's defaults.
- */
 static bool manifest_int(const char *shardPath, const char *key, int *out);
 
-/* The same, for a string field. One key needs it - "labels", which says
- * whether a shard's scores were produced by the games that played them or by a
- * search that can be run again - and that one decides whether `verify
- * -relabel` has anything it can check. */
 static bool manifest_str(const char *shardPath, const char *key, char *out, size_t cap) {
     char path[PATH_CAP];
     replace_ext(path, sizeof(path), shardPath, ".json");
@@ -1113,6 +943,10 @@ static bool manifest_str(const char *shardPath, const char *key, char *out, size
     return found;
 }
 
+/* Deliberately a scanner and not a parser: the fields `verify` needs are the flat integers
+ * manifest_write emits one per line, and a JSON parser here would be a dependency earned by
+ * two call sites. False when there is no manifest or no such field, which is not an error -
+ * a shard from an older datagen still verifies, against the caller's defaults. */
 static bool manifest_int(const char *shardPath, const char *key, int *out) {
     char path[PATH_CAP];
     replace_ext(path, sizeof(path), shardPath, ".json");
@@ -1143,9 +977,8 @@ static bool manifest_int(const char *shardPath, const char *key, int *out) {
     return found;
 }
 
-/* The same, for a boolean field - `true` or `false` as manifest_write emits
- * them. manifest_int cannot stand in: strtol on " true" consumes nothing and
- * the field would read as absent rather than as false. */
+/* manifest_int cannot stand in: strtol on " true" consumes nothing, and the field would
+ * read as absent rather than as false. */
 static bool manifest_bool(const char *shardPath, const char *key, bool *out) {
     char path[PATH_CAP];
     replace_ext(path, sizeof(path), shardPath, ".json");
@@ -1177,17 +1010,10 @@ static bool manifest_bool(const char *shardPath, const char *key, bool *out) {
     return found;
 }
 
-/*
- * Whether a shard has a manifest beside it at all.
- *
- * "No manifest" and "a manifest without this field" are different failures and
- * only the first is worth shouting about: a shard from an older datagen
- * legitimately lacks fields that did not exist yet, but a shard with no .json
- * has lost its provenance entirely, and anything built from it inherits
- * nothing. Silently writing zeros for that case is how a merged dataset comes
- * to claim it was labelled at 0 nodes with no tablebases - which is exactly
- * what `verify -relabel` then tries to reproduce.
- */
+/* "No manifest" and "a manifest without this field" are different failures and only the
+ * first is worth shouting about: a shard with no .json has lost its provenance entirely,
+ * and silently writing zeros for that case is how a merged dataset comes to claim it was
+ * labelled at 0 nodes with no tablebases. */
 static bool manifest_exists(const char *shardPath) {
     char path[PATH_CAP];
     replace_ext(path, sizeof(path), shardPath, ".json");
@@ -1199,13 +1025,9 @@ static bool manifest_exists(const char *shardPath) {
     return true;
 }
 
-/* ========================================================================== *
- *  Shard writer
- * ========================================================================== */
-
 typedef struct {
     FILE *rec;
-    FILE *pol; /* NULL when the policy sidecar is switched off */
+    FILE *pol;
     char recPath[PATH_CAP];
     uint64_t count;
     uint64_t bySource[SRC_NB];
@@ -1250,49 +1072,30 @@ static void shard_close(ShardWriter *w, const Manifest *m) {
         fclose(w->pol);
     manifest_write(w->recPath, m, w->count, w->bySource, w->pol != NULL);
 
-    /* Unconditional, so that "a manifest exists" and "a checkpoint exists" can
-     * never both be true: the first means the shard is finished, the second
-     * that it is not. remove() on a shard that was never checkpointed fails
-     * harmlessly. */
     char resumePath[PATH_CAP];
     replace_ext(resumePath, sizeof(resumePath), w->recPath, ".resume");
     remove(resumePath);
 }
 
-/* ========================================================================== *
- *  Resuming an interrupted run
- * ========================================================================== */
-
 /*
- * Labelling 22.6M positions at 10,000 nodes is a five-hour run, and without
- * this a machine that reboots four hours in has produced nothing: shard_open()
- * opens with "wb", so the obvious response - run the same command again -
- * starts from the first line.
+ * Resuming an interrupted run. Labelling 22.6M positions at 10,000 nodes is a five-hour
+ * run, and shard_open() opens with "wb", so without this the obvious response to a reboot
+ * four hours in starts from the first line.
  *
- * The checkpoint is a file of its own rather than a field in the manifest, for
- * two reasons. The manifest is JSON, and reading it back would need a parser
- * this file does not have. And the manifest already MEANS something: it is
- * written once, at the end, and its presence is what makes a shard
- * trustworthy. A `.resume` file present means precisely the opposite, so the
- * two are never consulted together and never disagree.
+ * The checkpoint is its own file rather than a manifest field, because the manifest is
+ * written once at the end and its presence is what makes a shard trustworthy - a `.resume`
+ * file present means precisely the opposite, so the two never disagree. What makes it safe
+ * is that the checkpoint is a LOWER bound: resuming TRUNCATES back to the recorded count,
+ * so a resumed shard can never hold a torn or duplicated record.
  *
- * What makes this safe is that the checkpoint is a LOWER bound. The shard on
- * disk may hold more records than the checkpoint claims - the process died
- * between a write and the next checkpoint - so resuming TRUNCATES back to the
- * recorded count and re-labels from the recorded line. Records are never
- * appended after a point the checkpoint did not cover, which is what stops a
- * resumed shard from holding a torn record or a duplicated one.
+ * This is the most re-labelling an interruption can cost, against one flush and a 64-byte
+ * write per interval.
  */
-
-/* The most re-labelling an interruption can cost, against one flush and a
- * 64-byte write per interval. */
 #define CHECKPOINT_SECONDS 30.0
 
 #define RESUME_MAGIC   "CKRESUME"
 #define RESUME_VERSION 1
-#define RESUME_BYTES                                        \
-    64 /* fixed, and written in one fwrite, so a checkpoint \
-          is never half-updated */
+#define RESUME_BYTES   64
 
 #if defined(_WIN32)
 #include <io.h>
@@ -1310,9 +1113,8 @@ static bool file_exists(const char *path) {
     return true;
 }
 
-/* The checkpoint, or false when there is none. A checkpoint that exists and
- * cannot be read is fatal rather than ignored: carrying on would append to a
- * shard whose contents are unknown, and silently produce duplicates. */
+/* The checkpoint, or false when there is none. One that exists and cannot be read is fatal
+ * rather than ignored: carrying on would append to a shard whose contents are unknown. */
 static bool resume_read(const char *path, uint64_t *records, long *nextLine) {
     FILE *f = fopen(path, "rb");
     if (!f)
@@ -1354,15 +1156,9 @@ static void resume_write(const char *path, uint64_t records, long nextLine) {
     fclose(f);
 }
 
-/*
- * Restores what the in-memory writer state would have been: the per-source
- * counts the manifest reports, and - when dedup is on - the key set.
- *
- * Rebuilding the key set rather than starting it empty is what makes a resumed
- * shard byte-identical to an uninterrupted one. Without it the second half of
- * the run cannot see the first half's positions, and the shard quietly holds
- * duplicates that no test looks for.
- */
+/* Restores what the in-memory writer state would have been. Rebuilding the key set rather
+ * than starting it empty is what makes a resumed shard byte-identical to an uninterrupted
+ * one: without it the second half of the run cannot see the first half's positions. */
 static void shard_rescan(ShardWriter *w, KeySet *seen) {
     if (fseek64(w->rec, 0, SEEK_SET) != 0)
         dief("cannot rewind %s to rescan it", w->recPath);
@@ -1387,15 +1183,14 @@ static void shard_rescan(ShardWriter *w, KeySet *seen) {
 }
 
 typedef enum {
-    SHARD_FRESH,    /* nothing on disk; opened truncating */
-    SHARD_RESUMED,  /* opened at a checkpoint, *resumeFrom is where to pick up */
-    SHARD_COMPLETE, /* a finished shard is already there; nothing opened */
+    SHARD_FRESH,
+    SHARD_RESUMED,
+    SHARD_COMPLETE,
 } ShardOpen;
 
-/*
- * shard_open(), plus the three states a shard can already be in. `seen` may be
- * NULL when dedup is off.
- */
+/* shard_open(), plus the three states a shard can already be in. `seen` may be NULL when
+ * dedup is off, and the file is reopened "r+b" rather than "ab" because it has to be
+ * truncated back to the checkpoint before anything is appended. */
 static ShardOpen shard_open_resumable(ShardWriter *w, const char *path, bool policy,
                                       long *resumeFrom, KeySet *seen) {
     memset(w, 0, sizeof(*w));
@@ -1421,8 +1216,6 @@ static ShardOpen shard_open_resumable(ShardWriter *w, const char *path, bool pol
         return SHARD_FRESH;
     }
 
-    /* "r+b", not "ab": the file has to be truncated back to the checkpoint
-     * before anything is appended, and append mode cannot be positioned. */
     w->rec      = xfopen(path, "r+b");
     w->count    = records;
     *resumeFrom = nextLine;
@@ -1459,9 +1252,9 @@ static ShardOpen shard_open_resumable(ShardWriter *w, const char *path, bool pol
     return SHARD_RESUMED;
 }
 
-/* Makes everything written so far durable, then records how far the INPUT got.
- * The flush has to come first: a checkpoint ahead of the data it describes is
- * the one ordering that cannot be recovered from. */
+/* Makes everything written so far durable, then records how far the INPUT got. The flush
+ * has to come first: a checkpoint ahead of the data it describes is the one ordering that
+ * cannot be recovered from. */
 static void shard_checkpoint(ShardWriter *w, long nextLine) {
     if (fflush(w->rec) != 0)
         dief("cannot flush %s", w->recPath);
@@ -1473,23 +1266,11 @@ static void shard_checkpoint(ShardWriter *w, long nextLine) {
     resume_write(resumePath, w->count, nextLine);
 }
 
-/* ========================================================================== *
- *  Labelling - the one definition, used by every subcommand that writes
- * ========================================================================== */
-
-/*
- * Scores `pos` with a fixed-node search from a cleared engine.
- *
- * `pos` MUST have come from board_set_fen. A position carried in from a game
- * brings its repetition history with it, and board_is_draw then scores it
- * differently from the same FEN parsed on its own - which would make the label
- * a function of the game rather than of the position, and `verify -relabel`
- * would (correctly) fail.
- */
+/* Scores `pos` with a fixed-node search from a cleared engine. `pos` MUST have come from
+ * board_set_fen: a position carried in from a game brings its repetition history with it,
+ * which would make the label a function of the game rather than of the position and would
+ * (correctly) fail `verify -relabel`. */
 static void label_position(const Position *pos, int nodes, SearchResult *out) {
-    /* search_clear drops the transposition table, the history tables, the
-     * killers and the continuation history: everything that carries from one
-     * search to the next. */
     search_clear();
 
     SearchLimits limits;
@@ -1499,8 +1280,8 @@ static void label_position(const Position *pos, int nodes, SearchResult *out) {
     search_run_sync(pos, &limits, out);
 }
 
-/* Returns false for a FEN that will not parse, and for a terminal position -
- * a checkmate or stalemate has no score worth training on. */
+/* False for a FEN that will not parse, and for a terminal position - a checkmate or
+ * stalemate has no score worth training on. */
 static bool label_fen(const char *fen, int nodes, Position *pos, SearchResult *out) {
     if (!board_set_fen(pos, fen))
         return false;
@@ -1508,8 +1289,8 @@ static bool label_fen(const char *fen, int nodes, Position *pos, SearchResult *o
     return out->score != VALUE_NONE && is_ok_move(out->best);
 }
 
-/* Castling is encoded king-takes-own-rook, so its destination square is
- * occupied by our own rook and must not be read as a capture. */
+/* Castling is encoded king-takes-own-rook, so its destination is occupied by our own rook
+ * and must not be read as a capture. */
 static bool move_is_tactical(const Position *pos, Move m) {
     const MoveType mt = type_of_move(m);
     if (mt == MT_PROMOTION || mt == MT_EN_PASSANT)
@@ -1517,16 +1298,10 @@ static bool move_is_tactical(const Position *pos, Move m) {
     return mt != MT_CASTLING && piece_on(pos, to_sq(m)) != NO_PIECE;
 }
 
-/* ========================================================================== *
- *  Worker processes
- * ========================================================================== */
-
 static bool is_help(const char *arg) {
     return !strcmp(arg, "-h") || !strcmp(arg, "-help") || !strcmp(arg, "--help");
 }
 
-/* True if any argument asks for help, so a parser can answer before it starts
- * rejecting things. */
 static bool wants_help(int argc, char **argv) {
     for (int i = 0; i < argc; ++i)
         if (is_help(argv[i]))
@@ -1536,8 +1311,8 @@ static bool wants_help(int argc, char **argv) {
 
 typedef int (*WorkerFn)(int index, int workers, void *ctx);
 
-/* Set from `--worker N`: this process is a child and must do exactly one
- * worker's share rather than spawning any more. */
+/* Set from `--worker N`: this process is a child and must do exactly one worker's share
+ * rather than spawning any more. */
 static int WorkerOverride = -1;
 static bool Quiet         = false;
 
@@ -1557,8 +1332,6 @@ static int spawn_children(int workers) {
         memset(&pi, 0, sizeof(pi));
         si.cb = sizeof(si);
 
-        /* Children inherit stdout, so their progress lines interleave with
-         * ours; each is written with a single fprintf to keep them whole. */
         if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
             fprintf(stderr, "datagen: CreateProcess failed for worker %d (error %lu)\n", i,
                     (unsigned long)GetLastError());
@@ -1583,13 +1356,10 @@ static int spawn_children(int workers) {
 }
 #endif
 
-/*
- * Runs `fn` in `workers` separate processes and returns the worst exit code.
- *
- * POSIX forks and keeps going in the child; Windows has no fork, so the parent
- * re-launches its own command line with `--worker N` appended and the child
- * lands back here with WorkerOverride set.
- */
+/* Runs `fn` in `workers` separate processes and returns the worst exit code. POSIX forks
+ * and keeps going in the child; Windows has no fork, so the parent re-launches its own
+ * command line with `--worker N` appended and the child lands back here with WorkerOverride
+ * set. Nothing is shared either way, which is the point. */
 static int run_workers(int workers, WorkerFn fn, void *ctx) {
     if (WorkerOverride >= 0)
         return fn(WorkerOverride, workers, ctx);
@@ -1610,8 +1380,6 @@ static int run_workers(int workers, WorkerFn fn, void *ctx) {
             return 1;
         }
         if (pid == 0) {
-            /* The child inherits an initialised engine and its own copy of the
-             * transposition table; nothing is shared, which is the point. */
             _exit(fn(i, workers, ctx) ? 1 : 0);
         }
         pids[i] = pid;
@@ -1628,18 +1396,10 @@ static int run_workers(int workers, WorkerFn fn, void *ctx) {
 #endif
 }
 
-/*
- * Loads tablebases for this process, and says which world the run is in -
- * loudly, once, because a shard labelled with tablebases and one labelled
- * without mean different things by the same bytes and are never mixed. A path
- * that yields no tables dies rather than degrading: a run that silently fell
- * back to search-only labels would produce exactly the mix-up the message
- * exists to prevent.
- *
- * Every worker process arrives here on its own: the Windows re-launch carries
- * -syzygy on the command line it copies, and a POSIX fork inherits the
- * parent's already-initialised tables.
- */
+/* Says which world the run is in - loudly, once, because a shard labelled with tablebases
+ * and one labelled without mean different things by the same bytes and are never mixed. A
+ * path that yields no tables dies rather than degrading, since a run that silently fell
+ * back to search-only labels would produce exactly that mix-up. */
 static void setup_syzygy(const char *path) {
     if (path == NULL) {
         if (WorkerOverride < 0)
@@ -1653,10 +1413,6 @@ static void setup_syzygy(const char *path) {
         fprintf(stderr, "syzygy: %d-man tablebases at %s\n", syzygy_max_pieces(), path);
 }
 
-/* ========================================================================== *
- *  Subcommand: selfplay
- * ========================================================================== */
-
 typedef struct {
     const char *out;
     int games;
@@ -1665,13 +1421,13 @@ typedef struct {
     int threads;
     uint64_t seed;
 
-    const char *book;    /* EPD of start positions, or NULL for the start position */
-    int openingPlies;    /* random plies before the game starts, low bound, inclusive */
-    int openingPliesMax; /* high bound, inclusive; equal to the low one for a fixed count */
+    const char *book;
+    int openingPlies;
+    int openingPliesMax;
     int openingMaxScore;
 
     int maxPlies;
-    const char *syzygyPath; /* NULL plays and labels endgames from the search alone */
+    const char *syzygyPath;
 
     int maxScore;
     bool quietFilter;
@@ -1681,21 +1437,6 @@ typedef struct {
     bool resume;
 } SelfplayOpts;
 
-/*
- * A record whose position, label and best move are all settled, waiting only
- * for the game to end.
- *
- * The label is the score the game's own search returned for this position, so
- * there is nothing left to compute: the record is packed the moment the search
- * that produced it finishes. What it cannot know yet is who won, and how many
- * plies away that was - so `stm` and `ply` ride along, and the two result
- * fields are patched in once the game is over.
- *
- * This is why a game buffers records rather than positions. It used to buffer
- * FENs and re-search every one from a cleared engine after the game, which
- * doubled the cost of a generation run to buy a label that measured 1.2 plies
- * SHALLOWER than the one already in hand and no less biased (E26).
- */
 typedef struct {
     Record rec;
     PolicyRecord pol;
@@ -1708,6 +1449,11 @@ typedef struct {
     size_t count, cap;
 } PendingList;
 
+/* A record whose position, label and best move are settled, waiting only for the game to
+ * end: the label is the score the game's own search returned, so `stm` and `ply` ride along
+ * and the two result fields are patched in afterwards. Buffering records rather than
+ * positions is E26 - re-searching every FEN after the game doubled the cost of a run to buy
+ * a label 1.2 plies SHALLOWER and no less biased. */
 static Pending *pending_push(PendingList *pl) {
     if (pl->count == pl->cap) {
         pl->cap   = pl->cap ? pl->cap * 2 : 256;
@@ -1718,15 +1464,11 @@ static Pending *pending_push(PendingList *pl) {
     return &pl->items[pl->count++];
 }
 
-/* Game result, always from white's point of view. RES_UNKNOWN is a game cut
- * short - the ply cap, or a search that failed to produce a move - and it
- * matters that it is NOT a draw: stamping WDL_DRAW on a game that was merely
- * abandoned mid-grind teaches the net that unconverted advantages are draws,
- * which is the exact feedback loop the adjudication removal exists to break.
- * WDL_UNKNOWN records train on their search score alone (the trainer falls
- * back to lambda = 1), so an unfinished game contributes no result at all. */
 typedef enum { RES_WHITE, RES_DRAW, RES_BLACK, RES_UNKNOWN } GameResult;
 
+/* RES_UNKNOWN is a game cut short, and it matters that it is NOT a draw: stamping WDL_DRAW
+ * on a game that was merely abandoned mid-grind teaches the net that unconverted advantages
+ * are draws, which is the feedback loop the adjudication removal exists to break. */
 static int wdl_for(GameResult r, Color stm) {
     if (r == RES_UNKNOWN)
         return WDL_UNKNOWN;
@@ -1737,24 +1479,14 @@ static int wdl_for(GameResult r, Color stm) {
 }
 
 /*
- * Plays `plies` uniformly random legal moves from `pos` as it already stands.
- * Everything after this is deterministic - fixed nodes, one worker thread, no
- * randomisation in move choice - so these plies are the ONLY variation two
- * games from the same start position ever get.
+ * Plays `plies` uniformly random legal moves. Everything after this is deterministic -
+ * fixed nodes, one worker thread, no randomisation in move choice - so these plies are the
+ * ONLY variation two games from the same start position ever get, which is why the count
+ * wants to be small when a book supplies the start.
  *
- * Which is why the count wants to be small when a book supplies the start: two
- * games sharing a book line and differing by a couple of random plies then play
- * out deterministically from near-identical positions, and the difference in
- * their results is attributable to the perturbation rather than to noise.
- *
- * The count's PARITY is a separate matter, and it is why the caller draws it
- * from a range rather than fixing it. A book extracted at one ply has one side
- * to move on every line of it - `tuner extract -minply 20 -maxply 20` gives
- * white on all of them - so a fixed EVEN count hands the engine white to move
- * at the start of every game in a generation, and a fixed odd one hands it
- * black. Alternating between two adjacent counts splits that evenly, and it is
- * the only place the split can be fixed: the sampler keeps whichever positions
- * the games walk through, and it cannot recover a parity the games never had.
+ * The count's PARITY is a separate matter and is why the caller draws it from a range: a
+ * book extracted at one ply has one side to move on every line, so a fixed even count hands
+ * the engine white at the start of every game and a fixed odd one black.
  */
 static bool random_opening(Position *pos, int plies, Rng *rng) {
     for (int i = 0; i < plies; ++i) {
@@ -1782,17 +1514,12 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     char path[PATH_CAP];
     expand_path(path, sizeof(path), o->out, index, workers);
 
-    /* Games are dealt out round-robin by GLOBAL ordinal, exactly as `label`
-     * splits its input by line, and each one is seeded from that ordinal
-     * alone - so game g is the same game whatever worker draws it and however
-     * many workers there are. That is what makes -resume possible at all: a
-     * stream advanced game by game could only be rejoined by replaying every
-     * draw before it, and the draws per game vary with rejected openings. */
     int games = 0;
     for (int g = index; g < o->games; g += workers)
         ++games;
-    /* Overwritten per game below. It is seeded here at all so that the tree
-     * sampler's pointer never aims at an indeterminate value. */
+
+    /* Overwritten per game below; seeded here at all so the tree sampler's pointer never
+     * aims at an indeterminate value. */
     Rng rng = worker_rng(o->seed, index);
 
     tt_resize((size_t)o->hashMb);
@@ -1837,25 +1564,27 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     double lastCheckpoint = start;
     int played            = 0;
 
+    /* Games are dealt out round-robin by GLOBAL ordinal and each is seeded from that ordinal
+     * alone, so game g is the same game whatever worker draws it and however many workers
+     * there are. That is what makes -resume possible: a stream advanced game by game could
+     * only be rejoined by replaying every draw before it. */
     for (int game = index; game < o->games; game += workers) {
         if (game < resumeFrom) {
             ++played;
             continue;
         }
 
-        /* Between games, never inside one: the checkpoint's contract is that
-         * everything before the recorded game is on disk and complete, and a
-         * game's records are all written after its result is known. */
         if (o->resume) {
             const double now = now_seconds();
+            /* Between games, never inside one: the checkpoint's contract is that everything
+             * before the recorded game is on disk and complete. */
             if (now - lastCheckpoint > CHECKPOINT_SECONDS) {
                 shard_checkpoint(&writer, game);
                 lastCheckpoint = now;
             }
         }
 
-        /* Reseeded per game rather than carried, so that game g reproduces from
-         * (seed, g) alone. See the note on the game loop above. */
+        /* Reseeded per game rather than carried, so game g reproduces from (seed, g) alone. */
         rng = game_rng(o->seed, game);
 
         int attempts = 0;
@@ -1864,10 +1593,9 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         pending.count = 0;
 
         for (;;) {
-            /* Reached by a book line this build cannot set up, and by an
-             * opening the search says is already decided. Both are normal a few
-             * times; a hundred in a row means -openingscore is tighter than the
-             * book is balanced, or the file is not a book at all. */
+            /* Reached by a book line this build cannot set up, and by an opening the search
+             * says is already decided. Both are normal a few times; a hundred in a row means
+             * -openingscore is tighter than the book is balanced. */
             if (++attempts > 100)
                 dief("no playable opening in 100 attempts (%s, -openingscore %d)",
                      o->book ? o->book : "start position", o->openingMaxScore);
@@ -1882,20 +1610,18 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 board_set_startpos(&pos);
             }
 
-            /* Drawn per attempt, not per game, so a rejected opening is retried
-             * with a fresh count as well as a fresh line. rng_below returns
-             * without consuming a draw when the range is one wide, so a fixed
-             * -opening N leaves the stream exactly where it was and reproduces
-             * every shard generated before the range existed. */
+            /* Drawn per attempt, not per game, so a rejected opening is retried with a fresh
+             * count as well as a fresh line. rng_below returns without consuming a draw when
+             * the range is one wide, so a fixed -opening N reproduces every shard generated
+             * before the range existed. */
             const int plies =
                 o->openingPlies +
                 (int)rng_below(&rng, (uint64_t)(o->openingPliesMax - o->openingPlies + 1));
             if (!random_opening(&pos, plies, &rng))
                 continue;
 
-            /* A fresh set of tables per game, so a game cannot be steered by
-             * the game before it. Inside the game the table stays warm: this
-             * is play, not labelling. */
+            /* A fresh set of tables per game, so a game cannot be steered by the game before
+             * it. Inside the game the table stays warm: this is play, not labelling. */
             search_clear();
             pending.count = 0;
 
@@ -1914,21 +1640,20 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 if (legalCount == 0) {
                     result = board_checkers(&pos)
                                  ? (pos.sideToMove == WHITE ? RES_BLACK : RES_WHITE)
-                                 : RES_DRAW; /* stalemate */
+                                 : RES_DRAW;
                     break;
                 }
-                /* The fifty-move rule, threefold repetition and insufficient
-                 * material are the ONLY draws: there is no adjudication. A
-                 * game the engine cannot finish is exactly the game whose
-                 * grind we want on the record - and whose result we must not
-                 * invent. The ply cap below therefore ends the game as
-                 * RES_UNKNOWN, never as a draw. */
+
+                /* The fifty-move rule, threefold repetition and insufficient material are the
+                 * ONLY draws: there is no adjudication. A game the engine cannot finish is
+                 * exactly the game whose grind we want on the record, and whose result we
+                 * must not invent - so the ply cap below ends it as RES_UNKNOWN. */
                 if (board_is_draw(&pos, 0)) {
                     result = RES_DRAW;
                     break;
                 }
                 if (pos.gamePly >= o->maxPlies)
-                    break; /* result stays RES_UNKNOWN */
+                    break;
 
                 SearchLimits limits;
                 search_limits_clear(&limits);
@@ -1940,32 +1665,21 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 if (!is_ok_move(res.best) || res.score == VALUE_NONE)
                     break;
 
-                /* A randomised opening that is already decided teaches the net
-                 * nothing about the middlegame, so the game is thrown away
-                 * rather than played out.
-                 *
-                 * Against `plies`, the count THIS game drew, and not against the
-                 * option: board_set_fen zeroes gamePly, so the post-opening
-                 * position is at gamePly == plies, and testing the low bound of
-                 * a range would silently stop screening every game that drew
-                 * anything else. */
+                /* A randomised opening that is already decided teaches the net nothing about
+                 * the middlegame, so the game is thrown away rather than played out. Tested
+                 * against `plies`, the count THIS game drew: board_set_fen zeroed gamePly, so
+                 * testing a range's low bound would silently stop screening most games. */
                 if (pos.gamePly == plies && iabs(res.score) > o->openingMaxScore) {
                     ++rejected;
                     restart = true;
                     break;
                 }
 
-                /*
-                 * THE LABEL IS THIS SEARCH. The record is built here, from the
-                 * position in hand, and only its result fields are filled in
-                 * once the game ends - see the note on `pending` above.
-                 *
-                 * Both filters run before anything is stored, because both can
-                 * be answered from a search that has already happened: nothing
-                 * downstream is paid for a position that is about to be
-                 * dropped. Promotions join captures in the quiet filter - a
-                 * promotion moves as much material as one does.
-                 */
+                /* THE LABEL IS THIS SEARCH: the record is built here from the position in hand,
+                 * and only its result fields are filled in once the game ends. Both filters
+                 * run before anything is stored, because both can be answered from a search
+                 * that has already happened - and promotions join captures in the quiet
+                 * filter, since a promotion moves as much material as one does. */
                 if (board_checkers(&pos) == BB_EMPTY &&
                     !(o->maxScore > 0 && iabs(res.score) > o->maxScore) &&
                     !(o->quietFilter && move_is_tactical(&pos, res.best)) &&
@@ -1983,25 +1697,21 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 board_do_move(&pos, res.best);
             }
 
-            /* Where the game stopped, in the same gamePly units the candidates
-             * recorded - board_set_fen zeroed it at the start position, so the
-             * difference between the two is a ply count and nothing else. */
+            /* Where the game stopped, in the same gamePly units the candidates recorded -
+             * board_set_fen zeroed it at the start position, so the difference between the
+             * two is a ply count and nothing else. */
             finalPly = pos.gamePly;
 
             if (!restart)
                 break;
         }
 
-        /*
-         * The result is the only thing a record could not know while the game
-         * was still running, so it is the only thing patched in here.
-         */
         for (size_t i = 0; i < pending.count; ++i) {
             Pending *pd = &pending.items[i];
 
-            /* No result, no distance to it: a game the ply cap stopped has an
-             * end nobody reached, and inventing a distance to it would be the
-             * same mistake as inventing the draw. */
+            /* The result is the only thing a record could not know while the game was running, so
+             * it is the only thing patched in. No result means no distance to it: inventing one
+             * would be the same mistake as inventing the draw. */
             const int pliesToEnd = result == RES_UNKNOWN ? -1 : finalPly - pd->ply;
 
             pd->rec.wdl = (uint8_t)wdl_for(result, pd->stm);
@@ -2031,9 +1741,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.command = "selfplay";
     man.nodes   = o->nodes;
     man.hashMb  = o->hashMb;
-    /* The base seed, not this worker's derived one: games are keyed on their
-     * global ordinal now, so base + ordinal is what reproduces one and the
-     * derived stream reproduces nothing. */
+
     man.seed            = o->seed;
     man.dedup           = o->dedup;
     man.games           = games;
@@ -2044,7 +1752,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.openingMaxScore = o->openingMaxScore;
     man.maxPlies        = o->maxPlies;
     man.gameProgress    = true;
-    /* The game's own search IS the label now; nothing is re-searched. */
+
     man.labels      = "game";
     man.maxScore    = o->maxScore;
     man.quietFilter = o->quietFilter;
@@ -2063,15 +1771,12 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     return 0;
 }
 
-/*
- * `-opening N` is exactly N plies; `-opening MIN-MAX` draws uniformly from
- * [MIN, MAX] per game. Parsed by hand rather than with atoi because atoi reads
- * "2-3" as 2 and discards the rest without a word - and a range silently
- * collapsed to its low bound is a generation whose games all start on one side
- * to move, which is the exact thing the range exists to prevent.
- */
+/* `-opening N` is exactly N plies; `-opening MIN-MAX` draws uniformly from [MIN, MAX] per
+ * game. Parsed by hand rather than with atoi, which reads "2-3" as 2 and discards the rest
+ * without a word - and a range silently collapsed to its low bound is a generation whose
+ * games all start on one side to move. */
 static bool parse_ply_range(const char *s, int *lo, int *hi) {
-    enum { PLY_CAP = 200 }; /* generous; -maxplies caps the game itself at 400 */
+    enum { PLY_CAP = 200 };
     char *end;
     const long a = strtol(s, &end, 10);
     if (end == s || a < 0 || a > PLY_CAP)
@@ -2169,17 +1874,19 @@ static int cmd_selfplay(int argc, char **argv) {
     o.threads = 1;
     o.seed    = 1;
     o.book    = NULL;
-    /* Resolved below, once it is known whether a book was given: 8 random plies
-     * are how a game from the start position gets anywhere at all, and are far
-     * too many to play on top of a book line that was chosen for its depth. */
+
+    /* Resolved below, once it is known whether a book was given: 8 random plies are how a
+     * game from the start position gets anywhere at all, and are far too many to play on top
+     * of a book line chosen for its depth. */
     o.openingPlies    = -1;
     o.openingPliesMax = -1;
     o.openingMaxScore = 800;
     o.maxPlies        = 400;
-    o.syzygyPath      = NULL;
-    /* 0: games are now played to their natural end, and the conversion of a
-     * decisive advantage is precisely the technique gen-5 onward trains -
-     * capping the label magnitude would drop every position of the grind. */
+    /* 0: games are played to their natural end, and the conversion of a decisive advantage
+     * is precisely what gen-5 onward trains - capping the label magnitude would drop every
+     * position of the grind. */
+    o.syzygyPath = NULL;
+
     o.maxScore    = 0;
     o.quietFilter = true;
     o.dedup       = true;
@@ -2238,13 +1945,10 @@ static int cmd_selfplay(int argc, char **argv) {
         die("-threads must be between 1 and 64");
     if (o.dedupBits < 10 || o.dedupBits > 30)
         die("-dedupbits must be between 10 and 30");
-    /*
-     * A game and the searches inside it share one Position, so its history has
-     * to hold the game's plies AND the deepest search's on top of them.
-     * board.h sizes that array at MAX_GAME_PLY; the cap used to be an
-     * unvalidated atoi, and `-maxplies 4000` wrote past the end of it several
-     * hours into a run rather than at the command line.
-     */
+
+    /* A game and the searches inside it share one Position, so its history has to hold the
+     * game's plies AND the deepest search's on top. The cap used to be an unvalidated atoi,
+     * and `-maxplies 4000` wrote past the end of that array hours into a run. */
     if (o.maxPlies < 2 || o.maxPlies > MAX_GAME_PLY - MAX_PLY - 1)
         dief("-maxplies must be between 2 and %d - a game's plies and the deepest search's "
              "share one %d-entry history",
@@ -2253,14 +1957,14 @@ static int cmd_selfplay(int argc, char **argv) {
         o.openingPlies = o.book ? 2 : 8;
     if (o.openingPliesMax < o.openingPlies)
         o.openingPliesMax = o.openingPlies;
-    /* Every worker opens the book for itself, so an unreadable one is N
-     * identical deaths several seconds in. Say it once, here, first. */
+
+    /* Every worker opens the book for itself, so an unreadable one is N identical deaths
+     * several seconds in. Say it once, here, first. */
     if (o.book) {
         FILE *probe = xfopen(o.book, "rb");
         fclose(probe);
     }
 
-    /* Once, here, rather than N times inside N workers. */
     char probe[PATH_CAP];
     expand_path(probe, sizeof(probe), o.out, 0, o.threads);
     ensure_parent_dir(probe);
@@ -2270,10 +1974,6 @@ static int cmd_selfplay(int argc, char **argv) {
     return run_workers(o.threads, selfplay_worker, &o);
 }
 
-/* ========================================================================== *
- *  Subcommand: label
- * ========================================================================== */
-
 typedef struct {
     const char *out;
     char **inputs;
@@ -2282,10 +1982,7 @@ typedef struct {
     int hashMb;
     int threads;
     int stride;
-    /* PER WORKER, not in total: with -threads 4 -max 1000 each of the four
-     * shards holds 1000 records. Capping the total instead would need the
-     * workers to agree on a count, and they are separate processes precisely
-     * so that they share nothing. */
+
     long max;
     long skip;
     SourceTag source;
@@ -2306,8 +2003,6 @@ static int label_worker(int index, int workers, void *ctx) {
 
     tt_resize((size_t)o->hashMb);
 
-    /* The key set comes first: a resumed shard replays its own records into it,
-     * so that the second half of a run can see the first half's positions. */
     KeySet seen;
     if (o->dedup)
         keyset_init(&seen, o->dedupBits);
@@ -2335,7 +2030,7 @@ static int label_worker(int index, int workers, void *ctx) {
     const double start    = now_seconds();
     double lastReport     = start;
     double lastCheckpoint = start;
-    long eligible         = 0; /* lines that passed -skip and -stride, all workers */
+    long eligible         = 0;
     uint64_t labelled     = 0;
 
     char line[512];
@@ -2356,25 +2051,23 @@ static int label_worker(int index, int workers, void *ctx) {
                 continue;
             if (o->stride > 1 && (ordinal - o->skip) % o->stride)
                 continue;
-            /* Workers split the file by line rather than by offset, so any
-             * worker count reads the same lines in the same order. */
+
+            /* Workers split the file by LINE rather than by offset, so any worker count reads
+             * the same lines in the same order - and the split is applied after -skip and
+             * -stride, never before, or a resumed run would get a different set. */
             if (((ordinal - o->skip) / (o->stride > 1 ? o->stride : 1)) % workers != index)
                 continue;
 
-            /* Applied AFTER the worker split, never before: the split is
-             * `(ordinal - skip) / stride % workers`, so anything that shifted
-             * the ordinals would hand this worker a different set of lines
-             * than the run being resumed gave it. */
             if (ordinal < resumeFrom)
                 continue;
 
-            /* This line is ours and not yet done, so everything before it is.
-             * Checkpointing here rather than after a successful write also
-             * covers a long run of lines the filters all rejected - the
-             * filters run AFTER the search, so replaying them is not free. */
             if (o->resume) {
                 const double now = now_seconds();
                 if (now - lastCheckpoint > CHECKPOINT_SECONDS) {
+                    /* This line is ours and not yet done, so everything before it is.
+                     * Checkpointing here rather than after a successful write also covers a
+                     * long run of lines the filters all rejected - the filters run after the
+                     * search, so replaying them is not free. */
                     shard_checkpoint(&writer, ordinal);
                     lastCheckpoint = now;
                 }
@@ -2401,8 +2094,9 @@ static int label_worker(int index, int workers, void *ctx) {
             }
 
             Record rec;
-            /* An EPD line carries a result but never the game it came from, so the
-             * distance to that result is unknown - not zero. */
+
+            /* An EPD line carries a result but never the game it came from, so the distance to
+             * that result is unknown - not zero. */
             record_from_position(&rec, &p, res.score, wdl, o->source, PROGRESS_UNKNOWN);
 
             PolicyRecord pol;
@@ -2510,7 +2204,7 @@ static int cmd_label(int argc, char **argv) {
     o.threads     = 1;
     o.stride      = 1;
     o.source      = SRC_OTHER;
-    o.maxScore    = 0; /* the EPDs were already filtered by the extractor */
+    o.maxScore    = 0;
     o.quietFilter = false;
     o.dedup       = true;
     o.dedupBits   = 22;
@@ -2581,19 +2275,6 @@ static int cmd_label(int argc, char **argv) {
     return rc;
 }
 
-/* ========================================================================== *
- *  Subcommand: shuffle
- *
- *  Positions from one game are correlated, and a training batch drawn from one
- *  region of the file is a batch of near-duplicates. A DataLoader shuffle
- *  buffer does not fix that: a 100k-record window over a file whose
- *  consecutive records come from the same game is not a shuffle.
- *
- *  Two passes. Scatter every record to a random bucket, then shuffle each
- *  bucket in memory and concatenate. Bucket count is chosen so a bucket fits in
- *  RAM; after this the trainer can read sequentially forever.
- * ========================================================================== */
-
 static void usage_shuffle(void) {
     printf("datagen shuffle <in.cnn>... -o <out.cnn> [options]\n"
            "\n"
@@ -2625,6 +2306,15 @@ static void usage_shuffle(void) {
            "  -quiet             progress lines off.\n");
 }
 
+/*
+ * Positions from one game are correlated, and a training batch drawn from one region of the
+ * file is a batch of near-duplicates - a DataLoader shuffle buffer does not fix that, since
+ * a 100k-record window over consecutive records from the same game is not a shuffle.
+ *
+ * Two passes: scatter every record to a random bucket, then shuffle each bucket in memory
+ * and concatenate. The bucket count is chosen so a bucket fits in RAM, after which the
+ * trainer can read sequentially forever.
+ */
 static int cmd_shuffle(int argc, char **argv) {
     if (wants_help(argc, argv)) {
         usage_shuffle();
@@ -2637,7 +2327,7 @@ static int cmd_shuffle(int argc, char **argv) {
     int inputCount   = 0;
     int buckets      = 0;
     uint64_t seed    = 1;
-    size_t bucketCap = 512u << 20; /* bytes of one in-memory bucket */
+    size_t bucketCap = 512u << 20;
     bool dedup       = true;
     int dedupBits    = 24;
 
@@ -2669,17 +2359,13 @@ static int cmd_shuffle(int argc, char **argv) {
 
     if (!out || inputCount == 0)
         die("usage: datagen shuffle <in.cnn>... -o <out.cnn> [-buckets K] [-seed S]");
-    /* Same ceiling as everywhere else: 2^30 slots is 8 GB of table, and 2^28
-     * already holds 150M distinct positions at the growth threshold. */
+
     if (dedupBits < 10 || dedupBits > 30)
         die("-dedupbits must be between 10 and 30");
 
-    /*
-     * The policy sidecar has to survive the permutation, so a record and its
-     * four policy bytes travel as one unit. All inputs must agree about whether
-     * a sidecar exists - a half-populated .pol would silently misalign every
-     * record after the join.
-     */
+    /* The policy sidecar has to survive the permutation, so a record and its four policy
+     * bytes travel as one unit. All inputs must agree about whether a sidecar exists - a
+     * half-populated .pol would silently misalign every record after the join. */
     bool policy = true;
     for (int i = 0; i < inputCount; ++i) {
         char pol[PATH_CAP];
@@ -2707,18 +2393,13 @@ static int cmd_shuffle(int argc, char **argv) {
     if (total == 0)
         die("nothing to shuffle");
 
-    /*
-     * The clamp below used to live inside the auto-compute branch, which left
-     * a user-supplied -buckets unvalidated: bucketFile/bucketCount are fixed
-     * at SHUFFLE_MAX_BUCKETS entries on the stack, so `-buckets 1000` wrote
-     * past both. bucketPath is heap-sized from the same number, which only
-     * made the corruption quieter.
-     */
+    /* Checked here rather than inside the auto-compute branch below, which left a
+     * user-supplied -buckets unvalidated: bucketFile/bucketCount are fixed at
+     * SHUFFLE_MAX_BUCKETS entries on the stack, so `-buckets 1000` wrote past both. */
     if (buckets > SHUFFLE_MAX_BUCKETS)
         dief("-buckets %d exceeds the maximum of %d", buckets, SHUFFLE_MAX_BUCKETS);
 
     if (buckets <= 0) {
-        /* -memory 0 would divide by zero here. */
         if (bucketCap == 0)
             die("-memory must be at least 1 MB");
 
@@ -2748,23 +2429,6 @@ static int cmd_shuffle(int argc, char **argv) {
 
     Rng rng = seed;
 
-    /*
-     * THE ONLY PLACE CROSS-SHARD DUPLICATES CAN BE SEEN.
-     *
-     * `selfplay` and `label` dedup within a shard, and their workers are
-     * separate processes that share nothing on purpose - so a position two
-     * workers both reach survives into the dataset twice, and nothing
-     * downstream looks. That is not a small effect: gen-004 is 122.7M records
-     * over 11.7M distinct positions, ten copies of everything, because the
-     * build that produced it seeded its workers so that each replayed its
-     * neighbours' games. The loss curve of a ten-times-redundant dataset looks
-     * completely normal and the net is merely weak.
-     *
-     * Shuffle is the pass every record already goes through before training,
-     * so it is where the whole dataset is in one stream and the check costs a
-     * hash. On by default for the same reason it is on by default everywhere
-     * else, and it says how many it dropped rather than doing it quietly.
-     */
     KeySet seen;
     if (dedup)
         keyset_init(&seen, dedupBits);
@@ -2787,11 +2451,13 @@ static int cmd_shuffle(int argc, char **argv) {
 
         uint8_t unitBuf[REC_BYTES + POL_BYTES];
         while (fread(unitBuf, 1, REC_BYTES, rf) == REC_BYTES) {
-            /* Read before the skip, always: the sidecar is positional, and a
-             * dropped record has to drop its four policy bytes with it. */
             if (pf && fread(unitBuf + REC_BYTES, 1, POL_BYTES, pf) != POL_BYTES)
                 die("policy sidecar is shorter than its shard");
 
+            /* THE ONLY PLACE CROSS-SHARD DUPLICATES CAN BE SEEN: `selfplay` and `label` dedup
+             * within a shard, so a position two workers both reach survives twice - gen-004
+             * was ten copies of everything, and its loss curve looked normal. The sidecar is
+             * read before the skip, always, because it is positional. */
             if (dedup && !keyset_insert(&seen, (Key)record_position_key(unitBuf))) {
                 ++dropped;
                 continue;
@@ -2892,11 +2558,7 @@ static int cmd_shuffle(int argc, char **argv) {
     man.inputs  = joined;
     man.seed    = seed;
     man.dedup   = dedup;
-    /* Carry the labelling conditions forward when every input agrees on them.
-     * Shuffling reorders records without relabelling any, so the output was
-     * labelled at the same nodes and hash as its inputs - and `verify -relabel`
-     * needs both to reproduce a score. Left at zero when the inputs disagree or
-     * do not say, which readers take as "not recorded". */
+
     char labels[32], firstLabels[32];
     char syzygy[PATH_CAP], firstSyzygy[PATH_CAP];
     bool labelsAgree = true, syzygyAgree = true;
@@ -2950,18 +2612,20 @@ static int cmd_shuffle(int argc, char **argv) {
         }
     }
 
-    /* Loud, because the alternative is a dataset that describes itself wrongly.
-     * Not fatal: shuffling records with no manifest is a legitimate thing to
-     * do, and refusing would strand anyone merging shards by hand. */
+    /* Loud, because the alternative is a dataset that describes itself wrongly. Not fatal:
+     * shuffling records with no manifest is a legitimate thing to do, and refusing would
+     * strand anyone merging shards by hand. */
     if (noManifest)
         fprintf(stderr,
                 "warning: %d of %d inputs have no manifest (first: %s)\n"
                 "         the output cannot inherit nodes, hash, tablebases or filters,\n"
                 "         and `verify -relabel` will read those as unset\n",
                 noManifest, inputCount, noManifestFirst);
-    /* Left null when the inputs disagree, which is the honest answer: a shard
-     * holding both kinds of label is not one kind, and `verify -relabel` has
-     * to be told that rather than shown a majority. */
+
+    /* Carry the labelling conditions forward when every input agrees: shuffling reorders
+     * records without relabelling any, so the output was labelled at the same nodes and hash
+     * as its inputs, and `verify -relabel` needs both. Left null when they disagree, which is
+     * the honest answer - a shard holding both kinds of label is not one kind. */
     man.labels     = labelsAgree ? firstLabels : NULL;
     man.syzygyPath = syzygyAgree ? firstSyzygy : NULL;
 
@@ -2970,23 +2634,6 @@ static int cmd_shuffle(int argc, char **argv) {
     fprintf(stdout, "shuffled %llu records into %s\n", (unsigned long long)written, out);
     return 0;
 }
-
-/* ========================================================================== *
- *  Subcommand: filter
- *
- *  Selects records by source tag. The tag exists so a mixture generated once
- *  can be re-weighted without regenerating anything, and trainer/nnue already
- *  does that at load time with --sources - so this subcommand buys nothing a
- *  trainer flag does not, except the bytes. A shard that will never be trained
- *  on with its tree nodes is cheaper to shrink once than to skip on every
- *  epoch of every run.
- *
- *  The .pol sidecar is read in lockstep and written for the kept records only.
- *  Dropping a record from one file but not the other is the one mistake in
- *  here that leaves a shard of a plausible length which teaches the wrong move
- *  for every position after the first drop, so the input sidecars are
- *  length-checked before a byte is written.
- * ========================================================================== */
 
 static void usage_filter(void) {
     printf("datagen filter <in.cnn>... -o <out.cnn> [-keep NAME]... [-drop NAME]...\n"
@@ -3005,6 +2652,16 @@ static void usage_filter(void) {
            "Either every input has a .pol or none may.\n");
 }
 
+/*
+ * Selects records by source tag. The tag exists so a mixture generated once can be
+ * re-weighted without regenerating anything, which trainer/nnue already does at load time -
+ * so this buys nothing a trainer flag does not, except the bytes.
+ *
+ * The .pol sidecar is read in lockstep and written for the kept records only. Dropping a
+ * record from one file but not the other leaves a shard of plausible length that teaches
+ * the wrong move for every position after the first drop, so the input sidecars are
+ * length-checked before a byte is written.
+ */
 static int cmd_filter(int argc, char **argv) {
     if (wants_help(argc, argv)) {
         usage_filter();
@@ -3055,18 +2712,12 @@ static int cmd_filter(int argc, char **argv) {
     if (!anyKept)
         die("the selection keeps no source at all");
 
-    /* shard_open() truncates, so an output that is also an input would be
-     * emptied before it is read. The shards this runs on are gigabytes. */
+    /* shard_open() truncates, so an output that is also an input would be emptied before it
+     * is read. The shards this runs on are gigabytes. */
     for (int i = 0; i < inputCount; ++i)
         if (!strcmp(inputs[i], out))
             dief("%s is both an input and the output", out);
 
-    /*
-     * All inputs must agree about whether a sidecar exists, and each one must
-     * be exactly four bytes per record. A short .pol means the pairing is
-     * already wrong going in, and copying it through would launder that into a
-     * file nothing downstream can tell is broken.
-     */
     bool policy = true;
     for (int i = 0; i < inputCount; ++i) {
         char pol[PATH_CAP];
@@ -3128,12 +2779,12 @@ static int cmd_filter(int argc, char **argv) {
             Record rec;
             record_decode(buf, &rec);
 
-            /* Read the sidecar for EVERY record, kept or not: it is positional,
-             * so a skipped read is exactly what desynchronises it. */
             PolicyRecord p = {0, 0};
             if (pol) {
                 uint8_t pbuf[POL_BYTES];
                 if (fread(pbuf, 1, POL_BYTES, pol) != POL_BYTES)
+                    /* Read for EVERY record, kept or not: the sidecar is positional, so a
+                     * skipped read is exactly what desynchronises it. */
                     dief("the policy sidecar of %s ran out before its shard did", inputs[f]);
                 policy_decode(pbuf, &p);
             }
@@ -3185,26 +2836,6 @@ static int cmd_filter(int argc, char **argv) {
     return 0;
 }
 
-/* ========================================================================== *
- *  Subcommand: verify - the acceptance gate
- *
- *  Three properties, and a shard that fails any of them is not usable:
- *
- *    1. Every record round-trips. unpack -> FEN -> board_set_fen -> repack
- *       must give back the identical 32 bytes. That covers the occupancy, the
- *       nibbles, the castling encoding, the en passant square and the clocks
- *       in one comparison.
- *    2. Labelling a position twice, in different runs, gives the same score.
- *       `-relabel N` re-searches N randomly chosen records and diffs.
- *    3. The policy sidecar is still aligned with its records. Every move it
- *       holds was produced FOR that record's position, so every one must be
- *       pseudo-legal in it. An off-by-one in the shuffler would leave a file
- *       that is the right length, parses cleanly, and quietly teaches a policy
- *       head the wrong move for every position in the dataset.
- *
- *  Exits non-zero on any failure, so it works as a Makefile gate.
- * ========================================================================== */
-
 typedef struct {
     char fen[FEN_MAX_LEN];
     int16_t score;
@@ -3237,6 +2868,20 @@ static void usage_verify(void) {
            "  -quiet             progress lines off.\n");
 }
 
+/*
+ * The acceptance gate. Three properties, and a shard that fails any of them is not usable:
+ *
+ *   1. Every record round-trips - unpack, FEN, board_set_fen, repack gives back the
+ *      identical 32 bytes, which covers occupancy, nibbles, castling, en passant and clocks
+ *      in one comparison.
+ *   2. Labelling a position twice in different runs gives the same score; `-relabel N`
+ *      re-searches N randomly chosen records and diffs.
+ *   3. The policy sidecar is still aligned with its records. An off-by-one in the shuffler
+ *      would leave a file of the right length that parses cleanly and quietly teaches a
+ *      policy head the wrong move for every position in the dataset.
+ *
+ * Exits non-zero on any failure, so it works as a Makefile gate.
+ */
 static int cmd_verify(int argc, char **argv) {
     if (wants_help(argc, argv)) {
         usage_verify();
@@ -3250,8 +2895,7 @@ static int cmd_verify(int argc, char **argv) {
     int hashMb             = 8;
     const char *syzygyPath = NULL;
     uint64_t seed          = 1;
-    /* Both are read from the shard's manifest below unless the caller names
-     * them, so the defaults above only survive for a shard with no .json. */
+
     bool nodesGiven = false;
     bool hashGiven  = false;
 
@@ -3285,35 +2929,13 @@ static int cmd_verify(int argc, char **argv) {
     if (relabel > 4096)
         relabel = 4096;
 
-    /*
-     * A label reproduces only under the conditions it was made under, and the
-     * hash size is one of them. `search_clear()` empties the table but keeps
-     * its geometry, so the same position at the same node count collides
-     * differently in an 8 MB table than in a 64 MB one and occasionally scores
-     * differently - about one record in a thousand. That is invisible in a spot
-     * check and fatal to a 256-record gate, and it bit exactly once per
-     * selfplay shard: `selfplay` defaults to 64 MB and this gate to 8.
-     *
-     * The manifest already records both numbers. Reading them back is what
-     * makes the gate check the shard rather than the caller's memory of it.
-     */
     if (relabel > 0) {
-        /*
-         * A relabel check re-searches a stored position from a cleared engine
-         * and requires the same score back. That only means something for a
-         * shard whose scores WERE a search from a cleared engine - which is
-         * what `label` produces and what `selfplay` used to, before its label
-         * became the score the game's own search had already returned for the
-         * position (E26). Re-searching one of those reproduces nothing: the
-         * game's search had a warm table and reached about 1.2 plies deeper.
-         *
-         * Refusing outright rather than reporting a wall of mismatches: a gate
-         * that always fails is worse than no gate, because the next person
-         * turns it off. What checks a game-labelled shard is regeneration -
-         * a game is a function of -seed and its ordinal, so the same command
-         * produces the same bytes.
-         */
         for (int i = 0; i < inputCount; ++i) {
+            /* A relabel check only means something for a shard whose scores WERE a search from
+             * a cleared engine - which is what `label` produces and what `selfplay` used to,
+             * before its label became the score the game's own search had returned (E26).
+             * Refusing outright rather than reporting a wall of mismatches: a gate that always
+             * fails is worse than no gate, because the next person turns it off. */
             char labels[32];
             if (manifest_str(inputs[i], "labels", labels, sizeof(labels)) &&
                 !strcmp(labels, "game"))
@@ -3324,6 +2946,12 @@ static int cmd_verify(int argc, char **argv) {
                      inputs[i]);
         }
 
+        /* A label reproduces only under the conditions it was made under, and the hash size is
+         * one of them: search_clear() empties the table but keeps its geometry, so the same
+         * position at the same node count collides differently in 8 MB than in 64 MB and
+         * occasionally scores differently - about one record in a thousand, invisible in a
+         * spot check and fatal to a 256-record gate. Reading both back from the manifest is
+         * what makes the gate check the shard rather than the caller's memory of it. */
         int manNodes = 0, manHash = 0;
         bool haveNodes = false, haveHash = false;
 
@@ -3367,12 +2995,10 @@ static int cmd_verify(int argc, char **argv) {
                     "relabelling at %d nodes, %d MB\n",
                     inputs[0], nodes, hashMb);
 
-        /* Tablebases are a labelling condition exactly like nodes and hash,
-         * but a path does not transplant between machines the way a number
-         * does, so the manifest is only consulted for a warning: the relabel
-         * itself will fail loudly on the mismatch, and this line says why
-         * before four hundred diffs do. */
         for (int i = 0; i < inputCount; ++i) {
+            /* Tablebases are a labelling condition exactly like nodes and hash, but a path does
+             * not transplant between machines the way a number does - so the manifest is only
+             * consulted for a warning, and this line says why before four hundred diffs do. */
             int men;
             if (manifest_int(inputs[i], "syzygy_men", &men)) {
                 if (men > 0 && syzygyPath == NULL)
@@ -3406,7 +3032,7 @@ static int cmd_verify(int argc, char **argv) {
 
         char polPath[PATH_CAP];
         replace_ext(polPath, sizeof(polPath), inputs[f], ".pol");
-        FILE *pol = fopen(polPath, "rb"); /* optional: absent is not an error */
+        FILE *pol = fopen(polPath, "rb");
 
         uint8_t buf[REC_BYTES];
         uint64_t index = 0;
@@ -3434,12 +3060,10 @@ static int cmd_verify(int argc, char **argv) {
             uint8_t again[REC_BYTES];
             memset(&p, 0, sizeof(p));
 
-            /* Bits 4-7 are the game-progress bucket now, and every one of the
-             * sixteen values is legal - 0 included, which is what a shard from
-             * before the field existed carries. There is nothing left in the
-             * flags byte to reject; the round-trip below still covers the bits,
-             * because record_from_position is handed the decoded bucket and has
-             * to put it back where it found it. */
+            /* Bits 4-7 are the game-progress bucket, and every one of the sixteen values is
+             * legal - 0 included, which is what a shard from before the field existed carries.
+             * The round-trip below still covers those bits, because record_from_position is
+             * handed the decoded bucket and has to put it back where it found it. */
             if (rec.wdl > WDL_UNKNOWN)
                 problem = "WDL is out of range";
             else if (record_source(&rec) >= SRC_NB)
@@ -3458,9 +3082,9 @@ static int cmd_verify(int argc, char **argv) {
             }
 
             if (!problem && havePolicy) {
-                /* Both moves were produced for THIS position - `best` by its
-                 * label search, `cutoff` at the tree node it was sampled from -
-                 * so both must be pseudo-legal in it. */
+                /* Both moves were produced for THIS position - `best` by its label search,
+                 * `cutoff` at the tree node it was sampled from - so both must be
+                 * pseudo-legal in it. */
                 const Move moves[2] = {(Move)policy.best, (Move)policy.cutoff};
                 for (int m = 0; m < 2; ++m) {
                     if (!is_ok_move(moves[m]))
@@ -3484,8 +3108,8 @@ static int cmd_verify(int argc, char **argv) {
                             problem);
                 ++bad;
             } else if (relabel) {
-                /* Reservoir over the whole dataset, so a relabel check on a
-                 * 100M-record shard still costs N searches. */
+                /* Reservoir over the whole dataset, so a relabel check on a 100M-record shard
+                 * still costs N searches. */
                 int slot = -1;
                 if (sampleCount < relabel)
                     slot = sampleCount++;
@@ -3563,15 +3187,6 @@ static int cmd_verify(int argc, char **argv) {
     return 0;
 }
 
-/* ========================================================================== *
- *  Subcommand: stats
- *
- *  NNUE.md: "The distribution of scores, phases and piece counts is dumped and
- *  eyeballed. A dataset that is 60% endgames or has a score histogram spiked at
- *  zero has a filter bug, and this is the last point where that is cheap to
- *  find."
- * ========================================================================== */
-
 static void bar(FILE *f, uint64_t value, uint64_t max, int width) {
     const int n = max ? (int)((value * (uint64_t)width) / max) : 0;
     for (int i = 0; i < n; ++i)
@@ -3592,6 +3207,9 @@ static void usage_stats(void) {
            "  -quiet             accepted and ignored.\n");
 }
 
+/* The distribution of scores, phases and piece counts, dumped to be eyeballed. A dataset
+ * that is 60% endgames or has a score histogram spiked at zero has a filter bug, and this is
+ * the last point where that is cheap to find. */
 static int cmd_stats(int argc, char **argv) {
     if (wants_help(argc, argv)) {
         usage_stats();
@@ -3618,7 +3236,7 @@ static int cmd_stats(int argc, char **argv) {
     uint64_t total = 0, inCheck = 0, blackToMove = 0;
     uint64_t bySource[SRC_NB], byWdl[WDL_NB], byPieces[33], byScore[SCORE_BINS];
     uint64_t byProgress[PROGRESS_MAX_BUCKET + 1];
-    uint64_t decisive    = 0; /* proven scores: a tablebase or a mate, not an evaluation */
+    uint64_t decisive    = 0;
     uint64_t halfmoveSum = 0, fullmoveSum = 0;
     long long scoreSum = 0;
     memset(bySource, 0, sizeof(bySource));
@@ -3645,9 +3263,9 @@ static int cmd_stats(int argc, char **argv) {
             const int pieces = popcount(rec.occupied);
             ++byPieces[pieces >= 0 && pieces <= 32 ? pieces : 32];
 
-            /* Biased by a large multiple of the step so the division floors
-             * rather than truncating toward zero, which would otherwise make
-             * the bin below zero twice as wide as every other one. */
+            /* Biased by a large multiple of the step so the division floors rather than
+             * truncating toward zero, which would make the bin below zero twice as wide as
+             * every other one. */
             int bin = (rec.score + SCORE_STEP / 2 + 1000 * SCORE_STEP) / SCORE_STEP - 1000 +
                       SCORE_BINS / 2;
             if (bin < 0)
@@ -3676,11 +3294,11 @@ static int cmd_stats(int argc, char **argv) {
            100.0 * (double)blackToMove / (double)total);
     printf("in check         %llu (%.2f%%)\n", (unsigned long long)inCheck,
            100.0 * (double)inCheck / (double)total);
-    /* A mate or a tablebase score is a PROVEN result, not an evaluation, and
-     * sigmoid(31500/400) is 1.0 to every digit a float carries - so these
-     * records train against a target the net cannot represent and can only
-     * chase. The trainer's --score-clip is the dial; this line is how to know
-     * whether it is worth reaching for. */
+
+    /* A mate or tablebase score is a PROVEN result, not an evaluation, and sigmoid(31500/400)
+     * is 1.0 to every digit a float carries - so these records train against a target the net
+     * cannot represent and can only chase. The trainer's --score-clip is the dial; this line
+     * is how to know whether it is worth reaching for. */
     printf("decisive scores  %llu (%.2f%%)  - mate or tablebase, see --score-clip\n",
            (unsigned long long)decisive, 100.0 * (double)decisive / (double)total);
     printf("mean score       %.1f cp\n", (double)scoreSum / (double)total);
@@ -3713,16 +3331,6 @@ static int cmd_stats(int argc, char **argv) {
         printf("\n");
     }
 
-    /*
-     * How far each position was from the end of its game. This is the histogram
-     * that says whether the WDL label is worth anything: a dataset whose mass
-     * sits in the high buckets is one where every result is fifty plies away
-     * from the position it is attached to, and a lambda schedule keyed on this
-     * is the only thing that can price that in. All-unknown means either a
-     * `label` shard, whose games we never saw, or a selfplay run whose games
-     * the ply cap all cut short - which is a -maxplies problem, not a lambda
-     * one.
-     */
     peak = 0;
     for (int i = 0; i <= PROGRESS_MAX_BUCKET; ++i)
         if (byProgress[i] > peak)
@@ -3733,6 +3341,10 @@ static int cmd_stats(int argc, char **argv) {
         if (!byProgress[i])
             continue;
         char label[16];
+        /* How far each position was from the end of its game - the histogram that says whether
+         * the WDL label is worth anything. Mass in the high buckets means every result is
+         * fifty plies from the position it is attached to; all-unknown means either a `label`
+         * shard or a selfplay run whose games the ply cap all cut short. */
         if (i == PROGRESS_UNKNOWN)
             snprintf(label, sizeof(label), "unknown");
         else if (i == PROGRESS_MAX_BUCKET)
@@ -3761,10 +3373,6 @@ static int cmd_stats(int argc, char **argv) {
 
     return 0;
 }
-
-/* ========================================================================== *
- *  Subcommand: dump
- * ========================================================================== */
 
 static void usage_dump(void) {
     printf("datagen dump <shard.cnn> [options]\n"
@@ -3824,8 +3432,6 @@ static int cmd_dump(int argc, char **argv) {
             fseek64(pol, (long long)skip * POL_BYTES, SEEK_SET);
     }
 
-    /* Semicolon-separated so it round-trips through a spreadsheet or a python
-     * split(';'), and the FEN keeps its own spaces. */
     printf("fen;score;wdl;source;in_check;progress%s\n", withPolicy ? ";best;cutoff" : "");
 
     uint8_t buf[REC_BYTES];
@@ -3850,7 +3456,7 @@ static int cmd_dump(int argc, char **argv) {
             if (fread(pbuf, 1, POL_BYTES, pol) == POL_BYTES)
                 policy_decode(pbuf, &p);
             char a[8], b[8];
-            /* Standard chess throughout: datagen has never generated Chess960. */
+
             printf(";%s;%s", p.best ? move_to_str((Move)p.best, false, a) : "-",
                    p.cutoff ? move_to_str((Move)p.cutoff, false, b) : "-");
         }
@@ -3863,23 +3469,6 @@ static int cmd_dump(int argc, char **argv) {
     return 0;
 }
 
-/* ========================================================================== *
- *  Entry point
- * ========================================================================== */
-
-/* ========================================================================== *
- *  Subcommand: syzygy
- * ========================================================================== */
-
-/*
- * The tablebase acceptance gate, run with THIS binary rather than with the
- * engine's - which is the whole point of it living here. A generation box
- * builds `datagen` and nothing else, and a box whose tables are truncated or
- * half-downloaded does not fail: it labels low-piece positions from the search
- * instead, and those records land in the same shard directory as everybody
- * else's, indistinguishable and wrong. This turns that into a provisioning
- * failure. The suite itself is src/syzygytest.c.
- */
 static int cmd_syzygy(int argc, char **argv) {
     if (wants_help(argc, argv) || argc < 1) {
         printf("datagen syzygy <tablebase dir>\n"
@@ -3908,7 +3497,6 @@ static void usage(void) {
                     "Every subcommand takes -quiet. The design is docs/NNUE.md.\n");
 }
 
-/* Pulls `--worker N` out of argv so the subcommand parsers never see it. */
 static void extract_worker_index(int *argc, char **argv) {
     for (int i = 0; i < *argc; ++i) {
         if (strcmp(argv[i], "--worker") || i + 1 >= *argc)
@@ -3925,16 +3513,11 @@ static void extract_worker_index(int *argc, char **argv) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    /* The same order main.c uses: attack tables underpin everything, and the
-     * Zobrist keys must exist before any position is hashed. */
     bb_init();
     zobrist_init();
     eval_init();
 #ifdef EVAL_NNUE
-    /* `make datagen EVAL=nnue` is how the pipeline bootstraps: net n+1 is
-     * trained on labels produced by searches that used net n. The label
-     * definition is "the search in this build", so the build has to be able
-     * to carry a net. */
+
     nnue_init();
 #endif
     search_init();

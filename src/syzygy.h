@@ -1,11 +1,9 @@
 /*
  * syzygy.h - the engine's view of the Syzygy endgame tablebases.
  *
- * Inactive until syzygy_init() finds tables, and inactive means every query
- * answers "not probable" from one branch - a build that never loads
- * tablebases behaves bit-identically to one built without this file, which is
- * what keeps bench deterministic across machines. The prober itself is
- * src/syzygy.c; CREDITS.md records what it derives from.
+ * Inactive until syzygy_init() finds tables, and while inactive every query
+ * answers "not probable" from one branch, so a machine with tables on disk
+ * benches identically to one without.
  */
 #ifndef SYZYGY_H
 #define SYZYGY_H
@@ -14,9 +12,8 @@
 #include "move.h"
 #include "types.h"
 
-/* Load tables from a path list (';'-separated on Windows, ':' on POSIX).
- * Whatever was loaded before is released first. Returns false - with the
- * prober left inactive - when the path holds nothing usable. */
+/* Path list, ';'-separated on Windows and ':' on POSIX. False, prober left
+ * inactive, when the path holds nothing usable. */
 bool syzygy_init(const char *path);
 void syzygy_free(void);
 
@@ -24,59 +21,32 @@ void syzygy_free(void);
 int syzygy_max_pieces(void);
 
 /*
- * WDL probe for interior nodes. VALUE_NONE when the position is not probable:
- * prober inactive, too many pieces, castling rights, or a nonzero halfmove
- * clock - WDL tables assume the fifty-move counter is fresh, so only the
- * capture or pawn move that entered the tablebase region probes.
- *
- * A win is VALUE_TB_WIN - ply, a loss the mirror; cursed wins and blessed
- * losses score VALUE_DRAW, because the fifty-move rule is in force.
- *
- * `pos` is NOT const, and that is the honest signature rather than an
- * oversight. A tablebase holds only positions with a zero fifty-move counter,
- * so resolving one with captures available means playing them out - the probe
- * makes moves and takes them back. It does so on the caller's board because a
- * Position carries its whole repetition history and copying one per probe
- * would cost more than the lookup. The board is restored exactly.
+ * VALUE_NONE when the position is not probable: inactive, too many pieces,
+ * castling rights, or a nonzero halfmove clock. `pos` is non-const because
+ * resolving captures means playing them out on the caller's board, which copying
+ * per probe would cost more than the lookup; it is restored exactly.
  */
 Value syzygy_probe_wdl(Position *pos, int ply);
 
-/* What a root probe found.
- *
- * The two fields fail INDEPENDENTLY and callers must test them independently.
- * A probe that could not answer at all reports MOVE_NONE and VALUE_NONE, but
- * `value` can also be a real result while `move` stays MOVE_NONE - every
- * child probe declining leaves the position's value known and no move
- * selected. */
 typedef struct {
-    Move move;   /* preserves the result; matched against the generator's list */
-    Value value; /* the true result at ply 0, fifty-move rule included */
-    int dtz;     /* plies to the next zeroing move that keeps the result */
+    Move move;
+    Value value;
+    /* Reported, not played: the one number a differential test can compare against
+     * an oracle to prove the DTZ table was decoded, not just that its sign fell out
+     * right. */
+    int dtz;
 } SyzygyRoot;
 
 /*
- * DTZ probe for the root, which answers two questions with one lookup.
+ * The move is one that provably makes progress, where WDL rates every winning
+ * move alike and lets the search shuffle the win away. The value matters too:
+ * unlike WDL, DTZ is correct at any halfmove clock, so a root that would
+ * otherwise be scored heuristically comes back from the tables.
  *
- * The move is what converts: WDL alone rates every winning move identically,
- * so a search free to choose among them can shuffle until the fifty-move rule
- * takes the win away. DTZ names one that provably makes progress.
- *
- * The value is why this is also the labelling path. Interior nodes only probe
- * at halfmoveClock == 0, so the children of a five-man root - clock 1 after
- * any piece move - are searched heuristically, and the root's score would come
- * back from the evaluation rather than from the tables. Unlike WDL, DTZ
- * accounts for a fifty-move counter already running, so this value is correct
- * at any clock.
- *
- * The move is matched against the generator's own list, never synthesised, so
- * nothing the generator did not produce is ever played.
- *
- * `dtz` is not used to play - the move already encodes the choice - and is
- * reported because it is the one number a differential test can compare
- * against an oracle to prove the DTZ TABLE was decoded correctly, rather than
- * merely that its sign came out right. The value derived from it saturates to
- * three outcomes and would hide a mapping or rounding bug entirely.
+ * `move` and `value` fail independently - a real value with MOVE_NONE means every
+ * child probe declined. Moves are matched against the generator's list, never
+ * synthesised.
  */
-SyzygyRoot syzygy_probe_root(Position *pos); /* mutates and restores; see above */
+SyzygyRoot syzygy_probe_root(Position *pos);
 
-#endif /* SYZYGY_H */
+#endif

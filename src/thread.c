@@ -1,16 +1,11 @@
-/*
- * thread.c - Win32 / pthreads implementations of the thread.h shim.
- */
+/* thread.c - Win32 / pthreads implementations of the thread.h shim. */
 
 /*
- * -std=c17 sets __STRICT_ANSI__, and glibc reads that as "declare ISO C and
- * nothing else" - which hides every POSIX declaration this file needs. The
- * request has to come before the first header, because feature test macros are
- * only consulted the first time one is included.
- *
- * Darwin is excluded deliberately: there _POSIX_C_SOURCE *subtracts* from the
- * default visibility instead of adding to it, and would take the BSD-only
- * _SC_NPROCESSORS_ONLN used below with it.
+ * -std=c17 sets __STRICT_ANSI__, which glibc reads as "ISO C and nothing else" and
+ * so hides every POSIX declaration below; the request has to come before the first
+ * header, because feature test macros are consulted only once. Darwin is excluded
+ * deliberately - there _POSIX_C_SOURCE subtracts from the default visibility, and
+ * would take the BSD-only _SC_NPROCESSORS_ONLN with it.
  */
 #if !defined(_WIN32) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
@@ -20,26 +15,21 @@
 
 #include <stdlib.h>
 
-/*
- * Search workers get an explicit, generous stack.
- *
- * Each search frame carries a MAX_MOVES move list, so a line that runs to
- * MAX_PLY needs on the order of half a megabyte - more under a sanitizer.
- * The Win32 default (1 MB, from the PE header) is uncomfortably close to
- * that, and some POSIX libcs default lower still. This is reserved address
- * space, committed only as it is touched, so asking for more costs nothing.
- */
+/* Each search frame carries a MAX_MOVES move list, so a line running to MAX_PLY needs
+ * on the order of half a megabyte, more under a sanitizer - and the Win32 default of
+ * 1 MB is uncomfortably close. Reserved address space is committed only as it is
+ * touched, so asking for more costs nothing. */
 #define THREAD_STACK_BYTES (8u * 1024u * 1024u)
 
 #if defined(_WIN32)
 
-/* Win32 thread entry points must return DWORD and use the stdcall ABI, so the
- * user's void(void*) function is smuggled through this trampoline. */
 typedef struct {
     ThreadEntry fn;
     void *arg;
 } ThreadStart;
 
+/* Win32 entry points must return DWORD and use the stdcall ABI, so the caller's
+ * void(void*) is smuggled through this trampoline. */
 static DWORD WINAPI thread_trampoline(LPVOID param) {
     ThreadStart *start = (ThreadStart *)param;
     ThreadEntry fn     = start->fn;
@@ -84,12 +74,12 @@ void mutex_lock(Mutex *m) { EnterCriticalSection(m); }
 void mutex_unlock(Mutex *m) { LeaveCriticalSection(m); }
 
 void cond_init(CondVar *cv) { InitializeConditionVariable(cv); }
-void cond_destroy(CondVar *cv) { (void)cv; /* Win32 condition variables need no teardown */ }
+void cond_destroy(CondVar *cv) { (void)cv; }
 void cond_wait(CondVar *cv, Mutex *m) { SleepConditionVariableCS(cv, m, INFINITE); }
 void cond_signal(CondVar *cv) { WakeConditionVariable(cv); }
 void cond_broadcast(CondVar *cv) { WakeAllConditionVariable(cv); }
 
-#else /* POSIX */
+#else
 
 #include <time.h>
 #include <unistd.h>
@@ -137,8 +127,8 @@ int thread_hardware_concurrency(void) {
     return n > 0 ? (int)n : 1;
 }
 
-/* nanosleep() rather than usleep(): POSIX.1-2008 removed the latter, so asking
- * for that level above is precisely what makes it unavailable. */
+/* nanosleep() rather than usleep(): POSIX.1-2008 removed the latter, so asking for
+ * that level at the top of this file is precisely what makes it unavailable. */
 void thread_sleep_ms(int ms) {
     struct timespec ts;
     ts.tv_sec  = ms / 1000;

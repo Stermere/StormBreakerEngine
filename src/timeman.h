@@ -1,55 +1,27 @@
-/*
- * timeman.h - clock handling.
- *
- * Time management is worth a surprising amount of Elo: an engine that thinks
- * well but allocates badly loses on time or wastes its advantage. It is also
- * one of the easiest things to test with SPRT, because the change is confined
- * to this module.
- */
+/* timeman.h - clock handling. */
 #ifndef TIMEMAN_H
 #define TIMEMAN_H
 
 #include "search.h"
 #include "types.h"
 
-/* Milliseconds from an unspecified monotonic origin. Only differences are
- * meaningful. Monotonic on purpose: a wall clock that jumps backwards (NTP,
- * DST) would otherwise hand the search a negative elapsed time. */
+/* Monotonic, from an unspecified origin: a wall clock that jumps backwards would
+ * hand the search a negative elapsed time. */
 int64_t time_ms(void);
 
 typedef struct {
-    int64_t optimum; /* target: stop here unless the position looks unstable */
-    int64_t maximum; /* hard ceiling: never exceed this, ever */
+    int64_t optimum;
+    int64_t maximum;
 } TimeManager;
 
-/*
- * Computes the budget for one move.
- *
- * Divide the remaining clock by an assumed twenty moves left, bank three
- * quarters of the increment, scale by where the game is, and cap the whole
- * thing well short of flag fall.
- *
- * `Move Overhead` is held back for GUI and network latency once per move still
- * to be played, not once for this one. With an increment the clock converges
- * rather than decays, and whatever it converges on has to cover the latency of
- * every move after this one too; reserving it up front is what keeps that
- * number off the floor. See the note in timeman.c.
- */
+/* Budget for one move. `Move Overhead` is held back once per move still to be
+ * played rather than once for this one - with an increment the clock converges,
+ * and what it converges on has to cover every later move's latency too. */
 void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly);
 
-/*
- * The optimum allocation, adjusted for how settled the search looks.
- *
- * `stability` is the number of consecutive completed iterations that agreed on
- * the best move. A search whose best move keeps changing has not found the
- * point of the position yet and is exactly where an extra iteration pays; one
- * that has returned the same move six times running is not about to change its
- * mind, and the time is worth more on a later move.
- *
- * This only ever moves the soft target. `maximum` is a hard ceiling and is
- * enforced separately, so an unstable position cannot talk the search into
- * flagging.
- */
+/* `stability` is how many consecutive iterations agreed on the best move; a
+ * settled search hands its time to later moves. Only the soft target moves -
+ * `maximum` is enforced separately, so an unstable position cannot flag. */
 int64_t timeman_optimum(const TimeManager *tm, int stability);
 
-#endif /* TIMEMAN_H */
+#endif

@@ -1,16 +1,17 @@
 /*
- * nnue.c - loading and evaluating the network.
+ * nnue.c - loading and evaluating the network. See nnue.h for the file format.
  *
- * See nnue.h for the file format and for what it takes to upgrade the net.
- * The whole file compiles to nothing unless EVAL_NNUE is defined, so a
- * classical build carries none of it.
+ * The arithmetic here is the C half of a two-implementation contract: every number this
+ * file produces is produced independently by tools/export_net.py in numpy, and
+ * `make nnue-test` requires the two to agree EXACTLY on ten thousand positions. That is
+ * the only reason to trust it - a quantisation that is subtly wrong loses about 30 Elo
+ * and looks healthy from every other angle.
  *
- * The arithmetic here is the C half of a two-implementation contract: every
- * number this file produces is also produced, independently, by
- * tools/export_net.py in numpy, and `make nnue-test` requires the two to agree
- * EXACTLY on ten thousand positions. That is the only reason to trust it. A
- * quantisation that is subtly wrong loses about 30 Elo and looks completely
- * healthy from every other angle.
+ * An evaluation is almost entirely two sums of at most 32 rows of `hidden` int16
+ * weights, so the accumulator is int16 rather than int32 (half the traffic, twice the
+ * lanes) and there is one activation and one feature set, hence no branch per unit or
+ * per piece. AVX2 and plain C must produce IDENTICAL integers, which they do because
+ * integer addition is associative and nothing in either path overflows.
  */
 #include "nnue.h"
 
@@ -23,87 +24,32 @@
 
 #include "eval.h"
 
-/*
- * ----------------------------------------------------------------------------
- * THE SHAPE OF THE HOT PATH
- * ----------------------------------------------------------------------------
- * An evaluation is, almost entirely, two sums of at most 32 rows of `hidden`
- * int16 weights. At 1024 wide that is 65,536 int16 additions per call, and
- * everything below exists to make them cheap:
- *
- *   * The accumulator is int16, not int32. It halves the bytes moved, and it
- *     is what lets sixteen lanes fit in one AVX2 register instead of eight.
- *     Nothing wraps, and that is not hoped for: tools/export_net.py refuses to
- *     write a net whose bias plus ENGINE_MAX_PIECES rows could leave int16,
- *     using a bound that holds over every diagram the FEN parser ACCEPTS -
- *     which is a fuller board than legal play can reach, and so a stricter
- *     bound than one over legal positions would be. That constant and the cap
- *     in board_set_fen are one decision in two files; raising either alone is
- *     how a crowded puzzle silently wraps the accumulator.
- *   * One activation and one feature set are implemented, so there is no
- *     branch per unit and none per piece.
- *   * AVX2 where the compiler says it is available, plain C otherwise. The two
- *     must produce IDENTICAL integers - not similar - and `make nnue-test`
- *     checks whichever one was built. Integer addition is associative, so the
- *     different summation orders agree exactly; the only way they could differ
- *     is an intermediate that overflows in one and not the other, which is why
- *     the flush below is a proof rather than a guess.
- */
 #if defined(__AVX2__)
 #include <immintrin.h>
 #define NNUE_AVX2 1
 
-/*
- * How many AVX2 int32 lanes of SCReLU may accumulate before being widened into
- * int64.
- *
- * One _mm256_madd_epi16 result is two products of (v * w) * v, and the load
- * checks bound |v * w| by int16 and v by QA, so a lane holds at most
- * 2 * 32767 * 255 = 16,711,170. Sixty-four of those is 1.07e9, comfortably
- * inside int32's 2.15e9; a hundred and thirty would not be. The flush costs
- * one horizontal add per 64 vectors, which is nothing, and it makes the bound
- * independent of the hidden width - so a wider net stays correct rather than
- * staying correct up to 2048.
- */
+/* How many int32 lanes of SCReLU may accumulate before being widened to int64. One
+ * madd result is bounded by 2 * 32767 * 255 = 16,711,170, so 64 of them is 1.07e9,
+ * comfortably inside int32. Flushing per 64 vectors costs one horizontal add and makes
+ * the bound independent of the hidden width. */
 #define NNUE_SCRELU_FLUSH 64
 #endif
 
-/*
- * The exporter packs this header with an explicit struct format string rather
- * than a C compiler, so its size is a contract rather than an implementation
- * detail. A field added without care - one that makes the compiler insert
- * padding - would silently shift every weight by a few bytes, and the failure
- * would look like a net that trained badly rather than one that loaded wrong.
- */
+/* The exporter packs the header with an explicit struct format string, so its size is a
+ * contract rather than an implementation detail: a field that made the compiler insert
+ * padding would shift every weight by a few bytes, and the failure would look like a net
+ * that trained badly rather than one that loaded wrong. */
 _Static_assert(sizeof(NnueHeader) == 96, "NnueHeader must stay 96 bytes; see HEADER_FMT in "
                                          "tools/export_net.py");
 
-/*
- * Everything below assumes a little-endian host: the net file is
- * little-endian and its weights are read in place rather than byte-swapped.
- * Every target the engine builds for is little-endian in practice; a
- * big-endian port would need a swap pass in nnue_adopt().
- */
-
-/*
- * Clamp on the returned score.
- *
- * Nothing structural stops a network from emitting an enormous number, and a
- * static evaluation that wanders into mate territory makes the search report
- * forced mates that do not exist. 20000 is far above any real evaluation and
- * far below VALUE_MATE_IN_MAX_PLY even after the search adds its margins.
- */
+/* Nothing structural stops a network from emitting an enormous number, and a static
+ * evaluation that wanders into mate territory makes the search report forced mates that
+ * do not exist. Far above any real evaluation, far below VALUE_MATE_IN_MAX_PLY. */
 #define NNUE_EVAL_LIMIT 20000
 
-/* ------------------------------------------------------------- sha-256 ---- */
-
-/*
- * A net is 50 MB of gitignored data and the bench node count depends on which
- * one is embedded, so a build has to be able to say which net it carries.
- * FIPS 180-4, about ninety lines, no dependency - which is the point, since
- * the engine links against nothing but libc.
- */
-
+/* A net is 50 MB of gitignored data and the bench node count depends on which one is
+ * embedded, so a build has to be able to say which net it carries. FIPS 180-4 in ninety
+ * lines, because the engine links against nothing but libc. */
 typedef struct {
     uint32_t state[8];
     uint64_t bits;
@@ -217,25 +163,18 @@ static void sha256_hex(const void *data, size_t len, char *out) {
     out[64] = '\0';
 }
 
-/* ----------------------------------------------------------- embedding ---- */
-
 /*
- * The net is embedded with .incbin so the shipped binary is self-contained:
- * OpenBench builds one file and runs it, and a bench node count has to be
- * reproducible from the binary alone.
+ * The net is embedded with .incbin so the shipped binary is self-contained: OpenBench
+ * builds one file and runs it, and a bench node count has to be reproducible from the
+ * binary alone. NNUE_EVALFILE is relative to the directory make ran in, which is the
+ * assembler's working directory too.
  *
- * NNUE_EVALFILE is a path relative to the directory make was run from, which
- * is the assembler's working directory too.
+ * Mach-O spells both halves differently to ELF - __TEXT,__const rather than .rodata, and
+ * an underscore prefix on every C identifier - and emitting the ELF spelling there fails
+ * at the .section directive, which is where the arm64 release build lost its net.
  */
 #ifdef NNUE_EVALFILE
-/*
- * Mach-O spells both halves of this differently to ELF: the read-only section
- * is __TEXT,__const rather than .rodata, and the assembler prefixes every C
- * identifier with an underscore, so a bare label here would not be the symbol
- * the extern declarations below resolve to. Emitting the ELF spelling on macOS
- * fails at the .section directive, which is where the arm64 release build was
- * losing its net.
- */
+
 #if defined(__APPLE__)
 #define NNUE_RODATA    ".section __TEXT,__const\n"
 #define NNUE_SYM(name) "_" name
@@ -259,21 +198,19 @@ extern const unsigned char nnueEmbeddedStart[];
 extern const unsigned char nnueEmbeddedEnd[];
 #endif
 
-/* ------------------------------------------------------------ the net ----- */
-
 typedef struct {
     NnueHeader hdr;
 
-    /* Pointers into the payload, which is either the embedded blob - read in
-     * place, never copied - or `owned` below. */
-    const int16_t *ftWeight;  /* [features][hidden], feature-major */
-    const int16_t *ftBias;    /* [hidden] */
-    const int16_t *outWeight; /* [outputBuckets][2 * hidden] */
-    const int32_t *outBias;   /* [outputBuckets] */
-    const int16_t *uncWeight; /* [outputBuckets][2 * hidden], NULL without the head */
-    const int32_t *uncBias;   /* [outputBuckets], NULL without the head */
+    /* Pointers into the payload, which is either the embedded blob - read in place, never
+     * copied - or `owned` below. */
+    const int16_t *ftWeight;
+    const int16_t *ftBias;
+    const int16_t *outWeight;
+    const int32_t *outBias;
+    const int16_t *uncWeight;
+    const int32_t *uncBias;
 
-    unsigned char *owned; /* non-NULL only when the net came from a file */
+    unsigned char *owned;
     char hash[65];
     char source[512];
     bool loaded;
@@ -281,23 +218,19 @@ typedef struct {
 
 static Net Loaded;
 
-/*
- * How many king slots a feature set folds the board onto, or 0 if this build
- * has never heard of it. The count is the feature set's shape, so the loader
- * derives the expected feature count from it rather than trusting the file to
- * be self-consistent about both.
- */
+/* How many king slots a feature set folds the board onto, or 0 if this build has never
+ * heard of it. The count is the feature set's shape, so the loader derives the expected
+ * feature count from it rather than trusting the file to be self-consistent. */
 static uint32_t nnue_king_slots(uint32_t featureSet) {
     switch (featureSet) {
     case NNUE_FEATURES_HALFKA_32SQ: return 32;
-    default: return 0; /* including the retired 8-bucket tag */
+    default: return 0;
     }
 }
 
-/* Bytes the payload must occupy for this header to be self-consistent. The
- * uncertainty head is a second output layer, so its flag adds exactly one more
- * outWeight-and-outBias worth of bytes - which is also why an engine that has
- * never heard of the flag rejects a flagged net on this count. */
+/* Bytes the payload must occupy for this header to be self-consistent. The uncertainty
+ * head is a second output layer, so its flag adds exactly one more outWeight-and-outBias
+ * worth - which is why an engine that never heard of the flag rejects on this count. */
 static uint64_t nnue_payload_bytes(const NnueHeader *h) {
     const uint64_t headBytes = (uint64_t)h->outputBuckets * 2u * h->hidden * sizeof(int16_t) +
                                (uint64_t)h->outputBuckets * sizeof(int32_t);
@@ -306,11 +239,9 @@ static uint64_t nnue_payload_bytes(const NnueHeader *h) {
            (uint64_t)h->hidden * sizeof(int16_t) + headBytes * (h->reserved[0] == 1 ? 2u : 1u);
 }
 
-/*
- * Every rejection names the field and both values. A net that fails to load is
- * almost always someone mid-upgrade, and "hidden width 1024, this build holds
- * at most 512" is a fix; "bad net file" is a morning.
- */
+/* Every rejection names the field and both values. A net that fails to load is almost
+ * always someone mid-upgrade, and "hidden width 1024, this build holds at most 512" is a
+ * fix where "bad net file" is a morning. */
 static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *what) {
     const NnueHeader *const h = (const NnueHeader *)(const void *)blob;
 
@@ -347,8 +278,8 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
                "case to nnue_output() in src/nnue.c",
                h->activation, (unsigned)NNUE_ACT_SCRELU);
 
-    /* The feature set's tag defines its own shape, so a file that disagrees was
-     * written by an exporter with a different idea of what the tag means. */
+    /* The feature set's tag defines its own shape, so a file that disagrees was written by
+     * an exporter with a different idea of what the tag means. */
     if (h->features != slots * 12u * 64u)
         REJECT("feature set %u is %u features, not %u", h->featureSet, slots * 12u * 64u,
                h->features);
@@ -363,9 +294,9 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
                "requires - retrain at a width that is",
                h->hidden, (unsigned)NNUE_WIDTH_MULTIPLE);
 
-    /* Buckets are indexed (pieceCount - 2) / (32 / buckets), which only covers
-     * every row when the count divides 32. A file that says otherwise would
-     * evaluate some piece counts out of a bucket that was never trained. */
+    /* Buckets are indexed (pieceCount - 2) / (32 / buckets), which covers every row only
+     * when the count divides 32. Otherwise some piece counts read a bucket that was never
+     * trained. */
     if (h->outputBuckets == 0 || h->outputBuckets > NNUE_MAX_OUTPUT_BUCKETS ||
         32u % h->outputBuckets != 0)
         REJECT("%u output buckets - must be a divisor of 32, at most %u", h->outputBuckets,
@@ -374,26 +305,22 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
     if (h->qa == 0 || h->qb == 0 || h->scale == 0)
         REJECT("degenerate quantisation (qa %u, qb %u, scale %d)", h->qa, h->qb, h->scale);
 
-    /* qa is the SCReLU clamp ceiling, and the vectorised path materialises it
-     * with _mm256_set1_epi16 - so a qa above INT16_MAX truncates THERE and not
-     * in the scalar path, and the same net then evaluates differently on two
-     * builds of this engine. Reject by name rather than let the two disagree:
-     * `make nnue-test` only ever gates whichever one was compiled. */
+    /* qa is the SCReLU clamp ceiling, and the vectorised path materialises it with
+     * _mm256_set1_epi16 - so a qa above INT16_MAX truncates THERE and not in the scalar
+     * path, and the same net evaluates differently on two builds of this engine. */
     if (h->qa > INT16_MAX)
         REJECT("qa %u exceeds the int16 clamp ceiling %d that the vectorised accumulator "
                "requires",
                h->qa, (int)INT16_MAX);
 
-    /* scale is signed, and only its magnitude is ever the intent. A negative
-     * one loads cleanly, prints a normal-looking info line, and negates every
-     * evaluation - the engine then plays the worst move it can find. */
+    /* Only the magnitude is ever the intent. A negative scale loads cleanly, prints a
+     * normal-looking info line, and negates every evaluation. */
     if (h->scale < 0)
         REJECT("scale %d is negative, which would invert every evaluation", h->scale);
 
-    /* reserved[0] is the uncertainty flag. The rest must still be zero: a
-     * future exporter that uses one would otherwise have its field silently
-     * ignored, which is the exact failure the reserved block exists to make
-     * loud. */
+    /* reserved[0] is the uncertainty flag; the rest must still be zero. A future exporter
+     * that used one would otherwise have its field silently ignored, which is the exact
+     * failure the reserved block exists to make loud. */
     if (h->reserved[0] > 1)
         REJECT("uncertainty flag %u, this build reads 0 or 1 - re-export with the current "
                "tools/export_net.py",
@@ -404,6 +331,10 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
                    "flag in byte 0 - it is too old for whatever wrote this net",
                    i, h->reserved[i]);
 
+    /* Not checked: that the weights keep the int16 accumulator and the int16 SCReLU
+     * product in range. tools/export_net.py refuses to WRITE a net that does not, and it
+     * is the only thing that writes one; re-deriving a looser bound here would cost a
+     * pass over 50 MB and could only reject a net the exporter already blessed. */
     const uint64_t need = nnue_payload_bytes(h);
     if (h->payloadBytes != need)
         REJECT("header claims %u payload bytes, its own shape needs %llu", h->payloadBytes,
@@ -413,21 +344,12 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
         REJECT("file is %zu bytes, header describes %llu", bytes,
                (unsigned long long)(sizeof(NnueHeader) + need));
 
-        /*
-         * Not checked here: that the weights keep the int16 accumulator and the
-         * int16 SCReLU product in range. tools/export_net.py refuses to WRITE a
-         * net that does not, with bounds that hold over every legal position, and
-         * it is the only thing that writes one. Re-deriving a looser bound at load
-         * would cost a pass over 50 MB and could only reject a net the exporter
-         * already blessed.
-         */
-
 #undef REJECT
     return true;
 }
 
-/* Points the net at a validated blob and hashes it. `owned` is NULL for the
- * embedded blob, which lives in rodata and must not be freed. */
+/* Points the net at a validated blob and hashes it. `owned` is NULL for the embedded
+ * blob, which lives in rodata and must not be freed. */
 static void nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *owned,
                        const char *source) {
     if (Loaded.owned)
@@ -519,23 +441,13 @@ void nnue_init(void) {
 #endif
 }
 
-/* ------------------------------------------------------------ features ---- */
-
-/*
- * The mirrored king square: file 0-3 after the mirror, so 32 slots. The net
- * indexes this directly rather than a bucketing of it, which is what lets it
- * distinguish a king on g1 from one on h1.
- */
+/* The mirrored king square: file 0-3 after the mirror, so 32 slots. The net indexes this
+ * directly rather than a bucketing of it, which is what lets it tell a king on g1 from
+ * one on h1. */
 static inline int nnue_king_square(Square normalisedKing) {
     return (int)rank_of(normalisedKing) * 4 + (int)file_of(normalisedKing);
 }
 
-/*
- * One perspective's view of the board: rank-flipped for black, file-mirrored
- * when that side's king sits on the kingside. The mirror is driven by the KING
- * and applied to every square, exactly as TERM_PSQK does in eval.c - fold the
- * two differently and the table is indexed inconsistently.
- */
 typedef struct {
     Color side;
     bool mirror;
@@ -543,11 +455,14 @@ typedef struct {
 } Perspective;
 
 /*
- * Split from nnue_perspective() so the incremental update can ask what a
- * perspective WOULD be with the king somewhere else. A king move that leaves
- * both `slot` and `mirror` alone changes nothing about how this side indexes
- * the board, and is therefore an ordinary two-feature delta rather than a
- * refresh - which is most king moves, and worth the two lines to notice.
+ * One perspective's view of the board: rank-flipped for black, file-mirrored when that
+ * side's king sits kingside. The mirror is driven by the KING and applied to every
+ * square, exactly as TERM_PSQK does in eval.c.
+ *
+ * Split from nnue_perspective() so the incremental update can ask what a perspective
+ * WOULD be with the king elsewhere: a king move that leaves both `slot` and `mirror`
+ * alone is an ordinary two-feature delta rather than a refresh, which is most king
+ * moves.
  */
 static Perspective nnue_perspective_of(Color side, Square king) {
     Perspective p;
@@ -567,48 +482,33 @@ static inline Perspective nnue_perspective(const Position *pos, Color side) {
     return nnue_perspective_of(side, king_square(pos, side));
 }
 
-/*
- * UPGRADE POINT: the index function IS the feature set. A feature set that is
- * not "king slot x 12 planes x 64 squares" - a piece-type-dependent offset, a
- * factorised set - gets its own version here, selected on the tag.
- */
+/* UPGRADE POINT: the index function IS the feature set. Anything that is not "king slot
+ * x 12 planes x 64 squares" gets its own version here, selected on the tag. Planes 0-5
+ * are the perspective's own pieces and 6-11 the enemy's, each in PAWN..KING order. */
 static inline int nnue_feature_index(const Perspective *p, Square sq, Piece pc) {
     Square s = (p->side == BLACK) ? flip_rank(sq) : sq;
     if (p->mirror)
         s = (Square)(s ^ 7);
 
-    /* Planes 0-5 are the perspective's own pieces, 6-11 the enemy's, each in
-     * PAWN..KING order. PieceType starts at 1, the planes at 0. */
     const int plane = (color_of(pc) == p->side ? 0 : 6) + (int)type_of(pc) - 1;
     return p->slot * (12 * 64) + plane * 64 + (int)s;
 }
 
-/*
- * One perspective's accumulator, from scratch.
- *
- * This is the evaluation. At 1024 wide it is 32 rows of 1024 int16 additions,
- * and everything else in this file is rounding error beside it. int16 rather
- * than int32 because it halves the traffic and doubles the lanes; the exporter
- * proves it cannot wrap.
- */
+/* One perspective's accumulator, from scratch. This is the evaluation: at 1024 wide it
+ * is 32 rows of 1024 int16 additions, and everything else in this file is rounding error
+ * beside it. */
 static void nnue_accumulate(const Position *pos, const Perspective *p, int16_t *acc) {
     const uint32_t hidden = Loaded.hdr.hidden;
 
     /*
-     * The rows are resolved first, in one pass over the occupancy, and only
-     * then summed. That unblocks the address arithmetic from the adds, and it
-     * makes the NEXT row known while the current one is being added, which is
-     * what the prefetch below needs.
+     * Rows are resolved first, in one pass over the occupancy, and only then summed. That
+     * unblocks the address arithmetic from the adds and makes the NEXT row known while
+     * the current one is being added, which is what the prefetch below needs - worth
+     * about 4% of bench nps, small but consistent.
      *
-     * The table is 50 MB and a row is 2 KB, so an evaluation streams ~128 KB
-     * of weights whose layout it did not choose. The prefetch measured about
-     * 4% of bench nps here - small, but it is two lines and it went the same
-     * way on every run. Anything much larger has to come from not recomputing
-     * the accumulator at all, which is what an incremental update is for.
+     * One row per occupied square, sized to a full board rather than the 32 of a legal
+     * position, because board_set_fen accepts any diagram that fits on the squares.
      */
-    /* One row per occupied square. Sized to a full board rather than to the 32
-     * of a legal position, because board_set_fen accepts any diagram that fits
-     * on the squares - see the cap there, which this must not be smaller than. */
     const int16_t *rows[64];
     int count = 0;
 
@@ -639,21 +539,10 @@ static void nnue_accumulate(const Position *pos, const Perspective *p, int16_t *
     }
 }
 
-/* --------------------------------------------------------------- output --- */
-
-/*
- * Which output row a position reads: piece count, folded onto the buckets the
- * net was trained with. The expression is output_bucket() in
- * trainer/nnue/format.py and must stay bit-identical to it, so the divisor
- * stays 32 whatever the engine's piece cap is - it is the net's own geometry,
- * not ours to reinterpret.
- *
- * Which is exactly why the clamp is here rather than there. A legal position
- * has 2..32 men and lands inside the table by construction; a 40-man puzzle
- * does not, and would read off the end of outWeight. Such a position is past
- * anything the net was trained on regardless, so the top bucket - the one for
- * the most crowded boards it has seen - is the honest row to give it.
- */
+/* Piece count folded onto the net's buckets. The expression is output_bucket() in
+ * trainer/nnue/format.py and must stay bit-identical to it, so the divisor stays 32
+ * whatever the engine's piece cap is - which is why the clamp is here instead: a 40-man
+ * puzzle would read off the end of outWeight. */
 static inline int nnue_output_bucket(const Position *pos) {
     const uint32_t buckets = Loaded.hdr.outputBuckets;
     if (buckets == 1)
@@ -664,8 +553,9 @@ static inline int nnue_output_bucket(const Position *pos) {
 }
 
 #ifdef NNUE_AVX2
-/* Eight int32 lanes into an int64. Called once per NNUE_SCRELU_FLUSH vectors,
- * so the store round-trip is free and the clarity is worth having. */
+
+/* Eight int32 lanes into an int64. Called once per NNUE_SCRELU_FLUSH vectors, so the
+ * store round-trip is free and the clarity is worth having. */
 static inline int64_t nnue_hsum_epi32(__m256i v) {
     int32_t lanes[8];
     _mm256_storeu_si256((__m256i *)(void *)lanes, v);
@@ -676,8 +566,9 @@ static inline int64_t nnue_hsum_epi32(__m256i v) {
     return sum;
 }
 
-/* SCReLU against one half of the output row, accumulated the way the bound at
- * the top of this file describes. */
+/* SCReLU against one half of the output row. v * w stays in int16 - the exporter refuses
+ * a net where it would not - and madd then widens (v * w) * v into int32 pairs, flushed
+ * as the bound at the top of this file describes. */
 static inline int64_t nnue_screlu_half(const int16_t *acc, const int16_t *w, uint32_t hidden,
                                        int32_t qa) {
     const __m256i zero = _mm256_setzero_si256();
@@ -692,8 +583,6 @@ static inline int64_t nnue_screlu_half(const int16_t *acc, const int16_t *w, uin
         const __m256i v = _mm256_min_epi16(_mm256_max_epi16(a, zero), top);
         const __m256i k = _mm256_loadu_si256((const __m256i *)(const void *)(w + j));
 
-        /* v * w stays in int16 - the exporter refuses a net where it would not
-         * - and madd then widens (v * w) * v into int32 pairs. */
         lanes = _mm256_add_epi32(lanes, _mm256_madd_epi16(_mm256_mullo_epi16(v, k), v));
 
         if (++pending == NNUE_SCRELU_FLUSH) {
@@ -707,19 +596,17 @@ static inline int64_t nnue_screlu_half(const int16_t *acc, const int16_t *w, uin
 #endif
 
 /*
- * The side to move always reads its own accumulator first. Getting this
- * backwards produces a net that plays reasonably, hates its own position, and
- * trains to a loss curve that looks completely normal.
+ * The side to move always reads its own accumulator first. Getting this backwards
+ * produces a net that plays reasonably, hates its own position, and trains to a loss
+ * curve that looks completely normal.
  *
- * SCReLU's rescale is the part with a wrong answer that looks right: the
- * squared activation carries QA^2 where the bias carries QA, so the sum is
- * divided by QA - truncating toward zero, which is what C's / does - BEFORE
- * the bias is added. tools/export_net.py spells out the same order in numpy,
- * where // would floor instead, and `make nnue-test` is what proves the two
- * agree on the negatives.
+ * SCReLU's rescale is the part with a wrong answer that looks right: the squared
+ * activation carries QA^2 where the bias carries QA, so the sum is divided by QA -
+ * truncating toward zero, as C's / does - BEFORE the bias is added. numpy's // would
+ * floor instead, and `make nnue-test` is what proves the two agree on the negatives.
  *
- * UPGRADE POINT: a new NnueActivation gets a branch here and a case in the
- * exporter's forward().
+ * UPGRADE POINT: a new NnueActivation gets a branch here and a case in the exporter's
+ * forward().
  */
 static int32_t nnue_head(const int16_t *own, const int16_t *other, const int16_t *weights,
                          const int32_t *biases, int bucket) {
@@ -732,9 +619,9 @@ static int32_t nnue_head(const int16_t *own, const int16_t *other, const int16_t
     const int64_t sum =
         nnue_screlu_half(own, w, hidden, qa) + nnue_screlu_half(other, w + hidden, hidden, qa);
 #else
-    /* int64 because a term reaches QA^2 * 32767 and there are 2 * hidden of
-     * them. The vector path above cannot use int64 lanes and does not need to;
-     * both orders sum the same integers, so both give the same answer. */
+
+    /* int64 because a term reaches QA^2 * 32767 and there are 2 * hidden of them. Both
+     * orders sum the same integers, so both give the same answer. */
     int64_t sum = 0;
 
     for (uint32_t j = 0; j < hidden; ++j) {
@@ -750,21 +637,15 @@ static int32_t nnue_head(const int16_t *own, const int16_t *other, const int16_t
     return (int32_t)(sum / qa) + bias;
 }
 
-/* The evaluation: the value head over the given accumulators. The uncertainty
- * head is the same arithmetic over its own weights - see nnue_uncertainty(). */
+/* The value head. The uncertainty head is the same arithmetic over its own weights. */
 static inline int32_t nnue_output(const int16_t *own, const int16_t *other, int bucket) {
     return nnue_head(own, other, Loaded.outWeight, Loaded.outBias, bucket);
 }
 
-/*
- * Raw output to centipawns.
- *
- * int64 because raw reaches several million and SCALE is 400. The division
- * TRUNCATES toward zero, which is plain C integer division and which
- * tools/export_net.py reproduces explicitly: numpy's floor division rounds the
- * other way for negatives, and that one asymmetry would fail about half the
- * test vectors.
- */
+/* int64 because raw reaches several million and the scale is 400. The division TRUNCATES
+ * toward zero, which tools/export_net.py reproduces explicitly: numpy's floor division
+ * rounds the other way for negatives, and that asymmetry alone would fail about half the
+ * test vectors. */
 static Value nnue_centipawns(int32_t raw) {
     const int64_t num = (int64_t)raw * (int64_t)Loaded.hdr.scale;
     const int64_t den = (int64_t)Loaded.hdr.qa * (int64_t)Loaded.hdr.qb;
@@ -777,12 +658,11 @@ static Value nnue_centipawns(int32_t raw) {
     return (Value)cp;
 }
 
-/* The raw integer output, shared by the evaluation and the verifier so the
- * gate tests the arithmetic the engine actually runs. */
+/* The raw integer output, shared by the evaluation and the verifier so the gate tests
+ * the arithmetic the engine actually runs. */
 static int32_t nnue_raw(const Position *pos) {
-    /* Aligned so the vector loads and stores land on cache-line boundaries.
-     * 8 KB of stack at the maximum width, which is fine at every depth the
-     * search reaches. */
+    /* Aligned so the vector loads and stores land on cache-line boundaries. 8 KB of stack
+     * at the maximum width, which is fine at every depth the search reaches. */
     _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
 
     for (Color c = WHITE; c <= BLACK; ++c) {
@@ -796,33 +676,21 @@ static int32_t nnue_raw(const Position *pos) {
 
 Value nnue_evaluate(const Position *pos) { return nnue_centipawns(nnue_raw(pos)); }
 
-/* ------------------------------------------------- incremental updates ---- */
-
 /*
- * The accumulator stack.
- *
- * A from-scratch accumulation is up to 32 rows per perspective - 64 KB of
- * weights streamed per call at 512 wide - and it is essentially the entire
- * cost of the network. A move changes at most two features per perspective,
- * three when it captures and four when it castles, so carrying the accumulator
+ * The accumulator stack. A from-scratch accumulation is up to 32 rows per perspective
+ * and is essentially the entire cost of the network, while a move changes at most two
+ * features per perspective - three on a capture, four on a castle - so carrying it
  * across make/unmake replaces 64 rows with 4.
  *
- * Two properties make this safe rather than merely fast:
+ * Two things make that safe rather than merely fast. Every level records the Zobrist key
+ * of the position it describes and rebuilds from the board when the key does not match,
+ * so a missing push costs a recomputation and never a wrong score; and debug builds
+ * assert the incremental value against a full recomputation at every evaluation, which
+ * is the only thing that catches the class of bug whose symptom is rare unreproducible
+ * blunders.
  *
- *   * Every level records the Zobrist key of the position it describes, and a
- *     level whose key does not match the board rebuilds itself from the board.
- *     A missing push, a stale root left over from the previous search, or an
- *     `eval` typed at the UCI prompt therefore costs a recomputation - never a
- *     wrong score. The residual risk is a Zobrist collision at one specific
- *     stack level, which is the risk the transposition table already takes.
- *   * Debug builds assert the incremental value against a full recomputation
- *     at every evaluation. That one assertion covers the whole class of
- *     incremental-update bugs, which is where NNUE integrations quietly go
- *     wrong: the symptom is rare unreproducible blunders, and nothing in a
- *     loss curve or a node count ever points at it.
- *
- * TODO(engine): Lazy SMP needs one stack per thread. It is file-scope for the
- * same reason search.c's ordering tables are, and it moves when they do.
+ * TODO(engine): Lazy SMP needs one stack per thread. It is file-scope for the same
+ * reason search.c's ordering tables are, and it moves when they do.
  */
 typedef struct {
     _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
@@ -830,27 +698,23 @@ typedef struct {
     /* Key of the position this level describes; 0 until it describes one. */
     Key key;
 
-    /* Per perspective, because a king that changes slot or crosses the mirror
-     * line reindexes every feature ITS side sees and none of the other's. */
+    /* Per perspective, because a king that changes slot or crosses the mirror line
+     * reindexes every feature ITS side sees and none of the other's. */
     bool computed[COLOR_NB];
 } Accumulator;
 
-/* The search returns at ply >= MAX_PLY - 1 before making a move, so the
- * deepest push is shallower than this; the slack is deliberate. */
+/* The search returns at ply >= MAX_PLY - 1 before making a move, so the deepest push is
+ * shallower than this; the slack is deliberate. */
 static Accumulator AccStack[MAX_PLY + 2];
 static int AccTop;
 
-/* One feature: a piece standing on a square. */
 typedef struct {
     Piece pc;
     Square sq;
 } NnueFeature;
 
-/*
- * What a move changed, in features, plus which perspectives cannot express it
- * as a delta at all. Two of each is the worst case and it is castling: two
- * pieces leave two squares and arrive on two others.
- */
+/* What a move changed, in features, plus which perspectives cannot express it as a delta
+ * at all. Two of each is the worst case, and it is castling. */
 typedef struct {
     NnueFeature added[2];
     NnueFeature removed[2];
@@ -859,26 +723,20 @@ typedef struct {
     bool refresh[COLOR_NB];
 } NnueDelta;
 
-/* Whether `side` still indexes the board the same way after its king moves. */
+/* Whether `side` still indexes the board the same way after its king moves. Both fields,
+ * not just the slot: a king stepping d1-e1 keeps slot 3 and gains the mirror, which
+ * reindexes every square just as thoroughly. */
 static inline bool nnue_king_reindexes(Color side, Square kingFrom, Square kingTo) {
     const Perspective before = nnue_perspective_of(side, kingFrom);
     const Perspective after  = nnue_perspective_of(side, kingTo);
 
-    /* Both fields, not just the slot: a king stepping d1-e1 keeps slot 3 and
-     * gains the mirror, which reindexes every square just as thoroughly. */
     return before.slot != after.slot || before.mirror != after.mirror;
 }
 
-/*
- * The features `m` changed, derived from the position AFTER it was played.
- *
- * After rather than before, because the level being pushed has to record the
- * key of the position it describes and that key only exists once do_move has
- * folded in the side to move, the castling rights and the en passant square.
- * Everything the delta needs survives the move: the moving piece stands on
- * `to`, the captured piece is on the Undo record do_move just pushed, and
- * castling's two pieces are known from the mover's colour.
- */
+/* The features `m` changed, derived from the position AFTER it was played - the level
+ * being pushed records the key of the position it describes, and that key exists only
+ * once do_move has folded in the side to move, the castling rights and the en passant
+ * square. Everything the delta needs survives the move. */
 static void nnue_delta(const Position *pos, Move m, NnueDelta *d) {
     const Color us    = (Color)(pos->sideToMove ^ 1);
     const Square from = from_sq(m);
@@ -907,14 +765,14 @@ static void nnue_delta(const Position *pos, Move m, NnueDelta *d) {
     /* do_move incremented gamePly, so the record it wrote is one below. */
     const Piece captured = pos->history[pos->gamePly - 1].captured;
     if (captured != NO_PIECE) {
-        /* En passant takes the pawn beside the destination, not on it, and the
-         * push direction belongs to the mover. */
+        /* En passant takes the pawn beside the destination, not on it, and the push
+         * direction belongs to the mover. */
         const Square capsq            = mt == MT_EN_PASSANT ? (Square)(to - pawn_push(us)) : to;
         d->removed[d->removedCount++] = (NnueFeature){captured, capsq};
     }
 
-    /* A promotion vacates `from` as a pawn and occupies `to` as something
-     * else, which is the one move where the two features disagree. */
+    /* A promotion vacates `from` as a pawn and occupies `to` as something else, which is
+     * the one move where the two features disagree. */
     const Piece vacated  = mt == MT_PROMOTION ? make_piece(us, PAWN) : piece_on(pos, to);
     const Piece occupied = piece_on(pos, to);
 
@@ -925,18 +783,14 @@ static void nnue_delta(const Position *pos, Move m, NnueDelta *d) {
         d->refresh[us] = nnue_king_reindexes(us, from, to);
 }
 
-/*
- * dst = src + the added rows - the removed rows, in one pass over the width.
- *
- * One pass because the accumulator IS the memory traffic: reading src, writing
- * dst and touching each weight row once is the floor, and separate add and
- * subtract passes would pay for dst repeatedly.
- */
+/* dst = src + the added rows - the removed rows, in one pass over the width. One pass
+ * because the accumulator IS the memory traffic: separate add and subtract passes would
+ * pay for dst repeatedly. */
 static void nnue_apply_delta(const int16_t *src, int16_t *dst, const int16_t *const *add,
                              int addCount, const int16_t *const *sub, int subCount,
                              uint32_t hidden) {
-    /* The overwhelmingly common shape - a quiet move, one square vacated and
-     * one occupied - gets a body with no inner loop at all. */
+    /* The overwhelmingly common shape - a quiet move, one square vacated and one occupied
+     * - gets a body with no inner loop at all. */
     if (addCount == 1 && subCount == 1) {
         const int16_t *const a = add[0];
         const int16_t *const b = sub[0];
@@ -994,8 +848,8 @@ void eval_state_push(const Position *pos, Move m) {
     const Accumulator *const parent = &AccStack[AccTop];
     Accumulator *const child        = &AccStack[++AccTop];
 
-    /* The key the parent must be describing if its accumulator is to be worth
-     * carrying forward: do_move recorded the pre-move key on the Undo. */
+    /* The key the parent must be describing if its accumulator is to be worth carrying
+     * forward: do_move recorded the pre-move key on the Undo. */
     const Key parentKey = pos->history[pos->gamePly - 1].key;
 
     child->key = pos->key;
@@ -1006,19 +860,17 @@ void eval_state_push(const Position *pos, Move m) {
     const uint32_t hidden = Loaded.hdr.hidden;
 
     for (Color c = WHITE; c <= BLACK; ++c) {
-        /* Nothing to carry forward from a parent that was never computed or
-         * that describes some other position, and nothing a delta can say to a
-         * perspective that reindexed. Either way the level is left for the
-         * next evaluation to rebuild from the board. */
+        /* Nothing to carry forward from a parent that was never computed or describes some
+         * other position, and nothing a delta can say to a perspective that reindexed.
+         * Either way the level is left for the next evaluation to rebuild. */
         if (d.refresh[c] || !parent->computed[c] || parent->key != parentKey) {
             child->computed[c] = false;
             continue;
         }
 
-        /* The perspective is read off the CURRENT board, which is legitimate
-         * precisely because this branch has established that `c` did not
-         * reindex - its slot and mirror are what they were before the move, so
-         * the same indices apply on both sides of it. */
+        /* Read off the CURRENT board, which is legitimate precisely because this branch has
+         * established that `c` did not reindex - the same indices apply on both sides of
+         * the move. */
         const Perspective p = nnue_perspective(pos, c);
 
         const int16_t *add[2];
@@ -1037,13 +889,9 @@ void eval_state_push(const Position *pos, Move m) {
     }
 }
 
-/*
- * A null move moves no piece, so both accumulators are already right and only
- * the key changed. The copy exists so the child level can carry that key:
- * without a level of its own, every node under a null move would find a key
- * mismatch and rebuild from scratch, which is the cost this section exists to
- * avoid.
- */
+/* A null move moves no piece, so both accumulators are already right and only the key
+ * changed. The copy exists so the child level can carry that key: without a level of its
+ * own, every node under a null move would find a mismatch and rebuild from scratch. */
 void eval_state_push_null(const Position *pos) {
     assert(AccTop + 1 < (int)(sizeof(AccStack) / sizeof(AccStack[0])));
 
@@ -1065,10 +913,8 @@ void eval_state_pop(void) {
     --AccTop;
 }
 
-/*
- * The level describing the board, with any perspective that cannot be trusted
- * rebuilt from it.
- */
+/* The level describing the board, with any perspective that cannot be trusted rebuilt
+ * from it. */
 static const Accumulator *nnue_current(const Position *pos) {
     Accumulator *const a = &AccStack[AccTop];
 
@@ -1087,17 +933,17 @@ static const Accumulator *nnue_current(const Position *pos) {
     return a;
 }
 
-/* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is
- * not set, so which one the engine runs costs nothing at runtime. */
+/* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is not set, so
+ * which one the engine runs costs nothing at runtime. */
 Value eval_evaluate(const Position *pos) {
     const Accumulator *const a = nnue_current(pos);
     const Color stm            = pos->sideToMove;
 
     const int32_t raw = nnue_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos));
 
-    /* The gate on the entire incremental path. Cheap to state, expensive to
-     * omit: an accumulator that drifts produces a legal-looking evaluation and
-     * surfaces only as blunders nobody can reproduce. */
+    /* The gate on the entire incremental path. Cheap to state, expensive to omit: an
+     * accumulator that drifts produces a legal-looking evaluation and surfaces only as
+     * blunders nobody can reproduce. */
     assert(raw == nnue_raw(pos) && "incremental accumulator disagrees with a full recomputation");
 
     return nnue_centipawns(raw);
@@ -1105,16 +951,14 @@ Value eval_evaluate(const Position *pos) {
 
 bool nnue_has_uncertainty(void) { return Loaded.uncWeight != NULL; }
 
-/* The uncertainty head's raw output over the given accumulators, shared by the
- * evaluation path and the verifier for the same reason nnue_raw() is. */
 static int32_t nnue_unc_output(const int16_t *own, const int16_t *other, int bucket) {
     assert(Loaded.uncWeight != NULL && "uncertainty asked of a net without the head");
     return nnue_head(own, other, Loaded.uncWeight, Loaded.uncBias, bucket);
 }
 
-/* The head predicts a magnitude, so the clamp floor is zero rather than the
- * value head's -NNUE_EVAL_LIMIT: a negative prediction is the head saying
- * "less error than I can express". tools/export_net.py clamps identically. */
+/* The head predicts a magnitude, so the floor is zero rather than -NNUE_EVAL_LIMIT: a
+ * negative prediction is the head saying "less error than I can express".
+ * tools/export_net.py clamps identically. */
 static Value nnue_unc_centipawns(int32_t raw) {
     const int64_t num = (int64_t)raw * (int64_t)Loaded.hdr.scale;
     const int64_t den = (int64_t)Loaded.hdr.qa * (int64_t)Loaded.hdr.qb;
@@ -1135,8 +979,6 @@ Value nnue_uncertainty(const Position *pos) {
         nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos)));
 }
 
-/* ------------------------------------------------------------- reporting -- */
-
 const char *nnue_hash(void) { return Loaded.loaded ? Loaded.hash : "no-net"; }
 
 void nnue_print_info(void) {
@@ -1151,9 +993,9 @@ void nnue_print_info(void) {
     memcpy(tag, h->tag, NNUE_TAG_LEN);
     tag[NNUE_TAG_LEN] = '\0';
 
-    /* Which inference path this binary took, as well as which net it carries:
-     * an nps that cannot be attributed to a build is as useless as a node
-     * count that cannot be attributed to a net. */
+    /* Which inference path this binary took as well as which net it carries: an nps that
+     * cannot be attributed to a build is as useless as a node count that cannot be
+     * attributed to a net. */
     printf("info string net %.12s  %u->%ux2->%u%s  screlu halfka-32sq %s  qa %u qb %u "
            "scale %d  tag %s  from %s\n",
            Loaded.hash, h->features, h->hidden, h->outputBuckets, Loaded.uncWeight ? "+unc" : "",
@@ -1166,8 +1008,6 @@ void nnue_print_info(void) {
     fflush(stdout);
 }
 
-/* ---------------------------------------------------------- the gate ------ */
-
 int nnue_verify_vectors(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -1179,10 +1019,9 @@ int nnue_verify_vectors(const char *path) {
     char line[512];
     long checked = 0, failed = 0;
 
-    /* The net says whether every line carries the two uncertainty columns.
-     * The vectors were written beside the net they describe, so a count that
-     * disagrees means these vectors belong to a different net - which the
-     * hash comment would also say, less loudly. */
+    /* The net says whether every line carries the two uncertainty columns. The vectors
+     * were written beside the net they describe, so a count that disagrees means these
+     * vectors belong to a different net. */
     const bool wantUnc = nnue_has_uncertainty();
 
     while (fgets(line, sizeof(line), f)) {
@@ -1224,8 +1063,8 @@ int nnue_verify_vectors(const char *path) {
         bool ok     = (long)raw == expectedRaw && (long)cp == expectedCp;
         long uncRaw = 0, uncCp = 0;
         if (wantUnc) {
-            /* Through the same accumulators the value just used, exactly as
-             * the reference computes both heads from one activation. */
+            /* Through the same accumulators the value just used, exactly as the reference
+             * computes both heads from one activation. */
             const Accumulator *const a = nnue_current(&pos);
             const Color stm            = pos.sideToMove;
 
@@ -1235,9 +1074,8 @@ int nnue_verify_vectors(const char *path) {
         }
 
         if (!ok) {
-            /* Print the first handful and then stop counting out loud: a
-             * quantisation bug fails every line, and ten thousand of them
-             * buries the one worth reading. */
+            /* Print the first handful and then stop counting out loud: a quantisation bug
+             * fails every line, and ten thousand of them buries the one worth reading. */
             if (failed < 10) {
                 printf("nnue verify: MISMATCH  raw %ld != %ld   cp %ld != %ld", (long)raw,
                        expectedRaw, (long)cp, expectedCp);
@@ -1265,4 +1103,4 @@ int nnue_verify_vectors(const char *path) {
     return 0;
 }
 
-#endif /* EVAL_NNUE */
+#endif

@@ -1,8 +1,4 @@
-/*
- * zobrist.c - fixed-seed Zobrist key generation.
- *
- * See the determinism contract in zobrist.h before touching anything here.
- */
+/* zobrist.c - fixed-seed key generation. See the determinism note in zobrist.h. */
 #include "zobrist.h"
 
 Key ZobristPiece[PIECE_NB][SQUARE_NB];
@@ -11,13 +7,10 @@ Key ZobristEnPassant[8];
 Key ZobristCastling[16];
 Key ZobristSideToMove;
 
-/*
- * xorshift64* - passes BigCrush, is two instructions per word, and is fully
- * reproducible across compilers and architectures because every operation is
- * defined on exact-width unsigned integers.
- */
 static uint64_t rng_state;
 
+/* xorshift64*: two instructions per word, and reproducible across compilers because
+ * every operation is defined on exact-width unsigned integers. */
 static uint64_t rng_next(void) {
     rng_state ^= rng_state >> 12;
     rng_state ^= rng_state << 25;
@@ -26,24 +19,23 @@ static uint64_t rng_next(void) {
 }
 
 void zobrist_init(void) {
-    rng_state = 0x9D39247E33776D41ULL; /* fixed seed - see zobrist.h */
+    rng_state = 0x9D39247E33776D41ULL;
 
     for (int p = 0; p < PIECE_NB; ++p)
         for (int s = 0; s < SQUARE_NB; ++s)
             ZobristPiece[p][s] = rng_next();
 
-    /* Derived rather than drawn: taking these from rng_next() would shift every
-     * key generated after them, which moves the bench node count for a change
-     * that alters no search decision. */
+    /* Derived rather than drawn: taking these from rng_next() would shift every key
+     * generated after them, moving the bench node count for a change that alters no
+     * search decision. */
     for (int p = 0; p < PIECE_NB; ++p)
         ZobristPawnSelect[p] = type_of((Piece)p) == PAWN ? ~(Key)0 : (Key)0;
 
     for (int f = 0; f < 8; ++f)
         ZobristEnPassant[f] = rng_next();
 
-    /* Castling keys are built from four independent right-keys and then XORed
-     * per mask. This lets do_move update the key by XORing a single combined
-     * value instead of toggling rights one at a time. */
+    /* Four independent right-keys, XORed together per mask, so do_move can update the
+     * key with one XOR instead of toggling rights one at a time. */
     Key rights[4];
     for (int i = 0; i < 4; ++i)
         rights[i] = rng_next();

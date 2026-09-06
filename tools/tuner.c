@@ -1,29 +1,20 @@
 /*
  * tuner.c - offline evaluation fitting. Not part of the engine binary.
  *
- * Two subcommands, which together are the whole pipeline from a database of
- * games to a regenerated src/evalparams.c:
- *
  *     tuner extract <pgn>... -o data.epd     games      -> labelled positions
  *     tuner tune    <data.epd> -o out.c      positions  -> fitted weights
  *
- * WHAT IS BEING FITTED. The evaluation is linear in its weights: every term is
- * a weight multiplied by a coefficient that depends only on the position, so a
- * position's score is a dot product. eval.c already reports those coefficients
- * through EvalTrace, which means the tuner never has to model what the
- * evaluation does - it reads out what the evaluation did. Add a term to eval.c
- * and this file fits it with no changes.
+ * The evaluation is linear in its weights, so a position's score is a dot product and
+ * eval.c already reports the coefficients through EvalTrace - the tuner never has to model
+ * what the evaluation does, it reads out what the evaluation did. Add a term to eval.c and
+ * this file fits it with no changes.
  *
- * WHAT THE LABEL IS. Each position carries the result of the game it came
- * from, 1 / 0.5 / 0 from white's point of view. Fitting a sigmoid of the score
- * to that result is logistic regression on win/draw/loss, and it is the only
- * signal available that does not come from the evaluation being replaced -
- * which is the entire reason it is worth more than a stronger but circular one.
- *
- * The scale K inside the sigmoid is fitted FIRST, on the starting weights, and
- * then frozen. K and the overall magnitude of the weights are the same degree
- * of freedom, so letting both move would leave the score free to drift off the
- * centipawn scale that every margin in search.c is written in.
+ * Each position is labelled with the result of the game it came from, so fitting a sigmoid
+ * of the score to that result is logistic regression on win/draw/loss - the only signal
+ * available that does not come from the evaluation being replaced. The scale K inside the
+ * sigmoid is fitted first and then frozen, because K and the overall magnitude of the
+ * weights are one degree of freedom and letting both move would drift the score off the
+ * centipawn scale search.c's margins are written in.
  */
 #include <math.h>
 #include <stdbool.h>
@@ -48,15 +39,14 @@ static int nthreads_option = 0;
 static int worker_count(void) {
     if (nthreads_option > 0)
         return nthreads_option < MAX_THREADS ? nthreads_option : MAX_THREADS;
-    int n = thread_hardware_concurrency() - 2; /* leave the machine usable */
+    int n = thread_hardware_concurrency() - 2;
     if (n < 1)
         n = 1;
     return n < MAX_THREADS ? n : MAX_THREADS;
 }
 
-/* Wall clock. Deliberately not clock(): that is wall time on Windows but
- * CPU time on POSIX, so every duration printed by a threaded run would be
- * inflated by the thread count on Linux. */
+/* Wall clock. Not clock(), which is CPU time on POSIX and would inflate every duration a
+ * threaded run prints. */
 static double now_seconds(void) { return (double)time_ms() / 1000.0; }
 
 static void die(const char *msg) {
@@ -71,18 +61,14 @@ static void *xmalloc(size_t n) {
     return p;
 }
 
-/* ========================================================================== */
-/*  Subcommand: extract                                                       */
-/* ========================================================================== */
-
 typedef struct {
-    int minPly;     /* skip this many plies of opening theory */
-    int maxPly;     /* stop sampling past this ply; 0 for no cap */
-    int stride;     /* keep one in this many eligible positions */
-    int minElo;     /* skip games below this rating */
-    int minBase;    /* skip games whose base time control is below this (s) */
-    int maxScore;   /* skip positions already decided by this margin (cp) */
-    int qsearchPly; /* depth of the quiescence used by the quiet filter */
+    int minPly;
+    int maxPly;
+    int stride;
+    int minElo;
+    int minBase;
+    int maxScore;
+    int qsearchPly;
 } ExtractOpts;
 
 typedef struct {
@@ -94,8 +80,8 @@ typedef struct {
     unsigned rng;
 } Extractor;
 
-/* xorshift: the sampling stride needs a different phase per game, and a
- * deterministic one so a re-run reproduces the same dataset exactly. */
+/* xorshift: the sampling stride needs a different phase per game, and a deterministic one
+ * so a re-run reproduces the same dataset exactly. */
 static unsigned next_rand(unsigned *s) {
     unsigned x = *s;
     x ^= x << 13;
@@ -104,15 +90,10 @@ static unsigned next_rand(unsigned *s) {
     return *s = x;
 }
 
-/* ------------------------------------------------------------ SAN parsing -- */
-
-/*
- * Turn one SAN token into a move by generating the legal moves and keeping the
- * one that matches every constraint the token expresses. Slower than decoding
- * the notation directly, but it cannot produce a move that is not legal in the
- * position, which is what matters when reading millions of games written by
- * software of varying quality.
- */
+/* Turn one SAN token into a move by generating the legal moves and keeping the one that
+ * matches every constraint the token expresses. Slower than decoding the notation
+ * directly, but it cannot produce a move that is not legal in the position, which is what
+ * matters when reading millions of games written by software of varying quality. */
 static Move parse_san(const Position *pos, const char *san) {
     char buf[32];
     size_t n = 0;
@@ -127,8 +108,6 @@ static Move parse_san(const Position *pos, const char *san) {
     ScoredMove list[MAX_MOVES];
     const int count = movegen_generate(pos, GEN_ALL, list);
 
-    /* Castling is spelled by destination in SAN but encoded king-captures-rook
-     * internally, so it cannot go through the square matcher below. */
     if (!strncmp(buf, "O-O-O", 5) || !strncmp(buf, "0-0-0", 5) || !strncmp(buf, "O-O", 3) ||
         !strncmp(buf, "0-0", 3)) {
         const bool queenside = (buf[3] == '-');
@@ -164,14 +143,12 @@ static Move parse_san(const Position *pos, const char *san) {
     if (n < i + 2)
         return MOVE_NONE;
 
-    /* The destination is always the last two characters. */
     const File toFile = (File)(buf[n - 2] - 'a');
     const Rank toRank = (Rank)(buf[n - 1] - '1');
     if (toFile < FILE_A || toFile > FILE_H || toRank < RANK_1 || toRank > RANK_8)
         return MOVE_NONE;
     const Square to = make_square(toFile, toRank);
 
-    /* Anything between the piece letter and the destination disambiguates. */
     int fromFile = -1, fromRank = -1;
     for (size_t k = i; k + 2 < n; ++k) {
         if (buf[k] >= 'a' && buf[k] <= 'h')
@@ -205,16 +182,6 @@ static Move parse_san(const Position *pos, const char *san) {
     return MOVE_NONE;
 }
 
-/* -------------------------------------------------------- quiet filtering -- */
-
-/*
- * A position is kept only if standing pat already beats every capture - i.e.
- * the static evaluation is not about to be contradicted by a two-move tactic.
- *
- * Fitting on tactical positions teaches the evaluation to predict the outcome
- * of a capture sequence, which is the search's job and which the evaluation has
- * no means to represent. Those positions are pure label noise here.
- */
 static Value quiesce(Position *pos, Value alpha, Value beta, int depth) {
     const bool inCheck = board_checkers(pos) != 0;
     Value best         = -VALUE_INFINITE;
@@ -251,10 +218,14 @@ static Value quiesce(Position *pos, Value alpha, Value beta, int depth) {
     }
 
     if (inCheck && legal == 0)
-        return -VALUE_MATE; /* mated; the caller discards these anyway */
+        return -VALUE_MATE;
     return best;
 }
 
+/* A position is kept only if standing pat already beats every capture. Fitting on tactical
+ * positions teaches the evaluation to predict the outcome of a capture sequence, which is
+ * the search's job and which the evaluation has no means to represent - those positions
+ * are pure label noise here. */
 static bool position_is_quiet(Extractor *ex) {
     if (board_checkers(ex->pos))
         return false;
@@ -269,8 +240,6 @@ static bool position_is_quiet(Extractor *ex) {
     return true;
 }
 
-/* -------------------------------------------------------------- PGN games -- */
-
 typedef struct {
     char result[8];
     char fen[FEN_MAX_LEN];
@@ -279,10 +248,9 @@ typedef struct {
     bool hasFen;
 } GameTags;
 
-/* Truncating copy. snprintf would do, but a PGN tag value is declared to the
- * compiler as up to 511 bytes and every fixed-size destination here is
- * smaller, which makes -Wformat-truncation fire on code that is already
- * correct. Doing the clamp explicitly says the same thing without the noise. */
+/* Truncating copy. snprintf would do, but a PGN tag value is declared as up to 511 bytes
+ * and every destination here is smaller, which makes -Wformat-truncation fire on code that
+ * is already correct. */
 static void copy_tag(char *dst, size_t cap, const char *src) {
     size_t n = strlen(src);
     if (n >= cap)
@@ -317,7 +285,7 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
         return;
     }
     if (ex->opt.minBase > 0) {
-        const int base = atoi(tags->timeControl); /* "300+3" -> 300, "-" -> 0 */
+        const int base = atoi(tags->timeControl);
         if (base < ex->opt.minBase) {
             ex->rejectedTc++;
             return;
@@ -331,8 +299,6 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
         board_set_startpos(ex->pos);
     }
 
-    /* Phase the sampling stride per game so we do not always take the same
-     * move number, which would bias the set towards one part of the game. */
     int countdown = (int)(next_rand(&ex->rng) % (unsigned)ex->opt.stride);
     int ply       = 0;
     bool used     = false;
@@ -341,10 +307,6 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
     char token[32];
 
     while (*p) {
-        /* Past the window there is nothing left to sample, and a PGN is mostly
-         * moves this game will never look at: stopping here is what makes
-         * `-minply N -maxply N` a cheap pass over a large corpus rather than a
-         * full SAN decode of every game in it. */
         if (ex->opt.maxPly > 0 && ply > ex->opt.maxPly)
             break;
 
@@ -353,7 +315,6 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
         if (!*p)
             break;
 
-        /* Comments, variations and NAGs carry no moves. */
         if (*p == '{') {
             while (*p && *p != '}')
                 ++p;
@@ -386,7 +347,6 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
         if (!n)
             continue;
 
-        /* Move numbers ("12." / "12...") and the result token. */
         if ((token[0] >= '0' && token[0] <= '9') && (strchr(token, '.') || strchr(token, '-')))
             continue;
         if (!strcmp(token, "*"))
@@ -395,11 +355,9 @@ static void play_game(Extractor *ex, const GameTags *tags, const char *movetext)
         const Move m = parse_san(ex->pos, token);
         if (!is_ok_move(m)) {
             ex->badSan++;
-            return; /* desynchronised: the rest of this game is unusable */
+            return;
         }
 
-        /* Sample BEFORE the move, so the position is one a player actually
-         * had to evaluate. */
         if (ply >= ex->opt.minPly) {
             if (countdown-- <= 0) {
                 countdown = ex->opt.stride - 1;
@@ -426,9 +384,9 @@ static void extract_file(Extractor *ex, const char *path, int fileIndex) {
         return;
     }
 
-    /* Seed from the file's index rather than from thread order: the sampling
-     * stride is randomised per game, and a dataset that depends on which core
-     * happened to pick a file up is not reproducible. */
+    /* Seeded from the file's index rather than from thread order: the sampling stride is
+     * randomised per game, and a dataset that depends on which core happened to pick a file
+     * up is not reproducible. */
     ex->rng = 0x2545F491u + 2654435761u * (unsigned)fileIndex;
 
     GameTags tags;
@@ -490,12 +448,6 @@ static void extract_file(Extractor *ex, const char *path, int fileIndex) {
     fclose(f);
 }
 
-/*
- * One worker per slice of the file list, each writing its own part file. PGN
- * parsing is entirely CPU-bound - the quiescence search deciding whether a
- * position is quiet dominates it - so this scales with cores, and it is the
- * difference between a five-minute extraction and an hour of one.
- */
 typedef struct {
     ExtractOpts opt;
     const char **files;
@@ -506,6 +458,11 @@ typedef struct {
     uint64_t rejectedElo, rejectedTc, rejectedResult, badSan;
 } ExtractJob;
 
+/* One worker per slice of the file list, each writing its own part file. PGN parsing is
+ * entirely CPU-bound - the quiescence search deciding whether a position is quiet dominates
+ * it - so this scales with cores, and it is the difference between a five-minute extraction
+ * and an hour of one. The parts are stitched together in worker order, which keeps the
+ * output a deterministic function of the input file list. */
 static void extract_worker(void *arg) {
     ExtractJob *job = (ExtractJob *)arg;
 
@@ -599,8 +556,6 @@ static int cmd_extract(int argc, char **argv) {
     const char **slices   = xmalloc((size_t)fileCount * sizeof(char *));
     int *sliceIdx         = xmalloc((size_t)fileCount * sizeof(int));
 
-    /* Deal the files out round-robin, so a worker that happens to draw several
-     * large months is not left running alone at the end. */
     int cursor = 0;
     for (int t = 0; t < nt; ++t) {
         jobs[t].opt     = ex.opt;
@@ -634,8 +589,6 @@ static int cmd_extract(int argc, char **argv) {
         totals.badSan += jobs[t].badSan;
     }
 
-    /* Stitch the parts together in worker order, which keeps the output a
-     * deterministic function of the input file list. */
     printf("\nconcatenating %d part files...\n", nt);
     FILE *final = fopen(out, "wb");
     if (!final)
@@ -670,10 +623,6 @@ static int cmd_extract(int argc, char **argv) {
     return 0;
 }
 
-/* ========================================================================== */
-/*  Subcommand: tune                                                          */
-/* ========================================================================== */
-
 typedef struct {
     uint16_t index;
     int16_t coeff;
@@ -687,13 +636,10 @@ typedef struct {
     float result;
 } Sample;
 
-/*
- * `pool` for a line the loader could not use. MAX_THREADS is 64, so this can
- * never be a real pool id, and it costs no extra byte in a struct there are
- * tens of millions of. load_dataset() compacts these out before fitting - the
- * slots would otherwise stay exactly as xmalloc left them, and fit_worker
- * would index Pools[] with an uninitialised byte and walk a wild pointer.
- */
+/* `pool` for a line the loader could not use. MAX_THREADS is 64, so this can never be a
+ * real pool id, and it costs no extra byte in a struct there are tens of millions of.
+ * load_dataset() compacts these out before fitting - otherwise fit_worker would index
+ * Pools[] with an uninitialised byte and walk a wild pointer. */
 #define SAMPLE_POOL_INVALID 0xFF
 
 typedef struct {
@@ -707,13 +653,11 @@ static Sample *Samples;
 static size_t SampleCount;
 static Pool Pools[MAX_THREADS];
 
-/* Weights under optimisation. Kept in double: the int16 tables they come from
- * and go back to cannot represent a gradient step. */
+/* Weights under optimisation. Kept in double: the int16 tables they come from and go back
+ * to cannot represent a gradient step. */
 static double *Wmg, *Weg;
-static double *Mmg, *Meg, *Vmg, *Veg; /* Adam moments */
+static double *Mmg, *Meg, *Vmg, *Veg;
 static double SigmoidK = 200.0;
-
-/* ------------------------------------------------------------- dataset ----- */
 
 static char *read_whole_file(const char *path, size_t *outLen) {
     FILE *f = fopen(path, "rb");
@@ -748,11 +692,10 @@ typedef struct {
     size_t bad;
 } LoadJob;
 
+/* Sample.offset is 32-bit. One thread would need ~4.3 billion features - roughly 60 million
+ * positions on a single thread - to reach this, but a silent wrap would corrupt the dataset
+ * in a way nothing downstream could detect, so it is worth one compare per feature. */
 static void pool_push(Pool *p, uint16_t index, int16_t coeff) {
-    /* Sample.offset is 32-bit. One thread would need ~4.3 billion features -
-     * roughly 60 million positions on a single thread - to reach this, but a
-     * silent wrap would corrupt the dataset in a way nothing downstream could
-     * detect, so it is worth one compare per feature. */
     if (p->len >= 0xFFFFFFFFu)
         die("feature pool overflowed 32-bit offsets; use more threads or -max");
 
@@ -783,7 +726,6 @@ static void load_worker(void *arg) {
     for (size_t i = job->first; i < job->last; ++i) {
         char *line = job->lines[i];
 
-        /* "<fen> [<result>]" */
         char *bracket = strrchr(line, '[');
         if (!bracket) {
             Samples[i].pool = SAMPLE_POOL_INVALID;
@@ -808,14 +750,6 @@ static void load_worker(void *arg) {
         s->phase  = (uint8_t)phase_of(pos);
         s->result = (float)result;
 
-        /*
-         * The dirty list is what makes reading the trace out cheap, but if a
-         * position ever touched more indices than it can hold, the ones it
-         * could not record would never be cleared and would leak into every
-         * later position. A position uses about 200 of the 1024 slots, so this
-         * should never fire - and if it does, a full clear is correct rather
-         * than merely safe.
-         */
         const bool overflowed = EvalTraceDirtyCount >= EVAL_TRACE_MAX;
 
         int kept = 0;
@@ -842,7 +776,6 @@ static void load_dataset(const char *path, size_t maxPositions) {
     size_t len;
     char *raw = read_whole_file(path, &len);
 
-    /* Index the lines in place. */
     size_t capacity = 1u << 20, count = 0;
     char **lines = xmalloc(capacity * sizeof(char *));
     char *p      = raw;
@@ -869,6 +802,10 @@ static void load_dataset(const char *path, size_t maxPositions) {
         p = nl + 1;
     }
 
+    /* Drop the lines nothing was written for. Every worker owns a disjoint slice, so this
+     * runs once here rather than needing coordination, and a Sample only ever moves so
+     * `offset` and `pool` stay valid. Without it SampleCount counts unusable lines and the
+     * fitter reads whatever xmalloc left in them. */
     SampleCount = count;
     Samples     = xmalloc(count * sizeof(Sample));
 
@@ -896,13 +833,6 @@ static void load_dataset(const char *path, size_t maxPositions) {
         features += Pools[i].len;
     }
 
-    /*
-     * Drop the lines nothing was written for. Every worker owns a disjoint
-     * slice, so this runs once here rather than needing coordination; the
-     * Feature pools are untouched and a Sample only ever moves, so `offset`
-     * and `pool` stay valid. Without it SampleCount counts unusable lines and
-     * the fitter reads whatever xmalloc left in them.
-     */
     if (bad) {
         size_t kept = 0;
         for (size_t k = 0; k < count; ++k)
@@ -918,11 +848,7 @@ static void load_dataset(const char *path, size_t maxPositions) {
     printf("  feature pool: %.2f GB\n", (double)(features * sizeof(Feature)) / 1e9);
 
     free(lines);
-    /* `raw` is deliberately leaked: the FEN strings are no longer needed, but
-     * freeing it here would only matter if this were a long-running process. */
 }
-
-/* --------------------------------------------------------------- fitting -- */
 
 static inline double sample_score(const Sample *s, const double *wmg, const double *weg) {
     const Feature *f = Pools[s->pool].data + s->offset;
@@ -978,6 +904,8 @@ static void fit_worker(void *arg) {
     job->loss = total;
 }
 
+/* One slice of the dataset per thread; `gradient` says whether to accumulate one as well as
+ * the loss. */
 static double run_jobs(size_t first, size_t last, bool gradient, FitJob *jobs,
                        ThreadHandle *handles, int nt) {
     for (int i = 0; i < nt; ++i) {
@@ -995,8 +923,8 @@ static double run_jobs(size_t first, size_t last, bool gradient, FitJob *jobs,
     return (last > first) ? loss / (double)(last - first) : 0.0;
 }
 
-/* True for the two king-relative tables, the only ones weight decay applies
- * to - see the note where it is used. */
+/* The two king-relative tables, the only ones weight decay applies to - see the note where
+ * it is used. */
 static bool is_king_relative(int index) {
     return (index >= PARAM_OFF_PsqOwnKing && index <= PARAM_LAST_PsqOwnKing) ||
            (index >= PARAM_OFF_PsqEnemyKing && index <= PARAM_LAST_PsqEnemyKing);
@@ -1027,8 +955,6 @@ static void weights_to_tables(const double *wmg, const double *weg) {
     }
 }
 
-/* ---------------------------------------------------------------- output -- */
-
 static void write_params(const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f)
@@ -1037,19 +963,12 @@ static void write_params(const char *path) {
     fprintf(f, "/*\n"
                " * evalparams.c - the evaluation's weights.\n"
                " *\n"
-               " * GENERATED DATA - do not edit by hand. What each term MEANS is\n"
-               " * documented in evalparams.h (the registry) and eval.c (where the terms\n"
-               " * are applied); this file is only the numbers. Regenerate it with:\n"
+               " * GENERATED DATA - do not edit by hand. Regenerate with `make tuner` and\n"
+               " * `./tuner tune <data.epd> -o src/evalparams.c`; what the terms MEAN is in\n"
+               " * evalparams.h and eval.c, and docs/TUNING.md covers the fit.\n"
                " *\n"
-               " *     make tuner\n"
-               " *     ./tuner tune <data.epd> -o src/evalparams.c\n"
-               " *\n"
-               " * See docs/TUNING.md for how the data is produced and what the fit\n"
-               " * actually optimises.\n"
-               " *\n"
-               " * Piece-square tables are in BOARD ORDER: index 0 is A1, so the first\n"
-               " * row printed is rank 1. They are read from the moving side's point of\n"
-               " * view, so black looks them up rank-flipped.\n"
+               " * Piece-square tables are in BOARD ORDER - index 0 is A1 - and are read from\n"
+               " * the moving side's point of view, so black looks them up rank-flipped.\n"
                " */\n"
                "#include \"evalparams.h\"\n\n");
 
@@ -1172,12 +1091,9 @@ static int cmd_tune(int argc, char **argv) {
         jobs[i].geg = xmalloc(PARAM_NB * sizeof(double));
     }
 
-    /*
-     * Fit K first, on the starting weights, then leave it alone. K and the
-     * overall scale of the weights are one degree of freedom between them, so
-     * pinning K is what keeps the fitted evaluation on the same centipawn
-     * scale the search's margins are written in.
-     */
+    /* Fit K first, on the starting weights, then leave it alone: K and the overall scale of
+     * the weights are one degree of freedom between them, and pinning K is what keeps the
+     * fitted evaluation on the centipawn scale the search's margins are written in. */
     printf("\nfitting the sigmoid scale...\n");
     double bestK = SigmoidK, bestKLoss = 1e30;
     for (double k = 60.0; k <= 600.0; k += 10.0) {
@@ -1232,17 +1148,9 @@ static int cmd_tune(int argc, char **argv) {
             Wmg[i] -= lr * (Mmg[i] / bc1) / (sqrt(Vmg[i] / bc2) + eps);
             Weg[i] -= lr * (Meg[i] / bc1) / (sqrt(Veg[i] / bc2) + eps);
 
-            /*
-             * Weight decay, on the king-relative tables only.
-             *
-             * Those two tables are collinear with the base piece-square tables
-             * by construction - anything they can say, the base tables can say
-             * on average. Decay is what resolves that: it makes the base tables
-             * carry the average and leaves the buckets holding only the
-             * deviation from it, which is both the interpretation we want and
-             * the one that generalises. The hand-written terms are left
-             * undecayed because there is nothing for them to be shrunk towards.
-             */
+            /* King-relative tables only: they are collinear with the base piece-square tables
+             * by construction, and decay is what leaves the base tables carrying the average
+             * and the buckets only the deviation. Nothing shrinks a hand-written term. */
             if (decay > 0.0 && is_king_relative(i)) {
                 Wmg[i] -= lr * decay * Wmg[i];
                 Weg[i] -= lr * decay * Weg[i];
@@ -1278,7 +1186,6 @@ static int cmd_tune(int argc, char **argv) {
 
     weights_to_tables(bmg, beg);
 
-    /* Report the cost of rounding the fitted doubles back to int16. */
     weights_from_tables();
     const double rounded = nval ? run_jobs(ntrain, SampleCount, false, jobs, handles, nt)
                                 : run_jobs(0, ntrain, false, jobs, handles, nt);
@@ -1290,8 +1197,6 @@ static int cmd_tune(int argc, char **argv) {
     printf("\nwrote %s\n", out);
     return 0;
 }
-
-/* ========================================================================== */
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);

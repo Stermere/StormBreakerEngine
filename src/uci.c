@@ -1,17 +1,10 @@
 /*
  * uci.c - Universal Chess Interface protocol layer.
  *
- * Two rules govern everything here:
- *
- *   1. NEVER BLOCK. Every command must be answered promptly, even mid-search.
- *      `stop` arriving during a think is the whole reason the search runs on a
- *      worker thread. If this loop ever waits on the search, GUIs will time
- *      the engine out and matches will be lost on protocol errors rather than
- *      chess.
- *
- *   2. NEVER TRUST INPUT. GUIs send malformed and unexpected commands. An
- *      unrecognised token is ignored, never fatal - crashing on a stray
- *      command forfeits the game.
+ * Two rules govern everything here. NEVER BLOCK: every command is answered promptly
+ * even mid-search, which is why the search runs on a worker thread. NEVER TRUST INPUT:
+ * an unrecognised or malformed token is ignored, never fatal, because crashing on a
+ * stray command forfeits the game.
  */
 #include "uci.h"
 
@@ -35,20 +28,13 @@
 #include "timeman.h"
 #include "tt.h"
 
-#define MAX_INPUT 65536 /* `position ... moves ...` grows long in a 300-move game */
+#define MAX_INPUT 65536
 
 static Position Pos;
 
-/* ------------------------------------------------------------- options --- */
-
-/*
- * The advertised bounds live here rather than inside the `option` strings so
- * that cmd_uci() and cmd_setoption() cannot drift apart. A GUI that is told
- * `max 5000` and then has 100000 accepted anyway is being lied to by whichever
- * of the two is wrong, and a Move Overhead outside this range is not a harmless
- * oddity: timeman.c subtracts it from the clock, so a negative one hands the
- * search time it does not have.
- */
+/* The advertised bounds live here rather than inside the `option` strings, so cmd_uci()
+ * and cmd_setoption() cannot drift apart. A Move Overhead outside this range is not a
+ * harmless oddity: timeman.c subtracts it from the clock. */
 #define OPT_HASH_MIN         1
 #define OPT_HASH_MAX         65536
 #define OPT_HASH_DEFAULT     16
@@ -58,30 +44,23 @@ static Position Pos;
 
 static int OptHash         = OPT_HASH_DEFAULT;
 static int OptMoveOverhead = OPT_OVERHEAD_DEFAULT;
-/* Purely so the notice below is printed once rather than on every `position`
- * command. The notation itself is decided by Pos.chess960. */
+
+/* Purely so the notice is printed once rather than on every `position`; the notation
+ * itself is decided by Pos.chess960. */
 static bool announcedChess960 = false;
 
 /*
- * False once a `position` command has been rejected, until one succeeds.
+ * False once a `position` command has been rejected, until one succeeds. A rejected FEN
+ * leaves `Pos` holding the last position that parsed, and answering from it confidently
+ * returns a move belonging to a different game - on black's turn that move is White's,
+ * and the GUI correctly reports the engine as having crashed.
  *
- * A rejected FEN leaves `Pos` holding the LAST position that parsed, which is
- * not the one the GUI believes is on the board. Searching it anyway is the
- * worst of the available options: the engine answers confidently with a move
- * belonging to a different game. On black's turn that move is White's, and the
- * GUI - correctly - reports the engine as having crashed. The engine is then
- * blamed for a protocol violation whose real cause is a FEN it printed one
- * line about and then ignored.
- *
- * UCI has no "I cannot" reply, so the honest answer is the null move: it says
- * "no move from me" without inventing a legal-looking one for a board nobody
- * else has.
+ * UCI has no "I cannot" reply, so the honest answer is the null move: it says "no move
+ * from me" without inventing a legal-looking one for a board nobody else has.
  */
 static bool posValid = true;
 
 int uci_move_overhead(void) { return OptMoveOverhead; }
-
-/* ------------------------------------------------------------ tokenising -- */
 
 static char *skip_spaces(char *s) {
     while (*s == ' ' || *s == '\t')
@@ -89,8 +68,8 @@ static char *skip_spaces(char *s) {
     return s;
 }
 
-/* Returns the next whitespace-delimited token and advances *cursor past it,
- * or NULL at end of input. Mutates the buffer, so callers pass a scratch copy. */
+/* The next whitespace-delimited token, or NULL at end of input. Mutates the buffer, so
+ * callers pass a scratch copy. */
 static char *next_token(char **cursor) {
     char *s = skip_spaces(*cursor);
     if (*s == '\0') {
@@ -114,28 +93,25 @@ static bool token_is(const char *tok, const char *word) {
     return tok != NULL && strcmp(tok, word) == 0;
 }
 
-/* Next token, or `fallback` when the line ended early. GUIs do send truncated
- * commands, and a missing argument must not become a NULL dereference. */
+/* GUIs do send truncated commands, and a missing argument must not become a NULL
+ * dereference. */
 static const char *next_or(char **cursor, const char *fallback) {
     const char *tok = next_token(cursor);
     return tok ? tok : fallback;
 }
 
-/* ---------------------------------------------------------- move syntax -- */
-
 char *move_to_str(Move m, bool chess960, char *buf) {
     if (m == MOVE_NONE || m == MOVE_NULL) {
-        strcpy(buf, "0000"); /* UCI's "no move" token */
+        strcpy(buf, "0000");
         return buf;
     }
 
     const Square from = from_sq(m);
     Square to         = to_sq(m);
 
-    /* Castling is stored internally as king-captures-own-rook so that Chess960
-     * stays unambiguous. Standard chess GUIs expect the king's actual
-     * destination (e1g1 / e1c1), so translate on the way out - but only for a
-     * position where that spelling cannot collide with an ordinary king move. */
+    /* Castling is stored king-captures-own-rook so Chess960 stays unambiguous, but
+     * standard GUIs expect the king's actual destination - so translate on the way out,
+     * and only where that spelling cannot collide with an ordinary king move. */
     if (type_of_move(m) == MT_CASTLING && !chess960)
         to = make_square(to > from ? FILE_G : FILE_C, rank_of(from));
 
@@ -152,14 +128,9 @@ char *move_to_str(Move m, bool chess960, char *buf) {
     return buf;
 }
 
-/*
- * Resolves "e2e4" / "e7e8q" against the moves legal in `pos`.
- *
- * Matching against generated moves rather than parsing the string into a move
- * directly is deliberate: it is the only way to know whether the move is a
- * capture, en passant, a castle or a double push, and it rejects illegal input
- * for free.
- */
+/* Resolves "e2e4" / "e7e8q" against the moves legal in `pos`. Matching against generated
+ * moves rather than parsing the string is the only way to know whether the move is a
+ * capture, en passant, a castle or a double push, and it rejects illegal input free. */
 static Move move_from_str(const Position *pos, const char *str) {
     ScoredMove moves[MAX_MOVES];
     char buf[8];
@@ -186,36 +157,32 @@ void uci_print_bestmove(Move best, Move ponder) {
     fflush(stdout);
 }
 
-/* ------------------------------------------------------------- handlers -- */
-
 static void cmd_uci(void) {
     printf("id name %s %s\n", ENGINE_NAME, ENGINE_VERSION);
     printf("id author %s\n", ENGINE_AUTHOR);
 
-    /* Hash and Threads are mandatory for OpenBench compliance. Threads is
-     * pinned to max 1 until the search is actually parallel - advertising a
-     * range the engine cannot honour makes test clients run games that are
-     * silently single-threaded. */
     printf("option name Hash type spin default %d min %d max %d\n", OPT_HASH_DEFAULT, OPT_HASH_MIN,
            OPT_HASH_MAX);
+    /* Hash and Threads are mandatory for OpenBench compliance. Threads is pinned to 1
+     * until the search is actually parallel - advertising a range the engine cannot
+     * honour makes test clients run games that are silently single-threaded. */
     printf("option name Threads type spin default 1 min 1 max 1\n");
     printf("option name Ponder type check default false\n");
     printf("option name Move Overhead type spin default %d min %d max %d\n", OPT_OVERHEAD_DEFAULT,
            OPT_OVERHEAD_MIN, OPT_OVERHEAD_MAX);
     printf("option name UCI_Chess960 type check default false\n");
-    /* Off until a GUI supplies a path, and `make bench` never does: with
-     * tablebases loaded the node count depends on which files are on the
-     * machine, and bench must not (CLAUDE.md invariant 1). */
+
+    /* Off until a GUI supplies a path, and `make bench` never does: with tablebases
+     * loaded the node count would depend on which files the machine has. */
     printf("option name SyzygyPath type string default <empty>\n");
+    /* The net is embedded, so the default is not a path. Setting this swaps the
+     * evaluation without a rebuild, which is what makes a candidate net cheap to try. */
 #ifdef EVAL_NNUE
-    /* The net is embedded, so the default is not a path. Setting this swaps
-     * the evaluation without a rebuild, which is what makes a candidate net
-     * cheap to try before it is worth embedding. */
     printf("option name EvalFile type string default <internal>\n");
 #endif
+    /* A tuning build advertises every search margin, so a sweep can drive the whole set
+     * through one binary rather than one build per candidate. */
 #ifdef TUNE_SEARCH
-    /* A tuning build advertises every search margin, so a sweep can drive the
-     * whole set through one binary rather than one build per candidate. */
     for (int i = 0; i < search_tunable_count(); ++i) {
         const char *name;
         int value, min, max;
@@ -228,15 +195,11 @@ static void cmd_uci(void) {
     fflush(stdout);
 }
 
-/*
- * Ends a running search before an option replaces something the worker still
- * holds a raw pointer into: the transposition table, the mapped tablebase
- * files, the network blob. This is a use-after-free rather than a race that
- * merely reads a stale value - `setoption name Hash` mid-search frees the
- * table out from under tt_probe() and the process dies. A GUI has no business
- * changing these while the engine thinks, but "no business" is not a memory
- * barrier.
- */
+/* Ends a running search before an option replaces something the worker still holds a
+ * raw pointer into - the transposition table, the mapped tablebases, the network blob.
+ * `setoption name Hash` mid-search frees the table out from under tt_probe() and the
+ * process dies; a GUI has no business doing that, but "no business" is not a memory
+ * barrier. */
 static void end_search_for_option(const char *name) {
     if (!search_running())
         return;
@@ -246,12 +209,9 @@ static void end_search_for_option(const char *name) {
     search_wait();
 }
 
-/*
- * Parses a spin option, clamping to the range cmd_uci() advertised and saying
- * so. Bare atoi() reports nothing for either failure mode: "abc" reads as 0
- * and a value past INT_MAX saturates, so both arrive as a plausible-looking
- * setting the GUI never asked for.
- */
+/* Clamps to the range cmd_uci() advertised, and says so. Bare atoi() reports nothing for
+ * either failure mode - "abc" reads as 0 and an overlarge value saturates - so both
+ * would arrive as a plausible-looking setting the GUI never asked for. */
 static int spin_value(const char *name, const char *value, int min, int max, int fallback) {
     char *end         = NULL;
     const long long v = strtoll(value, &end, 10);
@@ -298,15 +258,15 @@ static void cmd_setoption(char *args) {
         const int threads = atoi(value);
         if (threads != 1)
             printf("info string only 1 thread is supported; ignoring Threads=%d\n", threads);
+        /* Accepted and ignored on purpose: the option exists so a GUI will send
+         * `go ponder`, and it is that command the search acts on. */
     } else if (strcmp(name, "Ponder") == 0 && value) {
-        /* Accepted and ignored on purpose. The option exists so that a GUI
-         * will send `go ponder`, and it is that command the search acts on -
-         * there is no separate state for this flag to hold. */
     } else if (strcmp(name, "Move Overhead") == 0 && value) {
         OptMoveOverhead =
             spin_value(name, value, OPT_OVERHEAD_MIN, OPT_OVERHEAD_MAX, OptMoveOverhead);
     } else if (strcmp(name, "SyzygyPath") == 0 && value) {
         end_search_for_option(name);
+
         /* `<empty>` is what a GUI sends to clear the option it advertised. */
         if (*value == '\0' || strcmp(value, "<empty>") == 0) {
             syzygy_free();
@@ -314,37 +274,33 @@ static void cmd_setoption(char *args) {
         } else if (syzygy_init(value)) {
             printf("info string syzygy: %d-man tablebases at %s\n", syzygy_max_pieces(), value);
         } else {
-            /* A path that yields no tables is a misconfiguration worth saying
-             * out loud: probing silently never firing looks identical to
-             * working tablebases from the outside. */
+            /* A path that yields no tables is worth saying out loud: probing that never
+             * fires looks identical to working tablebases from the outside. */
             printf("info string syzygy: no usable tablebases at %s\n", value);
         }
 #ifdef EVAL_NNUE
+        /* A failed load leaves the previous net in place and says why: a typo in a GUI
+         * config must not leave the engine with no evaluation. */
     } else if (strcmp(name, "EvalFile") == 0 && value) {
-        /* A failed load leaves the previous net in place and says why: a typo in
-         * a GUI config must not leave the engine with no evaluation. */
         if (strcmp(value, "<internal>") == 0) {
             printf("info string EvalFile: keeping the embedded net\n");
         } else {
             end_search_for_option(name);
             if (nnue_load_file(value)) {
-                /* Everything cached from the previous net is now wrong: the
-                 * accumulator stack was built from its weights, and every TT
-                 * entry carries a static eval it produced (search.c reuses
-                 * that rather than re-evaluating). Without this, a search
-                 * after a swap is partly scored by the net that was replaced,
-                 * which quietly makes a net-vs-net comparison driven through
-                 * this option measure the wrong thing. */
+                /* Everything cached from the previous net is now wrong: the accumulator
+                 * stack was built from its weights, and every TT entry carries a static
+                 * eval it produced. Without this, a net-vs-net comparison driven through
+                 * this option is partly scored by the net that was replaced. */
                 eval_state_clear();
                 tt_clear();
                 nnue_print_info();
             }
         }
 #endif
+        /* Seeds the POSITION's flag, which is what every spelling decision reads.
+         * board_set_fen carries it across position changes and latches it on by itself
+         * for a FEN only Chess960 can describe. */
     } else if (strcmp(name, "UCI_Chess960") == 0 && value) {
-        /* Seeds the POSITION's flag, which is what every spelling decision
-         * actually reads. board_set_fen carries it across position changes and
-         * latches it on by itself for a FEN only Chess960 can describe. */
         Pos.chess960 = strcmp(value, "true") == 0;
     } else {
 #ifdef TUNE_SEARCH
@@ -367,8 +323,8 @@ static void cmd_position(char *args) {
         posValid = true;
         tok      = next_token(&cursor);
     } else if (token_is(tok, "fen")) {
-        /* Reassemble the FEN: it is six space-separated fields, and the
-         * optional clock fields may be missing, so scan up to `moves`. */
+        /* Reassemble the FEN: six space-separated fields, of which the clock fields may
+         * be missing, so scan up to `moves`. */
         char fen[FEN_MAX_LEN] = {0};
         size_t used           = 0;
 
@@ -385,9 +341,9 @@ static void cmd_position(char *args) {
 
         const char *why = "malformed";
         if (!board_set_fen_reason(&Pos, fen, &why)) {
-            /* Both lines matter: the reason is what the user can act on, and the
-             * refusal is what stops the next `go` from answering out of whatever
-             * position happened to be loaded before this one. */
+            /* Both lines matter: the reason is what the user can act on, and the refusal
+             * is what stops the next `go` answering out of whatever position was loaded
+             * before this one. */
             printf("info string invalid fen (%s): %s\n", why, fen);
             printf("info string no position is loaded; `go` will not answer until a "
                    "valid `position` command arrives\n");
@@ -397,35 +353,26 @@ static void cmd_position(char *args) {
         }
         posValid = true;
 
-        /*
-         * board_set_fen latches Pos.chess960 on for a FEN that only a Chess960
-         * board can produce, even if the GUI never sent UCI_Chess960. Say so,
-         * because it changes how this engine will spell castling from here on.
-         *
-         * One-way on purpose. The standard spelling is genuinely ambiguous on
-         * such a board - a king on b1 castling long spells "b1c1", which is
-         * also a legal king step - so guessing wrong in that direction hands
-         * the GUI a move that means two things. Guessing wrong the other way
-         * only costs a GUI that has already proven it speaks Chess960 a
-         * spelling it also understands.
-         */
+        /* board_set_fen latches this on for a FEN only a Chess960 board can produce, even if
+         * the GUI never sent UCI_Chess960 - say so, because it changes how castling is
+         * spelled from here on. One-way on purpose: the standard spelling is genuinely
+         * ambiguous on such a board. */
         if (Pos.chess960 && !announcedChess960) {
             announcedChess960 = true;
             printf("info string Chess960 position detected; castling is now "
                    "reported as king-takes-rook\n");
         }
     } else {
-        return; /* neither `startpos` nor `fen`: ignore */
+        return;
     }
 
     if (!token_is(tok, "moves"))
         return;
 
     while ((tok = next_token(&cursor)) != NULL) {
-        /* The search pushes up to MAX_PLY more Undo records onto the same
-         * array, so the game itself has to stop short of the end by that much.
-         * MAX_GAME_PLY is sized so no real game reaches this; saying so and
-         * stopping still beats writing past the end of Position if one does. */
+        /* The search pushes up to MAX_PLY more Undo records onto the same array, so the
+         * game has to stop short of the end by that much. MAX_GAME_PLY is sized so no
+         * real game gets here, but saying so beats writing past the end of Position. */
         if (Pos.gamePly + MAX_PLY >= MAX_GAME_PLY) {
             printf("info string game too long for the move history; ignoring the rest\n");
             fflush(stdout);
@@ -434,9 +381,8 @@ static void cmd_position(char *args) {
 
         const Move m = move_from_str(&Pos, tok);
 
-        /* An unresolvable move means the GUI and the engine disagree about the
-         * position. Stopping here leaves the board at the last state both
-         * agreed on, which is far safer than guessing. */
+        /* An unresolvable move means the GUI and the engine disagree about the position.
+         * Stopping leaves the board at the last state both agreed on. */
         if (m == MOVE_NONE) {
             printf("info string illegal move in position command: %s\n", tok);
             fflush(stdout);
@@ -448,10 +394,9 @@ static void cmd_position(char *args) {
 }
 
 static void cmd_go(char *args) {
-    /* No position means no answer. Replying with a move from the stale board
-     * is what turns a rejected FEN into an "engine crashed" report in the GUI:
-     * the move is legal somewhere, just not here, and on the wrong turn it is
-     * the wrong colour entirely. */
+    /* No position means no answer. Replying from the stale board is what turns a
+     * rejected FEN into an "engine crashed" report: the move is legal somewhere, just
+     * not here, and on the wrong turn it is the wrong colour entirely. */
     if (!posValid) {
         printf("info string ignoring `go`: the last `position` command was rejected\n");
         uci_print_bestmove(MOVE_NONE, MOVE_NONE);
@@ -487,13 +432,13 @@ static void cmd_go(char *args) {
             limits.infinite = true;
         else if (token_is(tok, "ponder"))
             limits.ponder = true;
+        /* `go perft N` - the divide output GUIs and Stockfish both use. */
         else if (token_is(tok, "perft")) {
-            /* `go perft N` - the divide output GUIs and Stockfish both use. */
             perft_divide(&Pos, atoi(next_or(&cursor, "1")));
             fflush(stdout);
             return;
-        } else if (token_is(tok, "searchmoves")) {
             /* Consumes the rest of the line: every remaining token is a move. */
+        } else if (token_is(tok, "searchmoves")) {
             while ((tok = next_token(&cursor)) != NULL && limits.searchmovesCount < MAX_MOVES) {
                 const Move m = move_from_str(&Pos, tok);
                 if (is_ok_move(m))
@@ -507,7 +452,7 @@ static void cmd_go(char *args) {
 }
 
 /* Non-zero once any command has reported failure. main() returns this, so
- * `engine perft suite` can be used directly as a CI gate. */
+ * `engine perft suite` works directly as a CI gate. */
 static int ExitCode;
 
 int uci_exit_code(void) { return ExitCode; }
@@ -516,8 +461,8 @@ static void cmd_perft(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
 
-    /* perft suite [path] [maxdepth] - maxdepth caps how deep each position is
-     * taken, so CI can run the same file the release check does, just faster. */
+    /* perft suite [path] [maxdepth] - maxdepth caps how deep each position is taken, so
+     * CI can run the same file the release check does, just faster. */
     if (token_is(tok, "suite")) {
         const char *path   = next_or(&cursor, "tests/perft/standard.epd");
         const int maxDepth = atoi(next_or(&cursor, "0"));
@@ -532,11 +477,7 @@ static void cmd_perft(char *args) {
 }
 
 #ifdef EVAL_NNUE
-/*
- * `nnue verify <file>` runs the shipped inference vectors through the net and
- * compares the output against the expected values - the gate proving the C
- * inference matches the quantised Python reference exactly.
- */
+
 static void cmd_nnue(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
@@ -561,13 +502,11 @@ static void cmd_nnue(char *args) {
 #endif
 
 #ifdef UNC_PROBE
-/*
- * `probe unc` measures the distribution unc_scale()'s constants are centred on,
- * so a retrain can be re-centred instead of quietly shifting every margin. See
- * test/uncprobe.h. It is a measurement rather than a gate, but it ships in the
- * binary for the same reason the gates do: the net and the search it has to
- * measure are the ones this build plays with.
- */
+
+/* `probe unc` measures the distribution unc_scale()'s constants are centred on, so a
+ * retrain can be re-centred instead of quietly shifting every margin. It ships in the
+ * binary for the reason the gates do: the net and the search it measures are the ones
+ * this build plays with. */
 static void cmd_probe(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
@@ -583,10 +522,10 @@ static void cmd_probe(char *args) {
     }
     fflush(stdout);
 }
-#endif /* UNC_PROBE */
+#endif
 
-/* `chess960 selftest` is the structural gate; see test/chess960test.c for what
- * it checks that perft cannot. */
+/* `chess960 selftest` is the structural gate; test/chess960test.c says what it checks
+ * that perft cannot. */
 static void cmd_chess960(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
@@ -594,9 +533,9 @@ static void cmd_chess960(char *args) {
     if (token_is(tok, "selftest")) {
         if (chess960_selftest() != 0)
             ExitCode = 1;
+        /* No argument prints all 960, which is what you diff against a published table
+         * when the numbering itself is in question. */
     } else if (token_is(tok, "sp")) {
-        /* No argument prints all 960, which is what you diff against a
-         * published table when the numbering itself is in question. */
         char *idx = next_token(&cursor);
         if (chess960_print_startpos(idx ? atoi(idx) : -1) != 0)
             ExitCode = 1;
@@ -606,9 +545,8 @@ static void cmd_chess960(char *args) {
     fflush(stdout);
 }
 
-/* `syzygy verify <path>` is the tablebase acceptance gate; see
- * test/syzygytest.c. It loads and releases its own tables, so it does not
- * disturb whatever SyzygyPath a running session had set. */
+/* `syzygy verify <path>` is the tablebase acceptance gate. It loads and releases its
+ * own tables, so it does not disturb whatever SyzygyPath a running session had set. */
 static void cmd_syzygy(char *args) {
     char *cursor = args;
     char *tok    = next_token(&cursor);
@@ -621,9 +559,9 @@ static void cmd_syzygy(char *args) {
         } else if (syzygy_verify_suite(path) != 0) {
             ExitCode = 1;
         }
+        /* The differential campaign's verdict, re-checked without the oracle that
+         * produced it. See syzygytest.h. */
     } else if (token_is(tok, "manifest")) {
-        /* The differential campaign's verdict, re-checked without the oracle
-         * that produced it. See syzygytest.h. */
         char *path     = next_token(&cursor);
         char *manifest = next_token(&cursor);
         if (!path || !manifest) {
@@ -644,8 +582,6 @@ static void cmd_syzygy(char *args) {
     fflush(stdout);
 }
 
-/* ---------------------------------------------------------- dispatcher --- */
-
 bool uci_execute(const char *line) {
     char buf[MAX_INPUT];
     char *cursor = buf;
@@ -654,9 +590,8 @@ bool uci_execute(const char *line) {
     strncpy(buf, line, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    /* Skip a UTF-8 BOM. No GUI sends one, but PowerShell prepends it when you
-     * pipe a string into the engine by hand, and the resulting "unknown
-     * command 'uci'" is baffling enough to be worth three lines to avoid. */
+    /* Skip a UTF-8 BOM. No GUI sends one, but PowerShell prepends it when a string is
+     * piped into the engine by hand, and "unknown command 'uci'" is baffling. */
     if ((unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB &&
         (unsigned char)buf[2] == 0xBF)
         cursor = buf + 3;
@@ -681,8 +616,8 @@ bool uci_execute(const char *line) {
     if (strcmp(cmd, "uci") == 0) {
         cmd_uci();
     } else if (strcmp(cmd, "isready") == 0) {
-        /* Must be answerable at any time, including mid-search. Do NOT wait on
-         * the search here - that is exactly the deadlock rule 1 warns about. */
+        /* Must be answerable at any time, including mid-search. Do NOT wait on the search
+         * here - that is exactly the deadlock rule 1 warns about. */
         printf("readyok\n");
         fflush(stdout);
     } else if (strcmp(cmd, "ucinewgame") == 0) {
@@ -690,7 +625,7 @@ bool uci_execute(const char *line) {
         search_wait();
         search_clear();
         board_set_startpos(&Pos);
-        posValid = true; /* a new game is a known position again */
+        posValid = true;
     } else if (strcmp(cmd, "setoption") == 0) {
         cmd_setoption(cursor);
     } else if (strcmp(cmd, "position") == 0) {
@@ -716,8 +651,8 @@ bool uci_execute(const char *line) {
         board_print(&Pos);
         fflush(stdout);
     } else if (strcmp(cmd, "eval") == 0) {
-        /* Always the classical breakdown: it is the only evaluation with terms
-         * to name. An NNUE build answers `nnue eval` as well. */
+        /* Always the classical breakdown: it is the only evaluation with terms to name.
+         * An NNUE build answers `nnue eval` as well. */
         eval_trace(&Pos);
         fflush(stdout);
 #ifdef EVAL_NNUE
@@ -739,11 +674,11 @@ void uci_loop(void) {
 
     while (fgets(line, sizeof(line), stdin)) {
         if (!uci_execute(line))
+            /* Reached on EOF too: a GUI that dies without sending `quit` must not leave a
+             * detached search thread spinning. */
             break;
     }
 
-    /* Reached on EOF too: a GUI that dies without sending `quit` must not
-     * leave a detached search thread spinning. */
     search_stop();
     search_wait();
 }

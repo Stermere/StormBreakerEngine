@@ -1,19 +1,12 @@
 /*
  * evalparams.c - the evaluation's weights.
  *
- * GENERATED DATA - do not edit by hand. What each term MEANS is
- * documented in evalparams.h (the registry) and eval.c (where the terms
- * are applied); this file is only the numbers. Regenerate it with:
+ * GENERATED DATA - do not edit by hand. Regenerate with `make tuner` and
+ * `./tuner tune <data.epd> -o src/evalparams.c`; what the terms MEAN is in
+ * evalparams.h and eval.c, and docs/TUNING.md covers the fit.
  *
- *     make tuner
- *     ./tuner tune <data.epd> -o src/evalparams.c
- *
- * See docs/TUNING.md for how the data is produced and what the fit
- * actually optimises.
- *
- * Piece-square tables are in BOARD ORDER: index 0 is A1, so the first
- * row printed is rank 1. They are read from the moving side's point of
- * view, so black looks them up rank-flipped.
+ * Piece-square tables are in BOARD ORDER - index 0 is A1 - and are read from
+ * the moving side's point of view, so black looks them up rank-flipped.
  */
 #include "evalparams.h"
 
@@ -1101,10 +1094,6 @@ Pair Tempo[1] = {
 };
 /* clang-format on */
 
-/*
- * The descriptor list the tuner walks. Generated from the same registry
- * as the flat offsets, so a table cannot appear in one and not the other.
- */
 /* clang-format off */
 const ParamTable EvalParamTables[] = {
 #define X(name, len, cols) {#name, name, len, cols},

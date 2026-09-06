@@ -1,10 +1,8 @@
 /*
  * movegen.h - move generation.
  *
- * Generators write into a caller-supplied array and return the count. The
- * caller owns the storage (normally a stack array of MAX_MOVES), so generation
- * never allocates and never touches global state - a hard requirement for
- * running searches on multiple threads later.
+ * Generators write into a caller-supplied array and return the count, so they
+ * never allocate and never touch global state.
  */
 #ifndef MOVEGEN_H
 #define MOVEGEN_H
@@ -12,42 +10,20 @@
 #include "board.h"
 #include "move.h"
 
-typedef enum {
-    GEN_CAPTURES, /* captures and queen promotions - the quiescence set */
-    GEN_QUIETS,   /* everything else */
-    GEN_EVASIONS, /* only moves that answer a check; generate these when in check */
-    GEN_ALL       /* every pseudo-legal move */
-} GenType;
+/* GEN_EVASIONS requires the side to move to actually be in check, and is narrower
+ * than filtering GEN_ALL. GEN_CAPTURES and GEN_QUIETS partition GEN_ALL exactly. */
+typedef enum { GEN_CAPTURES, GEN_QUIETS, GEN_EVASIONS, GEN_ALL } GenType;
 
-/*
- * Generates PSEUDO-LEGAL moves: moves that respect piece movement rules but
- * may leave the mover's own king in check. Filtering those out with
- * movegen_is_legal() lazily - only for moves the search actually tries - is
- * measurably faster than generating a strictly legal list up front, because
- * most generated moves are pruned before they are ever played.
- *
- * Returns the number of moves written to `list`, which must hold MAX_MOVES.
- * Only the `m` field is written: `score` belongs to whoever orders the list.
- *
- * GEN_EVASIONS requires the side to move to actually be in check, and is both
- * narrower and faster than filtering GEN_ALL. GEN_CAPTURES and GEN_QUIETS
- * partition GEN_ALL exactly - no move appears in both, and none is missed.
- */
+/* Generates PSEUDO-LEGAL moves - filtering with movegen_is_legal() only for the
+ * moves the search actually tries beats generating a legal list up front. `list`
+ * must hold MAX_MOVES, and only its `m` field is written. */
 int movegen_generate(const Position *pos, GenType type, ScoredMove *list);
 
-/* True if `m` leaves the side to move's own king safe. Assumes `m` is already
- * known to be pseudo-legal in `pos`. */
+/* True if `m` leaves the mover's own king safe; assumes `m` is pseudo-legal. */
 bool movegen_is_legal(const Position *pos, Move m);
 
-/*
- * True if `m` is a pseudo-legal move in `pos`.
- *
- * This is the validation gate for moves that did not come out of the
- * generator: transposition table hits and killer moves may be stale, and a
- * hash collision can hand the search a move belonging to a different position.
- * Playing one unchecked corrupts the board and is the single most common cause
- * of crashes in a young engine. Never skip it.
- */
+/* The gate for moves that did not come from the generator. A transposition hit
+ * can be stale or collided, and playing one unchecked corrupts the board. */
 bool movegen_is_pseudo_legal(const Position *pos, Move m);
 
-#endif /* MOVEGEN_H */
+#endif

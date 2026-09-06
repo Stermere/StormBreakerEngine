@@ -1,27 +1,51 @@
 # StormBreaker
 
 A UCI chess engine written in C, built for competitive strength built entirely
-from scratch with a mission to see how far a fully AI generated engine can go,
+from scratch with a mission to see how far a near fully AI generated engine can go,
 with some human help along the way of course.
-
-The initial engine was built with a classical evaluation function and tuned with a large set of human games and the outcome of the games.
-This engine landed at a strength of ~2800 Elo when playing against Stockfish with UCI_Elo set to 3000.
-
-Using that engine as a teacher, a NNUE was trained to reproduce the evaluation of the classical engine at 10k nodes using 200 million positions pulled from human games.
-The trained NNUE achived a strength of ~3000 Elo when playing against Stockfish with UCI_Elo set to 3000.
-
-Adding on a correction history and an SPSA tuned search brought this to ~3095 Elo at 40+0.4, beating Stockfish with UCI_Elo set to 3000 (60.3%) and losing to it at 3190 (39.5%).
-
-Retraining the net on self-play data brought the next step, and on top of that came an **uncertainty head**:
-a second output on the network that predicts the evaluation's own error, which the search uses to widen its
-pruning margins where the evaluation is unreliable and tighten them where it is not. That idea went in as two
-SPRT-gated steps worth ~+47 Elo together (E20, E21), and as far as we can find it is the first measured instance
-of a learned uncertainty head paying its way in an alpha-beta engine.
 
 The current build scores ~3410 on a gauntlet against five CCRL-rated engines at short time control, dead even
 head-to-head with Ethereal 12.75 (CCRL 3426). Ratings do not transfer perfectly across time controls, so we
-claim **~3300 CCRL Blitz** until a long-time-control gauntlet confirms it — the anchoring math and its caveats
-are in [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) under *Absolute strength*.
+claim **~3300 CCRL Blitz**.
+
+---
+
+## The uncertainty head
+
+The network carries two output heads over one accumulator. The value head
+scores the position. The **uncertainty head** predicts the magnitude of the
+residual `|search score − value|` — how far the evaluation is likely to be from
+what a search would return — trained by L1 against that residual, detached, so
+the value loss is untouched. The label was already in every training record, so
+the head cost a retrain rather than a regeneration, and it costs the search one
+extra output-row pass over the accumulator the evaluation already keeps.
+
+Every margin-based prune makes the same claim in different clothes: that *k*
+centipawns cover the gap between the static evaluation and a deeper search,
+with *k* a global constant fitted to the average position. That residual is
+heteroscedastic, so one constant is wrong in both directions at once.
+`unc_scale()` in [src/search.c](src/search.c) maps the predicted error onto a
+percentage, `min(73 + σ·13/16, 144)`, and eight pruning sites scale by it —
+reverse futility, futility, razoring, ProbCut and qsearch delta at full weight,
+the two SEE thresholds and the singular margin wired in at zero. Each site
+weights the mapping's *deviation* from 100 rather than the scale itself, which
+keeps the conditioning orthogonal to the margin constant beside it.
+
+A net without the head is still a valid net: `unc_scale()` then runs the same
+mapping off correction-history magnitude, a running measurement in place of a
+position-only prior. Both were tested, in that order, each against the build
+before it:
+
+| | Measured, STC 8+0.08 |
+|---|---|
+| Corrhist-magnitude probe, no network change (E20) | **+25.61 ± 9.85** |
+| The trained σ head replacing it (E21) | **+21.29 ± 9.22** |
+
+Corrhist-conditioned margins are prior art — Stockfish merged "corrplexity" in
+early 2025, worth 1-2 Elo there against margins SPSA'd for a decade. The
+*learned head* has no known precedent in an alpha-beta engine, and E21 is, as
+far as is known, the first measured instance of one paying its way. Both
+verdicts are STC-only.
 
 ---
 
@@ -40,27 +64,20 @@ extensions with multi-cut, killers, counter-moves, butterfly / capture /
 continuation history, and a pawn-structure-keyed correction history. The
 search runs on a worker thread so the UCI loop never blocks.
 
-**Uncertainty-scaled margins.** `unc_scale()` in
-[src/search.c](src/search.c) adjusts five pruning margins using the expected
-evaluation error. It uses the network's uncertainty head when available and
-falls back to correction-history magnitude otherwise. Both variants passed
-their SPRTs (E20 and E21). The constants are centred to preserve the average
-margin fitted by SPSA.
-
 **Evaluation.** A HalfKA-style NNUE — 24576 features over 32 mirrored king
 squares, SCReLU activation, piece-count output buckets, plus the uncertainty
-head — run with an incremental int16 accumulator and AVX2. The net file
+head above — run with an incremental int16 accumulator and AVX2. The net file
 describes its own architecture in its header, so a retrain at a different
-width or bucket count is a drop-in. It is what `make` builds. The classical
-evaluation still builds (`make classical`) and remains the tuner's model.
+width or bucket count is a drop-in, and the uncertainty head sits behind a
+header flag so a headless net stays loadable by every build.
+The classical evaluation still builds (`make classical`) and is much stronger now than the engine used to generate the first
+set of training data however it is still not compatible with the NNUE evaluation and is not used in the default build.
 
 **Training pipeline.** `tools/datagen.c` generates and labels positions with
 fixed-node searches into a packed 32-byte format; `trainer/` (PyTorch) fits
 the net; `tools/export_net.py` quantises it and writes test vectors; and
 `make nnue-test` requires the C inference to reproduce those vectors
-**exactly** — integer arithmetic, no tolerance. A net that is misread scores
-plausibly and loses Elo silently, which is the worst failure mode in this
-repository; the bit-exactness gate is what rules it out.
+**exactly**.
 
 **Testing discipline.** Correctness changes must pass perft exactly. Pure
 speedups must leave the bench node count unchanged. Everything else is a
@@ -156,11 +173,12 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 | `make nnue-export` | quantise `NET` (default `external/nets/net.pt`) into `EVALFILE` + test vectors |
 | `make net-fetch` | download the pinned net (`NET_SHA256` in the Makefile), hash-checked. The default build runs this for you when `EVALFILE` is missing |
 | `make nnue-info` | report the embedded net and its hash |
+| `make unc-probe` | build `stormbreaker-uncprobe` and measure the σ distribution `unc_scale()` is centred on, scaling held neutral. `PROBE_ARGS="-o <csv>"` records it, `-ref <csv>` solves for the constants that reproduce an older net's, `-live` measures the tree the mapping shapes instead |
 | `make net-publish` | upload `EVALFILE` as a content-addressed release |
 
 Training itself runs from `trainer/` — see [trainer/README.md](trainer/README.md);
-`--uncertainty` adds the error-predicting head ([docs/NNUE.md](docs/NNUE.md),
-Task 5b).
+`--uncertainty` adds the error-predicting head, `--unc-weight` sets its share of
+the loss ([docs/NNUE.md](docs/NNUE.md), Task 5b).
 
 An ad-hoc match, if you want one without the scripts (fastchess is on PATH as
 `fast-chess`):

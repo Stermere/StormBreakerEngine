@@ -1,36 +1,3 @@
-/*
- * chess960test.c - the Chess960 checks that perft cannot make.
- *
- * Perft is the right tool for the RULES, and tests/perft/chess960.epd plus
- * tests/perft/chess960-startpos.epd cover those against an independent engine.
- * But a node count is blind to four things that would each be a real bug:
- *
- *   - The SP NUMBERING. Perft proves the position it was given is played
- *     correctly; it cannot know the position was the one asked for. An
- *     off-by-one in the numbering makes every SP index name its neighbour, and
- *     every perft count in the suite would still be right, because the suite
- *     was sealed from the same wrong FENs. Only an external anchor catches it,
- *     and SP 518 being the standard array is that anchor.
- *
- *   - FEN ROUND-TRIPS. board_to_fen has to be able to describe what
- *     board_set_fen built, or the engine cannot report its own position - and
- *     KQkq provably cannot describe some Chess960 boards. A suite that only
- *     ever reads FENs never exercises the writer.
- *
- *   - NOTATION AMBIGUITY. On a board where the king starts on b1, castling
- *     long spells "b1c1" in standard notation, and so does an ordinary king
- *     step. Perft counts both and is perfectly happy. A GUI is not: it plays
- *     the wrong move. The invariant is that no two legal moves in a position
- *     ever share a spelling, and it has to be asserted directly.
- *
- *   - UNDO. Perft's counts come out right if do_move and undo_move are wrong
- *     in exactly opposite ways, which castling makes easy: it moves two pieces
- *     and, in Chess960, they can swap squares. Comparing the whole position
- *     before and after is the only way to see it.
- *
- * Everything here is a pure function of a seed, so a failure is reproducible
- * from the line it printed.
- */
 #include "chess960test.h"
 
 #include <stdio.h>
@@ -41,9 +8,22 @@
 #include "movegen.h"
 #include "uci.h"
 
-/* Deterministic, self-contained, and NOT rand(): invariant 1 forbids entropy
- * anywhere near the engine, and a test that walked a different tree each run
- * would report failures nobody could reproduce. */
+/*
+ * chess960test.c - the Chess960 checks that perft cannot make.
+ *
+ * A node count is blind to four things that would each be a real bug: the SP NUMBERING,
+ * which perft cannot check because the suite was sealed from the same FENs; FEN
+ * ROUND-TRIPS, since a suite that only reads FENs never exercises the writer; NOTATION
+ * AMBIGUITY, where two legal moves share a spelling and perft counts both happily; and
+ * UNDO, whose counts come out right if do_move and undo_move are wrong in exactly
+ * opposite ways.
+ *
+ * Everything here is a pure function of a seed, so a failure is reproducible from the
+ * line it printed.
+ */
+
+/* Deterministic and NOT rand(): a test that walked a different tree each run would report
+ * failures nobody could reproduce. */
 static uint64_t Rng = 0x9E3779B97F4A7C15ULL;
 
 static uint64_t next_random(void) {
@@ -60,18 +40,10 @@ static void fail(const char *what, const char *fen, const char *detail) {
     ++Failures;
 }
 
-/* ------------------------------------------------------------- numbering -- */
-
-/*
- * Every SP index must produce a legal Chess960 array, all 960 must differ, and
- * SP 518 must be the standard one.
- *
- * The three constraints checked per position are the definition of the
- * variant, not a paraphrase of the generator: bishops on opposite colours, the
- * king strictly between its rooks, and the same eight pieces as normal chess.
- * A generator that satisfies all three for 960 distinct arrays has enumerated
- * exactly the Chess960 set, because there are exactly 960 such arrays.
- */
+/* Every SP index must produce a legal Chess960 array, all 960 must differ, and SP 518 must
+ * be the standard one. The three constraints checked per position are the definition of
+ * the variant rather than a paraphrase of the generator, and a generator satisfying all
+ * three for 960 distinct arrays has enumerated exactly the Chess960 set. */
 static void test_numbering(void) {
     char fens[960][FEN_MAX_LEN];
     Position pos;
@@ -112,15 +84,11 @@ static void test_numbering(void) {
         else if (!(rooks[0] < king && king < rooks[1]))
             fail("numbering: king is not between its rooks", fens[idx], detail);
 
-        /* The two rooks must be the two castling rooks, or a right names a
-         * piece that cannot serve it. */
         if (castling_rook_square(&pos, WHITE, false) != make_square((File)rooks[0], RANK_1) ||
             castling_rook_square(&pos, WHITE, true) != make_square((File)rooks[1], RANK_1))
             fail("numbering: castling rights do not name both rooks", fens[idx], detail);
     }
 
-    /* The anchor. Without it every check above passes for a numbering that is
-     * internally consistent and shifted by one. */
     Position standard;
     memset(&standard, 0, sizeof(standard));
     board_set_startpos(&standard);
@@ -142,8 +110,6 @@ static void test_numbering(void) {
 
     printf("ok    numbering: 960 distinct legal arrays, SP 518 == the standard array\n");
 }
-
-/* --------------------------------------------------------- per-position -- */
 
 /* The geometry the position claims must match the pieces actually on it. */
 static void check_geometry(const Position *pos, const char *fen) {
@@ -173,14 +139,9 @@ static void check_geometry(const Position *pos, const char *fen) {
     }
 }
 
-/*
- * No two legal moves may share a spelling.
- *
- * This is the reason Chess960 notation exists, and the only test that would
- * catch move_to_str reverting to king-destination spelling on a 960 board:
- * every perft count stays correct, and the engine starts handing GUIs a string
- * that names two different moves.
- */
+/* No two legal moves may share a spelling. This is the only test that would catch
+ * move_to_str reverting to king-destination spelling on a 960 board: every perft count
+ * stays correct, and the engine starts handing GUIs a string that names two moves. */
 static void check_notation(const Position *pos, const char *fen) {
     ScoredMove moves[MAX_MOVES];
     char spellings[MAX_MOVES][8];
@@ -203,19 +164,14 @@ static void check_notation(const Position *pos, const char *fen) {
 }
 
 /*
- * board_to_fen -> board_set_fen must return the same position.
+ * board_to_fen -> board_set_fen must return the same position. Comparing keys is not
+ * enough: the Zobrist key hashes the castling RIGHTS rather than the squares they refer
+ * to, so a writer that lost track of which rook a right belongs to round-trips with an
+ * identical key and a different board.
  *
- * Comparing keys is not enough: the Zobrist key hashes the castling RIGHTS,
- * not the squares they refer to, so a writer that lost track of which rook a
- * right belongs to round-trips with an identical key and a different board.
- * The rook squares are compared directly for exactly that reason.
- *
- * Only for rights that still EXIST, though. Position keeps the geometry of a
- * revoked right rather than paying to clear it on the hot path - board.h says
- * so, and nothing reads it, because every consultation is gated on the right
- * first. A round-trip therefore legitimately produces SQ_NONE where a walked
- * position still holds the square a rook left ten moves ago. Comparing those
- * would be asserting an invariant the engine deliberately does not maintain.
+ * Only for rights that still EXIST. Position keeps the geometry of a revoked right rather
+ * than paying to clear it on the hot path, so a round-trip legitimately produces SQ_NONE
+ * where a walked position still holds an old square.
  */
 static void check_fen_roundtrip(const Position *pos, const char *fen) {
     char written[FEN_MAX_LEN], rewritten[FEN_MAX_LEN];
@@ -247,15 +203,11 @@ static void check_fen_roundtrip(const Position *pos, const char *fen) {
             }
 }
 
-/*
- * do_move followed by undo_move must restore the position exactly.
- *
- * Castling is where this can fail while perft still passes, because it moves
- * two pieces at once and in Chess960 they may swap squares or stay put. The
- * comparison covers the derived state too - pinned, checkers, the pawn key -
- * since those are restored from the Undo record rather than recomputed, and a
- * stale one silently changes what the search sees.
- */
+/* Castling is where this can fail while perft still passes, because it moves two pieces at
+ * once and in Chess960 they may swap squares or stay put. The comparison covers the
+ * derived state too - pinned, checkers, the pawn key - since those are restored from the
+ * Undo record rather than recomputed, and the incremental key is checked against a full
+ * recomputation, which release builds otherwise never do. */
 static void check_do_undo(Position *pos, const char *fen) {
     ScoredMove moves[MAX_MOVES];
     const int n = movegen_generate(pos, GEN_ALL, moves);
@@ -286,8 +238,6 @@ static void check_do_undo(Position *pos, const char *fen) {
             return;
         }
 
-        /* The incremental key must also equal the one computed from scratch,
-         * which is what release builds otherwise never check. */
         if (board_compute_key(pos) != pos->key) {
             fail("undo: the incremental key drifted from the computed one", fen, buf);
             return;
@@ -295,21 +245,16 @@ static void check_do_undo(Position *pos, const char *fen) {
     }
 }
 
-/*
- * The same board spelled KQkq and spelled with rook files must parse alike.
- *
- * Only meaningful when X-FEN can express the position at all - that is, when
- * each side's castling rook is the outermost one on its side. Where it cannot,
- * there is nothing to compare, and the Shredder spelling is the only correct
- * output; tests/perft/chess960.epd covers that case by counting it.
- */
+/* The same board spelled KQkq and spelled with rook files must parse alike. Only
+ * meaningful when X-FEN can express the position at all - that is, when each side's
+ * castling rook is the outermost on its side; where it cannot, the two spellings genuinely
+ * mean different positions and comparing them would assert a falsehood. */
 static void check_dual_spelling(const Position *pos, const char *fen) {
     char shredder[FEN_MAX_LEN], xfen[FEN_MAX_LEN];
     Position from_shredder, from_xfen;
 
     board_to_fen(pos, shredder);
 
-    /* Rebuild the same FEN with the rights spelled KQkq. */
     char rights[8];
     size_t n = 0;
     for (int i = 0; i < CASTLING_NB; ++i)
@@ -318,11 +263,8 @@ static void check_dual_spelling(const Position *pos, const char *fen) {
     rights[n] = '\0';
 
     if (n == 0)
-        return; /* nothing to spell two ways */
+        return;
 
-    /* X-FEN names the outermost rook. If the castling rook is not the
-     * outermost one on its side, the two spellings genuinely mean different
-     * positions and comparing them would be asserting a falsehood. */
     for (Color c = WHITE; c <= BLACK; ++c) {
         const Rank home = c == WHITE ? RANK_1 : RANK_8;
         for (int side = 0; side < 2; ++side) {
@@ -333,11 +275,10 @@ static void check_dual_spelling(const Position *pos, const char *fen) {
             const int step = side == 0 ? -1 : 1;
             for (int f = edge; f != (int)file_of(rook); f += step)
                 if (piece_on(pos, make_square((File)f, home)) == make_piece(c, ROOK))
-                    return; /* an outer rook exists: X-FEN would name that one */
+                    return;
         }
     }
 
-    /* Splice the new castling field into the written FEN. */
     const char *placement = shredder;
     const char *afterStm  = strchr(strchr(placement, ' ') + 1, ' ');
     const char *tail      = strchr(afterStm + 1, ' ');
@@ -362,17 +303,10 @@ static void check_dual_spelling(const Position *pos, const char *fen) {
     (void)fen;
 }
 
-/* ------------------------------------------------------------- the walk -- */
-
-/*
- * Random legal play from every start position, checking the invariants above
- * at every position along the way.
- *
- * Every SP is visited rather than a sample, for the same reason the tablebase
- * generator enumerates material configurations rather than sampling them: a
- * castling bug is a bug for a whole GEOMETRY, and there are only 960 of them.
- * Sampling would find one in proportion to how often random play reaches it.
- */
+/* Random legal play from every start position, checking the invariants above at every
+ * position along the way. Every SP is visited rather than a sample, for the reason the
+ * tablebase generator enumerates configurations: a castling bug is a bug for a whole
+ * GEOMETRY, and sampling would find one only in proportion to how often play reaches it. */
 static void test_walk(int pliesPerGame) {
     Position pos;
     char fen[FEN_MAX_LEN];
@@ -405,7 +339,7 @@ static void test_walk(int pliesPerGame) {
                     legal[count++] = moves[i].m;
 
             if (count == 0)
-                break; /* mate or stalemate */
+                break;
             board_do_move(&pos, legal[next_random() % (uint64_t)count]);
         }
     }
@@ -415,29 +349,27 @@ static void test_walk(int pliesPerGame) {
            positions);
 }
 
-/*
- * The rights a diagram cannot back must be dropped, not trusted.
- *
- * Chess960 widens this from a tidiness rule into a crash: a right whose rook
- * is not there makes gen_castling emit a move whose make_move lifts a piece
- * off an empty square. Position editors emit such FENs routinely.
- */
+/* The rights a diagram cannot back must be dropped, not trusted. Chess960 widens this from
+ * a tidiness rule into a crash: a right whose rook is not there makes gen_castling emit a
+ * move that lifts a piece off an empty square, and position editors emit such FENs
+ * routinely. */
 static void test_unbacked_rights(void) {
     static const struct {
         const char *fen;
         CastlingRights expected;
         const char *what;
     } cases[] = {
-        /* Claims a rook on b1; there is none. */
+
         {"4k3/8/8/8/8/8/8/2K4R w BH - 0 1", WHITE_OO, "file letter naming an empty square"},
-        /* King is not on its back rank, so no right can have survived. */
+        /* Duplicate claims on one side are not a reachable position; first wins, and what
+         * matters is that the survivor is backed by a rook. */
+
         {"4k3/8/8/8/8/8/4K3/R6R w KQ - 0 1", NO_CASTLING, "king off the back rank"},
-        /* X-FEN 'Q' with no rook to the queenside of the king. */
+
         {"4k3/8/8/8/8/8/8/2K4R w KQ - 0 1", WHITE_OO, "X-FEN naming a side with no rook"},
-        /* Two claims on the same side: not a reachable position. First wins,
-         * and the important part is that the survivor is backed by a rook. */
+
         {"4k3/8/8/8/8/8/8/RR2K3 w AB - 0 1", WHITE_OOO, "duplicate claims on one side"},
-        /* A black piece on the square a white right names. */
+
         {"4k3/8/8/8/8/8/8/1r2K2R w BH - 0 1", WHITE_OO, "enemy rook on the named square"},
     };
 
@@ -457,7 +389,6 @@ static void test_unbacked_rights(void) {
             continue;
         }
 
-        /* Whatever survived must be playable: generate and make every move. */
         ScoredMove moves[MAX_MOVES];
         const int n = movegen_generate(&pos, GEN_ALL, moves);
         for (int j = 0; j < n; ++j) {
@@ -472,8 +403,6 @@ static void test_unbacked_rights(void) {
         printf("ok    unbacked rights: %zu malformed castling fields dropped cleanly\n",
                sizeof(cases) / sizeof(*cases));
 }
-
-/* --------------------------------------------------------------- driver -- */
 
 int chess960_selftest(void) {
     Failures = 0;

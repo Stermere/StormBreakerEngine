@@ -1,10 +1,4 @@
-/*
- * uci.h - Universal Chess Interface protocol layer.
- *
- * UCI is the lingua franca of computer chess: Cute Chess, En Croissant,
- * fastchess, OpenBench and every arbiter tool speak it. Getting this layer
- * exactly right is what makes the engine plug into all of them unchanged.
- */
+/* uci.h - Universal Chess Interface protocol layer. */
 #ifndef UCI_H
 #define UCI_H
 
@@ -12,31 +6,21 @@
 #include "move.h"
 #include "types.h"
 
-/* Reads commands from stdin until `quit` or EOF. */
 void uci_loop(void);
 
-/* Handles a single command line. Exposed so main() can dispatch argv commands
- * ("engine bench", "engine perft 5") through exactly the same code path the
- * GUI drives - one implementation, so the two can never diverge. Returns false
- * if the command was `quit`. */
+/* Handles one command line, so main() can dispatch argv commands through exactly
+ * the path the GUI drives. False if the command was `quit`. */
 bool uci_execute(const char *line);
 
-/* Process exit status: non-zero once any executed command has failed, so
- * `engine perft suite` works as a CI gate. */
+/* Non-zero once any executed command has failed, so `engine perft suite` works as
+ * a CI gate. */
 int uci_exit_code(void);
 
-/* Emits `bestmove <move> [ponder <move>]`. Called by the search worker when it
- * finishes. Passing MOVE_NONE prints the UCI null move `0000`, which is what
- * GUIs expect when there is nothing to play. */
+/* MOVE_NONE prints the UCI null move `0000`, which is what GUIs expect when there
+ * is nothing to play. */
 void uci_print_bestmove(Move best, Move ponder);
 
-/* ------------------------------------------------------------- options --- */
-
-/* Live values of the UCI options, read by the search and evaluation.
- *
- * Only the options something outside uci.c actually consults are exported.
- * UCI_Chess960 is read by move_to_str() inside uci.c and stamped onto the
- * Position, so it needs no accessor here. */
+/* Only the options something outside uci.c consults are exported. */
 int uci_move_overhead(void);
 
-#endif /* UCI_H */
+#endif

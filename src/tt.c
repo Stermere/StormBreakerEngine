@@ -1,6 +1,4 @@
-/*
- * tt.c - transposition table storage.
- */
+/* tt.c - transposition table storage. */
 #include "tt.h"
 
 #include <assert.h>
@@ -21,12 +19,10 @@ static size_t ClusterCount;
 static size_t SizeMb;
 static uint8_t Generation;
 
-/* Generation lives in the top 6 bits of genBound, so it advances in steps of 4
+/* The generation lives in the top 6 bits of genBound, so it advances in steps of 4
  * and wraps after 64 searches. Ages are computed modulo that cycle. */
 #define GENERATION_DELTA 4
 #define GENERATION_MASK  0xFCu
-
-/* ------------------------------------------------------------- indexing -- */
 
 /* High 64 bits of a 64x64 multiply. */
 static inline uint64_t mul_hi64(uint64_t a, uint64_t b) {
@@ -42,39 +38,20 @@ static inline uint64_t mul_hi64(uint64_t a, uint64_t b) {
 #endif
 }
 
-/*
- * Maps a key onto a cluster.
- *
- * `key % ClusterCount` would be the obvious spelling and is a 64-bit hardware
- * division - tens of cycles, on the critical path of every node. The
- * multiply-shift below computes the same mapping for the cost of one multiply,
- * and unlike a power-of-two mask it does not force the table to round down to
- * the next power of two, which would discard up to half of whatever the user
- * set Hash to.
- *
- * The key is shifted left by 16 first because key_verifier() stores the top 16
- * bits: without the shift, the cluster index and the verification bits would
- * be drawn from the same part of the key, and two positions landing in one
- * cluster would be far more likely to also appear identical.
- */
+/* A multiply-shift rather than `key % ClusterCount`, a hardware division on the critical
+ * path; unlike a power-of-two mask it does not discard half of Hash. Shifted left by 16
+ * because key_verifier() takes the top bits, which must not also index the cluster. */
 static inline size_t cluster_index(Key key) {
     return (size_t)mul_hi64(key << 16, (uint64_t)ClusterCount);
 }
 
 static inline uint16_t key_verifier(Key key) { return (uint16_t)(key >> 48); }
 
-/* --------------------------------------------------------- mate scores -- */
-
 /*
- * A mate score means "mate in N plies from HERE", so it is only meaningful
- * relative to the node that produced it. The same position reached at a
- * different distance from the root carries a different absolute score, and
- * storing the absolute one makes the engine announce - and play for - mates
- * that are one transposition away from evaporating. Convert on the way in,
- * convert back on the way out.
- *
- * Tablebase scores (the band just below the mate band, see types.h) are
- * ply-relative for the same reason and get the same conversion, which is why
+ * A mate score means "mate in N plies from HERE", so the same position reached at a
+ * different distance from the root carries a different absolute score - store the
+ * absolute one and the engine announces mates that are a transposition away from
+ * evaporating. Tablebase scores are ply-relative for the same reason, which is why
  * these tests run against the TB band edge rather than the mate one.
  */
 static Value value_to_tt(Value v, int ply) {
@@ -97,8 +74,6 @@ Value tt_value_from_tt(Value v, int ply) {
     return v;
 }
 
-/* ------------------------------------------------------------- lifetime -- */
-
 bool tt_resize(size_t mb) {
     if (mb == 0)
         mb = 1;
@@ -108,7 +83,7 @@ bool tt_resize(size_t mb) {
 
     TTCluster *fresh = (TTCluster *)calloc(clusters, sizeof(TTCluster));
     if (!fresh)
-        return false; /* keep the existing table rather than running with none */
+        return false;
 
     free(Table);
     Table        = fresh;
@@ -131,7 +106,7 @@ void tt_clear(void) {
     Generation = 0;
 }
 
-void tt_new_search(void) { Generation += GENERATION_DELTA; /* low 2 bits belong to Bound */ }
+void tt_new_search(void) { Generation += GENERATION_DELTA; }
 
 size_t tt_size_mb(void) { return SizeMb; }
 
@@ -139,8 +114,8 @@ int tt_hashfull(void) {
     if (!Table || ClusterCount == 0)
         return 0;
 
-    /* Sample the first 1000 entries rather than walking a multi-gigabyte
-     * table; this is what `info hashfull` means by convention. */
+    /* Sample the first 1000 entries rather than walking a multi-gigabyte table; that is
+     * what `info hashfull` means by convention. */
     int used        = 0;
     const int probe = 1000;
     for (int i = 0; i < probe; ++i) {
@@ -150,8 +125,6 @@ int tt_hashfull(void) {
     }
     return used;
 }
-
-/* -------------------------------------------------------- probe / store -- */
 
 bool tt_probe(Key key, TTEntry *out) {
     if (!Table)
@@ -164,9 +137,8 @@ bool tt_probe(Key key, TTEntry *out) {
         TTEntry *const e = &cluster->entry[i];
 
         if (e->key16 == key16 && (e->genBound & 3) != BOUND_NONE) {
-            /* Refresh: an entry the search keeps hitting is worth more than
-             * its depth suggests, so drag it forward to the current
-             * generation and out of the replacement policy sights. */
+            /* An entry the search keeps hitting is worth more than its depth suggests, so
+             * drag it forward to the current generation and out of replacement's sights. */
             e->genBound = (uint8_t)(Generation | (e->genBound & 3));
             *out        = *e;
             return true;
@@ -180,15 +152,7 @@ static inline int entry_age(const TTEntry *e) {
     return (int)((uint8_t)(Generation - (e->genBound & GENERATION_MASK)) / GENERATION_DELTA);
 }
 
-/*
- * Replacement priority: depth, discounted by age.
- *
- * Depth alone would let a deep entry from three searches ago - so, about a
- * game position that has since been left behind - squat in the table
- * indefinitely. Charging eight plies per generation means a stale entry has to
- * be substantially deeper to survive, while an entry from the current search
- * is displaced only by something genuinely better.
- */
+/* Depth discounted by age, so a deep entry from three searches ago cannot squat. */
 static inline int replace_priority(const TTEntry *e) { return (int)e->depth - 8 * entry_age(e); }
 
 void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, bool pv,
@@ -218,27 +182,20 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
 
     const bool sameSlot = replace->key16 == key16;
 
-    /* A node that failed low has no best move to report. Rather than erase the
-     * move a previous - possibly deeper - search found here, keep it: it is
-     * still the best guess anything has made about this position. */
+    /* A node that failed low has no best move to report. Keep whatever a previous, and
+     * possibly deeper, search found here rather than erasing it. */
     if (!sameSlot || m != MOVE_NONE)
         replace->move = (uint16_t)m;
 
-    /* Sticky within the slot, and written even when the value below is not
-     * refreshed. A node that was once on a principal variation still was, and
-     * a shallow re-visit that declines to overwrite the score has learned
-     * nothing that unsays it. Only a different position taking the slot
-     * clears the flag. */
+    /* Sticky within the slot, and written even when the value below is not refreshed: a
+     * shallow re-visit that declines to overwrite the score has learned nothing that
+     * unsays the flag. */
     replace->pv = (uint8_t)(pv || (sameSlot && replace->pv));
 
-    /*
-     * Overwrite when the slot is not already ours, when the new result is
-     * exact, or when the new search is not meaningfully shallower. The
-     * four-ply slack matters: without it, re-searching a position at a reduced
-     * depth never refreshes the entry, so its generation goes stale while it
-     * is still in active use and the replacement policy starts evicting
-     * exactly the entries the search is relying on.
-     */
+    /* Overwrite when the slot is not already ours, when the new result is exact, or when
+     * the new search is not meaningfully shallower. The four-ply slack matters: without
+     * it a reduced-depth re-search never refreshes the entry, so its generation goes
+     * stale while it is still in use and replacement evicts what the search relies on. */
     if (!sameSlot || bound == BOUND_EXACT || (Depth)replace->depth < depth + 4) {
         const Value stored = value_to_tt(value, ply);
         assert(stored >= INT16_MIN && stored <= INT16_MAX);

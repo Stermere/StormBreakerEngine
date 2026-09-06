@@ -1,10 +1,7 @@
 /*
  * types.h - fundamental types, constants and CPU intrinsics.
  *
- * Board representation is little-endian rank-file (LERF): A1 = 0, H8 = 63,
- * so square = rank * 8 + file. This is the convention essentially every
- * modern engine uses; keeping it means published bitboard tricks translate
- * verbatim.
+ * Squares are little-endian rank-file: A1 = 0, H8 = 63, square = rank * 8 + file.
  */
 #ifndef TYPES_H
 #define TYPES_H
@@ -19,56 +16,27 @@
 #include <immintrin.h>
 #endif
 
-/* ------------------------------------------------------------------ meta -- */
-
 #define ENGINE_NAME    "StormBreaker"
 #define ENGINE_VERSION "0.3.0-dev"
 #define ENGINE_AUTHOR  "Collin Kees"
 
-/* --------------------------------------------------------------- limits -- */
-
-/*
- * MAX_MOVES bounds the move list, and what it has to cover is set by what
- * board_set_fen accepts - which is any diagram with at most 32 men, not just
- * the ones legal play can reach. A GUI position editor, a puzzle or a
- * hand-typed FEN can hand the engine nine pawns or fifteen queens, and those
- * generate far more moves than the 218 a legal position tops out at.
- *
- * 256 was sized for legal positions and is NOT enough: annealing over
- * placement and piece type finds 270 pseudo-legal moves from a hollow ring of
- * queens (BQQQQQQB/Q6Q/Q6Q/Q6Q/Q6Q/Q6Q/Q5RB/KQQQQQBk w - -). Raising the
- * parser's cap to a full board does NOT raise this: the optimum sits near
- * thirty men either way, because past that the pieces block each other faster
- * than they add moves, so a crowded board generates FEWER moves than a
- * half-empty one. Since NDEBUG deletes the generator's bounds assertion,
- * overrunning this is a silent write past a stack array in the search - so it
- * is sized with roughly a factor of two in hand rather than to the measured
- * worst case.
- */
 enum {
-    MAX_PLY   = 246, /* deepest search ply; also sizes the PV and killer tables */
-    MAX_MOVES = 512, /* see above: covers any <=32-man diagram, not just legal ones */
+    MAX_PLY = 246,
+    /* 256 is not enough. board_set_fen accepts any diagram, and a ring of queens
+     * generates 270 pseudo-legal moves; NDEBUG deletes the generator's bounds check. */
+    MAX_MOVES = 512,
     SQUARE_NB = 64,
     COLOR_NB  = 2,
-    PIECE_NB  = 16 /* piece codes are sparse: see the Piece enum */
+    PIECE_NB  = 16
 };
 
-/* ----------------------------------------------------------- basic types -- */
-
 typedef uint64_t Bitboard;
-typedef uint64_t Key; /* Zobrist hash */
+typedef uint64_t Key;
 typedef int Value;
 typedef int Depth;
 
-/* --------------------------------------------------------------- colours -- */
-
 typedef enum { WHITE = 0, BLACK = 1 } Color;
 
-/*
- * Piece encoding: piece = (color << 3) | type.
- * Colour is therefore `p >> 3` and type is `p & 7`, both single instructions,
- * and NO_PIECE = 0 makes an empty mailbox square falsy.
- */
 typedef enum {
     NO_PIECE_TYPE = 0,
     PAWN          = 1,
@@ -80,6 +48,8 @@ typedef enum {
     PIECE_TYPE_NB = 7
 } PieceType;
 
+/* piece = (colour << 3) | type, so both accessors are one instruction and
+ * NO_PIECE == 0 makes an empty mailbox square falsy. */
 typedef enum {
     NO_PIECE = 0,
     W_PAWN   = 1,
@@ -99,8 +69,6 @@ typedef enum {
 static inline Color color_of(Piece p) { return (Color)(p >> 3); }
 static inline PieceType type_of(Piece p) { return (PieceType)(p & 7); }
 static inline Piece make_piece(Color c, PieceType pt) { return (Piece)((c << 3) | pt); }
-
-/* --------------------------------------------------------------- squares -- */
 
 /* clang-format off */
 typedef enum {
@@ -124,17 +92,14 @@ static inline File file_of(Square s) { return (File)(s & 7); }
 static inline Rank rank_of(Square s) { return (Rank)(s >> 3); }
 static inline bool is_ok_square(Square s) { return s >= SQ_A1 && s <= SQ_H8; }
 
-/* Mirror a square vertically: used to read black's position with white's tables. */
+/* Mirror vertically, so black can read white's tables. */
 static inline Square flip_rank(Square s) { return (Square)(s ^ 56); }
 
-/* Rank as seen by `c`, so relative_rank(BLACK, SQ_A7) == RANK_2. */
+/* relative_rank(BLACK, SQ_A7) == RANK_2. */
 static inline Rank relative_rank(Color c, Square s) { return (Rank)((s >> 3) ^ (c * 7)); }
 
 static inline int pawn_push(Color c) { return c == WHITE ? 8 : -8; }
 
-/* -------------------------------------------------------------- castling -- */
-
-/* Bit flags so a position's whole castling state fits in 4 bits. */
 typedef enum {
     NO_CASTLING  = 0,
     WHITE_OO     = 1,
@@ -146,25 +111,14 @@ typedef enum {
     ANY_CASTLING = WHITE_ANY | BLACK_ANY
 } CastlingRights;
 
-enum { CASTLING_NB = 4 }; /* the four rights, and the width of the geometry tables */
+enum { CASTLING_NB = 4 };
 
-/*
- * The right, and its index into the per-position castling geometry on
- * Position, for one colour and one side of the king.
- *
- * "Kingside" means the rook that started on the HIGH side of the king, which
- * is what O-O means in Chess960 too - the king still finishes on the g-file
- * and the rook on the f-file, wherever the two of them began. Because a
- * castling move is encoded king-captures-own-rook, comparing the two squares
- * recovers the side, so nothing has to store it.
- */
+/* "Kingside" is the rook that started high of the king - what O-O means in Chess960 too. */
 static inline int castling_index(Color c, bool kingside) { return c * 2 + !kingside; }
 
 static inline CastlingRights castling_right(Color c, bool kingside) {
     return (CastlingRights)(1 << castling_index(c, kingside));
 }
-
-/* ---------------------------------------------------------------- values -- */
 
 enum {
     VALUE_ZERO     = 0,
@@ -172,17 +126,13 @@ enum {
     VALUE_INFINITE = 32001,
     VALUE_NONE     = 32002,
     VALUE_MATE     = 32000,
-    /* Scores at or beyond this are forced mates; used to detect and report them. */
+
     VALUE_MATE_IN_MAX_PLY  = VALUE_MATE - MAX_PLY,
     VALUE_MATED_IN_MAX_PLY = -VALUE_MATE_IN_MAX_PLY,
 
-    /* Tablebase scores get a band of their own directly below the mate band:
-     * "proven won, mate not yet in sight". A win probed at ply p scores
-     * VALUE_TB_WIN - p, so entering the won region sooner is worth more, the
-     * same gradient mate scores have. Everything at or beyond the band edge
-     * is ply-relative and needs the same TT adjustment as a mate score;
-     * everything below it - every heuristic evaluation - must stay out, which
-     * is what corrected_eval()'s clamp enforces. */
+    /* Tablebase scores get a band directly below the mate band: proven won, mate not
+     * yet in sight. A win probed at ply p scores VALUE_TB_WIN - p, so converting
+     * sooner is worth more. */
     VALUE_TB_WIN             = VALUE_MATE_IN_MAX_PLY - 1,
     VALUE_TB_WIN_IN_MAX_PLY  = VALUE_TB_WIN - MAX_PLY,
     VALUE_TB_LOSS_IN_MAX_PLY = -VALUE_TB_WIN_IN_MAX_PLY
@@ -194,20 +144,11 @@ static inline bool is_mate_score(Value v) {
     return v >= VALUE_MATE_IN_MAX_PLY || v <= VALUE_MATED_IN_MAX_PLY;
 }
 
-/*
- * A proven result: a mate score OR a tablebase score.
- *
- * Use this, not is_mate_score(), wherever the question is "is this a fact
- * rather than an evaluation?". A tablebase score sits in the band directly
- * BELOW the mate band, so is_mate_score() answers false for one - and any
- * heuristic that then treats a proven win as an ordinary score is learning
- * from, or pruning against, a number that has no evaluation error to teach.
- */
+/* Proven result - a mate score or a tablebase score. Ask this, not is_mate_score(),
+ * wherever the question is "fact or evaluation?": a TB score is not a mate score. */
 static inline bool is_decisive_score(Value v) {
     return v >= VALUE_TB_WIN_IN_MAX_PLY || v <= VALUE_TB_LOSS_IN_MAX_PLY;
 }
-
-/* ------------------------------------------------------------ intrinsics -- */
 
 static inline int popcount(Bitboard b) {
 #if defined(_MSC_VER) && defined(USE_POPCNT)
@@ -215,7 +156,7 @@ static inline int popcount(Bitboard b) {
 #elif defined(__GNUC__)
     return __builtin_popcountll(b);
 #else
-    /* Portable fallback (SWAR). */
+
     b = b - ((b >> 1) & 0x5555555555555555ULL);
     b = (b & 0x3333333333333333ULL) + ((b >> 2) & 0x3333333333333333ULL);
     b = (b + (b >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
@@ -245,19 +186,16 @@ static inline Square msb(Bitboard b) {
 #endif
 }
 
-/* The standard iteration idiom:
- *     while (bb) { Square s = pop_lsb(&bb); ... }
- */
+/* The iteration idiom: while (bb) { Square s = pop_lsb(&bb); ... } */
 static inline Square pop_lsb(Bitboard *b) {
     const Square s = lsb(*b);
     *b &= *b - 1;
     return s;
 }
 
-/* Parallel bit extract - the fast magic-free sliding attack lookup on Intel.
- * Guarded because it is microcoded and very slow on AMD Zen 1/2. */
+/* Guarded because PEXT is microcoded and very slow on AMD Zen 1/2. */
 #ifdef USE_PEXT
 static inline uint64_t pext(uint64_t src, uint64_t mask) { return _pext_u64(src, mask); }
 #endif
 
-#endif /* TYPES_H */
+#endif

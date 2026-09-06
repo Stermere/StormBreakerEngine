@@ -1,14 +1,11 @@
 /*
  * movegen.c - move generation.
  *
- * Moves are generated PSEUDO-LEGALLY and filtered by movegen_is_legal() only
- * for the moves the caller actually plays. That split is what makes the cached
- * `pinned` and `checkers` sets in Position worth maintaining: legality then
- * costs a bitboard test rather than an attack scan, and moves that get pruned
- * before they are played never pay for it at all.
- *
- * The one exception is en passant, which removes two pawns from one rank in a
- * single move. No pin set can express that, so it gets a full attack test.
+ * Moves are generated PSEUDO-LEGALLY and filtered by movegen_is_legal() only for the
+ * ones the caller actually plays, which is what makes the cached `pinned` and
+ * `checkers` sets worth maintaining. The exception is en passant, which takes two
+ * pawns off one rank in a single move - no pin set expresses that, so it gets a full
+ * attack test.
  */
 #include "movegen.h"
 
@@ -16,17 +13,13 @@
 
 #include "bitboard.h"
 
-/* ------------------------------------------------------------- emission -- */
-
-/* `score` is deliberately left untouched: move ordering owns that field, and
- * generation writing a zero into it would be a wasted store per move. */
+/* `score` is deliberately left untouched: move ordering owns that field, and writing
+ * a zero into it here would be a wasted store per move. */
 static inline ScoredMove *emit(ScoredMove *out, Square from, Bitboard targets) {
     while (targets)
         (out++)->m = make_move(from, pop_lsb(&targets));
     return out;
 }
-
-/* --------------------------------------------------------------- pawns --- */
 
 static inline Bitboard shift_up(Bitboard b, Color c) {
     return c == WHITE ? shift_north(b) : shift_south(b);
@@ -41,16 +34,11 @@ static inline Bitboard shift_up_west(Bitboard b, Color c) {
 }
 
 /*
- * Which promotion pieces to emit, split so that GEN_CAPTURES and GEN_QUIETS
- * partition the promotions exactly once between them:
- *
- *   - a queen promotion is a "capture" for search purposes whether or not it
- *     takes anything, because it swings material by nine pawns;
- *   - an underpromotion is only worth searching in quiescence when it also
- *     captures, so a quiet underpromotion belongs to GEN_QUIETS.
- *
- * Underpromotions matter: a knight promotion with check is the only way out of
- * some positions, and an engine that skips them plays them as blunders.
+ * Split so GEN_CAPTURES and GEN_QUIETS partition the promotions exactly once: a queen
+ * promotion is a capture for search purposes whether or not it takes anything, while
+ * an underpromotion is only worth quiescence when it also captures. Underpromotions
+ * matter - a knight promotion with check is the only way out of some positions, and an
+ * engine that skips them plays them as blunders.
  */
 static ScoredMove *make_promotions(ScoredMove *out, Square from, Square to, GenType type,
                                    bool capture) {
@@ -65,11 +53,8 @@ static ScoredMove *make_promotions(ScoredMove *out, Square from, Square to, GenT
     return out;
 }
 
-/*
- * `target` restricts destinations and is only consulted for GEN_EVASIONS -
- * every other generation type expresses its filter through `enemies` and the
- * empty-square set instead.
- */
+/* `target` restricts destinations and is consulted only for GEN_EVASIONS; every other
+ * type expresses its filter through `enemies` and the empty-square set instead. */
 static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, Bitboard target,
                                   ScoredMove *out) {
     const Color them       = (Color)(us ^ 1);
@@ -86,12 +71,11 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
     /* When answering a check, the only capturable piece is the checker itself. */
     const Bitboard enemies = type == GEN_EVASIONS ? pos->checkers : color_bb(pos, them);
 
-    /* --- pushes (never promotions; those are handled below) --- */
     if (type != GEN_CAPTURES) {
         Bitboard single = shift_up(rest, us) & empty;
         Bitboard dbl    = shift_up(single & rank3, us) & empty;
 
-        if (type == GEN_EVASIONS) { /* a push only helps if it blocks the check */
+        if (type == GEN_EVASIONS) {
             single &= target;
             dbl &= target;
         }
@@ -144,10 +128,9 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
         if (pos->epSquare != SQ_NONE) {
             const Square capsq = (Square)(pos->epSquare - up);
 
-            /* In check, an en passant capture is only worth generating when it
-             * takes the checking pawn or blocks the checking line. Legality
-             * (including the discovered-check case) is settled in
-             * movegen_is_legal either way. */
+            /* In check, an en passant capture is only worth generating when it takes the
+             * checking pawn or blocks the checking line. Legality, including the
+             * discovered-check case, is settled in movegen_is_legal either way. */
             if (type != GEN_EVASIONS || bb_test(pos->checkers, capsq) ||
                 bb_test(target, pos->epSquare)) {
                 Bitboard from = pawn_attacks(them, pos->epSquare) & rest;
@@ -160,25 +143,17 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
     return out;
 }
 
-/* ------------------------------------------------------------- castling -- */
-
-/*
- * Castling geometry is carried by the Position, built from the diagram by
- * board.c, because Chess960 puts the king and both rooks on arbitrary files.
- * For a standard position it resolves to exactly the squares this file used to
- * hard-code, so nothing here needs to know which variant is being played.
- *
- * `castlingKingPath` includes the king's ORIGIN square, which is what makes
- * movegen_is_legal reject castling out of check without a separate test.
- */
-
-/* Which right a castling move is, recovered from the move itself: it is
- * encoded king-captures-own-rook, and the h-side rook is the one on the high
- * side of the king in Chess960 exactly as in standard chess. */
+/* Which right a castling move is, recovered from the move itself: it is encoded
+ * king-captures-own-rook, and the h-side rook is the one on the high side of the king
+ * in Chess960 exactly as in standard chess. */
 static inline int castling_idx_of(Color us, Square kingFrom, Square rookFrom) {
     return castling_index(us, rookFrom > kingFrom);
 }
 
+/* The geometry is carried by the Position and built from the diagram by board.c, so
+ * nothing here needs to know which variant is being played. Whether the king's path
+ * is attacked is settled by movegen_is_legal, which keeps generation free of attack
+ * scans. */
 static ScoredMove *gen_castling(const Position *pos, Color us, ScoredMove *out) {
     for (int side = 0; side < 2; ++side) {
         const int idx = castling_index(us, side == 0);
@@ -187,27 +162,21 @@ static ScoredMove *gen_castling(const Position *pos, Color us, ScoredMove *out) 
             (occupied_bb(pos) & pos->castlingEmptyPath[idx]))
             continue;
 
-        /* A surviving right means neither piece has moved, so wherever the
-         * king stands now IS its castling origin - which is why the geometry
-         * does not store it. */
+        /* A surviving right means neither piece has moved, so wherever the king stands
+         * now IS its castling origin - which is why the geometry does not store it. */
         const Square kingFrom = king_square(pos, us);
         const Square rookFrom = pos->castlingRook[idx];
 
         assert(rookFrom != SQ_NONE);
         assert(piece_on(pos, rookFrom) == make_piece(us, ROOK));
 
-        /* Whether the king's path is attacked is settled by movegen_is_legal,
-         * so generation stays free of attack scans. */
         (out++)->m = make_move_typed(kingFrom, rookFrom, MT_CASTLING);
     }
     return out;
 }
 
-/* ------------------------------------------------------ generation core -- */
-
-/* Knights, bishops, rooks and queens. Queens are generated by the bishop and
- * rook loops in turn: the two attack sets are disjoint, so no move is emitted
- * twice and the switch on piece type disappears. */
+/* Queens are generated by the bishop and rook loops in turn: the two attack sets are
+ * disjoint, so no move is emitted twice and the switch on piece type disappears. */
 static ScoredMove *gen_piece_moves(const Position *pos, Color us, Bitboard target,
                                    ScoredMove *out) {
     const Bitboard occ = occupied_bb(pos);
@@ -233,14 +202,9 @@ static ScoredMove *gen_piece_moves(const Position *pos, Color us, Bitboard targe
     return out;
 }
 
-/*
- * Only moves that answer an existing check.
- *
- * King steps are computed against an occupancy with the king removed, because
- * a king running straight down a checking slider's line is still in check on
- * every square of it - the classic "king walks backwards along the rook file"
- * bug.
- */
+/* King steps are computed against an occupancy with the king removed, because a king
+ * running straight down a checking slider's line is still in check on every square of
+ * it - the classic "king walks backwards along the rook file" bug. */
 static ScoredMove *gen_evasions(const Position *pos, ScoredMove *out) {
     const Color us   = pos->sideToMove;
     const Square ksq = king_square(pos, us);
@@ -255,7 +219,7 @@ static ScoredMove *gen_evasions(const Position *pos, ScoredMove *out) {
 
     out = emit(out, ksq, king_attacks(ksq) & ~color_bb(pos, us) & ~sliderRays);
 
-    /* Against two checkers no interposition or capture can help both, so the
+    /* Against two checkers no interposition or capture can help against both, so the
      * king moves above are the complete answer. */
     if (bb_more_than_one(pos->checkers))
         return out;
@@ -294,16 +258,10 @@ int movegen_generate(const Position *pos, GenType type, ScoredMove *list) {
     return (int)(out - list);
 }
 
-/* ------------------------------------------------------------- legality -- */
-
-/*
- * The en passant special case.
- *
- * The capture vacates the capturing pawn's square AND the captured pawn's
- * square, which are on the same rank. Two pieces leaving one rank can uncover
- * a rook or queen that neither a pin test nor a check test saw, so the only
- * reliable answer is to build the resulting occupancy and ask directly.
- */
+/* The capture vacates the capturing pawn's square AND the captured pawn's, which sit
+ * on the same rank, and two pieces leaving one rank can uncover a slider that neither
+ * a pin test nor a check test saw. The only reliable answer is to build the resulting
+ * occupancy and ask directly. */
 static bool en_passant_is_legal(const Position *pos, Square from, Square to) {
     const Color us     = pos->sideToMove;
     const Color them   = (Color)(us ^ 1);
@@ -311,8 +269,8 @@ static bool en_passant_is_legal(const Position *pos, Square from, Square to) {
     const Square capsq = (Square)(to - pawn_push(us));
     const Bitboard occ = (occupied_bb(pos) ^ square_bb(from) ^ square_bb(capsq)) | square_bb(to);
 
-    /* The captured pawn is gone, so it must not count as an attacker - it may
-     * well have been the piece giving check. */
+    /* The captured pawn is gone, so it must not count as an attacker - it may well have
+     * been the piece giving check. */
     const Bitboard enemy = color_bb(pos, them) & ~square_bb(capsq);
 
     return !(pawn_attacks(us, ksq) & enemy & pos->byType[PAWN]) &&
@@ -336,33 +294,23 @@ bool movegen_is_legal(const Position *pos, Move m) {
         return en_passant_is_legal(pos, from, to);
 
     if (mt == MT_CASTLING) {
-        /* kingPath includes the origin square, so this also rejects castling
-         * out of check. The king cannot screen its own path: any attacker
-         * aligned through it would already be giving check, and the origin is
-         * one of the squares being scanned. */
+        /* kingPath includes the origin square, so this also rejects castling out of
+         * check. The king cannot screen its own path: any attacker aligned through it
+         * would already be giving check. */
         Bitboard path = pos->castlingKingPath[castling_idx_of(us, from, to)];
         while (path)
             if (board_square_attacked(pos, pop_lsb(&path), them, occupied_bb(pos)))
                 return false;
 
-        /*
-         * The ROOK can screen, though, and only Chess960 can arrange it: there
-         * the rook may stand between its own king and an enemy slider on the
-         * back rank. The scan above ran with the rook still on the board, so
-         * it called a square safe that the rook was covering - and the rook is
-         * about to leave. King c1, rook b1, enemy queen a1: O-O-O does not
-         * move the king at all and drops it into check.
-         *
-         * Being pinned is exactly that condition, and it is free to test.
-         * Standard chess never trips it, because a castling rook on a1 or h1
-         * has no square behind it for a slider to pin from.
-         */
+        /* The ROOK can screen, though, and only Chess960 can arrange it: king c1, rook b1,
+         * enemy queen a1 - O-O-O does not move the king at all and drops it into check.
+         * Being pinned is exactly that condition, and it is free to test. */
         return !(pos->pinned & square_bb(to));
     }
 
     if (from == ksq) {
-        /* Remove the king before testing: otherwise it blocks the very slider
-         * it is trying to escape and every square on that line looks safe. */
+        /* Remove the king before testing: otherwise it blocks the very slider it is
+         * trying to escape and every square on that line looks safe. */
         return !board_square_attacked(pos, to, them, occupied_bb(pos) ^ square_bb(from));
     }
 
@@ -372,7 +320,7 @@ bool movegen_is_legal(const Position *pos, Move m) {
 
     if (pos->checkers) {
         if (bb_more_than_one(pos->checkers))
-            return false; /* only the king can answer a double check */
+            return false;
 
         const Square checksq = lsb(pos->checkers);
         if (!bb_test(SquaresBetween[checksq][ksq] | square_bb(checksq), to))
@@ -381,8 +329,6 @@ bool movegen_is_legal(const Position *pos, Move m) {
 
     return true;
 }
-
-/* --------------------------------------------------------- validation --- */
 
 bool movegen_is_pseudo_legal(const Position *pos, Move m) {
     if (!is_ok_move(m))
@@ -399,9 +345,9 @@ bool movegen_is_pseudo_legal(const Position *pos, Move m) {
         return false;
 
     if (mt == MT_CASTLING) {
-        /* `from` matching the king square is what makes the rest safe to
-         * trust: it establishes that the mover is the king AND that it is on
-         * its castling origin, since a right cannot outlive the king moving. */
+        /* `from` matching the king square is what makes the rest safe to trust: it
+         * establishes that the mover is the king AND that it is on its castling origin,
+         * since a right cannot outlive the king moving. */
         if (pos->checkers || from != king_square(pos, us))
             return false;
 

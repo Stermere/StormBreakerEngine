@@ -1,6 +1,4 @@
-/*
- * perft.c - move generation correctness testing.
- */
+/* perft.c - move generation correctness testing. */
 #include "perft.h"
 
 #include <assert.h>
@@ -11,12 +9,9 @@
 #include "movegen.h"
 #include "timeman.h"
 
-/*
- * In check the evasion generator is both narrower and faster, and it is what
- * the search uses - so perft exercises that path rather than leaving it
- * unverified. Debug builds additionally assert that the two generators agree
- * on the legal moves, which keeps GEN_ALL honest under the same suites.
- */
+/* In check the evasion generator is narrower, faster, and what the search actually
+ * uses, so perft exercises it rather than leaving it unverified. Debug builds also
+ * assert that the two generators agree on the legal moves. */
 static int generate_for_perft(const Position *pos, ScoredMove *list) {
     if (!board_checkers(pos))
         return movegen_generate(pos, GEN_ALL, list);
@@ -55,9 +50,8 @@ uint64_t perft(Position *pos, int depth) {
         if (!movegen_is_legal(pos, moves[i].m))
             continue;
 
-        /* Bulk counting: at depth 1 the legal moves ARE the leaves, so there
-         * is no need to make and unmake each one. Roughly a 5x speedup, and
-         * the counts are identical. */
+        /* Bulk counting: at depth 1 the legal moves ARE the leaves, so there is no need
+         * to make and unmake each one. Roughly 5x faster, and the counts are identical. */
         if (depth == 1) {
             ++nodes;
             continue;
@@ -96,8 +90,8 @@ void perft_divide(Position *pos, int depth) {
                (unsigned long long)nodes);
     }
 
-    /* Blank line then "Nodes searched:" matches Stockfish's `go perft` output,
-     * so the two can be diffed directly. */
+    /* Blank line then "Nodes searched:" matches Stockfish's `go perft` output, so the
+     * two can be diffed directly. */
     printf("\nNodes searched: %llu\n", (unsigned long long)total);
 }
 
@@ -169,9 +163,8 @@ bool perft_run_suite(const char *path, int maxDepth) {
     printf("\n%d positions, %d failures, %llu nodes in %lldms\n", positions, failures,
            (unsigned long long)totalNodes, (long long)elapsed);
 
-    /* A suite that checked nothing reports success, which would be a silent
-     * false pass in CI. Say so explicitly; the caller still treats it as a
-     * failure via the `totalNodes > 0` term below. */
+    /* A suite that checked nothing would otherwise report success, which is a silent
+     * false pass in CI; the `totalNodes > 0` term below is what actually fails it. */
     if (failures == 0 && totalNodes == 0)
         printf("NOTE: no positions were checked - the suite file parsed but every "
                "depth was filtered out by maxDepth.\n");

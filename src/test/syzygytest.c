@@ -1,38 +1,16 @@
 /*
  * syzygytest.c - does the prober actually answer known endgames correctly?
  *
- * The gate this file is: a wrong tablebase probe does not crash. It returns a
- * plausible number, the search believes it, and every label the generator
- * writes for a low-piece position is quietly wrong - the same failure mode
- * invariant 8 exists to catch for nets, applied to the data pipeline.
+ * A wrong tablebase probe does not crash: it returns a plausible number, the search
+ * believes it, and every label the generator writes for a low-piece position is quietly
+ * wrong. Every expected result below came from the lichess.org tablebase API - an oracle
+ * with no code in common with this integration - which earned its keep immediately, since
+ * the first draft asserted a blocked KNPvKP is drawn and it is won.
  *
- * WHAT THE SUITE HOLDS, and where the answers came from. Every expected
- * result below was taken from the lichess.org tablebase API - an oracle with
- * no code in common with this integration - rather than from theory recalled
- * at the keyboard. That check earned its keep immediately: the first draft of
- * this file asserted that a knight and a pawn against a pawn with the pawns
- * blocked and facing is drawn, and it is not, it is won. A suite written from
- * memory would have failed a correct prober.
- *
- * The cases are chosen so that agreeing with a material count is not enough:
- *
- *   - Draws worth several pawns on paper. A knight ahead and drawn; a bishop
- *     and pawn ahead and drawn; a QUEEN ahead and drawn. A search with a
- *     material-counting evaluation calls all of these winning, which is the
- *     failure that motivated integrating tablebases at all.
- *   - Two contrast pairs, one square apart. The wrong-colour-bishop draw and
- *     its win differ only in whether the bishop stands on h1 or g1; the
- *     rook-pawn knight draw and its win differ only in where the white king
- *     stands. No evaluation of material can separate either pair, and a
- *     prober that returned a constant would fail both.
- *   - Wins that need real technique: KQ vs KR, KR vs K.
- *   - Losses, so the sign is exercised in both directions.
- *   - Mirror pairs. Every case is probed as given and with the colours
- *     reflected, which catches a side-to-move or bitboard mix-up - the single
- *     most likely wiring bug, and one a symmetric suite would miss.
- *
- * A probe that silently never fires answers VALUE_NONE and fails here, rather
- * than passing because the rest of the engine happened to agree with it.
+ * The cases are chosen so that agreeing with a material count is not enough: draws worth
+ * several pawns on paper, two contrast pairs one square apart that no material evaluation
+ * can separate, wins that need technique, losses so the sign is exercised both ways, and
+ * a colour-reflected mirror of every case to catch a side-to-move mix-up.
  */
 #include "syzygytest.h"
 
@@ -49,68 +27,51 @@ typedef enum { EXPECT_WIN, EXPECT_DRAW, EXPECT_LOSS } Expect;
 
 typedef struct {
     const char *fen;
-    Expect expect; /* from the side to move */
+    Expect expect;
     const char *what;
 } TbCase;
 
-/* Every FEN has halfmove clock 0: that is the condition the WDL probe fires
- * under, and a case that cannot be probed is a case that tests nothing. */
+/* Every FEN has halfmove clock 0: that is the condition the WDL probe fires under, and a
+ * case that cannot be probed is a case that tests nothing. */
 static const TbCase Cases[] = {
-    /* A piece up and drawn. The first is the position that started this: a
-     * knight ahead, which a material-counting evaluation scores around +3.
-     * The draw is the rook pawn - the defending king reaches the corner in
-     * front of it and cannot be dislodged. */
+    /* A piece up and drawn, worth up to +8 to a material count. */
+
     {"k7/8/K7/P7/8/8/6p1/6N1 w - - 0 1", EXPECT_DRAW, "KNPvKP, rook pawn, king in the corner"},
     {"k7/8/K7/P7/8/6p1/8/6N1 w - - 0 1", EXPECT_DRAW, "KNPvKP, same, black pawn a rank back"},
 
-    /* ...and the same material WON, with the white king one square over. No
-     * evaluation of material can tell this from the two above. */
     {"k7/8/1K6/P7/8/8/5p2/5N2 w - - 0 1", EXPECT_WIN, "KNPvKP, king on b6 instead: won"},
 
-    /* A bishop AND a pawn up, drawn: the bishop does not control the pawn's
-     * promotion square. The pair differs by one square. */
     {"7k/8/5K2/7P/8/8/8/7B w - - 0 1", EXPECT_DRAW, "KBPvK, wrong-colour bishop on h1"},
     {"7k/8/5K2/7P/8/8/8/6B1 w - - 0 1", EXPECT_WIN, "KBPvK, right-colour bishop on g1"},
 
-    /* A QUEEN up and drawn: a bishop pawn on the seventh, its king beside it,
-     * and the stalemate resource holds. Worth ~+8 to a material count. */
     {"7K/7Q/8/8/8/8/1kp5/8 w - - 0 1", EXPECT_DRAW, "KQvKP, c-pawn on the 7th"},
     {"7K/7Q/8/8/8/8/2p5/1k6 w - - 0 1", EXPECT_DRAW, "KQvKP, c-pawn, king behind"},
 
-    /* Two knights cannot force mate, so a pawn down is still a draw. */
     {"8/8/8/8/8/1k6/1p6/1K1N1N2 w - - 0 1", EXPECT_DRAW, "KNNvKP, no forced mate"},
 
-    /* Pawn endings whose result is opposition, not material. */
     {"8/8/8/4k3/4p3/4P3/4K3/8 w - - 0 1", EXPECT_DRAW, "KPvKP, blocked and facing"},
     {"8/8/8/8/8/6k1/6P1/6K1 b - - 0 1", EXPECT_DRAW, "KPvK, defender has the opposition"},
 
-    /* Wins that need technique rather than counting. */
+    /* The same material WON, one square over - no evaluation of material tells these
+     * apart - and wins that need technique rather than counting. */
     {"8/8/8/4k3/4p3/4P3/4KN2/8 w - - 0 1", EXPECT_WIN, "KNPvKP, centre pawns: won"},
     {"8/8/8/4k3/8/8/4K3/4Q3 w - - 0 1", EXPECT_WIN, "KQvK"},
     {"8/8/8/3k4/8/8/3K4/3R4 w - - 0 1", EXPECT_WIN, "KRvK"},
     {"8/8/8/4k3/8/8/3r4/3QK3 w - - 0 1", EXPECT_WIN, "KQvKR"},
 
-    /* Losses, so the sign is exercised in both directions. */
     {"4q3/4k3/8/8/8/8/4K3/8 w - - 0 1", EXPECT_LOSS, "KvKQ"},
     {"8/8/8/3k4/3p4/3P4/3KN3/8 b - - 0 1", EXPECT_LOSS, "KPvKNP, centre pawns"},
 };
 
-/*
- * Mirrors a FEN vertically and swaps the colours: a position and its
- * reflection must give the same result from the mover's point of view.
- *
- * Done on the string, reversing the rank fields and swapping the case of the
- * piece letters, then handed to board_set_fen like any other FEN - which is
- * what keeps every derived field (keys, checkers, pinned) computed the one
- * way the engine computes them. Every case above has no castling rights and
- * no en passant square, so only the board and the side to move move.
- */
+/* Mirrors a FEN vertically and swaps the colours: a position and its reflection must give
+ * the same result from the mover's point of view. Done on the string and handed to
+ * board_set_fen like any other FEN, which keeps every derived field computed the one way
+ * the engine computes it. */
 static bool mirror_fen(const char *fen, char *out, size_t cap) {
     char board[128], rest[128];
     if (sscanf(fen, "%127s %127[^\n]", board, rest) != 2)
         return false;
 
-    /* Split the board field into its eight ranks, then emit them backwards. */
     char *ranks[8];
     int n       = 0;
     char *saved = board;
@@ -134,8 +95,7 @@ static bool mirror_fen(const char *fen, char *out, size_t cap) {
         for (const char *p = ranks[r]; *p; ++p) {
             if (used + 2 >= cap)
                 return false;
-            /* A piece belongs to whichever side its case names, so swapping
-             * case is exactly swapping colours. */
+
             char ch = *p;
             if (ch >= 'a' && ch <= 'z')
                 ch = (char)(ch - 'a' + 'A');
@@ -151,9 +111,9 @@ static bool mirror_fen(const char *fen, char *out, size_t cap) {
     }
     out[used] = '\0';
 
-    /* The side to move flips with the colours; the rest of the FEN is
-     * unchanged, which holds only because these cases have no castling
-     * rights and no en passant square. */
+    /* A piece belongs to whichever side its case names, so swapping case is exactly swapping
+     * colours. The side to move flips with them and the rest of the FEN is unchanged, which
+     * holds only because these cases have no castling rights and no en passant square. */
     const char stm = rest[0] == 'w' ? 'b' : 'w';
     if (used + strlen(rest) + 2 >= cap)
         return false;
@@ -241,36 +201,22 @@ int syzygy_verify_suite(const char *path) {
     return failures;
 }
 
-/* ====================================================================== *
- *  Position generator
+/*
+ * The position generator. Material configurations are ENUMERATED and placements within
+ * them sampled, because a wrong prober is wrong for a whole table at a time.
  *
- *  See syzygytest.h for what this is for. The short version: material
- *  configurations are ENUMERATED and placements within them are sampled,
- *  because a wrong prober is wrong for a whole table at a time.
- * ====================================================================== */
-
-/* Non-king piece types, in the order a configuration's digits are read. */
+ * A configuration is a multiset of coloured non-king pieces addressed by an integer, so
+ * the whole space is walkable without holding it in memory: configuration N's k-th piece
+ * is type (N / 10^k) % 10, and multisets are the codes whose digits are non-increasing.
+ * Most integers in the range decode to nothing, which costs a divide each once per
+ * configuration and buys a pure function with no table to build.
+ */
 static const PieceType GenTypes[5] = {PAWN, KNIGHT, BISHOP, ROOK, QUEEN};
 
-/*
- * A configuration is a multiset of coloured non-king pieces, addressed by an
- * integer so that the whole space is walkable without holding it in memory.
- * The encoding is plain base-10 digits over the ten coloured types:
- * configuration N's k-th piece is type (N / 10^k) % 10. Multisets are then the
- * subset of those integers whose digits are non-increasing, which
- * config_decode enforces by rejecting the rest - one spelling per multiset, so
- * nothing is generated twice.
- *
- * Wasteful, in that most integers in the range decode to nothing, and it does
- * not matter: the rejects cost a divide each and are walked once per
- * configuration rather than once per position. What it buys is that
- * configuration -> material is a pure function with no table to build, and
- * adding a man does not renumber anything below it.
- */
-enum { GEN_MAX_EXTRA = 5 }; /* seven men, kings included */
+enum { GEN_MAX_EXTRA = 5 };
 
-/* Fills counts[colour][type] and returns the number of non-king pieces, or -1
- * when `code` is not a canonical (non-increasing) multiset. */
+/* Fills counts[colour][type] and returns the number of non-king pieces, or -1 when `code`
+ * is not a canonical (non-increasing) multiset. */
 static int config_decode(uint64_t code, int extra, int counts[2][PIECE_TYPE_NB]) {
     for (int c = 0; c < 2; ++c)
         for (int t = 0; t < PIECE_TYPE_NB; ++t)
@@ -324,9 +270,9 @@ static uint64_t config_code(int extra, int index, int *found) {
     return 0;
 }
 
-/* Configurations are laid out by piece count - every 2-man one, then every
- * 3-man one - so a prefix of the space is the smaller endgames and a run cut
- * short still covered whole piece counts. */
+/* Configurations are laid out by piece count - every 2-man one, then every 3-man one - so
+ * a prefix of the space is the smaller endgames and a run cut short still covered whole
+ * piece counts. */
 static int config_split(int maxMen, int config, int *extraOut) {
     const int maxExtra = maxMen - 2;
     for (int extra = 0; extra <= maxExtra && extra <= GEN_MAX_EXTRA; ++extra) {
@@ -379,8 +325,6 @@ void tbgen_config_name(int maxMen, int config, char *buf, size_t cap) {
         return;
     }
 
-    /* The conventional spelling: white's men, 'v', black's men, kings first
-     * and each side ordered from the strongest piece down. */
     size_t n = 0;
     for (int c = 0; c < 2; ++c) {
         if (c == 1)
@@ -393,9 +337,9 @@ void tbgen_config_name(int maxMen, int config, char *buf, size_t cap) {
     buf[n] = 0;
 }
 
-/* SplitMix64: a seed in, a well-distributed word out, no state to carry. Two
- * positions from adjacent seeds have to be unrelated, because the seeds ARE
- * adjacent - the caller counts up. */
+/* SplitMix64: a seed in, a well-distributed word out, no state to carry. Two positions
+ * from adjacent seeds have to be unrelated, because the seeds ARE adjacent - the caller
+ * counts up. */
 static uint64_t splitmix(uint64_t *x) {
     uint64_t z = (*x += 0x9E3779B97F4A7C15ULL);
     z          = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -403,6 +347,9 @@ static uint64_t splitmix(uint64_t *x) {
     return z ^ (z >> 31);
 }
 
+/* Built as a FEN and parsed rather than assembled through board_put_piece: board_set_fen
+ * is the one path that fills in every derived field, and a generator that set them by hand
+ * would be testing its own bookkeeping as much as the prober's answers. */
 bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
     int counts[2][PIECE_TYPE_NB];
     int extra;
@@ -411,11 +358,6 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
 
     uint64_t rng = seed * 0x2545F4914F6CDD1DULL + (uint64_t)config * 0x9E3779B97F4A7C15ULL + 1;
 
-    /* Built as a FEN and parsed, rather than assembled through
-     * board_put_piece: board_set_fen is the one path that fills in every
-     * derived field - the keys, the checkers, the pinned set - and a generator
-     * that set them by hand would be testing its own bookkeeping as much as
-     * the prober's answers. */
     char board[SQUARE_NB];
     for (int s = 0; s < SQUARE_NB; ++s)
         board[s] = 0;
@@ -432,17 +374,14 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
     board[wk] = 'K';
     board[bk] = 'k';
 
-    /*
-     * When the material allows it, sometimes BUILD the en passant geometry
-     * rather than hoping for it: one white pawn on rank 4 with a black pawn
-     * beside it, and the two squares behind the white one clear. Left to
-     * chance this arose in 63 placements out of 410,960, which is not
-     * coverage of the subtlest branch in the prober - it is a rounding error.
-     */
     int placedW = 0, placedB = 0;
+    /* When the material allows it, sometimes BUILD the en passant geometry rather than
+     * hoping for it - a white pawn on rank 4 with a black pawn beside it and the squares
+     * behind clear. Left to chance this arose in 63 placements out of 410,960, which is not
+     * coverage of the subtlest branch in the prober but a rounding error. */
     if (counts[0][PAWN] && counts[1][PAWN] && (splitmix(&rng) & 1)) {
-        const int f  = (int)(splitmix(&rng) % 7); /* leaves room for f+1 */
-        const int wq = 24 + f;                    /* rank 4 */
+        const int f  = (int)(splitmix(&rng) % 7);
+        const int wq = 24 + f;
         const int bq = wq + 1;
         if (board[wq] == 0 && board[bq] == 0 && board[wq - 8] == 0 && board[wq - 16] == 0) {
             board[wq] = 'P';
@@ -459,9 +398,6 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
                 Square s;
                 int tries = 0;
                 do {
-                    /* A pawn on the first or last rank is not a position, and
-                     * a generator that produced them would spend its retries
-                     * there rather than on placements. */
                     s = (t == PAWN) ? (Square)(8 + splitmix(&rng) % 48)
                                     : (Square)(splitmix(&rng) % SQUARE_NB);
                     if (++tries > 128)
@@ -493,34 +429,14 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
         if (r > 0)
             fen[n++] = '/';
     }
-    /* No castling, no en passant, a zero clock: the conditions under which a
-     * WDL probe is defined at all. Appended by hand rather than with snprintf,
-     * whose bound the compiler cannot relate to `n` and warns about. The board
-     * field is at most 71 characters and the suffix is 10, so FEN_MAX_LEN is
-     * ample. */
-    /*
-     * En passant, sometimes, because the probe's hardest code is the branch
-     * that handles it - a tablebase knows nothing about ep rights, so an ep
-     * capture's value has to be weighed against the position as the table sees
-     * it, including a stalemate case where the two genuinely differ. A
-     * generator that always wrote "-" would leave every line of that untested,
-     * and it did until this was added.
-     *
-     * A square is only offered when the double push that would have created it
-     * is consistent - the two squares behind the pawn empty - and an enemy pawn
-     * actually stands ready to take it, which is the case worth testing.
-     */
+
     char epField[3] = {'-', 0, 0};
     char stm        = (splitmix(&rng) & 1) ? 'w' : 'b';
 
-    /* Taken whenever the geometry allows rather than at random: the material
-     * that can produce one - pawns on both sides, adjacent, on the right rank -
-     * is rare enough in random placements that sampling on top of it left the
-     * branch with a few dozen positions in four hundred thousand. */
     {
         for (int sq = 0; sq < SQUARE_NB; ++sq) {
             const int f = sq & 7, r = sq >> 3;
-            /* A white pawn on rank 4 could have just come from rank 2. */
+
             if (board[sq] == 'P' && r == 3 && board[sq - 8] == 0 && board[sq - 16] == 0 &&
                 ((f > 0 && board[sq - 1] == 'p') || (f < 7 && board[sq + 1] == 'p'))) {
                 epField[0] = (char)('a' + f);
@@ -528,7 +444,7 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
                 stm        = 'b';
                 break;
             }
-            /* ...and a black pawn on rank 5 from rank 7. */
+
             if (board[sq] == 'p' && r == 4 && board[sq + 8] == 0 && board[sq + 16] == 0 &&
                 ((f > 0 && board[sq - 1] == 'P') || (f < 7 && board[sq + 1] == 'P'))) {
                 epField[0] = (char)('a' + f);
@@ -539,21 +455,26 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
         }
     }
 
+    /* No castling, no en passant unless offered, a zero clock: the conditions under which a
+     * WDL probe is defined at all. An ep square is offered only when the double push that
+     * would have created it is consistent and an enemy pawn stands ready to take it, and it
+     * is taken whenever the geometry allows rather than at random - the material that can
+     * produce one is rare enough that sampling on top left the branch with a few dozen
+     * positions in four hundred thousand. */
     n += (size_t)snprintf(fen + n, FEN_MAX_LEN - n, " %c - %s 0 1", stm, epField);
     (void)n;
 
     if (!board_set_fen(pos, fen))
         return false;
 
-    /* The side that just moved cannot still be in check. This also rejects
-     * adjacent kings, which is the same condition. */
+    /* The side that just moved cannot still be in check. This also rejects adjacent kings,
+     * which is the same condition. */
     const Color them = pos->sideToMove == WHITE ? BLACK : WHITE;
     return !board_square_attacked(pos, king_square(pos, them), pos->sideToMove, occupied_bb(pos));
 }
 
-/* Whether the side to move has any legal reply. The root probe is defined only
- * where one exists, and both the sealer and this file must skip the same
- * positions or their checksums cannot agree. */
+/* The root probe is defined only where a legal reply exists, and both the sealer and this
+ * file must skip the same positions or their checksums cannot agree. */
 static bool has_any_legal(Position *pos) {
     ScoredMove list[MAX_MOVES];
     const int n = movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_ALL, list);
@@ -563,26 +484,9 @@ static bool has_any_legal(Position *pos) {
     return false;
 }
 
-/* ====================================================================== *
- *  Checksum manifest
- *
- *  See syzygytest.h. This is the half that VERIFIES. The half that SEALED
- *  the manifest was a temporary tools/tbdiff.c that linked Fathom in as an
- *  oracle; it went away with Fathom itself (docs/EXPERIMENTS.md E24), which
- *  is the point - verifying must not need the oracle, only sealing did.
- *  Re-earning the manifest from scratch would mean reinstating an
- *  independent prober, not resurrecting that file.
- * ====================================================================== */
-
-/*
- * FNV-1a over the two numbers, in a fixed order.
- *
- * A checksum rather than the values themselves because 286 configurations at
- * the manifest's `per 200` is 57,200 answers and the point is a file a human reads
- * and git can diff. What is lost is which POSITION broke, which is why the
- * checksum is per configuration and the seed is recorded: a failing endgame
- * can be replayed exactly.
- */
+/* FNV-1a over the two numbers, in a fixed order. A checksum rather than the values because
+ * 286 configurations at `per 200` is 57,200 answers and the point is a file git can diff;
+ * what is lost is which POSITION broke, which is why the seed is recorded. */
 uint64_t tbgen_checksum(uint64_t acc, int wdl, int dtz) {
     const uint64_t Prime = 0x100000001B3ULL;
     acc                  = (acc ^ (uint64_t)(uint32_t)wdl) * Prime;
@@ -590,19 +494,13 @@ uint64_t tbgen_checksum(uint64_t acc, int wdl, int dtz) {
     return acc;
 }
 
-/* The sentinel a declined probe folds in, so that a prober which quietly
- * refuses more positions than the oracle did fails rather than agreeing. */
+/* The sentinel a declined probe folds in, so a prober that quietly refuses more positions
+ * than the oracle did fails rather than agreeing. */
 enum { TBGEN_DECLINED = 99 };
 
-/*
- * One configuration's checksum, using this engine's prober.
- *
- * The two normalisations here are the ones the differential harness settled
- * on and they have to match the sealer exactly: the root probe is skipped for
- * positions with no legal move (the engine never root-probes one, and the
- * oracle reported those as their own outcomes rather than as values), and the
- * distance is folded in as a magnitude because the oracle's is unsigned.
- */
+/* The two normalisations here are the differential harness's and have to match the sealer
+ * exactly: the root probe is skipped for positions with no legal move, and the distance is
+ * folded in as a magnitude because the oracle's is unsigned. */
 uint64_t tbgen_config_checksum(int maxMen, int config, uint64_t seed, long per) {
     uint64_t acc = 0xcbf29ce484222325ULL;
 
@@ -653,7 +551,7 @@ int syzygy_verify_manifest(const char *tbPath, const char *manifestPath) {
             continue;
         if (sscanf(line, "seed %llu", (unsigned long long *)&seed) == 1)
             continue;
-        break; /* the first checksum line; rewound below */
+        break;
     }
 
     if (version != 1 || maxMen < 3 || per < 1) {
@@ -686,12 +584,11 @@ int syzygy_verify_manifest(const char *tbPath, const char *manifestPath) {
         if (sscanf(line, "%31s %llx", name, &want) != 2)
             continue;
         if (name[0] != 'K')
-            continue; /* a header line, not a configuration */
+            continue;
 
-        /* The manifest is ordered as the generator enumerates, so the index is
-         * the line's position among the checksum lines. Names are checked
-         * rather than assumed, because a manifest sealed by a different
-         * generator would otherwise be compared against the wrong endgames. */
+        /* The manifest is ordered as the generator enumerates, so the index is the line's
+         * position. Names are checked rather than assumed, because a manifest sealed by a
+         * different generator would otherwise be compared against the wrong endgames. */
         char expect[16];
         tbgen_config_name(maxMen, checked, expect, sizeof(expect));
         if (strcmp(expect, name) != 0) {

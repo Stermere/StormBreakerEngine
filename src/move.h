@@ -1,24 +1,13 @@
 /*
  * move.h - 16-bit move encoding.
  *
- * Layout:
- *   bits  0-5   origin square      (0..63)
- *   bits  6-11  destination square (0..63)
- *   bits 12-13  promotion piece    (0=knight, 1=bishop, 2=rook, 3=queen)
- *   bits 14-15  move type          (see MoveType)
+ *   bits  0-5   origin square
+ *   bits  6-11  destination square
+ *   bits 12-13  promotion piece (0=knight .. 3=queen), promotions only
+ *   bits 14-15  move type
  *
- * Packing a move into 16 bits keeps move lists cache-resident and lets the
- * transposition table store a move in half a word. The promotion field is only
- * meaningful when type == MT_PROMOTION.
- *
- * Castling is encoded king-captures-own-rook (origin = king, destination =
- * rook). That looks odd but it is the only encoding that stays unambiguous in
- * Chess960: there the king may start on b1, where the standard spelling of
- * O-O-O is "b1c1" - which is also an ordinary king step.
- *
- * Chess960 is fully supported. The geometry a castling move refers to lives on
- * the Position (board.h), so both variants share one generator, and the
- * UCI_Chess960 option changes only how castling is SPELLED on the way out.
+ * Castling is encoded king-captures-own-rook, the only spelling that stays
+ * unambiguous in Chess960, where a king on b1 castling long reads as a king step.
  */
 #ifndef MOVE_H
 #define MOVE_H
@@ -27,10 +16,7 @@
 
 typedef uint16_t Move;
 
-enum {
-    MOVE_NONE = 0,
-    MOVE_NULL = 65 /* b1b1: not a legal move, so it is safe as a sentinel */
-};
+enum { MOVE_NONE = 0, MOVE_NULL = 65 };
 
 typedef enum {
     MT_NORMAL     = 0,
@@ -56,33 +42,21 @@ static inline Move make_promotion(Square from, Square to, PieceType promo) {
     return (Move)(from | (to << 6) | ((promo - KNIGHT) << 12) | MT_PROMOTION);
 }
 
-/* Neither sentinel. Note MOVE_NONE == 0 is falsy. */
+/* Neither sentinel. Note that MOVE_NONE == 0 is falsy. */
 static inline bool is_ok_move(Move m) { return m != MOVE_NONE && m != MOVE_NULL; }
 
-/* A scored move. Move ordering is the single largest contributor to search
- * efficiency, so generation and scoring share one struct to stay cache-local. */
+/* Generation and scoring share one struct to keep ordering cache-local. */
 typedef struct {
     Move m;
     int score;
 } ScoredMove;
 
 /*
- * Writes long algebraic notation ("e2e4", "e7e8q") into `buf`, which must hold
- * at least 6 bytes. Returns `buf`.
- *
- * `chess960` selects how a CASTLING move is spelled, and it is a parameter
- * rather than a setting read from somewhere because the answer belongs to the
- * position the move came from, not to the process:
- *
- *   false   the king's destination, "e1g1" - what a standard GUI expects.
- *   true    king-captures-own-rook, "e1h1" - the only unambiguous spelling on
- *           a Chess960 board, where a king on f8 castling short and a king on
- *           f8 stepping to g8 are both "f8g8".
- *
- * Pass `pos->chess960`. A global would let the two drift, and the drift is
- * silent: every count and every score stays right, and the engine hands the
- * GUI one string that names two legal moves.
+ * Long algebraic ("e2e4", "e7e8q") into `buf`, which must hold six bytes; returns
+ * `buf`. `chess960` picks how CASTLING is spelled - false the king's destination
+ * "e1g1", true king-takes-rook "e1h1" - and is a parameter because the answer
+ * belongs to the position rather than the process, so pass pos->chess960.
  */
 char *move_to_str(Move m, bool chess960, char *buf);
 
-#endif /* MOVE_H */
+#endif

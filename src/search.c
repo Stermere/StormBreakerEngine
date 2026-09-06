@@ -1,27 +1,15 @@
 /*
- * search.c - search driver and worker thread.
+ * search.c - search driver and worker thread: iterative deepening over a principal
+ * variation search, with a quiescence search at the leaves.
  *
- * Iterative deepening over a principal variation search, with a quiescence
- * search at the leaves.
+ * Almost everything here exists to make alpha-beta see the best move first. That is not
+ * a detail - alpha-beta only approaches its theoretical node count under good ordering,
+ * and the gap between good and bad is a factor of ten in tree size. With the ordering
+ * good enough to rely on, null-move pruning and late move reductions pay for themselves.
  *
- * Almost everything here exists to make alpha-beta see the best move first.
- * That is not a detail: alpha-beta only approaches its theoretical node count
- * under perfect ordering, and the gap between good and bad ordering is a
- * factor of ten in tree size long before it is anything else. In rough order
- * of how much they contribute:
- *
- *   - the transposition table move, which was actually best last time;
- *   - MVV-LVA on captures and promotions;
- *   - killers, counter-moves and butterfly history on the quiet moves.
- *
- * With the ordering good enough to rely on, two prunings pay for themselves:
- * null-move pruning, which skips positions too good to need searching, and
- * late move reductions, which search the tail of the move list shallower and
- * re-search anything that surprises us.
- *
- * Anything added from here is a BEHAVIOURAL change and must not be committed
- * without a passing SPRT. See docs/TESTING.md; roughly half of the patches
- * that look obviously good measure neutral or worse.
+ * Anything added from here is a BEHAVIOURAL change and must not be committed without a
+ * passing SPRT: roughly half the patches that look obviously good measure neutral or
+ * worse.
  */
 #include "search.h"
 
@@ -41,85 +29,75 @@
 #include "tt.h"
 #include "uci.h"
 
-/* Root state, owned by the worker while a search is running. The main thread
- * only writes these before the worker starts, and only reads them after it
- * has been joined, so no lock is needed. */
+/* Root state, owned by the worker while a search runs. The main thread writes these
+ * before the worker starts and reads them after it is joined, so no lock is needed. */
 static Position RootPos;
 static SearchLimits Limits;
 static TimeManager Timer;
 
 static ThreadHandle Worker;
-static bool WorkerStarted; /* main thread only */
+static bool WorkerStarted;
 
-/* Cross-thread flags. Relaxed ordering would be enough for a stop flag, but
- * the default sequential consistency costs nothing at the rate we poll it. */
+/* Relaxed ordering would be enough for a stop flag, but sequential consistency costs
+ * nothing at the rate these are polled. */
 static atomic_bool Searching;
 static atomic_bool StopFlag;
 static atomic_bool Pondering;
 
 static atomic_ullong Nodes;
 
-/* When the clock the search is spending actually started running. Normally
- * the moment `go` arrived, but a ponder search moves it forward on ponderhit:
- * the time spent guessing was free. */
+/* When the clock the search is spending actually started running: normally the moment
+ * `go` arrived, but a ponder search moves it forward on ponderhit, since the time spent
+ * guessing was free. */
 static atomic_llong ClockOrigin;
 
-/* ------------------------------------------------------- worker-owned --- */
-
-/* Touched only by the search thread. NodeCount is published into the atomic
- * `Nodes` periodically rather than per node, because an atomic increment in
- * the innermost loop of the search is a measurable cost for a counter nothing
- * reads at that granularity. */
+/* Touched only by the search thread, and published into the atomic `Nodes` periodically
+ * rather than per node: an atomic increment in the innermost loop is a measurable cost
+ * for a counter nothing reads at that granularity. */
 static uint64_t NodeCount;
 
-/* Syzygy state for this search: the piece-count gate, cached at search start
- * so the per-node test is one comparison against a local, and the probe
- * counter behind `info ... tbhits`. TbLimit is 0 whenever no tablebases are
- * loaded, which short-circuits every probe - a build that never loads them
- * searches bit-identically to one without the prober, and bench stays
- * deterministic across machines. */
+/* The piece-count gate, cached at search start so the per-node test is one comparison
+ * against a local, plus the counter behind `info tbhits`. TbLimit is 0 whenever no
+ * tablebases are loaded, which short-circuits every probe and keeps bench identical
+ * across machines. */
 static int TbLimit;
 static uint64_t TbHits;
 
-/* Triangular PV table. PvTable[ply] is the principal variation from `ply`
- * downwards; a child's line is copied up behind the move that produced it. */
+/* Triangular PV table: PvTable[ply] is the principal variation from `ply` downwards, and
+ * a child's line is copied up behind the move that produced it. */
 static Move PvTable[MAX_PLY][MAX_PLY];
 static int PvLength[MAX_PLY];
 
-/* What is being searched at each ply. The child needs to know the move that
- * led to it - to look up its counter-move, and to refuse a second null move in
- * a row - and the piece that made it, which the board no longer says once the
- * move has been played. */
+/* What is being searched at each ply. The child needs the move that led to it - for its
+ * counter-move, and to refuse a second null move in a row - and the piece that made it,
+ * which the board no longer says once the move has been played. */
 typedef struct {
     Move move;
     Piece movedPiece;
-    Value staticEval; /* kept so a node can compare against its grandparent */
+    Value staticEval;
 
-    /* Set only while a singular search is running at this ply: the move that
-     * search must pretend does not exist. See the singular extension. */
+    /* Set only while a singular search runs at this ply: the move that search must
+     * pretend does not exist. */
     Move excludedMove;
 } SearchStack;
 
 static SearchStack Stack[MAX_PLY];
 
-/* Nominal depth of the iteration currently running. Extensions are bounded
- * relative to it, so a line that can be extended indefinitely - a perpetual
- * check, say - cannot grow the tree without limit. */
+/* Nominal depth of the iteration currently running. Extensions are bounded relative to
+ * it, so a line that can be extended indefinitely cannot grow the tree without limit. */
 static Depth RootDepth;
 
-/* Score and depth of the last iteration that ran to completion, published for
- * search_run_sync. The UCI path reads the same numbers off the `info` lines,
- * which is why nothing but an offline tool ever needed them exposed. */
+/* The last completed iteration's score and depth, published for search_run_sync. The
+ * UCI path reads the same numbers off the `info` lines. */
 static Value RootScore;
 static Depth CompletedDepth;
 
-/* Suppresses the `info` lines. Set only for the duration of a synchronous
- * search: datagen runs millions of them and wants its own stdout. */
+/* Suppresses the `info` lines, for the duration of a synchronous search only: datagen
+ * runs millions of them and wants its own stdout. */
 static bool Silent;
 
-/* Deepest ply any line reached this iteration, quiescence included. Reported
- * as `info seldepth`, which is how a GUI tells a search that is genuinely
- * looking deep along forcing lines from one that is merely reporting a big
+/* Deepest ply any line reached this iteration, quiescence included. It is how a GUI
+ * tells a search genuinely looking deep along forcing lines from one reporting a big
  * nominal depth after heavy reductions. */
 static int SelDepth;
 
@@ -128,79 +106,63 @@ static inline void update_seldepth(int ply) {
         SelDepth = ply;
 }
 
-/*
- * Late move reduction amounts, indexed by [depth][move number] and built once
- * by init_reductions().
- */
+/* Late move reduction amounts by [depth][move number], built once by
+ * init_reductions(). */
 static uint8_t Reductions[64][64];
 
 /*
- * The ordering heuristics. Declared here rather than beside the code that uses
- * them because search_clear() has to reset every one: anything that carries
- * information from one search into the next makes a result depend on what was
- * searched before it, which quietly destroys reproducibility. See the move
- * ordering section for what each of them means.
+ * The ordering heuristics, declared here rather than beside their use because
+ * search_clear() has to reset every one - anything carrying information from one search
+ * into the next makes a result depend on what was searched before it.
+ *
+ * Killers are quiet moves that cut at this ply elsewhere in the tree, since siblings
+ * tend to share refutations; History is how well a quiet move has been doing lately,
+ * untied to a ply; CounterMoves is the quiet reply that most recently refuted this exact
+ * move.
  */
 static Move Killers[MAX_PLY][2];
 static int16_t History[COLOR_NB][SQUARE_NB][SQUARE_NB];
 static Move CounterMoves[PIECE_NB][SQUARE_NB];
 
-/*
- * Continuation history, indexed [slot][previous piece][previous to][this
- * piece][this to]. 2 MB per slot, which is why these are file-scope arrays
- * rather than anything per-node. See the note beside their use for what they
- * buy.
- *
- * Three slots, keyed on the move played one, two and four plies above. One ply
- * back is the direct reply and the strongest single signal. Two plies back is
- * the same side's own previous move, which is what makes a plan legible to the
- * ordering - "knight to d2 then knight to f1" scores as a unit rather than as
- * two unrelated moves. Four plies back catches the slower manoeuvres that a
- * two-ply window still reads as noise.
- */
 #define CONT_SLOTS 3
 
-/* How far back each slot looks. Sized independently of CONT_SLOTS so that
- * lowering the slot count is a one-flag change; only the first CONT_SLOTS
- * entries are ever read. */
+/* How far back each slot looks. Sized independently of CONT_SLOTS so lowering the slot
+ * count is a one-flag change; only the first CONT_SLOTS entries are read. */
 static const int ContPlies[3] = {1, 2, 4};
 
+/*
+ * Continuation history, [slot][previous piece][previous to][this piece][this to], 2 MB a
+ * slot. Where CounterMoves remembers a single best reply, this scores EVERY reply
+ * against the same context, which is what lets ordering understand plans rather than
+ * one-move refutations.
+ *
+ * Three slots, keyed one, two and four plies back: the direct reply, the same side's own
+ * previous move (so "knight to d2 then f1" scores as a unit), and the slower manoeuvres
+ * a two-ply window reads as noise.
+ */
 static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 
-/*
- * Capture history, indexed [moving piece][to][captured type].
- *
- * MVV-LVA says what a capture takes and SEE says what it wins, and between
- * them they still cannot tell two equal-looking captures apart. This does, on
- * the same evidence the quiet history runs on: whether the capture has been
- * producing cutoffs lately. It is what orders the exchanges that SEE calls
- * level, which in a sharp middlegame is most of them.
- */
+/* Capture history, [moving piece][to][captured type]. MVV-LVA says what a capture takes
+ * and SEE what it wins, and neither can separate two equal-looking exchanges; recent
+ * success can, which in a sharp middlegame is most of them. */
 static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
-/*
- * Correction history, indexed [side to move][pawn key]. See the section just
- * above quiescence for what it holds and why the key is the pawn structure.
- *
- * Three further keys were tried here - minor pieces, non-pawn material per
- * colour, and the move that led to the node - at two different weightings, and
- * both measured slightly negative against this network over 2076 games. See
- * E16. Pawn structure is the one that carries information the trained net has
- * not already absorbed.
- */
-#define CORRHIST_SIZE       16384                 /* power of two; the index is a mask */
-#define CORRHIST_GRAIN      256                   /* fixed point, so sub-pawn drift survives */
-#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32) /* at most 32cp of correction, either way */
-#define CORRHIST_WEIGHT_MAX 256                   /* denominator of the moving average */
+#define CORRHIST_SIZE       16384
+#define CORRHIST_GRAIN      256
+#define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32)
+#define CORRHIST_WEIGHT_MAX 256
 
+/* Correction history, [side to move][pawn key]. Three further keys were tried - minor
+ * pieces, non-pawn material, and the move that led to the node - at two weightings, and
+ * both measured slightly negative over 2076 games (E16). */
 static int16_t PawnCorrHist[COLOR_NB][CORRHIST_SIZE];
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-/* Nodes between clock checks. Fine enough that a search cannot overrun its
- * budget by more than a millisecond or two, coarse enough that the clock read
- * does not show up in a profile. Must be a power of two. */
+/* Nodes between clock checks: fine enough that a search cannot overrun by more than a
+ * millisecond or two, coarse enough that the clock read does not show up in a profile.
+ * Must be a power of two. */
 #define CHECK_INTERVAL 2048
 
 void search_limits_clear(SearchLimits *limits) {
@@ -208,11 +170,10 @@ void search_limits_clear(SearchLimits *limits) {
     limits->startTime = time_ms();
 }
 
-/* round(ln(i) * 1024) for i in 0..63, with ln(0) folded to 0 so index 0 is
- * safe. Hard-coded rather than computed with libm on purpose: log() is allowed
- * to differ by an ULP between platforms, and a single ULP either side of an
- * integer boundary changes a reduction, which changes the tree, which breaks
- * the cross-machine bench determinism OpenBench requires. */
+/* round(ln(i) * 1024) for i in 0..63, with ln(0) folded to 0. Hard-coded rather than
+ * computed with libm: log() may differ by an ULP between platforms, and one ULP either
+ * side of an integer boundary changes a reduction, which changes the tree and breaks the
+ * cross-machine bench determinism OpenBench requires. */
 /* clang-format off */
 static const int LogFixed[64] = {
        0,    0,  710, 1125, 1420, 1648, 1835, 1993,
@@ -226,17 +187,6 @@ static const int LogFixed[64] = {
 };
 /* clang-format on */
 
-/*
- * Reduction ~ log(depth) * log(moveNumber) / 2.4, in exact integer arithmetic.
- *
- * Both logarithms matter. Scaling with move number is the whole idea - the
- * twentieth move tried is far less likely to be best than the fourth. Scaling
- * with depth is what stops the reduction being reckless near the leaves, where
- * there is no depth left to absorb a mistake.
- */
-/* Defined below the pruning-margin block rather than here, because the two
- * constants that shape the curve are declared with the other tunables and an
- * enum constant is not visible before its declaration. */
 static void init_reductions(void);
 
 void search_init(void) {
@@ -267,13 +217,10 @@ uint64_t search_nodes(void) { return atomic_load(&Nodes); }
 
 static int64_t elapsed_ms(void) { return time_ms() - atomic_load(&ClockOrigin); }
 
-/*
- * Enforces the limits the search cannot express structurally.
- *
- * Depth is handled by the iteration loop; node and time limits have to be
- * noticed mid-tree. An infinite or pondering search ignores the clock
- * entirely - UCI gives the GUI sole authority over when those end.
- */
+/* Enforces the limits the search cannot express structurally. Depth is handled by the
+ * iteration loop; node and time limits have to be noticed mid-tree, and an infinite or
+ * pondering search ignores the clock entirely because UCI gives the GUI sole authority
+ * over when those end. */
 static void check_limits(void) {
     if (atomic_load(&StopFlag))
         return;
@@ -297,18 +244,15 @@ static inline void count_node(void) {
     }
 }
 
-/* ------------------------------------------------------- move ordering -- */
-
 /*
- * Ordering bands, far enough apart that nothing scored within one band can be
- * promoted past a band above it.
+ * Ordering bands, far enough apart that nothing scored within one can be promoted past
+ * the band above it:
  *
  *   TT move > winning captures and promotions > killers > counter-move
  *           > quiets by history > losing captures
  *
- * The transposition table move is the best-informed guess available - it was
- * actually best last time this position was searched, usually to a greater
- * depth - so nothing generated locally should displace it.
+ * The transposition table move was actually best last time this position was searched,
+ * usually to a greater depth, so nothing generated locally should displace it.
  */
 #define SCORE_TT       (1 << 24)
 #define SCORE_CAPTURE  1000000
@@ -319,227 +263,119 @@ static inline void count_node(void) {
 /* Below every quiet move, since history is bounded by HISTORY_MAX. */
 #define SCORE_BAD_CAPTURE (-1000000)
 
-/* Bound on a history entry, chosen so the whole quiet band stays well below
- * SCORE_COUNTER and so the value fits an int16_t with room for the update
- * arithmetic. */
+/* Chosen so the whole quiet band stays well below SCORE_COUNTER and the value fits an
+ * int16_t with room for the update arithmetic. */
 #define HISTORY_MAX 16384
 
-/* ------------------------------------------------------ pruning margins -- */
-
-/*
- * Centipawns per ply of remaining depth that the search is willing to assume a
- * position cannot swing by. Every one of these is a guess that trades safety
- * for speed, and every one of them is wrong sometimes - which is exactly why
- * each arrived behind its own SPRT rather than on the argument that it looks
- * reasonable.
- *
- * They are also all wrong TOGETHER whenever the evaluation changes underneath
- * them. Each was fitted against the classical model's scale and its noise
- * profile, and the network shares neither; docs/NNUE.md Task 4 is explicit
- * that re-fitting them is where a real part of the network's value is found.
- *
- * So the margins below are written with TUNABLE rather than #define. In a
- * normal build that expands to an enum constant and the compiler folds it
- * exactly as it folded the macro - the released engine is unchanged. Under
- * `make TUNE_SEARCH=on` it expands to a variable and uci.c advertises each one as a
- * spin option, so sweeping a candidate value costs a `setoption` instead of a
- * rebuild, and a sweep can drive the whole set from one binary.
- */
 #ifdef TUNE_SEARCH
 #define TUNABLE(name, def) int name = (def)
 #else
 #define TUNABLE(name, def) enum { name = (def) }
 #endif
 
-TUNABLE(RFP_MARGIN, 67); /* reverse futility: how far above beta is "safely won" */
+/*
+ * Centipawns per ply of remaining depth that the search is willing to assume a position
+ * cannot swing by. Every one of these trades safety for speed, is wrong sometimes, and
+ * arrived behind its own SPRT rather than on the argument that it looks reasonable.
+ *
+ * They are also all wrong TOGETHER when the evaluation changes underneath them: each was
+ * fitted against the classical model's scale and noise, and the network shares neither.
+ * Hence TUNABLE rather than #define - in a normal build it folds to an enum constant and
+ * the released engine is unchanged, while `make TUNE_SEARCH=on` makes each a spin option
+ * so a sweep costs a `setoption` instead of a rebuild.
+ */
+TUNABLE(RFP_MARGIN, 67);
 #define RFP_DEPTH 7
 
-#define LMP_DEPTH 8 /* deepest node that will discard its late quiet moves */
+#define LMP_DEPTH 8
 
 #define FUTILITY_DEPTH 6
 
-/*
- * Futility margin per ply of remaining depth.
- *
- * Much smaller than the "value of a quiet move" intuition suggests. At a
- * null-window node alpha tracks the search
- * window, which tracks the evaluation, so staticEval sits very close to alpha
- * far more often than not. A margin of 100/ply asks for a full pawn of slack
- * at depth 1 and essentially never fires - measured at 0.008% of the bench
- * tree. The useful range is narrow and the whole curve is worth re-measuring
- * before anyone "corrects" this number upwards.
- */
+/* Much smaller than the "value of a quiet move" intuition suggests: at a null-window node
+ * alpha tracks the evaluation, so staticEval sits close to alpha far more often than
+ * not, and 100/ply measured at 0.008% of the bench tree. The useful range is narrow. */
 TUNABLE(FUTILITY_MARGIN, 58);
 
-/* The depth below which the previous score is too unreliable to aim an
- * aspiration window at. ASPIRATION_DELTA, its half-width, is a TUNABLE below;
- * this floor stays a #define because it is a small integer threshold, and SPSA
- * perturbs continuously and then rounds, so both sides of a gradient estimate
- * land on the same value and the measurement is noise. Thresholds like this
- * want a sweep of their own, not a sweep seat. */
+/* The depth below which the previous score is too unreliable to aim a window at. A
+ * #define rather than a TUNABLE because SPSA perturbs continuously and then rounds, so
+ * both sides of a gradient estimate land on the same integer and the measurement is
+ * noise; thresholds want a sweep of their own, not a sweep seat. */
 #define ASPIRATION_MIN_DEPTH 5
 
-/*
- * Razoring: how far below alpha the static evaluation has to sit before the
- * node is dropped straight into quiescence.
- *
- * The claim is narrower than futility pruning's and that is why the margin is
- * so much larger. Futility discards individual quiet moves; this discards the
- * whole node on the strength of a quiescence search, so it has to be nearly
- * certain no quiet move here recovers the deficit. Verified rather than
- * assumed - the qsearch actually runs, and only its result can prune.
- */
+/* How far below alpha the static evaluation must sit before the node drops straight into
+ * quiescence. Much larger than futility's because the claim is bigger - this discards
+ * the whole node - and it is verified rather than assumed: the qsearch actually runs,
+ * and only its result can prune. */
 TUNABLE(RAZOR_MARGIN, 309);
 #define RAZOR_DEPTH 3
 
-/*
- * SEE pruning thresholds, in centipawns per unit of depth.
- *
- * A move that loses material outright is worth searching only if there is
- * enough depth left to show what it wins back. Captures scale linearly and
- * quiets quadratically because a quiet move that hangs a piece has no
- * compensation to demonstrate in the first place - the bar for keeping one
- * should rise much faster as depth falls.
- */
+/* A move that loses material outright is worth searching only if there is depth left to
+ * show what it wins back. Captures scale linearly and quiets quadratically, because a
+ * quiet move that hangs a piece has no compensation to demonstrate in the first place. */
 #define SEE_CAPTURE_DEPTH 6
 TUNABLE(SEE_CAPTURE_MARGIN, 86);
 #define SEE_QUIET_DEPTH 8
 TUNABLE(SEE_QUIET_MARGIN, 12);
 
 /*
- * ProbCut: the mirror of razoring, at the other end of the window.
+ * ProbCut, the mirror of razoring at the other end of the window: a capture that still
+ * beats a raised beta after a search several plies shallow is strong evidence the node
+ * fails high. Only captures are tried, and that is the claim rather than a shortcut -
+ * the bet is that material alone carries the node past the raised bound.
  *
- * A capture that still beats a beta raised by this margin after a search
- * several plies shallow is strong evidence that the node fails high - the
- * shallow search had every chance to find the refutation and did not.
- * Razoring asks quiescence whether a hopeless-looking node is really hopeless;
- * this asks a real search whether a winning-looking one is really winning, and
- * answers a whole node for a fraction of what proving it properly costs.
- *
- * Only captures are tried, and that is the claim rather than a shortcut: the
- * bet is that material alone carries the node past the raised bound. A quiet
- * move that could do the same is exactly the case there is no cheap evidence
- * for, so it is left to the full search.
- *
- * The margin has to cover the noise a search this much shallower carries. The
- * depth floor is what keeps `depth - PROBCUT_REDUCTION` a real search rather
- * than a quiescence with extra steps.
+ * The depth floor is a TUNABLE only so an ablation has a switch: set it above any depth
+ * the search reaches and ProbCut is off with no rebuild. It is a threshold, not a sweep
+ * seat - pass it to `make tune ARGS="--exclude ..."`.
  */
-/* The floor is a TUNABLE only so that an ablation has a switch: set it above
- * any depth the search reaches and ProbCut is off, with no rebuild. It is NOT
- * a sweep seat - it is a depth threshold, and the note beside
- * ASPIRATION_MIN_DEPTH says why those measure as noise under SPSA. Pass it to
- * `make tune ARGS="--exclude ..."`. The minimum is 5 because the verification
- * searches `depth - PROBCUT_REDUCTION` and that has to stay a real search. */
 TUNABLE(PROBCUT_DEPTH, 5);
 #define PROBCUT_REDUCTION 4
 TUNABLE(PROBCUT_MARGIN, 109);
 
-/*
- * Delta pruning margin for quiescence.
- *
- * Standing pat is always available, so a capture that cannot bring the
- * evaluation within a minor piece of alpha even after winning its victim
- * outright is not going to raise it. The margin has to cover what the rest of
- * the sequence might swing, which is why it is a piece rather than a pawn.
- */
+/* Standing pat is always available, so a capture that cannot bring the evaluation within
+ * a minor piece of alpha even after winning its victim outright will not raise it. The
+ * margin covers what the rest of the sequence might swing, hence a piece rather than a
+ * pawn. */
 TUNABLE(DELTA_MARGIN, 389);
 
-/*
- * Singular extension: the shallowest depth worth testing, and how far below
- * the stored score the verification window sits, in sixteenths of a centipawn
- * per ply of depth.
- *
- * The depth floor is what keeps this affordable - the verification is a real
- * search, so testing it near the leaves costs more than the extension can
- * return. The margin has to be wide enough that a move which is merely best
- * does not read as singular, and narrow enough that a genuinely forced line
- * still does.
- */
+/* The shallowest depth worth a singular test, and how far below the stored score the
+ * verification window sits (in sixteenths of a centipawn per ply). The floor keeps it
+ * affordable, and the margin has to be wide enough that a merely best move does not read
+ * as singular and narrow enough that a forced line still does. */
 #define SINGULAR_DEPTH 7
 TUNABLE(SINGULAR_MARGIN, 39);
 
-/*
- * How much the correction is believed, out of CORR_W_UNIT - so CORR_W_UNIT
- * itself means "in full". A TUNABLE because how far to trust a learned
- * evaluation bias is the kind of question a sweep answers better than a
- * person; it was chosen rather than fitted. See E14.
- */
 #define CORR_W_UNIT 128
+/* How much the correction is believed, out of CORR_W_UNIT. A TUNABLE because how far to
+ * trust a learned evaluation bias is the kind of question a sweep answers better than a
+ * person; this was chosen rather than fitted. See E14. */
 TUNABLE(CORR_W_PAWN, 132);
 
-/*
- * Uncertainty scaling of the margins above: floor percentage, percent per
- * centipawn of learned correction, and the cap. The idea, the measured
- * distribution these were originally centred on, and the reason the floor
- * stays near 100 all live with unc_scale(), beside the correction history.
- *
- * The cap is SPSA-fitted (E22, E22a); the floor and slope are not, and cannot
- * be by any sweep run against a net that has an uncertainty head, because
- * unc_scale() returns on the sigma branch before it reads them. E22 swept them
- * against such a net and moved the slope on a random walk. They still bind in
- * a classical build and under a headless net, where they are centred values
- * with that walk on top. See E22a.
- */
+/* Uncertainty scaling of the margins above: floor percentage, percent per centipawn of
+ * learned correction, and the cap. The cap is SPSA-fitted (E22, E22a); the floor and
+ * slope are centred values, and cannot be swept against a net with an uncertainty head
+ * because unc_scale() returns on the sigma branch before reading them. */
 TUNABLE(UNC_SCALE_BASE, 89);
 TUNABLE(UNC_SCALE_SLOPE, 1);
 TUNABLE(UNC_SCALE_MAX, 144);
 
-/*
- * The same mapping for a net that carries the trained uncertainty head, whose
- * signal is centipawns of predicted |eval error| rather than centipawns of
- * learned bias - a larger number with a different distribution, hence its own
- * floor and slope (the slope is sixteenths of a percent per cp).
- *
- * Originally centred on sigma over the d12 bench tree, measured with scaling
- * held neutral so the mapping could not shape the tree it was read from:
- * median 47cp, node-weighted mean ~72cp. That distribution is right-skewed and
- * UNC_SCALE_MAX truncates its tail, so more of this mapping's centring rode
- * on the cap than the corrhist pair's did - a sweep that moves the cap moves
- * the average margin with it. E22's sweep did exactly that, raising the cap
- * and the slope together; these are fitted values now, not centred ones. The
- * slope was that run's largest coherent mover, and E22a's re-sweep moved both
- * of these one unit and stopped - the mapping is converged. See E21, E22a.
- */
+/* The same mapping for a net carrying the trained uncertainty head, whose signal is
+ * predicted |eval error| rather than learned bias - a larger number with its own
+ * distribution, hence its own floor and slope (sixteenths of a percent per cp). Centred
+ * on sigma over the d12 bench tree and then fitted by E22; E22a's re-sweep moved both one
+ * unit and stopped, so the mapping is converged. */
 TUNABLE(UNC_SIGMA_BASE, 73);
 TUNABLE(UNC_SIGMA_SLOPE, 13);
 
 /*
- * How much of the mapping each margin actually wants.
+ * How much of the mapping each margin actually wants. unc_scale() returns ONE number, and
+ * every consumer multiplying by it asserts that RFP, razoring, ProbCut, delta and SEE all
+ * want the same conditioning - which nothing ever measured, and which NNUE.md 5c found
+ * two to three times too flat over half the tree.
  *
- * unc_scale() returns ONE number and every consumer multiplied by it, which
- * asserts that reverse futility, razoring, ProbCut, delta and SEE all want
- * their allowance conditioned on uncertainty by the same factor. Nothing ever
- * measured that. It was an artifact of there being one mapping: the margins
- * differ in what they claim, in the depths they claim it at, and in what a
- * wrong answer costs, so there is no reason the same sigma should move them
- * together. NNUE.md 5c measured the requirement curve and found the mapping
- * two to three times too flat over half the tree - a diagnosis a single global
- * factor cannot act on, because tightening it where it is too wide loosens it
- * where it is already right.
- *
- * So each site gets a weight in UNC_W_UNIT-ths of the mapping DEVIATION:
- *
- *     scale_c = 100 + (scale - 100) * W / UNC_W_UNIT
- *
- * The deviation rather than the scale is what makes this orthogonal to the
- * margin constant beside it. A weight on the scale itself would just be a
- * second spelling of the margin, and a sweep holding both seats would walk
- * them against each other and converge on nothing; a weight on the deviation
- * moves only how hard this margin listens to uncertainty, and leaves what it
- * charges at an average node exactly where the fit left it.
- *
- * UNC_W_UNIT reproduces today's behaviour and zero switches the conditioning
- * off, so the defaults below - 16 where the scale was already applied, 0 where
- * it was not - are the current engine to the node. That is the point: the
- * patch is a no-op that a bench node count can prove, and the Elo, if there is
- * any, comes from the sweep that follows rather than from the patch.
- *
- * The ceiling is 4x because 5c's requirement curve tracks sigma close to
- * one-for-one in percent where the shipped mapping tracks it at roughly a
- * third of that. If that measurement means anything, the answer for at least
- * some of these seats is above UNC_W_UNIT, and a range that stopped there
- * could only ever confirm the value it started from.
+ * So each site weights the mapping DEVIATION: scale_c = 100 + (scale - 100) * W / UNIT.
+ * Weighting the deviation rather than the scale keeps this orthogonal to the margin
+ * beside it - a weight on the scale itself would just be a second spelling of the margin,
+ * and a sweep holding both seats would converge on nothing.
  */
 #define UNC_W_UNIT 16
 TUNABLE(UNC_W_RFP, 16);
@@ -548,81 +384,60 @@ TUNABLE(UNC_W_RAZOR, 16);
 TUNABLE(UNC_W_PROBCUT, 16);
 TUNABLE(UNC_W_DELTA, 16);
 
-/* Zero, because these two never consulted the mapping at all. A SEE threshold
- * is the same kind of claim as a futility margin - how much material this node
- * can afford to be wrong about - so its exclusion was an omission rather than
- * a decision, and a seat that starts at zero costs nothing to leave there. */
+/* Zero because these two never consulted the mapping at all. A SEE threshold is the same
+ * kind of claim as a futility margin, so the exclusion was an omission rather than a
+ * decision, and a seat that starts at zero costs nothing to leave there. */
 TUNABLE(UNC_W_SEE_CAPTURE, 0);
 TUNABLE(UNC_W_SEE_QUIET, 0);
 
-/* Zero for the same reason, and one more: this margin sets a verification
- * WINDOW rather than a pruning threshold, so a wider one extends more rather
- * than prunes less. Whether uncertainty should buy extensions is a genuine
- * question and not the one the other seats ask. */
+/* Zero for that reason and one more: this margin sets a verification WINDOW rather than a
+ * pruning threshold, so a wider one extends more rather than prunes less. Whether
+ * uncertainty should buy extensions is a genuine question, and not the one the other
+ * seats ask. */
 TUNABLE(UNC_W_SINGULAR, 0);
 
 /*
- * ---------------------------------------------------------------------------
- * The second tier: constants that shape a formula rather than sit in a
- * comparison. Wrapping them costs the
- * shipped engine nothing - TUNABLE folds to an enum constant in a normal build
- * and the compiler treats it exactly as it treated the literal, which the
- * unchanged bench node count is the proof of.
+ * The second tier: constants that shape a formula rather than sit in a comparison.
+ * Wrapping them costs the shipped engine nothing, which the unchanged bench node count is
+ * the proof of. Every DIVISOR has a minimum of 1 rather than 0, and that is load-bearing:
+ * a sweep may walk a parameter to its bound, and zero here is a division by zero in the
+ * hot path.
  *
- * The DIVISORs all have a minimum of 1 rather than 0, and that is load-bearing:
- * a sweep is allowed to walk a parameter to its bound, and a bound of zero here
- * is a division by zero in the hot path.
- * ---------------------------------------------------------------------------
+ * Reductions[d][m] is built from LMR_BASE and LMR_DIVISOR once, so search_tunable_set()
+ * rebuilds the table.
  */
-
-/* Late move reduction curve. `Reductions[d][m]` is built from these once, so
- * search_tunable_set() rebuilds the table - see the note there. */
 TUNABLE(LMR_BASE, 14);
 TUNABLE(LMR_DIVISOR, 22);
 
-/* How much history is allowed to pull a reduction back. Larger means less
- * influence, which is why these are divisors and not multipliers. */
+/* How much history is allowed to pull a reduction back. Larger means less influence,
+ * which is why these are divisors and not multipliers. */
 TUNABLE(LMR_HIST_DIVISOR, 7714);
 TUNABLE(LMR_CONT_DIVISOR, 6845);
 TUNABLE(CAPHIST_DIVISOR, 5);
 
-/* Null-move reduction: base, how fast it grows with depth, and how much of the
- * margin above beta is allowed to buy extra reduction before it is capped. */
+/* Null-move reduction: base, how fast it grows with depth, and how much of the margin
+ * above beta may buy extra reduction before it is capped. */
 TUNABLE(NMP_BASE, 5);
 TUNABLE(NMP_DEPTH_DIVISOR, 5);
 TUNABLE(NMP_EVAL_DIVISOR, 187);
 TUNABLE(NMP_EVAL_MAX, 3);
 
-/* How much less a node that was on a principal variation, but is not one in
- * this tree, gets reduced. Zero disables the exemption. */
+/* How much less a node that was on a principal variation, but is not one in this tree,
+ * gets reduced. Zero disables the exemption. */
 TUNABLE(TTPV_REDUCTION, 2);
 
-/* History bonus curve: the multiplier on depth-squared, and the depth past
- * which extra confidence stops being real.
- *
- * The cap looks like a parameter and at short time controls is not one.
- * `history_bonus` takes `min(depth, cap)` and `depth` is remaining depth, so
- * the cap cannot bind unless the search reaches past it. At STC this engine
- * reaches depth 12-13, which makes a cap of 20 inert, and a sweep run there
- * random-walks it inside a flat region and reports the walk. Its range reaches
- * 32 for the sake of LTC sweeps, where depths do get there; at STC exclude it
- * from the fit rather than give it room to wander. */
+/* History bonus curve: the multiplier on depth-squared, and the depth past which extra
+ * confidence stops being real. The cap cannot bind unless the search reaches past it, so
+ * at STC - where this engine reaches depth 12-13 - a sweep random-walks it inside a flat
+ * region; exclude it from the fit there rather than give it room to wander. */
 TUNABLE(HIST_BONUS_MUL, 8);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
 
-/*
- * The same curve for the moves that FAILED, on its own multiplier.
- *
- * "This move caused a cutoff" and "this move was tried and did not" are not
- * claims of equal strength - the first names one move out of the list, the
- * second is levelled at up to sixty-three of them at once - so nothing says
- * the answer to one should size the other. Hence a seat of its own in the
- * sweep; fitting it is the tuner's job.
- *
- * The depth cap stays shared on purpose: "past this depth the extra confidence
- * is not real" is a statement about the search, and it is equally true of
- * evidence pointing either way.
- */
+/* The same curve for the moves that FAILED, on its own multiplier. "This move caused a
+ * cutoff" and "this move was tried and did not" are not claims of equal strength - the
+ * second is levelled at up to sixty-three moves at once - so nothing says the answer to
+ * one should size the other. The depth cap stays shared, because it is a statement about
+ * the search and is equally true of evidence pointing either way. */
 TUNABLE(HIST_MALUS_MUL, 9);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
@@ -633,20 +448,11 @@ TUNABLE(ASPIRATION_DELTA, 20);
 
 #ifdef TUNE_SEARCH
 
-/*
- * The sweep's view of the margins above: a name to set them by and the range
- * a sweep is allowed to explore.
- *
- * Written out by hand rather than generated from a macro list, because a list
- * that generated both could not carry the comments above - and those comments
- * are the whole reason someone choosing a range picks a sensible one instead
- * of a symmetric guess around the default.
- *
- * The ranges are deliberately wider than any value that looks plausible now.
- * A sweep that cannot leave the neighbourhood of the current value can only
- * ever confirm it, and the point of re-fitting these against the network is
- * that the neighbourhood itself may be wrong.
- */
+/* The sweep's view of the margins above: a name to set them by and the range a sweep may
+ * explore. Written by hand rather than generated from a macro list because a list that
+ * generated both could not carry the comments above, and the ranges are deliberately
+ * wider than anything that looks plausible now - a sweep that cannot leave the
+ * neighbourhood of the current value can only confirm it. */
 static const struct {
     const char *name;
     int *value;
@@ -705,24 +511,25 @@ void search_tunable_info(int i, const char **name, int *value, int *min, int *ma
 bool search_tunable_set(const char *name, int value) {
     for (int i = 0; i < search_tunable_count(); ++i)
         if (strcmp(name, Tunables[i].name) == 0) {
-            /* Clamped rather than rejected: a sweep that walks outside the
-             * range should stay at the edge and keep playing, not have one
-             * engine silently keep the previous value for the rest of a match
-             * while the other moved. */
+            /* Clamped rather than rejected: a sweep that walks outside the range should
+             * stay at the edge and keep playing, not have one engine silently keep the
+             * previous value for the rest of a match while the other moved. */
             *Tunables[i].value = iclamp(value, Tunables[i].min, Tunables[i].max);
 
-            /* Reductions[][] is precomputed from LMR_BASE and LMR_DIVISOR, so
-             * setting either without rebuilding it would leave the sweep
-             * measuring the previous curve and quietly conclude the parameter
-             * does nothing. Rebuilt unconditionally: it is 4096 iterations,
-             * once per setoption, against a table read at every node. */
+            /* Reductions[][] is precomputed from LMR_BASE and LMR_DIVISOR, so setting
+             * either without rebuilding would leave the sweep measuring the previous curve
+             * and conclude the parameter does nothing. */
             init_reductions();
             return true;
         }
     return false;
 }
-#endif /* TUNE_SEARCH */
+#endif
 
+/* Reduction ~ log(depth) * log(moveNumber) / 2.4 in exact integer arithmetic. Both
+ * logarithms matter: scaling with move number is the whole idea, and scaling with depth
+ * is what stops the reduction being reckless near the leaves, where there is no depth
+ * left to absorb a mistake. */
 static void init_reductions(void) {
     for (int d = 0; d < 64; ++d)
         for (int m = 0; m < 64; ++m)
@@ -730,50 +537,10 @@ static void init_reductions(void) {
                                          (1024LL * 1024 * LMR_DIVISOR));
 }
 
-/*
- * The three quiet-move heuristics, all declared at the top of the file so
- * search_clear() can reset them:
- *
- *   Killers[ply]        - quiet moves that caused a beta cutoff at this ply
- *                         somewhere else in the tree. Sibling nodes tend to
- *                         share refutations (the same fork, the same back-rank
- *                         threat), so a move that worked one branch over is
- *                         worth trying early with nothing else to recommend it.
- *
- *   History[c][from][to] - how well a quiet move has been doing lately. Not
- *                         tied to a ply, so it carries across the whole tree,
- *                         and it is what orders the long tail of quiet moves
- *                         no other heuristic has an opinion about.
- *
- *   CounterMoves[pc][to] - the quiet reply that most recently refuted this
- *                         exact move. Many threats have one specific answer
- *                         regardless of the rest of the position.
- *
- *   ContHist[..][..]    - continuation history: how well "this move, given the
- *                         move played N plies ago" has been doing.
- *                         CounterMoves remembers a single best reply; this
- *                         scores EVERY reply against the same context, which
- *                         is what lets the ordering understand plans rather
- *                         than one-move refutations - the bishop retreat that
- *                         is right only after the opponent played h6, and
- *                         wrong otherwise.
- *
- *   CaptureHist[..]     - the same idea for the tactical moves, which the
- *                         quiet tables never see. MVV-LVA and SEE between them
- *                         cannot separate two exchanges that win the same
- *                         material; recent success can.
- */
-
-/*
- * True if the move is a capture or a promotion - the moves that change material
- * and so must never be reduced or written to the quiet history.
- *
- * Castling needs the explicit exclusion: it is encoded king-captures-own-rook,
- * so a naive look at the destination square finds a friendly rook there and
- * calls it the capture of a rook by a king. That both orders a quiet
- * developing move ahead of every real threat on the board and hides it from
- * the history tables.
- */
+/* Captures and promotions - the moves that change material, and so must never be reduced
+ * or written to the quiet history. Castling needs the explicit exclusion: it is encoded
+ * king-captures-own-rook, so a naive look at the destination finds a friendly rook and
+ * calls it a capture. */
 static inline bool is_tactical(const Position *pos, Move m) {
     switch (type_of_move(m)) {
     case MT_CASTLING: return false;
@@ -784,27 +551,18 @@ static inline bool is_tactical(const Position *pos, Move m) {
 }
 
 /*
- * Static exchange evaluation: is the material won by playing `m` at least
- * `threshold`, once both sides have exchanged optimally on the target square?
+ * Is the material won by playing `m` at least `threshold`, once both sides have exchanged
+ * optimally on the target square? MVV-LVA answers what a capture takes; this answers what
+ * it WINS, which is the useful question - QxP looks excellent to MVV-LVA and is a
+ * disaster if the pawn is defended.
  *
- * MVV-LVA answers "what does this capture take"; SEE answers "what does this
- * capture WIN", which is a different and much more useful question. QxP looks
- * excellent to MVV-LVA and is a disaster if the pawn is defended. Searching
- * those first wastes the whole benefit of ordering, and in quiescence - where
- * every capture is searched and there is no depth limit to stop it - it is the
- * single largest source of wasted nodes.
- *
- * The algorithm is the standard swap-off: play the least valuable attacker
- * each time, tracking the running balance, and stop as soon as the side to
- * move would rather stand pat than continue. Removing each attacker from
- * `occupied` is what reveals the sliders x-raying through it.
- *
- * Answers a >= question rather than computing the exact value, because that
- * allows the early exits above and every caller only ever wanted a comparison.
+ * The standard swap-off: play the least valuable attacker each time, tracking the
+ * balance, and stop as soon as the side to move would rather stand pat. Removing each
+ * attacker from `occupied` is what reveals the sliders x-raying through it.
  */
 static bool see_ge(const Position *pos, Move m, Value threshold) {
-    /* Castling captures nothing, en passant and promotions change material in
-     * ways the swap loop does not model. Decline to judge them. */
+    /* Castling captures nothing, and en passant and promotions change material in ways the
+     * swap loop does not model. Decline to judge them. */
     if (type_of_move(m) != MT_NORMAL)
         return VALUE_ZERO >= threshold;
 
@@ -814,11 +572,11 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
     /* Balance after the first capture, from the mover's point of view. */
     int swap = PieceValues[type_of(piece_on(pos, to))] - threshold;
     if (swap < 0)
-        return false; /* even winning the victim for free falls short */
+        return false;
 
     swap = PieceValues[type_of(piece_on(pos, from))] - swap;
     if (swap <= 0)
-        return true; /* the recapture cannot take back enough to matter */
+        return true;
 
     Bitboard occupied  = occupied_bb(pos) ^ square_bb(from) ^ square_bb(to);
     Bitboard attackers = board_attackers_to(pos, to, occupied);
@@ -835,11 +593,9 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
 
         result ^= 1;
 
-        /*
-         * Capture with the least valuable attacker available. Each branch
-         * reveals only the sliders that could have been behind the piece just
-         * removed, which is why the x-ray refresh differs per piece type.
-         */
+        /* Capture with the least valuable attacker available. Each branch reveals only the
+         * sliders that could have been behind the piece just removed, which is why the
+         * x-ray refresh differs per piece type. */
         Bitboard bb;
         if ((bb = mine & pos->byType[PAWN])) {
             if ((swap = PieceValues[PAWN] - swap) < result)
@@ -849,7 +605,7 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
         } else if ((bb = mine & pos->byType[KNIGHT])) {
             if ((swap = PieceValues[KNIGHT] - swap) < result)
                 break;
-            occupied ^= square_bb(lsb(bb)); /* a knight never unblocks anything */
+            occupied ^= square_bb(lsb(bb));
         } else if ((bb = mine & pos->byType[BISHOP])) {
             if ((swap = PieceValues[BISHOP] - swap) < result)
                 break;
@@ -868,23 +624,18 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
                 (bishop_attacks(to, occupied) & (pos->byType[BISHOP] | pos->byType[QUEEN])) |
                 (rook_attacks(to, occupied) & (pos->byType[ROOK] | pos->byType[QUEEN]));
         } else {
-            /* Only the king is left, and capturing into a defended square is
-             * illegal - so if the other side still attacks it, the side to move
-             * cannot continue and loses the exchange by default. */
+            /* Only the king is left, and capturing into a defended square is illegal - so if
+             * the other side still attacks it, the side to move cannot continue and loses
+             * the exchange by default. */
             return (attackers & ~color_bb(pos, stm)) ? (result ^ 1) != 0 : result != 0;
         }
     }
     return result != 0;
 }
 
-/*
- * The continuation-history slice for the move played `back` plies above `ply`,
- * or NULL when there is no such move - the top of the tree, or a null move,
- * which is nobody's plan and must not have continuations attributed to it.
- *
- * The returned block is the trailing [PIECE_NB][SQUARE_NB] of the table,
- * flattened; index it with cont_index().
- */
+/* The continuation-history slice for the move played `back` plies above `ply`, or NULL
+ * when there is no such move - the top of the tree, or a null move, which is nobody's
+ * plan and must not have continuations attributed to it. */
 static inline int16_t *cont_slice(int slot, int ply, int back) {
     if (ply < back)
         return NULL;
@@ -910,8 +661,8 @@ static inline int cont_score(int16_t *const *slices, Piece pc, Square to) {
     return total;
 }
 
-/* The victim a move takes, or NO_PIECE_TYPE if it takes nothing. Castling is
- * encoded king-captures-own-rook, so it needs the explicit exclusion. */
+/* The victim a move takes, or NO_PIECE_TYPE. Castling is encoded king-captures-own-rook,
+ * so it needs the explicit exclusion. */
 static inline PieceType victim_of(const Position *pos, Move m) {
     switch (type_of_move(m)) {
     case MT_EN_PASSANT: return PAWN;
@@ -920,12 +671,9 @@ static inline PieceType victim_of(const Position *pos, Move m) {
     }
 }
 
-/*
- * MVV-LVA for the tactical moves: capture the most valuable victim with the
- * least valuable attacker first, with SEE deciding which band the capture
- * lands in and capture history separating the ones SEE calls equal. Quiet
- * moves fall through to the heuristic tables above.
- */
+/* MVV-LVA for the tactical moves - most valuable victim, least valuable attacker - with
+ * SEE deciding which band a capture lands in and capture history separating the ones SEE
+ * calls equal. Quiet moves fall through to the heuristic tables. */
 static void score_moves(const Position *pos, ScoredMove *list, int count, Move ttMove, int ply,
                         Move counter) {
     const Color us     = pos->sideToMove;
@@ -953,14 +701,12 @@ static void score_moves(const Position *pos, ScoredMove *list, int count, Move t
         if (victim != NO_PIECE_TYPE) {
             const int mvvLva = PieceValues[victim] * 16 - PieceValues[type_of(moved)];
 
-            /* Divided down so it refines the MVV-LVA order rather than
-             * overturning it: history is evidence about a capture, not a
-             * replacement for knowing what it takes. */
+            /* Divided down so it refines the MVV-LVA order rather than overturning it:
+             * history is evidence about a capture, not a replacement for knowing what it
+             * takes. A capture that loses material once the recaptures are played out is
+             * worse than almost any quiet move, so it goes below them. */
             const int capHist = CaptureHist[moved][to_sq(m)][victim] / CAPHIST_DIVISOR;
 
-            /* A capture that loses material once the recaptures are played out
-             * is worse than almost any quiet move, not better than all of them.
-             * Order it below them instead of ahead of the whole list. */
             score =
                 (see_ge(pos, m, VALUE_ZERO) ? SCORE_CAPTURE : SCORE_BAD_CAPTURE) + mvvLva + capHist;
         }
@@ -968,9 +714,9 @@ static void score_moves(const Position *pos, ScoredMove *list, int count, Move t
         if (mt == MT_PROMOTION)
             score += SCORE_CAPTURE + PieceValues[promotion_type(m)];
 
-        /* Nothing tactical matched, so the move is quiet. Tested explicitly
-         * rather than by `score == 0`: capture history can push a capture's
-         * score anywhere inside its band, including onto zero. */
+        /* Nothing tactical matched, so the move is quiet. Tested explicitly rather than by
+         * `score == 0`: capture history can push a capture's score anywhere inside its
+         * band, including onto zero. */
         if (victim == NO_PIECE_TYPE && mt != MT_PROMOTION) {
             if (m == killer0)
                 score = SCORE_KILLER_1;
@@ -992,33 +738,25 @@ static Move counter_move(int ply) {
     return is_ok_move(prev) ? CounterMoves[Stack[ply - 1].movedPiece][to_sq(prev)] : MOVE_NONE;
 }
 
-/* A cutoff found deep in the tree is much stronger evidence than one found
- * next to the leaves, so the bonus grows with depth - but is capped, because
- * beyond a point the extra confidence is not real and a single deep cutoff
- * should not be able to saturate an entry on its own. */
+/* A cutoff found deep in the tree is much stronger evidence than one next to the leaves,
+ * so the bonus grows with depth - but is capped, because beyond a point the extra
+ * confidence is not real and one deep cutoff should not saturate an entry alone. */
 static int history_bonus(Depth depth) {
     const Depth d = imin(depth, HIST_BONUS_DEPTH_MAX);
     return d * d * HIST_BONUS_MUL;
 }
 
-/* What everything tried before the cutoff is charged. Same shape, its own
- * multiplier - see the note beside HIST_MALUS_MUL for why it is not simply the
- * bonus negated. */
+/* What everything tried before the cutoff is charged: the same shape on its own
+ * multiplier. */
 static int history_malus(Depth depth) {
     const Depth d = imin(depth, HIST_BONUS_DEPTH_MAX);
     return d * d * HIST_MALUS_MUL;
 }
 
-/*
- * Applies `bonus`, decaying the entry towards zero in proportion to how large
- * it already is.
- *
- * That gravity term is the whole design. A plain running total saturates: once
- * an entry is large, further evidence cannot move it, and the table ends up
- * describing the opening rather than the position on the board. Scaling the
- * decay by the current value makes the entry an exponential moving average of
- * recent success instead, which is what ordering actually wants.
- */
+/* Applies `bonus`, decaying the entry toward zero in proportion to how large it already
+ * is. That gravity term is the whole design: a plain running total saturates and ends up
+ * describing the opening rather than the position on the board, where scaling the decay
+ * by the current value makes the entry an exponential moving average of recent success. */
 static void history_update(int16_t *entry, int bonus) {
     const int b = bonus > HISTORY_MAX ? HISTORY_MAX : bonus < -HISTORY_MAX ? -HISTORY_MAX : bonus;
     *entry += (int16_t)(b - (int)*entry * (b < 0 ? -b : b) / HISTORY_MAX);
@@ -1035,25 +773,22 @@ static void cont_hist_update(int ply, Piece pc, Square to, int bonus) {
     }
 }
 
-/* Capture history is keyed on what the capture takes, so the victim has to be
- * read off the board - which means this must run AFTER the move was undone. */
+/* Keyed on what the capture takes, so the victim has to be read off the board - which
+ * means this must run AFTER the move was undone. */
 static void capture_hist_update(const Position *pos, Move m, int bonus) {
     const Piece moved = piece_on(pos, from_sq(m));
     history_update(&CaptureHist[moved][to_sq(m)][victim_of(pos, m)], bonus);
 }
 
 /*
- * Records that `best` caused a cutoff, and that everything tried before it did
- * not. Knowing what fails is worth as much to ordering as knowing what works:
- * without the penalty, a move that is tried early and always fails keeps its
- * position forever because nothing ever pushes it down.
+ * Records that `best` caused a cutoff and that everything tried before it did not.
+ * Knowing what fails is worth as much as knowing what works: without the penalty, a move
+ * tried early that always fails keeps its position forever, because nothing pushes it
+ * down.
  *
- * Both lists are penalised whichever kind of move cut, because both were tried
- * and both failed. Only the winner's own table is credited - a capture teaches
- * the quiet heuristics nothing, and a quiet cutoff says nothing about which
- * exchange was worth making.
- *
- * Credit and blame are sized by separate curves. See HIST_MALUS_MUL.
+ * Both lists are penalised whichever kind of move cut, because both were tried and both
+ * failed; only the winner's own table is credited, since a capture teaches the quiet
+ * heuristics nothing.
  */
 static void update_stats(const Position *pos, Move best, const Move *quiets, int quietCount,
                          const Move *captures, int captureCount, Depth depth, int ply) {
@@ -1090,14 +825,14 @@ static void update_stats(const Position *pos, Move best, const Move *quiets, int
             capture_hist_update(pos, captures[i], -malus);
 }
 
-/* Anything but kings and pawns. The test that decides whether null-move
- * pruning is safe: see the note at its call site. */
+/* Anything but kings and pawns - the test that decides whether null-move pruning is
+ * safe. */
 static inline bool has_non_pawn_material(const Position *pos, Color c) {
     return (pieces2_bb(pos, c, KNIGHT, BISHOP) | pieces2_bb(pos, c, ROOK, QUEEN)) != BB_EMPTY;
 }
 
-/* Selection sort, one move at a time. A beta cutoff usually lands within the
- * first few moves, so sorting the whole list up front is mostly wasted work. */
+/* Selection sort, one move at a time: a beta cutoff usually lands within the first few
+ * moves, so sorting the whole list up front is mostly wasted work. */
 static void pick_move(ScoredMove *list, int count, int index) {
     int best = index;
     for (int i = index + 1; i < count; ++i)
@@ -1119,54 +854,30 @@ static void update_pv(int ply, Move m) {
     PvLength[ply] = childLength + 1;
 }
 
-/* --------------------------------------------------- correction history -- */
-
-/*
- * The static evaluation is a guess about a position; the search is the truth
- * about it. Correction history remembers how far apart the two have been
- * running lately for a given pawn structure, and shifts the next static
- * evaluation by that much.
- *
- * Pawn structure is the key because it is the feature that survives the moves
- * a search actually makes. A blocked centre, a ruined king shelter, a passer
- * the evaluation undervalues - each is wrong in the same direction across a
- * whole region of the tree, and a standing bias is exactly what is worth
- * learning. Keying on the full position instead would be a transposition table
- * with a worse replacement policy: every entry written once and never
- * confirmed.
- *
- * Nothing the search reports as a score is corrected. The corrected value
- * feeds `improving`, the pruning margins and the reductions - decisions that
- * are already bets - while what goes into the transposition table is the raw
- * evaluation, so a later probe re-corrects with whatever the table has learned
- * since instead of inheriting a stale adjustment.
- */
-
+/* Correction history remembers how far the static evaluation and the search have been
+ * running apart for a given pawn structure. Pawn structure is the key because it survives
+ * the moves a search makes, so the bias it carries is worth learning. */
 static inline int16_t *corr_entry(const Position *pos) {
     return &PawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
 }
 
-/* Mate and tablebase scores are clamped away deliberately: a correction is
- * evidence about an evaluation, and letting one push a score into a range
- * reserved for proven results would have the search report a proof that
- * nothing proved. */
+/* Nothing the search reports is corrected. The corrected value feeds `improving`, the
+ * margins and the reductions - decisions that are already bets - while the table keeps the
+ * raw evaluation, so a later probe re-corrects with whatever has been learned since. */
 static Value corrected_eval(const Position *pos, Value raw) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
 
+    /* Mate and tablebase scores are clamped away deliberately: a correction is evidence
+     * about an evaluation, and letting one push a score into a range reserved for proven
+     * results would have the search report a proof that nothing proved. */
     const int v = raw + (CORR_W_PAWN * *corr_entry(pos) / CORR_W_UNIT) / CORRHIST_GRAIN;
     return (Value)iclamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 
-/*
- * Folds one observation into the entry as an exponential moving average,
- * weighted by depth because a deeper search is better evidence about the same
- * question. The gravity term is the same idea as in history_update: an entry
- * that cannot be moved once it is large describes the opening, not the board.
- *
- * What counts as an observation is the decision that matters, and it is made
- * at the call site rather than here.
- */
+/* Folds one observation in as an exponential moving average, weighted by depth because a
+ * deeper search is better evidence about the same question. What counts as an observation
+ * is the decision that matters, and it is made at the call site. */
 static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth) {
     int16_t *const e  = corr_entry(pos);
     const int weight  = imin(depth + 1, 16);
@@ -1176,56 +887,24 @@ static void corrhist_update(const Position *pos, Value searched, Value staticEva
     *e = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
 }
 
-/*
- * One consumer's share of the mapping. See the weights' declaration for why
- * this scales the deviation from 100 rather than the scale itself.
- *
- * Clamped at zero because a sweep is allowed to walk a weight to its bound,
- * and a large enough weight on a below-100 scale would otherwise produce a
- * NEGATIVE margin - which is not a tighter margin but a different rule: a
- * reverse futility test with one fires where the static evaluation is BELOW
- * beta. Every seat here must stay a margin over its whole range.
- */
+/* One consumer's share of the mapping; see the weights' declaration for why this scales
+ * the deviation from 100 rather than the scale. Clamped at zero because a large enough
+ * weight on a below-100 scale would otherwise produce a NEGATIVE margin, which is not a
+ * tighter margin but a different rule. */
 static inline int unc_apply(int scale, int weight) {
     const int scaled = 100 + (scale - 100) * weight / UNC_W_UNIT;
     return scaled < 0 ? 0 : scaled;
 }
 
 /*
- * How wide this node's margin-based prunes should be, as a percentage.
+ * How wide this node's margin-based prunes should be, as a percentage. Every margin above
+ * is a global constant fitted by SPSA - a statement about the AVERAGE position - where the
+ * residual it insures against is nowhere near homoscedastic.
  *
- * Every margin above is the same claim wearing different clothes: that k
- * centipawns cover the gap between the static evaluation and what a deeper
- * search would have said. k is a global constant fitted by SPSA, which makes
- * it a statement about the AVERAGE position - and the residual it insures
- * against is nowhere near homoscedastic. Measured on the d12 bench tree, the
- * learned correction's magnitude has median zero and mean ~6cp: half the tree
- * is structures where the evaluation has never been caught drifting, and a
- * twentieth is structures pinned at the correction clamp. One margin serves
- * both only by being wrong for both.
- *
- * So the margins are scaled by the position's expected evaluation error, from
- * whichever of two signals the loaded net can offer:
- *
- *   - A net carrying the trained uncertainty head (docs/NNUE.md Task 5b)
- *     predicts the residual's scale directly, from the accumulator the
- *     evaluation already keeps, for one extra output-row pass. The branch is
- *     on a load-time constant, so it predicts perfectly; a compile-time split
- *     would tie the binary to one net generation, which invariant 8 exists to
- *     prevent.
- *   - Otherwise, |correction| stands in: how far the evaluation has provably
- *     been wrong in this pawn structure before. A measure of bias standing in
- *     for the residual's spread - the bet that the two travel together. The
- *     margin surface has real structure; see E20.
- *
- * The corrhist defaults are centred, not chosen: 89 + 2 * 6cp (the measured
- * mean) lands the node-weighted average scale at ~100%, so the shipped margins
- * are on average the ones that were fitted, and the conditioning is measured
- * on its own rather than as a disguised global margin shift. A cold entry
- * reads as zero and lands on the floor, which is why the floor sits just under
- * 100 rather than lower: the floor is also the engine's posture in structures
- * it knows nothing about. The sigma mapping is centred on its own distribution
- * the same way - see the note at its declaration.
+ * So they are scaled by whichever signal the loaded net offers: a trained uncertainty head
+ * predicts the residual's scale directly, and otherwise |correction| stands in. The
+ * corrhist defaults are centred rather than chosen, and a cold entry lands on the floor -
+ * which is why the floor sits just under 100.
  */
 static inline int unc_scale(const Position *pos) {
 #ifdef EVAL_NNUE
@@ -1242,12 +921,11 @@ static inline int unc_scale(const Position *pos) {
 }
 
 #ifdef UNC_PROBE
-/*
- * The other half of what `probe err` pairs: this node's signal, and what the
- * search ended up saying about the same node. Reading the signal again here
- * rather than carrying it down from unc_scale() keeps the probe out of the
- * search stack, and it is the same number - it is a function of the position.
- */
+
+/* The other half of what `probe err` pairs: this node's signal, and what the search ended
+ * up saying about the same node. Read again here rather than carried down from
+ * unc_scale() to keep the probe out of the search stack; it is the same number, being a
+ * function of the position. */
 static void unc_probe_node(const Position *pos, Value searched, Value staticEval, Bound bound,
                            Depth depth) {
     if (staticEval == VALUE_NONE)
@@ -1268,9 +946,9 @@ static void unc_probe_node(const Position *pos, Value searched, Value staticEval
                        is_decisive_score(searched), depth);
 }
 
-/* Which constants the mapping above is running on, and on which signal. The
- * branch is the same one unc_scale() takes, written once here so a report of
- * the mapping cannot describe a branch the search is not taking. */
+/* Which constants the mapping is running on, and on which signal. The branch is the one
+ * unc_scale() takes, written once here so a report of the mapping cannot describe a
+ * branch the search is not taking. */
 void search_unc_mapping(UncMapping *out) {
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
@@ -1297,17 +975,14 @@ static inline void unc_probe_node(const Position *pos, Value searched, Value sta
     (void)bound;
     (void)depth;
 }
-#endif /* UNC_PROBE */
-
-/* ----------------------------------------------------------- quiescence -- */
+#endif
 
 /*
- * Search only the forcing moves until the position is quiet.
- *
- * Without this the engine hangs pieces at every depth: a search that stops
- * counting material in the middle of an exchange believes whatever the last
- * capture left on the board. It is not an optimisation, it is the difference
- * between an engine that plays chess and one that does not.
+ * Search only the forcing moves until the position is quiet. Without this the engine
+ * hangs pieces at every depth: a search that stops counting material in the middle of an
+ * exchange believes whatever the last capture left on the board. It is not an
+ * optimisation, it is the difference between an engine that plays chess and one that does
+ * not.
  */
 static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     count_node();
@@ -1322,31 +997,23 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
 
-    /*
-     * Quiescence probes the same table the main search writes to. Everything
-     * stored from here carries depth 0, so a quiescence entry can never
-     * satisfy a main-search probe - but a main-search entry, which is deeper,
-     * answers a quiescence probe perfectly well.
-     */
+    /* Quiescence probes the same table the main search writes to. Everything stored from
+     * here carries depth 0, so a quiescence entry can never satisfy a main-search probe -
+     * but a main-search entry, being deeper, answers a quiescence probe perfectly well. */
     TTEntry tte;
     const bool ttHit    = tt_probe(key, &tte);
     const Value ttValue = ttHit ? tt_value_from_tt(tt_entry_value(&tte), ply) : VALUE_NONE;
     Move ttMove         = ttHit ? tt_entry_move(&tte) : MOVE_NONE;
 
-    /* Sixteen bits of key is not proof of identity, and the entry may predate
-     * several moves of the game. Never play a probed move unvalidated. */
+    /* Sixteen bits of key is not proof of identity, and the entry may predate several moves
+     * of the game. Never play a probed move unvalidated. */
     if (ttMove != MOVE_NONE && !movegen_is_pseudo_legal(pos, ttMove))
         ttMove = MOVE_NONE;
 
-    /*
-     * Quiescence PRESERVES the flag and never sets it. Seeding from `pvNode`
-     * here instead looks equivalent and is not: a PV node hands quiescence a
-     * full window, the window propagates through the whole capture tree below
-     * it, and every position in it would be marked. Measured, that was 18% of
-     * the classical bench tree reducing less for having once been a recapture
-     * on the principal variation. Marking a position is the main search's
-     * decision to make.
-     */
+    /* Quiescence PRESERVES the flag and never sets it. Seeding from `pvNode` looks
+     * equivalent and is not: a PV node hands quiescence a full window, and 18% of the
+     * classical bench tree would then reduce less for having once been a recapture on the
+     * principal variation. */
     const bool ttPv = ttHit && tt_entry_is_pv(&tte);
 
     if (!pvNode && ttValue != VALUE_NONE &&
@@ -1357,12 +1024,12 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     Value best         = -VALUE_INFINITE;
     Value staticEval   = VALUE_NONE;
     Value rawEval      = VALUE_NONE;
-    int uncScale       = 100; /* only read where !inCheck guards already hold */
+    int uncScale       = 100;
 
     if (!inCheck) {
-        /* Stand pat: the side to move is never obliged to capture, so the
-         * static evaluation is a lower bound on what it can achieve. In check
-         * there is no such option - every reply must be searched. */
+        /* Stand pat: the side to move is never obliged to capture, so the static evaluation
+         * is a lower bound on what it can achieve. In check there is no such option and
+         * every reply must be searched. */
         rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
         staticEval = corrected_eval(pos, rawEval);
@@ -1380,9 +1047,8 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
     ScoredMove moves[MAX_MOVES];
     const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_CAPTURES, moves);
 
-    /* No counter-move: quiescence only reaches quiet moves when answering a
-     * check, and an evasion is dictated by the check rather than by whatever
-     * the opponent played to arrive here. */
+    /* No counter-move: quiescence only reaches quiet moves when answering a check, and an
+     * evasion is dictated by the check rather than by whatever the opponent played. */
     score_moves(pos, moves, count, ttMove, ply, MOVE_NONE);
 
     Move bestMove = MOVE_NONE;
@@ -1392,34 +1058,17 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         pick_move(moves, count, i);
         const Move m = moves[i].m;
 
-        /*
-         * Drop the losing captures.
-         *
-         * score_moves already ran SEE on every capture and put the ones that
-         * lose material into the only negative band a capture list contains, so
-         * this costs nothing beyond the comparison. pick_move has just selected
-         * the highest remaining score, so once it is negative every move left
-         * is a losing capture and the whole tail can go.
-         *
-         * This is where quiescence earns most of its speed. Standing pat is
-         * always available out of check, so a capture that ends up down
-         * material cannot beat it, and searching the recapture sequence to find
-         * that out is pure cost. In check there is no stand pat and every reply
-         * has to be searched, however bad it looks.
-         */
+        /* Drop the losing captures. score_moves already ran SEE and put them in the only
+         * negative band a capture list contains, and pick_move has just selected the highest
+         * remaining score, so once it is negative the whole tail can go. This is where
+         * quiescence earns most of its speed. */
         if (!inCheck && moves[i].score < 0)
             break;
 
-        /*
-         * Delta pruning: even winning this victim outright, and granting a
-         * margin for whatever the rest of the sequence swings, leaves the
-         * score short of alpha. Standing pat already beats that, so searching
-         * the capture cannot change the answer.
-         *
-         * Skipped for promotions, whose material gain is the new piece rather
-         * than the captured one, and while in check, where there is no stand
-         * pat to fall back on and every reply must be searched.
-         */
+        /* Delta pruning: even winning this victim outright, plus a margin for what the rest
+         * of the sequence swings, leaves the score short of alpha, and standing pat already
+         * beats that. Skipped for promotions, whose gain is the new piece rather than the
+         * captured one, and in check, where there is no stand pat. */
         if (!inCheck && type_of_move(m) != MT_PROMOTION && !is_mate_score(alpha) &&
             staticEval + PieceValues[victim_of(pos, m)] +
                     DELTA_MARGIN * unc_apply(uncScale, UNC_W_DELTA) / 100 <=
@@ -1430,9 +1079,9 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
             continue;
         ++legal;
 
-        /* Quiescence maintains the stack too, so that a node below it reads the
-         * move that actually led there rather than whatever the main search
-         * left at this ply on an earlier visit. */
+        /* Quiescence maintains the stack too, so a node below it reads the move that
+         * actually led there rather than whatever the main search left at this ply on an
+         * earlier visit. */
         Stack[ply].move       = m;
         Stack[ply].movedPiece = piece_on(pos, from_sq(m));
         Stack[ply].staticEval = staticEval;
@@ -1458,33 +1107,29 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         }
     }
 
-    /* Evasions are the complete move list, so no legal reply here really is
-     * checkmate - worth detecting, since missing it makes the engine walk into
-     * mate believing it has stand-pat equality. */
+    /* Evasions are the complete move list, so no legal reply here really is checkmate -
+     * worth detecting, since missing it makes the engine walk into mate believing it has
+     * stand-pat equality. */
     if (inCheck && legal == 0)
         return mated_in(ply);
 
-    /* Quiescence never searches the full move list, so it can never prove an
-     * exact score: the value is a lower bound if it failed high and an upper
-     * bound otherwise. */
+    /* Quiescence never searches the full move list, so it can never prove an exact score:
+     * the value is a lower bound if it failed high and an upper bound otherwise. */
     tt_store(key, bestMove, best, rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER, ttPv, ply);
 
     return best;
 }
 
-/* --------------------------------------------------------------- search -- */
-
 /*
- * `cutNode` is the caller's expectation, not a fact: it is true at a node the
- * parent believes will fail high. It costs nothing to propagate and it is the
- * best available prior on how a node will turn out, which is exactly what the
- * reductions want - a node expected to cut is one where searching the tail
- * cheaply is least likely to lose anything. Being wrong about it is safe:
- * everything it feeds either re-searches or is bounded by depth.
+ * `cutNode` is the caller's expectation, not a fact: it is true at a node the parent
+ * believes will fail high. It costs nothing to propagate and it is the best available
+ * prior on how a node will turn out, which is exactly what the reductions want; being
+ * wrong about it is safe, since everything it feeds either re-searches or is bounded by
+ * depth.
  */
 static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int ply, bool cutNode) {
-    /* Cleared here rather than at each use, so that a child which never
-     * extends the PV (a quiescence node) leaves a length of zero behind. */
+    /* Cleared here rather than at each use, so a child that never extends the PV leaves a
+     * length of zero behind. */
     PvLength[ply] = 0;
 
     if (depth <= 0)
@@ -1496,18 +1141,15 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     if (search_stopped())
         return VALUE_ZERO;
 
-    /*
-     * Read and clear in one step. A singular search sets this immediately
-     * before re-entering at the same ply, and every other entry must see
-     * MOVE_NONE - including a later, unrelated visit to this ply, which would
-     * otherwise inherit an exclusion from whatever ran here before.
-     */
+    /* Read and clear in one step. A singular search sets this immediately before re-entering
+     * at the same ply, and every other entry must see MOVE_NONE - including a later,
+     * unrelated visit that would otherwise inherit an exclusion. */
     const Move excluded     = Stack[ply].excludedMove;
     Stack[ply].excludedMove = MOVE_NONE;
     const bool isExcluded   = excluded != MOVE_NONE;
 
-    /* The root is handled by search_root, so this is never ply 0 - which is
-     * what lets the draw and mate-distance tests below run unconditionally. */
+    /* The root is handled by search_root, so this is never ply 0 - which is what lets the
+     * draw and mate-distance tests below run unconditionally. */
     assert(ply > 0);
 
     if (board_is_draw(pos, ply))
@@ -1516,17 +1158,14 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     if (ply >= MAX_PLY - 1)
         return corrected_eval(pos, eval_evaluate(pos));
 
-    /* Determined before mate distance pruning narrows the window: a node is a
-     * PV node because of where it sits in the tree, and must keep being
-     * treated as one even if the narrowing leaves it with a null window. */
+    /* Determined before mate distance pruning narrows the window: a node is a PV node
+     * because of where it sits in the tree, and must keep being treated as one even if the
+     * narrowing leaves it with a null window. */
     const bool pvNode = beta - alpha > 1;
 
-    /*
-     * Mate distance pruning. Once a mate is known at this ply, no line can
-     * beat it by mating later, and none can be worse than being mated right
-     * now - so the window narrows to that range. It costs two comparisons and
-     * stops the search wandering through longer mates once a short one exists.
-     */
+    /* Mate distance pruning. Once a mate is known at this ply, no line can beat it by
+     * mating later and none can be worse than being mated now, so the window narrows to
+     * that range for two comparisons. */
     if (alpha < mated_in(ply))
         alpha = mated_in(ply);
     if (beta > mate_in(ply + 1))
@@ -1541,61 +1180,45 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     const Value ttValue = ttHit ? tt_value_from_tt(tt_entry_value(&tte), ply) : VALUE_NONE;
     Move ttMove         = ttHit ? tt_entry_move(&tte) : MOVE_NONE;
 
-    /* Sixteen bits of key is not proof of identity, and the entry may predate
-     * several moves of the game. Never play a probed move unvalidated. */
     if (ttMove != MOVE_NONE && !movegen_is_pseudo_legal(pos, ttMove))
         ttMove = MOVE_NONE;
 
     /*
-     * Was this position ever on a principal variation?
+     * Was this position ever on a principal variation? `pvNode` says where the node sits in
+     * THIS tree; the table says where the position sat in every tree before, which is the
+     * better-informed question - a position worth an exact score once is worth accuracy
+     * again now.
      *
-     * `pvNode` says where the node sits in THIS tree; the table says where the
-     * position sat in every tree that came before, which is the better-informed
-     * question. A position that was worth an exact score once is worth accuracy
-     * again now, even though the move order that reached it this time happens
-     * to have arrived on a null window.
-     *
-     * It cannot run away. The flag is seeded only by genuine PV nodes and
-     * spreads only through the table, never down the stack - a node computes it
-     * fresh rather than inheriting it - so the set it marks is bounded by the
+     * It cannot run away: the flag is seeded only by genuine PV nodes and spreads only
+     * through the table, never down the stack, so the set it marks is bounded by the
      * positions that have actually appeared on a principal variation.
      */
     const bool ttPv = pvNode || (ttHit && tt_entry_is_pv(&tte));
 
     /*
-     * Cut off on a stored result that is at least as deep and whose bound
-     * points the right way.
+     * Cut off on a stored result at least as deep whose bound points the right way. Not at
+     * PV nodes: a bound proves a cutoff but cannot name the move that caused it, so the
+     * reported principal variation would be truncated here.
      *
-     * Not at PV nodes: a bound is enough to prove a cutoff but not to name the
-     * move that caused it, so returning one there leaves the reported
-     * principal variation truncated at this node.
-     *
-     * Not near the fifty-move boundary either. A stored score says nothing
-     * about how many reversible moves preceded the position, and a won
-     * position that is four plies from a draw claim is not worth what the same
-     * position was worth eighty plies earlier.
+     * Not near the fifty-move boundary either - a stored score says nothing about how many
+     * reversible moves preceded the position. And never while verifying a singular move,
+     * whose stored result was proved with the excluded move available.
      */
-    /* Never while verifying a singular move: the stored result was proved with
-     * the excluded move available, so it answers a different question than the
-     * one this search is asking. */
     if (!isExcluded && !pvNode && ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth &&
         pos->halfmoveClock < 90 &&
         (tt_entry_bound(&tte) & (ttValue >= beta ? BOUND_LOWER : BOUND_UPPER)))
         return ttValue;
 
     /*
-     * Syzygy WDL probe. The halfmove-clock gate keeps this off the hot path
-     * and is also a correctness condition: WDL tables assume a fresh
-     * fifty-move counter, so only the capture or pawn move that entered the
-     * tablebase region probes - everything behind it transposes through the
-     * table entry stored here.
+     * Syzygy WDL probe. The halfmove-clock gate keeps this off the hot path and is also a
+     * correctness condition: WDL tables assume a fresh fifty-move counter, so only the
+     * capture or pawn move that entered the tablebase region probes and everything behind
+     * it transposes through the entry stored here.
      *
-     * The value is game-theoretic truth, not a heuristic, so it is returned
-     * outright; at a PV node that truncates the printed line, which is
-     * cosmetic. A win is only a lower bound (a search might still prefer the
-     * faster mate score) and a loss only an upper one, and the entry records
-     * that. Stored a few plies deeper than asked so neighbouring nodes
-     * transpose into it rather than re-probing the disk.
+     * The value is game-theoretic truth rather than a heuristic, so it is returned
+     * outright; a win is only a lower bound (a search might still prefer the faster mate)
+     * and a loss only an upper one. Stored a few plies deeper than asked so neighbouring
+     * nodes transpose into it rather than re-probing the disk.
      */
     if (TbLimit != 0 && !isExcluded && pos->halfmoveClock == 0 && pos->castling == NO_CASTLING &&
         popcount(occupied_bb(pos)) <= TbLimit) {
@@ -1614,87 +1237,50 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     const Color us     = pos->sideToMove;
     const bool inCheck = board_checkers(pos) != BB_EMPTY;
 
-    /*
-     * Internal iterative reduction.
-     *
-     * No table move means nothing has ever searched this node deeply enough to
-     * leave an opinion, so the move list will be ordered by heuristics alone.
-     * A badly ordered node at full depth is the most expensive kind there is -
-     * alpha-beta degenerates towards its worst case exactly when the best move
-     * is tried last. Searching one ply shallower is cheaper, and it leaves a
-     * table move behind for when this node is revisited, which is worth more
-     * than the ply given up.
-     */
+    /* Internal iterative reduction: no table move means nothing has searched this node
+     * deeply enough to leave an opinion, so the list will be ordered by heuristics alone -
+     * and a badly ordered node at full depth is the most expensive kind there is. One ply
+     * shallower is cheaper and leaves a table move behind for the revisit. */
     if (depth >= 4 && ttMove == MOVE_NONE && !inCheck)
         --depth;
 
-    /*
-     * Static evaluation, reusing the one cached in the table when this position
-     * has been seen before. In check it is not computed at all: the score of a
-     * position whose king is attacked says nothing useful, and every heuristic
-     * below that would consume it is disabled while in check anyway.
-     */
+    /* Reusing the evaluation cached in the table when this position has been seen before.
+     * In check it is not computed at all: the score of a position whose king is attacked
+     * says nothing useful, and every heuristic that would consume it is disabled while in
+     * check anyway. The table keeps `rawEval`; everything below reasons with the corrected
+     * one. */
     const Value rawEval = inCheck
                               ? VALUE_NONE
                               : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
                                                                             : eval_evaluate(pos));
 
-    /* The table keeps `rawEval`; everything below reasons with the corrected
-     * one. See the correction history section for why those differ. */
     const Value staticEval = corrected_eval(pos, rawEval);
     const int uncScale     = inCheck ? 100 : unc_scale(pos);
 
     Stack[ply].staticEval = staticEval;
 
-    /*
-     * Is this side's position getting better?
-     *
-     * Compared against the grandparent, because that is the last node where the
-     * same side was to move - the parent's evaluation belongs to the opponent
-     * and is roughly the negation of ours. A side whose evaluation is rising
-     * has the initiative, and both pruning and reductions want to know: a
-     * rising position is more likely to produce the fail high that pruning is
-     * betting on, and a falling one deserves the benefit of the doubt.
-     *
-     * In check there is no static evaluation to compare, and at the top of the
-     * tree there is no grandparent, so both default to false - the cautious
-     * answer, since it prunes less.
-     */
+    /* Is this side's position getting better? Compared against the GRANDPARENT, because that
+     * is the last node where the same side was to move. A rising evaluation is more likely
+     * to produce the fail high pruning is betting on, and a falling one deserves the benefit
+     * of the doubt; in check and at the top of the tree it defaults to false, which prunes
+     * less. */
     const bool improving = !inCheck && ply >= 2 && Stack[ply - 2].staticEval != VALUE_NONE &&
                            staticEval > Stack[ply - 2].staticEval;
 
-    /*
-     * Reverse futility pruning, also called static null move pruning.
-     *
-     * If the static evaluation is so far above beta that even conceding a
-     * pawn-and-a-bit per remaining ply would not bring it back down, the node
-     * is not going to fail low, and searching it to prove that is wasted work.
-     *
-     * The depth limit is what keeps it honest: the margin is a claim about how
-     * much a position can plausibly swing in the plies left, and past a handful
-     * of plies that claim stops being true - deep enough searches find swings
-     * of any size. Restricted to non-PV nodes with no mate score in the window,
-     * because giving up a proof is only acceptable where a bound is all anyone
-     * was going to use.
-     */
+    /* Reverse futility pruning: the static evaluation is so far above beta that conceding a
+     * pawn-and-a-bit per remaining ply would not bring it down, so the node is not going to
+     * fail low. The depth limit keeps it honest - deep enough searches find swings of any
+     * size - and it is restricted to non-PV nodes, where a bound was all anyone wanted. */
     if (!pvNode && !inCheck && depth <= RFP_DEPTH && !is_mate_score(beta) &&
         staticEval - RFP_MARGIN * (depth - improving) * unc_apply(uncScale, UNC_W_RFP) / 100 >=
             beta)
         return staticEval;
 
-    /*
-     * Razoring: the mirror image of reverse futility, at the other end of the
-     * window.
-     *
-     * A position this far below alpha is one where the quiet moves are not
-     * going to save it, and what is left to check is whether a tactic does.
-     * That is precisely the question quiescence answers, so ask it directly
-     * rather than spending a full-width search arriving at the same place.
-     *
-     * The qsearch is what makes this safe. Nothing is pruned on the margin
-     * alone - the margin only decides that the node is worth a cheap second
-     * opinion, and the node is dropped only if that opinion agrees.
-     */
+    /* Razoring, the mirror image at the other end of the window: a position this far below
+     * alpha is one the quiet moves will not save, and whether a tactic does is exactly what
+     * quiescence answers. The qsearch is what makes it safe - the margin only decides the
+     * node is worth a cheap second opinion, and the node is dropped only if that opinion
+     * agrees. */
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
         staticEval + RAZOR_MARGIN * depth * unc_apply(uncScale, UNC_W_RAZOR) / 100 < alpha) {
         const Value v = qsearch(pos, alpha - 1, alpha, ply);
@@ -1702,19 +1288,11 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             return v;
     }
 
-    /*
-     * Null-move pruning: hand the opponent a free move. If the position still
-     * fails high after that, it was far too good to be worth searching
-     * properly, and a shallow verification is enough to say so.
-     *
-     * The non-pawn-material test is what keeps this sound. Its assumption is
-     * that having to move is a burden, and in a king-and-pawn endgame that is
-     * routinely false - zugzwang is often the entire content of the position,
-     * and a side that would love to pass will happily "prove" a cutoff it
-     * cannot actually achieve. Refusing a second null move in a row matters
-     * for the same reason: two passes in succession prove nothing about a
-     * game in which passing is illegal.
-     */
+    /* Null-move pruning: hand the opponent a free move, and if the position still fails high
+     * it was too good to be worth searching properly. The non-pawn-material test is what
+     * keeps this sound - in a king-and-pawn endgame zugzwang is often the whole content of
+     * the position, and a side that would love to pass will "prove" a cutoff it cannot
+     * achieve. Refusing two null moves in a row matters for the same reason. */
     if (!pvNode && !inCheck && !isExcluded && depth >= 3 && staticEval >= beta &&
         Stack[ply - 1].move != MOVE_NULL && has_non_pawn_material(pos, us)) {
         const Depth r = NMP_BASE + depth / NMP_DEPTH_DIVISOR +
@@ -1733,36 +1311,22 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         if (search_stopped())
             return VALUE_ZERO;
 
-        /* A mate score proved by letting the opponent move twice is not a mate
-         * at all. Return the bound the search is entitled to, not the claim. */
+        /* A mate score proved by letting the opponent move twice is not a mate at all. Return
+         * the bound the search is entitled to, not the claim. */
         if (v >= beta)
             return v >= VALUE_MATE_IN_MAX_PLY ? beta : v;
     }
 
     /*
-     * ProbCut. The margin's declaration has the idea; what matters here is the
-     * order of the two searches. Quiescence runs first because it refutes most
-     * candidates for the price of one capture sequence, and only what survives
-     * it is worth a real search.
+     * ProbCut. The margin's declaration has the idea; what matters here is that quiescence
+     * runs first, because it refutes most candidates for the price of one capture sequence
+     * and only what survives is worth a real search.
      *
-     * Skipped while verifying a singular move, and that is correctness rather
-     * than caution: this ignores `excluded`, so it could prove a fail high
-     * with the very move the verification is pretending does not exist.
-     *
-     * Skipped when the table already says, from a search of comparable depth,
-     * that the position does not reach the raised bound - that is the same
-     * evidence this is about to spend nodes gathering. Comparable means
-     * `depth - 3`, because what gets proved here is a move followed by a
-     * search of `depth - 4`.
-     *
-     * Skipped, too, when the static evaluation is already past the raised
-     * bound. There is then no gap for a capture to close, and the SEE filter
-     * below - which asks a capture to win `probCutBeta - staticEval` - has its
-     * threshold go negative, which admits every capture on the board including
-     * the losing ones. Stockfish rarely meets that case because its reverse
-     * futility pruning runs to depth 13 and has already returned; RFP_DEPTH
-     * here is 7, so without this the nodes between are exactly where ProbCut
-     * spends the most and proves the least.
+     * Skipped while verifying a singular move - this ignores `excluded`, so it could prove a
+     * fail high with the very move being hidden - and skipped when the table already says
+     * from a comparable depth that the bound is not reached. Skipped, too, when staticEval
+     * is already past the raised bound: the SEE filter's threshold would go negative and
+     * admit every capture on the board.
      */
     const Value probCutBeta = beta + PROBCUT_MARGIN * unc_apply(uncScale, UNC_W_PROBCUT) / 100;
 
@@ -1772,17 +1336,15 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         ScoredMove pcMoves[MAX_MOVES];
         const int pcCount = movegen_generate(pos, GEN_CAPTURES, pcMoves);
 
-        /* No counter-move: the list is captures, which the quiet heuristics
-         * have no opinion about. */
+        /* No counter-move: the list is captures, which the quiet heuristics have no opinion
+         * about. The capture has to reach the raised bound on material alone - one needing
+         * the search to find compensation is not what this is looking for. */
         score_moves(pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE);
 
         for (int i = 0; i < pcCount; ++i) {
             pick_move(pcMoves, pcCount, i);
             const Move m = pcMoves[i].m;
 
-            /* The capture has to reach the raised bound on material alone. One
-             * that needs the search to find compensation is not what this is
-             * looking for, and searching it here only pays for it twice. */
             if (!see_ge(pos, m, probCutBeta - staticEval))
                 continue;
 
@@ -1808,8 +1370,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                 return VALUE_ZERO;
 
             if (v >= probCutBeta) {
-                /* Stored at the depth the evidence actually covers, so a later
-                 * probe cannot read it as a full-depth result. */
+                /* Stored at the depth the evidence actually covers, so a later probe cannot
+                 * read it as a full-depth result. */
                 tt_store(key, m, v, rawEval, depth - PROBCUT_REDUCTION + 1, BOUND_LOWER, ttPv, ply);
                 return v;
             }
@@ -1820,18 +1382,17 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_ALL, moves);
     score_moves(pos, moves, count, ttMove, ply, counter_move(ply));
 
-    /* Moves already tried here, so that the one that eventually cuts can
-     * penalise them. Bounded: a node with more than this many is one where the
-     * ordering statistics were not going to be decisive anyway. */
+    /* Moves already tried here, so the one that eventually cuts can penalise them. Bounded:
+     * a node with more than this many is one where the ordering statistics were not going to
+     * be decisive anyway. */
     Move quiets[64];
     int quietCount = 0;
     Move captures[32];
     int captureCount = 0;
 
-    /* The same continuation context score_moves used, kept for the pruning and
-     * reduction decisions below - a quiet move the plan-aware tables like
-     * deserves the benefit of the doubt that its position in the list denies
-     * it. */
+    /* The same continuation context score_moves used, kept for the pruning and reduction
+     * decisions below: a quiet move the plan-aware tables like deserves the benefit of the
+     * doubt that its position in the list denies it. */
     int16_t *slices[CONT_SLOTS];
     for (int i = 0; i < CONT_SLOTS; ++i)
         slices[i] = cont_slice(i, ply, ContPlies[i]);
@@ -1840,22 +1401,16 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     Move bestMove = MOVE_NONE;
     int moveCount = 0;
 
-    /*
-     * Tracked separately from `bestMove`, and the distinction is the whole
-     * difference between an exact score and an upper bound. Every node ends up
-     * with a best-scoring move, including one that failed low - so using
-     * `bestMove != MOVE_NONE` to mean "we proved a score" would mark every
-     * fail-low entry BOUND_EXACT, and a later probe would happily read that
-     * upper bound back as a proven lower bound and cut on it.
-     */
+    /* Tracked separately from `bestMove`, and the distinction is the whole difference
+     * between an exact score and an upper bound. Every node ends up with a best-scoring
+     * move, including one that failed low, so using `bestMove != MOVE_NONE` would mark every
+     * fail-low entry BOUND_EXACT and a later probe would cut on it. */
     bool raisedAlpha = false;
 
     for (int i = 0; i < count; ++i) {
         pick_move(moves, count, i);
         const Move m = moves[i].m;
 
-        /* The move this search is proving the rest of the list can live
-         * without. */
         if (m == excluded)
             continue;
 
@@ -1866,43 +1421,26 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         const bool tactical = is_tactical(pos, m);
         const Piece moved   = piece_on(pos, from_sq(m));
 
-        /* How the plan-aware tables rate this move. Only meaningful for quiet
-         * moves - the tactical ones are scored by what they win. */
+        /* How the plan-aware tables rate this move. Only meaningful for quiet moves - the
+         * tactical ones are scored by what they win. */
         const int contScore = tactical ? 0 : cont_score(slices, moved, to_sq(m));
 
-        /*
-         * Shallow-depth pruning of quiet moves.
-         *
-         * Guarded on `best` being better than a forced mate: until the node has
-         * found something that is not losing outright, every remaining move is
-         * a candidate escape and none of them can be discarded on a heuristic.
-         *
-         * Late move pruning: the move list is ordered, so once this many quiet
-         * moves have been tried without one of them raising alpha, the rest are
-         * overwhelmingly unlikely to. Unlike a reduction this does not
-         * re-search, so it can genuinely lose a move - which is why it is
-         * confined to low depths, where the cost of being wrong is smallest and
-         * the number of nodes saved is largest.
-         */
+        /* Shallow-depth pruning of quiet moves, guarded on `best` beating a forced mate:
+         * until the node has found something that is not losing outright, every remaining
+         * move is a candidate escape. */
         if (!pvNode && !inCheck && best > VALUE_MATED_IN_MAX_PLY && !tactical) {
-            /* Half as many quiets get a look when the position is not
-             * improving: the moves are less likely to be worth it and the node
-             * is less likely to be the one that matters. */
+            /* Late move pruning: the list is ordered, so once this many quiets have been
+             * tried without raising alpha the rest overwhelmingly will not. Unlike a
+             * reduction this does not re-search, which is why it is confined to low depths -
+             * and half as many get a look when the position is not improving. */
             if (depth <= LMP_DEPTH && moveCount >= (improving ? LMP_BASE + depth * depth
                                                               : (LMP_BASE + depth * depth) / 2))
                 continue;
 
-            /*
-             * Futility pruning: the position is already so far below alpha
-             * that a quiet move - which by definition wins no material - has
-             * no realistic way of closing the gap in the depth remaining.
-             *
-             * Note this prunes the whole quiet TAIL, not just this move: the
-             * test does not depend on which move it is, so once it fires it
-             * fires for every quiet still to come. Captures keep being
-             * searched, which is the point - material is exactly what a quiet
-             * move cannot produce and a capture can.
-             */
+            /* Futility pruning: the position is so far below alpha that a quiet move, which
+             * wins no material by definition, cannot close the gap in the depth remaining.
+             * This prunes the whole quiet TAIL rather than one move, since the test does not
+             * depend on which move it is; captures keep being searched, which is the point. */
             if (depth <= FUTILITY_DEPTH &&
                 staticEval + FUTILITY_MARGIN * depth * unc_apply(uncScale, UNC_W_FUTILITY) / 100 <=
                     alpha)
@@ -1910,36 +1448,24 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         }
 
         /*
-         * SEE pruning. The move loses material outright and there is not
-         * enough depth left for whatever it was playing for to appear.
+         * SEE pruning: the move loses material outright and there is not enough depth left
+         * for whatever it was playing for to appear. This is the one rule that applies to
+         * captures as well as quiets, and that is why it is worth having - nothing above
+         * touches a capture, so a piece thrown onto a defended square is otherwise searched
+         * at full width.
          *
-         * This is the one pruning rule that applies to captures as well as
-         * quiets, and it is the reason it is worth having: nothing above
-         * touches a capture, so a piece thrown onto a defended square is
-         * otherwise searched at full width no matter how bad it is.
-         *
-         * The thresholds scale differently on purpose. A capture that loses a
-         * little is often a real sacrifice, so its allowance grows linearly
-         * with the depth left to justify it. A quiet move that hangs material
-         * has won nothing to weigh against the loss, so its allowance is
-         * squeezed much harder as depth falls.
-         *
-         * see_ge() declines to judge castling, en passant and promotions, and
-         * answers VALUE_ZERO >= threshold for them - which against a negative
-         * threshold is always true, so those moves are never pruned here.
+         * The thresholds scale differently on purpose: a capture that loses a little is
+         * often a real sacrifice, so its allowance grows linearly with the depth left to
+         * justify it, while a quiet move that hangs material has won nothing to weigh
+         * against the loss.
          */
         if (!pvNode && !inCheck && best > VALUE_MATED_IN_MAX_PLY) {
             const Depth seeDepth = tactical ? SEE_CAPTURE_DEPTH : SEE_QUIET_DEPTH;
 
-            /* The margin is computed under the depth guard rather than beside
-             * it, and that is a range check rather than a tidy-up. The quiet
-             * threshold is quadratic in depth, and both the uncertainty weight
-             * and UNC_SCALE_MAX are sweep seats: at their bounds unc_apply()
-             * returns 500, and 120 * 246 * 246 * 500 is 3.6e9, which does not
-             * fit in the int a Value is. Under the guard depth is at most
-             * SEE_QUIET_DEPTH and the product cannot approach it. Identical
-             * pruning either way - see_ge() was never reached when the guard
-             * was false. */
+            /* The margin is computed under the depth guard rather than beside it, and that is
+             * a range check: the quiet threshold is quadratic in depth, and at the sweep
+             * bounds 120 * 246 * 246 * 500 does not fit in the int a Value is. Identical
+             * pruning either way - see_ge() was never reached when the guard was false. */
             if (depth <= seeDepth) {
                 const Value seeMargin = tactical ? -SEE_CAPTURE_MARGIN * depth *
                                                        unc_apply(uncScale, UNC_W_SEE_CAPTURE) / 100
@@ -1961,32 +1487,20 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         Depth extension = 0;
 
         /*
-         * Singular extension.
+         * Singular extension. The table says this move was best here, from a search nearly as
+         * deep as this one, and the question worth asking is not whether it is good but
+         * whether it is the ONLY move that is - a forced line is where an extra ply buys the
+         * most, because the branching that makes depth expensive is not there.
          *
-         * The table says this move was best here, and says so from a search
-         * nearly as deep as this one. The question worth asking is not whether
-         * it is good but whether it is the ONLY move that is: a position with
-         * one playable move is a forced line, and forced lines are where an
-         * extra ply buys the most, because the branching that usually makes
-         * depth expensive is not there.
+         * One search of every OTHER move against a window just below the stored score gives
+         * three outcomes: all fail low, so extend; the reduced search beats the real beta, so
+         * several moves are good enough and this node fails high outright (multi-cut); or the
+         * others reach the window while the table move already beats beta, so the node is
+         * over-searched and plies come off.
          *
-         * The test is a search of every OTHER move against a window just below
-         * the stored score. If they all fail low, the move is singular and gets
-         * a ply. Three outcomes come out of one search:
-         *
-         *   - all others fail low: singular, extend.
-         *   - the reduced search beats the real beta: several moves are good
-         *     enough here, so this node fails high and none of them needs
-         *     proving. That is multi-cut - a whole node skipped rather than a
-         *     ply added.
-         *   - others reach the window and the table move already beats beta:
-         *     this node is easy and over-searched. Take plies AWAY.
-         *
-         * The verification runs at this same ply with `excludedMove` set, so
-         * everything it can see is exactly what this node can see minus the one
-         * move. That re-entrancy is why the excluded flag is read-and-cleared
-         * on entry and why the TT is neither trusted nor written while it is
-         * set.
+         * The verification runs at this same ply with `excludedMove` set, which is why the
+         * flag is read-and-cleared on entry and why the table is neither trusted nor written
+         * while it is set.
          */
         if (!isExcluded && depth >= SINGULAR_DEPTH && m == ttMove && ttValue != VALUE_NONE &&
             !is_mate_score(ttValue) && (tt_entry_bound(&tte) & BOUND_LOWER) &&
@@ -1995,10 +1509,9 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                 ttValue - SINGULAR_MARGIN * depth * unc_apply(uncScale, UNC_W_SINGULAR) / 100 / 16;
             const Depth singularDepth = (depth - 1) / 2;
 
-            /* The verification searches this ply again and writes the PV table
-             * as it goes. Nothing has been recorded here yet - the table move
-             * always sorts first - but restoring it keeps that an observation
-             * rather than a dependency. */
+            /* The verification searches this ply again and writes the PV table as it goes.
+             * Nothing has been recorded here yet - the table move always sorts first - but
+             * restoring it keeps that an observation rather than a dependency. */
             const int savedPvLength = PvLength[ply];
 
             Stack[ply].excludedMove = m;
@@ -2028,65 +1541,42 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
 
         const bool givesCheck = board_checkers(pos) != BB_EMPTY;
 
-        /*
-         * Check extension: search a checking move to full depth rather than
-         * one less.
-         *
-         * A check is the most forcing move in chess - the reply set is tiny and
-         * often single - so the branch costs little and the tactics that decide
-         * games live there. Without it the search reaches its horizon in the
-         * middle of a forcing sequence and evaluates a position that is about
-         * to change completely.
-         *
-         * Bounded by ply so a perpetual-check line cannot extend forever: past
-         * twice the nominal iteration depth, stop paying for it. Never stacked
-         * on top of a singular extension - one ply is the answer to "this line
-         * is forced", however many reasons there are to think so.
-         */
+        /* Check extension: a check is the most forcing move in chess - the reply set is tiny
+         * and often single - so the branch costs little and the tactics that decide games
+         * live there. Bounded by ply so a perpetual cannot extend forever, and never stacked
+         * on a singular extension: one ply is the answer to "this line is forced", however
+         * many reasons there are to think so. */
         if (extension == 0 && givesCheck && ply < 2 * RootDepth)
             extension = 1;
 
         const Depth childDepth = depth - 1 + extension;
         Value v                = VALUE_NONE;
 
-        /*
-         * Late move reductions.
-         *
-         * Move ordering is good enough that a quiet move tried this late is
-         * very unlikely to be best, so search it shallower and cheaply. The
-         * safety net is the re-search: anything that beats alpha despite the
-         * reduction gets searched again at full depth, so a reduction can cost
-         * time but cannot lose a move. Captures, checks, and replies to check
-         * are excluded - they are forcing, and reducing a forcing line is how
-         * an engine walks into a tactic it had the depth to see.
-         */
+        /* Late move reductions: ordering is good enough that a quiet move tried this late is
+         * very unlikely to be best, so search it shallower. The safety net is the re-search -
+         * anything that beats alpha despite the reduction is searched again at full depth, so
+         * a reduction can cost time but cannot lose a move. Forcing moves are excluded,
+         * because reducing a forcing line is how an engine walks into a tactic. */
         Depth r = 0;
         if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && !givesCheck) {
             r = Reductions[imin(depth, 63)][imin(moveCount, 63)];
 
-            /* The principal variation is where accuracy is worth paying for -
-             * and a position that was on one before is still that position,
-             * whatever window this visit happens to be using.
-             *
-             * Written as two arms rather than the equivalent `if (ttPv) --r` so
-             * that an ablation can switch the second off: at TTPV_REDUCTION = 1
-             * this is exactly `if (ttPv) --r`, since ttPv is true wherever
-             * pvNode is; at 0 the table flag is still written but nothing
-             * reads it. */
+            /* The principal variation is where accuracy is worth paying for, and a position
+             * that was on one before is still that position whatever window this visit uses.
+             * Two arms rather than `if (ttPv) --r` so an ablation can switch the second off. */
             if (pvNode)
                 --r;
             else if (ttPv)
                 r -= TTPV_REDUCTION;
 
-            /* A position that is not improving is one where the search has
-             * less to lose by looking at the tail more cheaply. */
+            /* A position that is not improving is one where the search has less to lose by
+             * looking at the tail more cheaply. */
             if (!improving)
                 ++r;
 
-            /* A quiet move the history tables like is not "late" in any sense
-             * that matters, whatever its position in the list. Both tables get
-             * a say: the butterfly history knows the move, the continuation
-             * tables know the move in this context. */
+            /* A quiet move the history tables like is not "late" in any sense that matters,
+             * whatever its position in the list. Both tables get a say: the butterfly history
+             * knows the move, the continuation tables know the move in this context. */
             r -= History[us][from_sq(m)][to_sq(m)] / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
@@ -2096,15 +1586,11 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                 r = childDepth - 1;
         }
 
-        /*
-         * Principal variation search. The first move is searched with the full
-         * window; for the rest the only question worth asking is whether
-         * anything BEATS it, and a null window answers that far more cheaply.
-         * Whatever does beat it is then re-searched properly.
-         */
+        /* Principal variation search: the first move is searched with the full window, and for
+         * the rest the only question worth asking is whether anything BEATS it, which a null
+         * window answers far more cheaply. A reduced null-window search is a bet that the
+         * move fails low, so the child is by definition expected to fail high. */
         if (r > 0) {
-            /* A reduced null-window search is a bet that the move fails low,
-             * so the child is by definition expected to fail high. */
             v = -negamax(pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
             if (v > alpha)
                 v = -negamax(pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
@@ -2112,8 +1598,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             v = -negamax(pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
 
-        /* A full-window search is never a cut node: the whole point is that its
-         * value is wanted exactly, not as a bound. */
+        /* A full-window search is never a cut node: the whole point is that its value is
+         * wanted exactly, not as a bound. */
         if (pvNode && (moveCount == 1 || (v > alpha && v < beta)))
             v = -negamax(pos, childDepth, -beta, -alpha, ply + 1, false);
 
@@ -2131,10 +1617,9 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                 raisedAlpha = true;
                 update_pv(ply, m);
                 if (v >= beta) {
-                    /* Fail high: the opponent would avoid this line. Everything
-                     * tried here learns from it - the move that cut is credited
-                     * in whichever table describes it, and everything tried
-                     * before it is blamed in both. */
+                    /* Fail high: the opponent would avoid this line. The move that cut is
+                     * credited in whichever table describes it, and everything tried before it
+                     * is blamed in both. */
                     update_stats(pos, m, quiets, quietCount, captures, captureCount, depth, ply);
                     break;
                 }
@@ -2142,15 +1627,10 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         }
     }
 
-    /*
-     * No legal move at all: mate if the king is attacked, stalemate if not.
-     * Scoring mate by ply is what makes the engine prefer the faster one.
-     *
-     * Unless a move was excluded, in which case "no moves" means only that the
-     * position has exactly one, and the position is neither mate nor stalemate
-     * - it is the most singular a move can be. Return alpha so the caller reads
-     * a fail low and extends.
-     */
+    /* No legal move at all: mate if the king is attacked, stalemate if not, scored by ply so
+     * the engine prefers the faster mate. Unless a move was excluded, in which case "no
+     * moves" means the position has exactly one - the most singular a move can be - so
+     * return alpha and let the caller read a fail low and extend. */
     if (moveCount == 0) {
         if (isExcluded)
             return alpha;
@@ -2161,19 +1641,14 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     }
 
     /*
-     * A move that raised alpha without failing high proves an exact score,
-     * because every alternative was searched and none beat it. At a null-window
-     * node that cannot happen - raising alpha there is already a fail high - so
-     * only PV nodes ever store an exact entry. Everything else failed low, and
-     * all its score proves is that the true value is no higher.
+     * A move that raised alpha without failing high proves an exact score, because every
+     * alternative was searched and none beat it. At a null-window node that cannot happen,
+     * so only PV nodes ever store an exact entry. `bestMove` is still stored on a fail low -
+     * it is a hint about what to try first next time, which costs nothing to be wrong about.
      *
-     * `bestMove` is still stored on a fail low. It is only a hint about which
-     * move to try first next time, which costs nothing to be wrong about, and
-     * it is what stops a re-search of this node starting from scratch.
+     * Never from a singular verification: its move list was missing a move, so its score is
+     * not a fact about this position and must not be cached as one.
      */
-    /* Never from a singular verification: its move list was missing a move, so
-     * its score is not a fact about this position and must not be cached as
-     * one. */
     if (!isExcluded) {
         const Bound bound = best >= beta ? BOUND_LOWER : raisedAlpha ? BOUND_EXACT : BOUND_UPPER;
         tt_store(key, bestMove, best, rawEval, depth, bound, ttPv, ply);
@@ -2182,21 +1657,14 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         unc_probe_node(pos, best, staticEval, bound, depth);
 
         /*
-         * Learn from this node only where the search genuinely contradicted the
-         * static evaluation, on the static evaluation's own terms.
+         * Learn from this node only where the search genuinely contradicted the static
+         * evaluation, on the static evaluation's own terms. In check there is nothing to be
+         * wrong about, and a proven score is a different kind of fact - the test must be
+         * is_decisive_score(), because a tablebase score would otherwise be fed in as an
+         * ~8,000,000cp "error" that saturates the entry on one observation.
          *
-         * In check there is no static evaluation to be wrong about. A proven
-         * score - mate or tablebase - is not an evaluation error, it is a
-         * different kind of fact; the test has to be is_decisive_score()
-         * rather than is_mate_score(), because a tablebase score sits just
-         * below the mate band and would otherwise be fed to the table as an
-         * ~8,000,000cp "error" that saturates the entry on one observation. A
-         * tactical best move means the gap was material that quiescence found
-         * rather than a standing bias, and crediting it would teach the table
-         * that every structure which once contained a hanging piece is worth a
-         * pawn more than it is. And a bound is evidence only in the direction
-         * it bounds: a fail high proves the truth is at least `best`, which
-         * says nothing at all if the evaluation was already above that.
+         * A tactical best move means the gap was material quiescence found rather than a
+         * standing bias, and a bound is evidence only in the direction it bounds.
          */
         if (!inCheck && !is_decisive_score(best) &&
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
@@ -2207,8 +1675,6 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
 
     return best;
 }
-
-/* ------------------------------------------------------------- the root -- */
 
 /* Legal root moves, restricted to `go searchmoves ...` when the GUI asked. */
 static int collect_root_moves(const Position *pos, ScoredMove *out) {
@@ -2237,8 +1703,8 @@ static int collect_root_moves(const Position *pos, ScoredMove *out) {
     return n;
 }
 
-/* Insertion sort by descending score. Stable, so equal-scoring moves keep
- * their generation order and the node count stays reproducible. */
+/* Insertion sort by descending score. Stable, so equal-scoring moves keep their generation
+ * order and the node count stays reproducible. */
 static void sort_root_moves(ScoredMove *roots, int count) {
     for (int i = 1; i < count; ++i) {
         const ScoredMove key = roots[i];
@@ -2251,15 +1717,11 @@ static void sort_root_moves(ScoredMove *roots, int count) {
     }
 }
 
-/*
- * One iteration of the root search.
- *
- * Written out rather than folded into negamax because the root is the only
- * place that has to honour `searchmoves`, keep its move list alive between
- * iterations so it can be reordered, and score every move rather than cutting
- * off. Returns VALUE_NONE if the iteration was interrupted, in which case its
- * partial result must be discarded.
- */
+/* One iteration of the root search. Written out rather than folded into negamax because
+ * the root is the only place that has to honour `searchmoves`, keep its move list alive
+ * between iterations so it can be reordered, and score every move rather than cutting off.
+ * Returns VALUE_NONE if the iteration was interrupted, in which case its partial result
+ * must be discarded. */
 static Value search_root(Position *pos, ScoredMove *roots, int count, Depth depth, Value alpha,
                          Value beta, Move *bestMove) {
     Value best = -VALUE_INFINITE;
@@ -2271,26 +1733,20 @@ static Value search_root(Position *pos, ScoredMove *roots, int count, Depth dept
 
         Stack[0].move       = m;
         Stack[0].movedPiece = piece_on(pos, from_sq(m));
-        Stack[0].staticEval = VALUE_NONE; /* no grandparent above the root */
+        Stack[0].staticEval = VALUE_NONE;
 
         board_do_move(pos, m);
         eval_state_push(pos, m);
         tt_prefetch(pos->key);
 
-        /*
-         * Principal variation search, as in negamax: the first root move
-         * establishes alpha with the full window, and every later one only has
-         * to answer the cheap question of whether it beats that. The ones that
-         * do - rare, once the root list is sorted by the previous iteration -
-         * pay for a proper re-search.
-         */
         Value v;
         if (i == 0) {
             v = -negamax(pos, depth - 1, -beta, -alpha, 1, false);
         } else {
-            /* The expectation behind a null-window root search is that the move
-             * is worse than the one already found - which is the child failing
-             * high on its own terms. */
+            /* As in negamax: the first root move establishes alpha with the full window, and
+             * every later one only has to answer whether it beats that. The ones that do -
+             * rare, once the list is sorted by the previous iteration - pay for a re-search,
+             * and the null-window expectation is that the child fails high on its own terms. */
             v = -negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true);
             if (v > alpha && v < beta && !search_stopped())
                 v = -negamax(pos, depth - 1, -beta, -alpha, 1, false);
@@ -2312,9 +1768,8 @@ static Value search_root(Position *pos, ScoredMove *roots, int count, Depth dept
             if (v > alpha)
                 alpha = v;
 
-            /* Beat the aspiration window: the caller has to widen and retry,
-             * so there is nothing to gain from searching the rest of the list
-             * against a bound already known to be wrong. */
+            /* Beat the aspiration window: the caller has to widen and retry, so there is
+             * nothing to gain from searching the rest against a bound already known wrong. */
             if (v >= beta)
                 break;
         }
@@ -2328,20 +1783,16 @@ static int mate_in_moves(Value v) {
     return v > 0 ? (VALUE_MATE - v + 1) / 2 : -((VALUE_MATE + v + 1) / 2);
 }
 
+/*
+ * The line is assembled in full and written once. main.c makes stdout unbuffered and the
+ * UCI thread answers `isready` while this worker searches, so a sequence of printf calls
+ * lets another thread's output land in the middle: the GUI sees
+ * `info depth 12 seldepth 18 readyok`, which is neither a parsable info line nor a
+ * readyok. One fputs of a complete line cannot be split that way.
+ */
 static void print_iteration(Depth depth, Value value, int64_t elapsed, bool chess960) {
-    /*
-     * The line is assembled in full and written once.
-     *
-     * main.c makes stdout unbuffered and the UCI thread answers `isready`
-     * while this worker searches (invariant 4), so emitting the line as a
-     * sequence of printf calls lets another thread's output land in the middle
-     * of it: the GUI sees `info depth 12 seldepth 18 readyok`, which is
-     * neither a parsable info line nor a readyok, and reports the engine as
-     * unresponsive. One fputs of a complete line cannot be split that way.
-     *
-     * The buffer cannot be outgrown: the fixed prefix is under 200 characters
-     * and the PV is at most MAX_PLY moves of five characters plus a space.
-     */
+    /* Cannot be outgrown: the fixed prefix is under 200 characters and the PV is at most
+     * MAX_PLY moves of five characters plus a space. */
     char line[256 + MAX_PLY * 6];
     char buf[8];
     size_t n = 0;
@@ -2390,30 +1841,25 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
     ScoredMove roots[MAX_MOVES];
     int rootCount = collect_root_moves(pos, roots);
 
-    /* Checkmate, stalemate, or a `searchmoves` list with nothing legal in it.
-     * MOVE_NONE prints as `bestmove 0000`, which is what GUIs expect. */
+    /* Checkmate, stalemate, or a `searchmoves` list with nothing legal in it. MOVE_NONE
+     * prints as `bestmove 0000`, which is what GUIs expect. */
     if (rootCount == 0)
         return MOVE_NONE;
 
-    /*
-     * Syzygy at the root, which settles the move and the score together.
-     *
-     * The move: WDL alone cannot convert, because every winning move scores
-     * the same and a search free to choose among them can shuffle until the
-     * fifty-move rule takes the win away. DTZ names one that provably makes
-     * progress, and the root list is cut down to it. The search then runs
-     * normally over that one move, so the PV, the info lines and time
-     * management all still work.
-     *
-     * The score: interior nodes only probe at halfmoveClock == 0, so the
-     * children of a five-man root - clock 1 after any piece move - are
-     * searched heuristically and the tree would hand back an evaluation, not
-     * the result. `tbRootValue` is the tables' own answer, and it is what
-     * gets reported below. That is the difference between a labelled
-     * KNP-vs-KP position scoring 0 and scoring +3.
-     */
     Value tbRootValue = VALUE_NONE;
 
+    /*
+     * Syzygy at the root, which settles the move and the score together. WDL alone cannot
+     * convert, because every winning move scores the same and a search free to choose among
+     * them can shuffle until the fifty-move rule takes the win away; DTZ names one that
+     * provably makes progress, and the root list is cut down to it so the PV, the info lines
+     * and time management all still work.
+     *
+     * The score matters too: interior nodes only probe at halfmoveClock == 0, so the children
+     * of a five-man root are searched heuristically and the tree would hand back an
+     * evaluation. That is the difference between a labelled KNP-vs-KP position scoring 0 and
+     * scoring +3.
+     */
     if (TbLimit != 0 && Limits.searchmovesCount == 0) {
         const SyzygyRoot tb = syzygy_probe_root(pos);
         if (tb.value != VALUE_NONE) {
@@ -2437,10 +1883,9 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
 
     Value prevScore = VALUE_NONE;
 
-    /* Consecutive completed iterations that agreed on the best move. Feeds the
-     * time manager: a search still changing its mind is one worth letting run
-     * a little longer. Tracked against its own previous value rather than
-     * against `best`, which starts out holding an unsearched move. */
+    /* Consecutive completed iterations that agreed on the best move, feeding the time
+     * manager. Tracked against its own previous value rather than against `best`, which
+     * starts out holding an unsearched move. */
     int stability = 0;
     Move prevBest = MOVE_NONE;
 
@@ -2449,26 +1894,13 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         SelDepth           = 0;
         Move iterationBest = MOVE_NONE;
 
-        /*
-         * Aspiration windows.
-         *
-         * The score at depth N is nearly always close to the score at depth
-         * N-1, so searching the whole range from -infinity to +infinity throws
-         * away information we already have. A narrow window around the previous
-         * score produces far more cutoffs; the price is that when the score
-         * does move, the search fails at the window edge and has to be redone.
-         *
-         * Widening geometrically is what keeps that price bounded - a position
-         * whose score is genuinely collapsing reaches a full window in a few
-         * re-searches rather than dozens. On a fail low the opposite edge is
-         * pulled in towards the score too, because a fail low means the true
-         * value is below the window and there is no reason to keep believing
-         * the optimistic side of it.
-         */
         Value alpha = -VALUE_INFINITE;
         Value beta  = VALUE_INFINITE;
         Value delta = ASPIRATION_DELTA;
 
+        /* Aspiration windows: the score at depth N is nearly always close to the score at
+         * N-1, so a narrow window produces far more cutoffs, at the price of a re-search
+         * whenever the score moves outside it. Widening geometrically bounds that price. */
         if (depth >= ASPIRATION_MIN_DEPTH && prevScore != VALUE_NONE && !is_mate_score(prevScore)) {
             alpha = prevScore - delta > -VALUE_INFINITE ? prevScore - delta : -VALUE_INFINITE;
             beta  = prevScore + delta < VALUE_INFINITE ? prevScore + delta : VALUE_INFINITE;
@@ -2493,20 +1925,17 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
             delta += delta / 3;
         }
 
-        /* An interrupted iteration searched some moves under a window the
-         * others never saw, so its ordering is meaningless. Keep the last
-         * completed iteration's move instead. */
+        /* An interrupted iteration searched some moves under a window the others never saw,
+         * so its ordering is meaningless: keep the last completed iteration's move. */
         if (search_stopped())
             break;
 
         stability = (prevBest != MOVE_NONE && iterationBest == prevBest) ? stability + 1 : 0;
         prevBest  = iterationBest;
 
-        /* A proven result outranks the tree's opinion of it. `prevScore` keeps
-         * the tree's own number so the next iteration's aspiration window is
-         * centred on something the tree can actually return; everything
-         * outward-facing - the info line, and the score datagen writes into a
-         * label - reports the proof. */
+        /* A proven result outranks the tree's opinion of it. `prevScore` keeps the tree's own
+         * number so the next aspiration window is centred on something the tree can return,
+         * while everything outward-facing reports the proof. */
         const Value reported = tbRootValue != VALUE_NONE ? tbRootValue : value;
 
         prevScore      = value;
@@ -2514,10 +1943,9 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         RootScore      = reported;
         CompletedDepth = depth;
 
-        /* Cleared, not left alone, when this iteration has no second PV move:
-         * the stale entry belongs to a line the search has since abandoned, and
-         * pondering on a move that no longer follows `best` wastes the whole
-         * ponder search and desynchronises the GUI on ponderhit. */
+        /* Cleared, not left alone, when this iteration has no second PV move: the stale entry
+         * belongs to a line the search has abandoned, and pondering on a move that no longer
+         * follows `best` wastes the ponder search and desynchronises the GUI on ponderhit. */
         *ponderMove = PvLength[0] > 1 ? PvTable[0][1] : MOVE_NONE;
 
         if (!Silent)
@@ -2527,11 +1955,9 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)
             break;
 
-        /*
-         * Do not begin an iteration there is no realistic chance of finishing.
-         * Each one costs several times the last, so starting one at 90% of the
-         * budget just burns the remainder and throws the result away.
-         */
+        /* Do not begin an iteration there is no realistic chance of finishing: each costs
+         * several times the last, so starting one at 90% of the budget burns the remainder
+         * and throws the result away. */
         if (!Limits.infinite && !atomic_load(&Pondering) &&
             elapsed_ms() >= timeman_optimum(&Timer, stability))
             break;
@@ -2541,20 +1967,17 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
     return best;
 }
 
-/* ------------------------------------------------------------ lifecycle -- */
-
-/* One search over RootPos under Limits, shared by the worker thread and by
- * search_run_sync so the two can never drift apart. */
+/* One search over RootPos under Limits, shared by the worker thread and search_run_sync so
+ * the two can never drift apart. */
 static Move run_search(Move *ponderMove) {
     NodeCount = 0;
     SelDepth  = 0;
-    TbLimit   = syzygy_max_pieces(); /* cached: one comparison per node, not a call */
+    TbLimit   = syzygy_max_pieces();
     TbHits    = 0;
+    /* Per-search state, not per-game: a stale excluded move or grandparent evaluation left
+     * here by the previous search would make this one depend on it. */
     atomic_store(&Nodes, 0);
 
-    /* Per-search state, not per-game: a stale excluded move or a stale
-     * grandparent evaluation left here by the previous search would make this
-     * one depend on it. */
     memset(Stack, 0, sizeof(Stack));
 
     *ponderMove = MOVE_NONE;
@@ -2567,11 +1990,9 @@ static void worker_entry(void *arg) {
     Move ponderMove;
     Move best = run_search(&ponderMove);
 
-    /*
-     * UCI forbids sending `bestmove` during a ponder or an infinite search:
-     * the GUI owns that decision and will send `stop` or `ponderhit` first.
-     * Replying early desynchronises the GUI and shows up as spurious losses.
-     */
+    /* UCI forbids sending `bestmove` during a ponder or an infinite search: the GUI owns that
+     * decision and will send `stop` or `ponderhit` first. Replying early desynchronises the
+     * GUI and shows up as spurious losses. */
     while (!atomic_load(&StopFlag) && (atomic_load(&Pondering) || Limits.infinite))
         thread_sleep_ms(1);
 
@@ -2580,15 +2001,10 @@ static void worker_entry(void *arg) {
 }
 
 void search_start(const Position *pos, const SearchLimits *limits) {
-    /*
-     * Only one search at a time, so the previous worker has to be joined - but
-     * joining it is not enough on its own. A `go infinite` or `go ponder`
-     * worker parks in worker_entry() until StopFlag is set, so a bare join
-     * would block the UCI thread inside `go`, and the `stop` that would
-     * release it can only arrive on that same thread. That is a permanent
-     * deadlock and a direct breach of invariant 4, so ask the running search
-     * to stop first and make the wait bounded.
-     */
+    /* Only one search at a time, so the previous worker has to be joined - but joining is not
+     * enough on its own. A `go infinite` worker parks until StopFlag is set, so a bare join
+     * would block the UCI thread inside `go` while the `stop` that would release it can only
+     * arrive on that same thread. Asking it to stop first makes the wait bounded. */
     search_stop();
     search_wait();
 
@@ -2603,17 +2019,10 @@ void search_start(const Position *pos, const SearchLimits *limits) {
 
     WorkerStarted = thread_create(&Worker, worker_entry, NULL);
     if (!WorkerStarted) {
-        /*
-         * Thread creation failed. Searching inline still produces a legal game
-         * - it just cannot be interrupted - which beats not moving at all.
-         *
-         * The ponder/infinite hold has to be dropped along with it. That loop
-         * waits for a `stop` which only the UCI thread can deliver, and the
-         * UCI thread is the one about to run the search, so honouring it here
-         * would hang the process outright rather than merely finish
-         * uninterrupted. Clearing both makes worker_entry() return as soon as
-         * the search does.
-         */
+        /* Searching inline still produces a legal game - it just cannot be interrupted - which
+         * beats not moving at all. The ponder/infinite hold has to be dropped with it: that
+         * loop waits for a `stop` only the UCI thread can deliver, and the UCI thread is the
+         * one about to run the search. */
         Limits.infinite = false;
         atomic_store(&Pondering, false);
         worker_entry(NULL);
@@ -2629,8 +2038,9 @@ void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResu
     Limits  = *limits;
 
     atomic_store(&StopFlag, false);
-    /* A synchronous ponder search would wait for a `stop` that no one is
-     * around to send, so the flag is dropped rather than honoured. */
+
+    /* A synchronous ponder search would wait for a `stop` that no one is around to send, so
+     * the flag is dropped rather than honoured. */
     atomic_store(&Pondering, false);
     atomic_store(&ClockOrigin, limits->startTime);
     atomic_store(&Searching, true);
@@ -2651,20 +2061,16 @@ void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResu
 void search_stop(void) { atomic_store(&StopFlag, true); }
 
 void search_ponderhit(void) {
-    /*
-     * Only a pondering search may have its clock restarted. Without this
-     * guard a stray `ponderhit` during an ordinary timed search resets the
-     * origin every elapsed-time test is measured against, handing the search a
-     * second full budget and losing the game on time.
-     */
+    /* Only a pondering search may have its clock restarted. Without this guard a stray
+     * `ponderhit` during an ordinary timed search resets the origin every elapsed-time test
+     * is measured against, handing the search a second full budget. */
     if (!atomic_load(&Pondering))
         return;
 
-    /* The opponent played our predicted move: the ponder search becomes a real
-     * one and the clock is now ours. Time spent pondering was free, so the
-     * allocation computed at `go` runs from this moment rather than from then.
-     * Only the origin moves - the budget itself was derived from the clock the
+    /* The opponent played our predicted move, so the ponder search becomes a real one and the
+     * clock is now ours. Only the origin moves - the budget was derived from the clock the
      * GUI reported, which has not changed. */
+
     atomic_store(&ClockOrigin, time_ms());
     atomic_store(&Pondering, false);
 }

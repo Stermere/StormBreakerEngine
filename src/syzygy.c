@@ -1,30 +1,20 @@
 /*
  * syzygy.c - Syzygy endgame tablebase probing.
  *
- * Derived from Ronald de Man's reference implementation by way of Jon Dart's
- * Fathom (MIT); CREDITS.md records the relationship and retains the notice.
- * A file format is not something an implementation gets to choose, so the
- * constant tables below and the shape of the index and decompression code
- * follow it exactly. What is this engine's own is everything that touches a
- * position: placement reads our bitboards directly, capture resolution uses
- * our generator and our make/unmake, and nothing is marshalled through a
- * second board representation on the way in.
+ * Derived from Ronald de Man's reference implementation by way of Jon Dart's Fathom
+ * (MIT); CREDITS.md records the relationship and retains the notice. A file format is not
+ * something an implementation gets to choose, so the constant tables below and the shape
+ * of the index and decompression code follow it exactly - what is this engine's own is
+ * everything that touches a position.
  *
- * WHAT A TABLE IS. A Syzygy file is an indexed, block-compressed array. A
- * position becomes an index by placing its men in a canonical order and
- * folding away the symmetries the format exploits - left-right always, and
- * up-down and diagonal reflection when there are no pawns. The index selects a
- * block; the block is a stream of re-pair-compressed symbols that expands to
- * the byte for that position. Three quantities, three places to be wrong, and
- * none of them announce themselves: a wrong prober returns a plausible number
- * for a plausible position. docs/EXPERIMENTS.md E24 is how this one was
- * checked.
+ * A table is an indexed, block-compressed array. A position becomes an index by placing
+ * its men in canonical order and folding away the symmetries the format exploits; the
+ * index selects a block, and the block expands to that position's byte. Three quantities,
+ * three places to be wrong, and none of them announce themselves - see E24 for how this
+ * one was checked.
  *
- * WDL answers won/drawn/lost and is what the search probes. DTZ answers "plies
- * to the next capture or pawn move that preserves the result" and is what
- * converts at the root under the fifty-move rule. There is no depth-to-mate
- * here because standard Syzygy carries none: DTM lives in .rtbm files that the
- * distributions do not ship.
+ * WDL answers won/drawn/lost and is what the search probes; DTZ answers plies to the next
+ * capture or pawn move that preserves the result, and is what converts at the root.
  */
 #include "syzygy.h"
 
@@ -51,35 +41,27 @@
 #include <unistd.h>
 #endif
 
-/* ------------------------------------------------------------- constants -- */
-
 enum { TB_PIECES = 7, TB_HASHBITS = 12, TB_MAX_SYMS = 4096 };
 
-/* How many distinct endgames exist up to TB_PIECES men, counted rather than
- * guessed: 254/256 at six men, 650/861 at seven. These MUST match TB_PIECES -
- * carrying the six-man numbers with a seven-man enumeration silently drops
- * every seven-man table on the floor, because the guards in init_tb return
- * quietly when an array is full and MaxPieces then never reaches 7. */
+/* How many distinct endgames exist up to TB_PIECES men, counted rather than guessed:
+ * 254/256 at six men, 650/861 at seven. These MUST match TB_PIECES - the guards in
+ * init_tb return quietly when an array is full, so six-man numbers under a seven-man
+ * enumeration silently drop every seven-man table. */
 enum { TB_MAX_PIECE_TABLES = 650, TB_MAX_PAWN_TABLES = 861 };
 
-/* The two table kinds this engine reads. The format defines a third, .rtbm
- * (depth to mate), which the distributions do not ship and nothing here asks
- * for. */
+/* The format defines a third kind, .rtbm (depth to mate), which the distributions do not
+ * ship and nothing here asks for. */
 enum { TB_WDL = 0, TB_DTZ = 1 };
 static const char *const TbSuffix[2] = {".rtbw", ".rtbz"};
 static const uint32_t TbMagic[2]     = {0x5d23e871u, 0xa50c66d7u};
 
-/* How a position becomes an index. Pawnless material folds on both diagonals;
- * pawns break the up-down and diagonal symmetries, so those tables are split
- * by the file of the leading pawn instead. */
+/* Pawnless material folds on both diagonals; pawns break the up-down and diagonal
+ * symmetries, so those tables are split by the file of the leading pawn instead. */
 enum { PIECE_ENC = 0, FILE_ENC = 1 };
 
-/*
- * Material keys. Each coloured piece type gets a prime and a position's key is
- * the sum over its men, so two positions share a key exactly when they share
- * material. The values are the format's: a key has to agree with the one the
- * table was built under.
- */
+/* Each coloured piece type gets a prime and a position's key is the sum over its men, so
+ * two positions share a key exactly when they share material. The values are the
+ * format's: a key has to agree with the one the table was built under. */
 #define PRIME_WHITE_QUEEN  11811845319353239651ull
 #define PRIME_WHITE_ROOK   10979190538029446137ull
 #define PRIME_WHITE_BISHOP 12311744257139811149ull
@@ -280,17 +262,14 @@ static size_t Binomial[7][64];
 static size_t PawnIdx[6][24];
 static size_t PawnFactorFile[6][4];
 
-/* ------------------------------------------------------------ byte order -- */
-
-/* Tables are little-endian on disk; the compressed stream is read big-endian.
- * Both are a load and possibly a bswap, never bytes assembled by hand - no
- * compiler reliably folds that back into a load. */
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define TB_BIG_ENDIAN 1
 #else
 #define TB_BIG_ENDIAN 0
 #endif
 
+/* Tables are little-endian on disk, the compressed stream big-endian; never hand-assembled
+ * from bytes, which no compiler reliably folds back into a load. */
 static inline uint16_t bswap16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
 
 static inline uint32_t bswap32(uint32_t v) {
@@ -325,8 +304,6 @@ static inline uint32_t read_be32(const void *p) {
     memcpy(&v, p, sizeof(v));
     return TB_BIG_ENDIAN ? v : bswap32(v);
 }
-
-/* --------------------------------------------------------------- mapping -- */
 
 #if defined(_WIN32)
 typedef HANDLE TbFile;
@@ -368,11 +345,9 @@ static void close_tb(TbFile fd) {
 #endif
 }
 
-/*
- * A complete table is a multiple of 64 bytes plus a 16-byte header. A
- * truncated one is the failure this exists for: it maps and probes perfectly
- * well and answers nonsense for the positions whose blocks are missing.
- */
+/* A complete table is a multiple of 64 bytes plus a 16-byte header. A truncated one is
+ * the failure this exists for: it maps and probes perfectly well and answers nonsense for
+ * the positions whose blocks are missing. */
 static bool table_present(const char *name, const char *suffix) {
     const TbFile fd = open_tb(name, suffix);
     if (fd == TB_FILE_NONE)
@@ -422,8 +397,8 @@ static void *map_tb(const char *name, const char *suffix, TbMap *mapping) {
         return NULL;
     *mapping = (size_t)st.st_size;
 #ifdef POSIX_MADV_RANDOM
-    /* Probes land on unrelated blocks; read-ahead only evicts what is worth
-     * keeping. */
+
+    /* Probes land on unrelated blocks; read-ahead only evicts what is worth keeping. */
     posix_madvise(data, (size_t)st.st_size, POSIX_MADV_RANDOM);
 #endif
 #endif
@@ -441,8 +416,6 @@ static void unmap_tb(void *data, TbMap mapping) {
 #endif
 }
 
-/* ---------------------------------------------------------------- tables -- */
-
 typedef struct {
     const uint8_t *indexTable;
     const uint16_t *sizeTable;
@@ -454,7 +427,7 @@ typedef struct {
     uint8_t idxBits;
     uint8_t minLen;
     uint8_t constValue[2];
-    uint64_t base[1]; /* h entries; allocated with the struct */
+    uint64_t base[1];
 } PairsData;
 
 typedef struct {
@@ -469,24 +442,20 @@ typedef struct {
     uint8_t *data[2];
     TbMap mapping[2];
     bool ready[2];
-    /* Latched when init_table() rejects this table, so a corrupt file is
-     * mapped and parsed once rather than on every probe. It lives here rather
-     * than on the hash slot because hash_add() gives an endgame TWO slots (its
-     * key and the mirrored key2): a marker on one slot leaves the other able
-     * to re-enter init_table, which re-maps the file and leaks the first
-     * mapping along with the PairsData the failed attempt allocated. */
+
+    /* Latched when init_table() rejects this table, so a corrupt file is mapped and parsed
+     * once rather than on every probe. It lives here rather than on the hash slot because
+     * hash_add() gives an endgame TWO slots, and a marker on one would leave the other able
+     * to re-enter init_table and leak the first mapping. */
     bool failed[2];
     uint8_t num;
     bool symmetric, hasPawns, hasDtz;
     union {
-        bool kk_enc; /* pawnless: exactly two men are unique */
+        bool kk_enc;
         uint8_t pawns[2];
     };
 } BaseEntry;
 
-/* The ei layout, with no gaps for the depth-to-mate tables this does not read:
- *   pawnless  [0] wdl white, [1] wdl black, [2] dtz
- *   pawnful   [0..7] wdl (file + 4*black), [8..11] dtz (file) */
 typedef struct {
     BaseEntry be;
     EncInfo ei[3];
@@ -520,13 +489,14 @@ static int MaxPieces;
 
 static int num_tables(const BaseEntry *be) { return be->hasPawns ? 4 : 1; }
 
+/* The ei layout, with no gaps for the depth-to-mate tables this does not read:
+ *   pawnless  [0] wdl white, [1] wdl black, [2] dtz
+ *   pawnful   [0..7] wdl (file + 4*black), [8..11] dtz (file) */
 static EncInfo *first_ei(BaseEntry *be, int type) {
     if (be->hasPawns)
         return &AS_PAWN(be)->ei[type == TB_WDL ? 0 : 8];
     return &AS_PIECE(be)->ei[type == TB_WDL ? 0 : 2];
 }
-
-/* ------------------------------------------------------------------ keys -- */
 
 static uint64_t material_key(const Position *pos, bool mirror) {
     const Bitboard w = color_bb(pos, mirror ? BLACK : WHITE);
@@ -575,8 +545,6 @@ static void table_name(const Position *pos, char *str, bool flip) {
     *str = 0;
 }
 
-/* --------------------------------------------------------------- indices -- */
-
 static void init_indices(void) {
     for (int i = 0; i < 7; ++i)
         for (int j = 0; j < 64; ++j) {
@@ -614,14 +582,9 @@ static int leading_pawn(int *p, const BaseEntry *be) {
     return FileToFile[p[0] & 7];
 }
 
-/*
- * Position -> index.
- *
- * The squares in `p` are folded onto the canonical region the table was built
- * over - left-right always, and for pawnless material also up-down and along
- * the main diagonal. What is left is a mixed-radix number whose digits are
- * "which combination of like men", which the factors turn into an offset.
- */
+/* Position -> index. The squares in `p` are folded onto the canonical region the table
+ * was built over, and what is left is a mixed-radix number whose digits are "which
+ * combination of like men", which the factors turn into an offset. */
 static size_t encode(int *p, const EncInfo *ei, const BaseEntry *be, int enc) {
     const int n = be->num;
     size_t idx;
@@ -770,8 +733,6 @@ static size_t init_enc_info(EncInfo *ei, BaseEntry *be, const uint8_t *tb, int s
     return f;
 }
 
-/* ---------------------------------------------------------- decompression -- */
-
 static void calc_sym_len(PairsData *d, uint32_t s, char *tmp) {
     const uint8_t *w  = d->symPat + 3 * s;
     const uint32_t s2 = ((uint32_t)w[2] << 4) | (w[1] >> 4);
@@ -796,7 +757,6 @@ static PairsData *setup_pairs(uint8_t **ptr, size_t tbSize, size_t *size, uint8_
 
     *flags = data[0];
 
-    /* A table whose every entry is the same value stores only that value. */
     if (data[0] & 0x80) {
         d = (PairsData *)malloc(sizeof(PairsData));
         if (!d)
@@ -854,14 +814,10 @@ static PairsData *setup_pairs(uint8_t **ptr, size_t tbSize, size_t *size, uint8_
     return d;
 }
 
-/*
- * idx -> the symbol's bytes.
- *
- * The index table names a block and an offset inside it; the block is a bit
- * stream of canonical-Huffman codes over symbols that each expand to a run of
- * bytes. So the walk is: skip whole symbols until the offset falls inside one,
- * then descend that symbol's pair tree to the byte.
- */
+/* idx -> the symbol's bytes. The index table names a block and an offset inside it, and
+ * the block is a bit stream of canonical-Huffman codes over symbols that each expand to a
+ * run of bytes - so the walk skips whole symbols until the offset falls inside one, then
+ * descends that symbol's pair tree. */
 static const uint8_t *decompress_pairs(const PairsData *d, size_t idx) {
     if (!d->idxBits)
         return d->constValue;
@@ -870,10 +826,11 @@ static const uint8_t *decompress_pairs(const PairsData *d, size_t idx) {
     int litIdx =
         (int)(idx & (((size_t)1 << d->idxBits) - 1)) - (int)((size_t)1 << (d->idxBits - 1));
 
+    /* Unsigned, as the format defines it. Read as signed this goes negative, the block walk
+     * below runs off the front of sizeTable, and `--block` underflows a uint32 into a
+     * four-billion-entry read. */
     uint32_t block = read_le32(d->indexTable + 6 * mainIdx);
-    /* Unsigned, as the format defines it. Read as signed this goes negative,
-     * the block walk below runs off the front of sizeTable, and `--block`
-     * underflows a uint32 into a four-billion-entry read. */
+
     litIdx += (int)read_le16(d->indexTable + 6 * mainIdx + 4);
 
     if (litIdx < 0)
@@ -893,7 +850,7 @@ static const uint8_t *decompress_pairs(const PairsData *d, size_t idx) {
     uint32_t sym;
 
     uint64_t code   = read_be64(ptr);
-    uint32_t bitCnt = 0; /* empty bits at the bottom of `code` */
+    uint32_t bitCnt = 0;
     ptr += 2;
 
     for (;;) {
@@ -927,8 +884,6 @@ static const uint8_t *decompress_pairs(const PairsData *d, size_t idx) {
 
     return &symPat[3 * sym];
 }
-
-/* ----------------------------------------------------------- table setup -- */
 
 static bool init_table(BaseEntry *be, const char *name, int type) {
     uint8_t *data = (uint8_t *)map_tb(name, TbSuffix[type], &be->mapping[type]);
@@ -1050,13 +1005,18 @@ static void hash_add(BaseEntry *be, uint64_t key) {
     TbHash[idx].ptr = be;
 }
 
-/* Piece letters strongest first: within a side the format always names the
- * strongest man first - KNPvK, never KPNvK. */
+/* Piece letters strongest first: within a side the format always names the strongest man
+ * first - KNPvK, never KPNvK. */
 static const char GenLetters[5] = {'Q', 'R', 'B', 'N', 'P'};
 static int GenW[6], GenB[6];
 
 static void init_tb(const char *name);
 
+/* Every endgame name, by brute force over both sides. Which SIDE the format names first
+ * is a rule this deliberately does not reproduce - it has enough exceptions (KBBvKQ, but
+ * KQvKP) that deriving it is a way to be subtly wrong for one table and never notice - so
+ * both orderings are offered and the filesystem settles it, for a few thousand failed
+ * opens once at load. */
 static void emit_name(int wn, int bn) {
     char name[16];
     size_t n = 0;
@@ -1073,16 +1033,6 @@ static void emit_name(int wn, int bn) {
     init_tb(name);
 }
 
-/*
- * Every endgame name, by brute force over both sides.
- *
- * Which SIDE the format names first is a rule this deliberately does not try
- * to reproduce - it is roughly "more men first, then by strength", with enough
- * exceptions (KBBvKQ, but KQvKP) that deriving it is a way to be subtly wrong
- * for one table and never notice. Both orderings are offered and the one whose
- * file exists is the one that registers, so the filesystem settles it. The
- * cost is a few thousand failed opens, once, at load.
- */
 static void gen_black(int wn, int bn, int i, int start) {
     if (i == bn) {
         emit_name(wn, bn);
@@ -1131,10 +1081,6 @@ static void init_tb(const char *name) {
     const uint64_t key2 = key_from_counts(pcs, true);
     const bool hasPawns = pcs[PAWN] || pcs[8 + PAWN];
 
-    /* Loudly, not quietly: a table that exists on disk and is refused here is
-     * a hole in the engine's endgame knowledge that nothing downstream would
-     * report. The caps are sized for TB_PIECES above, so this is unreachable
-     * unless that sizing is wrong. */
     BaseEntry *be;
     if (hasPawns) {
         if (NumPawnEntries >= TB_MAX_PAWN_TABLES) {
@@ -1198,21 +1144,12 @@ static void init_tb(const char *name) {
         hash_add(be, key2);
 }
 
-/* ---------------------------------------------------------------- probing -- */
-
-/*
- * The squares of every man, grouped in the piece order the table expects.
- * `flip` swaps the colours (the table may be stored from the other side's
- * point of view) and `mirror` reflects vertically for pawnful material.
- *
- * Reading our own bitboards here is the single largest difference from a
- * general-purpose prober: there is no second board representation to fill in
- * before a probe can start.
- */
+/* The squares of every man, grouped in the piece order the table expects. `flip` swaps the
+ * colours and `mirror` reflects vertically for pawnful material. Reading our own bitboards
+ * here is the largest difference from a general-purpose prober: there is no second board
+ * representation to fill in before a probe can start. */
 static int fill_squares(const Position *pos, const uint8_t *pc, bool flip, int mirror, int *p,
                         int i) {
-    /* The format codes a man as `type | colour << 3` with 1 = pawn, which is
-     * this engine's own layout - hence nothing is translated here. */
     Color c = (Color)((pc[i] >> 3) & 1);
     if (flip)
         c = c == WHITE ? BLACK : WHITE;
@@ -1225,17 +1162,12 @@ static int fill_squares(const Position *pos, const uint8_t *pc, bool flip, int m
     return i;
 }
 
-/*
- * The raw table lookup: WDL as -2..2, DTZ as a distance.
- *
- * `success` comes back 0 when the position cannot be probed at all, and -1
- * when a DTZ table stores only the other side's half - which the caller
- * answers by searching a ply and asking again.
- */
+/* The raw table lookup: WDL as -2..2, DTZ as a distance. `success` comes back 0 when the
+ * position cannot be probed at all, and -1 when a DTZ table stores only the other side's
+ * half - which the caller answers by searching a ply and asking again. */
 static int probe_table(const Position *pos, int s, int *success, int type) {
     const uint64_t key = material_key(pos, false);
 
-    /* Bare kings are not a table, and are drawn. */
     if (type == TB_WDL && key == 0)
         return 0;
 
@@ -1258,19 +1190,16 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
         return 0;
     }
 
-    /* Mapped on first use rather than at startup: a generation touches a
-     * handful of endgames, and mapping all 290 would be address space spent on
-     * tables nobody asks for. */
+    /* Mapped on first use rather than at startup: a generation touches a handful of
+     * endgames, and mapping all 290 would be address space spent on tables nobody asks
+     * for. */
     if (!be->ready[type]) {
         char name[16];
         table_name(pos, name, be->key != key);
         if (!init_table(be, name, type)) {
-            /*
-             * Every other rejection in this file names itself; this one used
-             * to be the exception, and a table that silently answers "not
-             * probable" forever is indistinguishable from one that is simply
-             * absent. `failed` latches, so this prints once per endgame.
-             */
+            /* Named rather than silent: a table that answers "not probable" forever is
+             * indistinguishable from one that is simply absent. `failed` latches, so this
+             * prints once per endgame. */
             printf("info string syzygy: %s%s is unusable and will not be probed again\n", name,
                    TbSuffix[type]);
             fflush(stdout);
@@ -1291,8 +1220,9 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
     }
 
     EncInfo *ei = first_ei(be, type);
-    /* Zeroed because fill_squares only writes the men this table has, and the
-     * compiler cannot see that encode reads exactly those. Seven ints. */
+
+    /* Zeroed because fill_squares only writes the men this table has, and the compiler
+     * cannot see that encode reads exactly those. Seven ints. */
     int p[TB_PIECES] = {0};
     size_t idx;
     int t         = 0;
@@ -1349,10 +1279,8 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
     return v;
 }
 
-/* ----------------------------------------------------- capture resolution -- */
-
-/* A capture in the format's sense: the destination is occupied, or it is an en
- * passant capture. A promotion counts only when it takes something. */
+/* A capture in the format's sense: the destination is occupied, or it is en passant. A
+ * promotion counts only when it takes something. */
 static inline bool is_capture_move(const Position *pos, Move m) {
     return piece_on(pos, to_sq(m)) != NO_PIECE || type_of_move(m) == MT_EN_PASSANT;
 }
@@ -1366,21 +1294,9 @@ static bool has_legal_move(Position *pos) {
     return false;
 }
 
-/*
- * Every capture, resolved down to a position a table actually holds.
- *
- * A WDL table only stores positions with the fifty-move counter at zero, so a
- * position with captures available is not in any table: its value is the best
- * of its captures against the table value of the position with none. That is
- * why a WDL "probe" is a small search rather than a lookup.
- */
 static int probe_ab(Position *pos, int alpha, int beta, int *success) {
     ScoredMove list[MAX_MOVES];
-    /* GEN_CAPTURES, not GEN_ALL: this loop wants captures and throws every
-     * quiet move away, and generating them was a quarter of the probe. The
-     * set is exactly right - it holds every capture including capturing
-     * underpromotions, plus quiet queen promotions that the filter below
-     * drops. In check the evasion set is the only safe one, and it is small. */
+
     const int count =
         movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_CAPTURES, list);
 
@@ -1407,18 +1323,22 @@ static int probe_ab(Position *pos, int alpha, int beta, int *success) {
 }
 
 /*
- * WDL from the side to move: -2 loss, -1 cursed loss, 0 draw, 1 cursed win,
- * 2 win. `*success` comes back 2 when a capture forces the value, which
- * probe_dtz needs in order to know the distance without another table read.
+ * WDL from the side to move: -2 loss, -1 cursed loss, 0 draw, 1 cursed win, 2 win.
+ * `*success` comes back 2 when a capture forces the value, which probe_dtz needs in order
+ * to know the distance without another table read.
  *
- * En passant is the awkward case throughout: the tables know nothing of it, so
- * an ep capture's value has to be weighed against the position as the table
- * sees it, and the stalemate branch at the end is where the two genuinely
- * disagree.
+ * A WDL table only stores positions with the fifty-move counter at zero, so a position
+ * with captures available is not in any table: its value is the best of its captures
+ * against the table value of the position with none. That is why a "probe" is a small
+ * search rather than a lookup.
  */
 static int probe_wdl_captures(Position *pos, int *success) {
     *success = 1;
 
+    /* GEN_CAPTURES, not GEN_ALL: generating the quiet moves was a quarter of the probe. The
+     * set is exactly right - every capture including capturing underpromotions, plus quiet
+     * queen promotions the filter below drops - and in check the evasion set is the only
+     * safe one. */
     ScoredMove list[MAX_MOVES];
     const int count =
         movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_CAPTURES, list);
@@ -1465,13 +1385,12 @@ static int probe_wdl_captures(Position *pos, int *success) {
         return bestCap;
     }
 
-    /* The table said draw, but it was asked about the position WITHOUT en
-     * passant rights. If that position is stalemate and an ep capture exists,
-     * the ep capture is the only move and its value is the position's. */
+    /* The table said draw, but it was asked about the position WITHOUT en passant rights. If
+     * that position is stalemate and an ep capture exists, the ep capture is the only move
+     * and its value is the position's. */
     if (bestEp > -3 && v == 0) {
-        /* Regenerated in full, deliberately: this asks whether the position is
-         * STALEMATE but for the en passant capture, and the list above holds
-         * only captures. Reusing it would call every quiet position stalemate. */
+        /* Regenerated in full, deliberately: the list above holds only captures, and reusing
+         * it would call every quiet position stalemate. */
         ScoredMove all[MAX_MOVES];
         const int n = movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_ALL, all);
 
@@ -1488,12 +1407,9 @@ static int probe_wdl_captures(Position *pos, int *success) {
     return v;
 }
 
-/*
- * DTZ from the side to move, in the format's units: 0 draw, 1..100 a win in n
- * plies from a zero counter, over 100 a win the fifty-move rule takes away,
- * and the mirror for losses. May be off by one, which is why the root compares
- * distances rather than trusting one.
- */
+/* DTZ from the side to move, in the format's units: 0 draw, 1..100 a win in n plies from a
+ * zero counter, over 100 a win the fifty-move rule takes away, and the mirror for losses.
+ * May be off by one, which is why the root compares distances rather than trusting one. */
 static int probe_dtz(Position *pos, int *success) {
     const int wdl = probe_wdl_captures(pos, success);
     if (*success == 0 || wdl == 0)
@@ -1506,9 +1422,9 @@ static int probe_dtz(Position *pos, int *success) {
     ScoredMove list[MAX_MOVES];
     int count = 0;
 
+    /* A pawn move zeroes the counter, so if one holds the win the distance is one ply and no
+     * DTZ read is needed at all. */
     if (wdl > 0) {
-        /* A pawn move zeroes the counter, so if one holds the win the distance
-         * is one ply and no DTZ read is needed at all. */
         count = movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_ALL, list);
         for (int i = 0; i < count; ++i) {
             const Move m = list[i].m;
@@ -1531,35 +1447,34 @@ static int probe_dtz(Position *pos, int *success) {
     if (*success >= 0)
         return WdlToDtz[wdl + 2] + ((wdl > 0) ? dtz : -dtz);
 
-    /* The table holds only the other side's half, so the distance has to come
-     * from searching one ply and asking again. */
+    /* The table holds only the other side's half, so the distance has to come from searching
+     * one ply and asking again. The losing seed is already a losing capture or pawn move;
+     * captures and pawn moves zero the counter and are accounted for either way. */
     int best;
     if (wdl > 0) {
         best = INT32_MAX;
     } else {
-        /* The worst case is already a losing capture or pawn move, which is
-         * what this seeds; in a mate it leaves -1. */
         best  = WdlToDtz[wdl + 2];
         count = movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_ALL, list);
     }
 
     for (int i = 0; i < count; ++i) {
         const Move m = list[i].m;
-        /* Captures and pawn moves zero the counter and are already accounted
-         * for - by the scan above when winning, by `best` when losing. */
+
         if (is_capture_move(pos, m) || type_of(piece_on(pos, from_sq(m))) == PAWN ||
             !movegen_is_legal(pos, m))
             continue;
 
         board_do_move(pos, m);
         const int v = -probe_dtz(pos, success);
-        /* Mate in one is distance one, not the zero a drawn child would say. */
+
         const bool childMated = (v == 1) && board_checkers(pos) != BB_EMPTY && !has_legal_move(pos);
         board_undo_move(pos, m);
 
         if (*success == 0)
             return 0;
 
+        /* Mate in one is distance one, not the zero a drawn child would say. */
         if (childMated)
             best = 1;
         else if (wdl > 0) {
@@ -1571,14 +1486,10 @@ static int probe_dtz(Position *pos, int *success) {
         }
     }
 
-    /*
-     * The winning seed is INT32_MAX, and every path that should replace it
-     * needs a quiet non-pawn move that preserves the win. That move must exist
-     * for a genuine win whose distance did not already come from the capture
-     * or pawn scan above - but "must" is an argument, not a check, and the
-     * caller does `dtz + halfmoveClock`, which overflows on the sentinel and
-     * reports a proven win for an undetermined position. Decline instead.
-     */
+    /* Every path that should replace the winning seed needs a quiet non-pawn move that
+     * preserves the win, and that move must exist for a genuine win - but "must" is an
+     * argument, not a check, and the caller does `dtz + halfmoveClock`, which overflows on
+     * the sentinel and reports a proven win for an undetermined position. Decline instead. */
     if (best == INT32_MAX) {
         *success = 0;
         return 0;
@@ -1587,16 +1498,13 @@ static int probe_dtz(Position *pos, int *success) {
     return best;
 }
 
-/* ------------------------------------------------------------ public API -- */
-
 bool syzygy_init(const char *path) {
     syzygy_free();
 
     if (path == NULL || *path == '\0')
         return false;
 
-    /* Split once and held: open_tb walks this list for every name it looks
-     * for. */
+    /* Split once and held: open_tb walks this list for every name it looks for. */
     snprintf(PathBuffer, sizeof(PathBuffer), "%s", path);
 #if defined(_WIN32)
     const char sep = ';';
@@ -1626,15 +1534,6 @@ bool syzygy_init(const char *path) {
     }
     memset(TbHash, 0, sizeof(TbHash));
 
-    /*
-     * Up to seven men, which is every table the format defines. A name whose
-     * file is absent simply does not register.
-     *
-     * Six men and up only on a 64-bit size_t: `encode`'s index products
-     * overflow 32 bits from six men onward, and the result is not a failure but
-     * a wrong index into a valid table - a plausible answer for the wrong
-     * position. Fathom refuses the same way and for the same reason.
-     */
     const int menLimit = sizeof(size_t) >= 8 ? 5 : 3;
     for (int extra = 1; extra <= menLimit; ++extra)
         for (int wn = 0; wn <= extra; ++wn)
@@ -1677,15 +1576,10 @@ void syzygy_free(void) {
 
 int syzygy_max_pieces(void) { return MaxPieces; }
 
-/*
- * Probing makes moves on the caller's position and takes them back rather than
- * working on a copy: a Position carries its whole repetition history and runs
- * to tens of kilobytes, so copying one per probe would cost far more than the
- * lookup it protects. The board is restored exactly.
- */
+/* Probing makes moves on the caller's position rather than on a copy, because a Position
+ * runs to tens of kilobytes. Capture resolution recurses at most once per man and probe_dtz
+ * adds a quiet ply, so this refuses rather than run off the end of the history. */
 static bool probe_guard(const Position *pos) {
-    /* Capture resolution recurses at most once per man and probe_dtz adds a
-     * quiet ply on top; refuse rather than run off the end of the history. */
     return MaxPieces != 0 && pos->castling == NO_CASTLING &&
            pos->gamePly + TB_PIECES + 2 < MAX_GAME_PLY && popcount(occupied_bb(pos)) <= MaxPieces;
 }
@@ -1699,8 +1593,8 @@ Value syzygy_probe_wdl(Position *pos, int ply) {
     if (!success)
         return VALUE_NONE;
 
-    /* Cursed wins and blessed losses are draws under the fifty-move rule,
-     * which this engine plays by. */
+    /* Cursed wins and blessed losses are draws under the fifty-move rule, which this engine
+     * plays by. */
     if (wdl > 1)
         return VALUE_TB_WIN - ply;
     if (wdl < -1)
@@ -1723,9 +1617,8 @@ SyzygyRoot syzygy_probe_root(Position *pos) {
 
     out.dtz = dtz;
 
-    /* The fifty-move-aware result: a win whose distance plus the counter
-     * already on the board runs past 100 is drawn, however won the table says
-     * it is. */
+    /* The fifty-move-aware result: a win whose distance plus the counter already on the
+     * board runs past 100 is drawn, however won the table says it is. */
     const int clock = pos->halfmoveClock;
     if (dtz > 0)
         out.value = (dtz + clock <= 100) ? VALUE_TB_WIN : VALUE_DRAW;
@@ -1734,14 +1627,12 @@ SyzygyRoot syzygy_probe_root(Position *pos) {
     else
         out.value = VALUE_DRAW;
 
-    /*
-     * The move: among the legal ones, the child that keeps the result and is
-     * nearest to zeroing. Taken from the generator's own list, so nothing the
-     * generator did not produce can ever reach the board.
-     */
     ScoredMove list[MAX_MOVES];
     const int count = movegen_generate(board, board_checkers(board) ? GEN_EVASIONS : GEN_ALL, list);
 
+    /* The move: among the legal ones, the child that keeps the result and is nearest to
+     * zeroing, taken from the generator's own list so nothing it did not produce can reach
+     * the board. */
     int bestOutcome = -2, bestTiebreak = 0;
     for (int i = 0; i < count; ++i) {
         const Move m = list[i].m;
@@ -1759,31 +1650,25 @@ SyzygyRoot syzygy_probe_root(Position *pos) {
         if (!childOk)
             continue;
 
-        /* A zeroing move restarts the fifty-move clock, so its distance is
-         * measured from zero; anything else inherits the clock. */
+        /* A zeroing move restarts the fifty-move clock, so its distance is measured from
+         * zero; anything else inherits the clock. */
         const int childClock = zeroing ? 0 : clock + 1;
 
         /*
-         * Rank by OUTCOME first and distance second, both from the root
-         * mover's point of view.
+         * Rank by OUTCOME first and distance second, both from the root mover's point of
+         * view. Outcome first is what makes this safe: ranking on distance alone needs every
+         * branch's sign convention to be right, and an earlier version had one backwards - it
+         * degenerated to "play the first legal move", which search.c cannot correct because
+         * it cuts the root list down to whatever is chosen here.
          *
-         * Outcome first is what makes this safe. Ranking on distance alone
-         * needs every branch's sign convention to be right, and an earlier
-         * version of this loop got one of them backwards - it rejected our own
-         * winning moves in a drawn position and never rejected a losing one,
-         * which degenerated to "play the first legal move" and could throw the
-         * game away. search.c cuts the root list down to whatever is chosen
-         * here, so nothing downstream can correct it.
-         *
-         * The fifty-move rule is applied here rather than to the raw distance:
-         * a win too far away to claim is a draw, and a loss too far away is a
-         * draw too, which is exactly the resource a lost position plays for.
+         * The fifty-move rule is applied here rather than to the raw distance: a win too far
+         * away to claim is a draw, and so is a loss too far away, which is exactly the
+         * resource a lost position plays for. Then shortest win, longest resistance.
          */
         const int childOutcome = (childDtz > 0 && childDtz + childClock <= 100)    ? 1
                                  : (childDtz < 0 && -childDtz + childClock <= 100) ? -1
                                                                                    : 0;
 
-        /* Shortest win, longest resistance; irrelevant for a draw. */
         const int tiebreak = childOutcome > 0 ? -childDtz : childOutcome < 0 ? -childDtz : 0;
 
         if (out.move == MOVE_NONE || childOutcome > bestOutcome ||
