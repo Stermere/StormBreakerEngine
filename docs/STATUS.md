@@ -61,7 +61,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
 | **Self-play data generation with deliberate variation** | **TODO** |
 | **gen-5 data generated with tablebases and no adjudication** | **TODO** |
-| **Lazy SMP (`Threads` is capped at 1)** | **TODO** |
+| Lazy SMP: per-thread state, parked pool, `Threads` 1–1024, Windows processor groups | built, **scaling measured, no SPRT** |
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
@@ -185,11 +185,45 @@ The open work, roughly in order of Elo per unit of effort:
    all STC-only, and the ~3300 blitz claim is provisional on the same
    grounds. A 40+0.4 SPRT (or the 40+0.4 gauntlet) retires the debt.
 
-5. **Lazy SMP.** `Threads` is capped at 1. The ordering tables in `search.c`
-   and the accumulator stack in `src/nnue.c` are file-scope and must move into
-   a per-thread block first. Worth nothing in a single-threaded SPRT and worth
-   a great deal to anyone actually playing the engine — and it makes every
-   future data generation run cheaper.
+5. **Lazy SMP follow-ups.** The pool is built and scales (see the table
+   below); what is not settled is how it is *steered*. Three things, each its
+   own measurement and none of them measurable by a single-threaded SPRT:
+
+   - **How the pool's result is chosen.** `best_thread()` takes the deepest
+     completed iteration, breaking ties on score. Stockfish weighs votes across
+     threads instead, which protects against one thread's single deep fluke.
+     Swapping one for the other is a change with its own test — an equal-threads
+     SPRT of the engine against itself, not a bench.
+   - **The skip schedule.** The helpers sit out iterations on the fixed pattern
+     Stockfish used for years. It is known to work; it was not fitted here, and
+     nothing says the shape that suits this engine's aspiration windows and
+     reductions is that one.
+   - **Whether the eight quiet threads want the same margins as one.** Every
+     pruning constant in `search.c` was fitted by SPSA at one thread. A pool
+     that reaches a given depth six times faster is a different search, and the
+     margins have never been asked about it.
+
+   Throughput scaling, measured on a 16-logical-processor machine over three
+   positions at `go movetime 3000`, 256 MB hash, two runs agreeing within 4%:
+
+   | Threads | nps | vs 1 thread |
+   |---|---|---|
+   | 1 | 285k | 1.0x |
+   | 2 | 560k | 2.0x |
+   | 4 | 1.04M | 3.6x |
+   | 8 | 1.90M | 6.7x |
+   | 16 | 2.80M | 9.8x |
+
+   **That table is nps and nps is not Elo.** It says the pool is not contending
+   on anything, which is the thing a threading implementation can be wrong
+   about; it says nothing about strength. Lazy SMP's speedup in *time to depth*
+   is always far below its speedup in nodes, because much of the extra work is
+   threads re-deriving cutoffs another thread already found - and time to depth
+   is itself so noisy here (three positions, 800 ms to 5.8 s for the same depth
+   at the same thread count between two runs) that it is not worth quoting at
+   this sample size. The number that would settle it is a thread-count
+   gauntlet - the same binary at 1 thread against itself at N, at a fixed time
+   control - and nobody has run one.
 
 6. **Staged move generation**, in the three steps the status table breaks it
    into, each with its own SPRT — after reading the notes above.

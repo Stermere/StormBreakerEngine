@@ -8,7 +8,8 @@ A UCI chess engine in **C** (C17), built for competitive strength.
 
 Scaffolding, move generation, make/unmake, search and evaluation are all
 complete and verified. The search is a PVS with a transposition table, null
-move, LMR, singular extensions, SEE pruning and history heuristics. Chess960 is
+move, LMR, singular extensions, SEE pruning and history heuristics, run on a
+Lazy SMP thread pool that scales past 128 cores. Chess960 is
 supported in full — castling geometry is derived per position, so both variants
 share one generator — though nothing in the *evaluation* has been tuned for it. The
 classical evaluation is a 13,684-parameter linear model — material, piece-square tables,
@@ -20,8 +21,8 @@ quantises it, `src/nnue.c` runs it bit-exactly against the Python reference, and
 `make` builds it. It became the default on the strength of E11 (+238.05 ± 35.48
 Elo at STC), which is Task 4's gate in docs/NNUE.md. The classical model is not
 retired by that: `make classical` still builds it, it needs no net, and it is
-what `tools/tuner.c` fits. What remains is ablating the eval batch, Lazy SMP,
-and NNUE Task 5 — see the status table in docs/STATUS.md.
+what `tools/tuner.c` fits. What remains is ablating the eval batch and NNUE
+Task 5 — see the status table in docs/STATUS.md.
 
 ## Build and test
 
@@ -45,6 +46,7 @@ make trainer-test       # the trainer's pytest suite
 make syzygy-fetch       # 3-4-5-man tablebases (~939 MB into external/)
 make syzygy-test        # known endgames, plus the sealed probe manifest
 
+make smp-test           # the parallel-search checks a node count cannot make
 make chess960-test      # the Chess960 checks a node count cannot make
 make chess960-campaign  # differential perft vs ORACLE= (default stockfish)
 ```
@@ -74,7 +76,9 @@ is worse than a bug — it makes every subsequent result untrustworthy.
 
 1. **Bench must stay deterministic.** Identical node counts across runs and
    machines. Never seed Zobrist keys from `time()`, `rand()`, or any entropy
-   source. Never let thread count or hash size affect the count.
+   source. Never let thread count or hash size affect the count — `bench_run()`
+   pins both, because a parallel search reaches the shared table in whatever
+   order the scheduler produces and its node count is reproducible nowhere.
 
 2. **Bench must keep printing `<nodes> nodes <nps> nps`** as its final line.
    OpenBench parses exactly that.
@@ -95,8 +99,9 @@ is worse than a bug — it makes every subsequent result untrustworthy.
    be stale or collided; playing one unchecked corrupts the board.
 
 7. **`search_clear()` must reset everything that carries between searches** —
-   transposition table, history, killers. Otherwise results depend on what was
-   searched before, and reproducibility is gone.
+   transposition table, history, killers, and *every thread's* copy of them.
+   Otherwise results depend on what was searched before, and reproducibility is
+   gone.
 
 8. **A net is described by its own file, and every rejection names the field.**
    `src/nnue.c` reads the architecture out of the net's header rather than from
@@ -121,6 +126,17 @@ is worse than a bug — it makes every subsequent result untrustworthy.
     nonlinear by design, and `eval_classical()` stays reachable by name in every
     build precisely so the tuner keeps fitting the model it thinks it is.
 
+11. **Only the transposition table is shared between search threads.** Every
+    ordering heuristic, the correction history, the PV table, the search stack
+    and the NNUE accumulator stack are per-thread — in `SearchThread`, and in
+    nnue.c's thread-local stack. A shared history table is not merely a race: it
+    is two searches averaging their opinions into a table neither can then
+    trust, and the ordering that comes out is worse than either thread's alone.
+    The table is the exception because its entries are self-describing and
+    because invariant 6 validates every move that comes out of one. Anything
+    new that a node WRITES belongs in `SearchThread`; put it at file scope and
+    it will work perfectly at `Threads 1` and quietly lose Elo above it.
+
 ## Testing discipline
 
 Read [docs/TESTING.md](docs/TESTING.md) for the method and
@@ -131,6 +147,10 @@ record every new result there. The short version:
   exactly. Not "close" — exactly. That includes the two Chess960 suites: the
   castling geometry is one code path for both variants, so a standard-chess
   change can break Chess960 and the reverse.
+- **Anything a search thread writes to**: must pass `make smp-test`. A node
+  count says nothing about the pool - bench pins one thread - so the gate is
+  that the helpers really search and that a single-threaded search afterwards
+  still reproduces its own node counts to the node.
 - **Pure speedups**: bench node count must be *unchanged*. If it changed, the
   change is behavioural and needs an SPRT.
 - **Behavioural changes** (search, eval, time management): require a passing
@@ -168,7 +188,7 @@ correct response is to implement movegen, not to relax the check.
 | Path | Contents |
 |---|---|
 | `src/` | engine sources — flat, and everything here can run during a game |
-| `src/test/` | acceptance gates compiled into the engine but never reached while playing: `chess960 selftest`, `syzygy verify`, `syzygy manifest`. In the binary on purpose, so `make chess960-test` and `make syzygy-test` cannot gate a different build than the one that plays |
+| `src/test/` | acceptance gates compiled into the engine but never reached while playing: `chess960 selftest`, `smp selftest`, `syzygy verify`, `syzygy manifest`. In the binary on purpose, so `make chess960-test` and `make syzygy-test` cannot gate a different build than the one that plays |
 | `tests/perft/` | correctness suites (EPD) — data, no code |
 | `tests/syzygy/` | the sealed probe manifest — data, no code |
 | `tools/` | SPRT, SPSA tuning, gauntlet, baselines (Python, stdlib only). Setup, GUI launch and engine registration stay PowerShell - they are Windows integration. Invoke the Python ones through `make sprt` / `make tune` / `make gauntlet` / `make snapshot`, never by naming an interpreter |

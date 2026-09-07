@@ -58,6 +58,11 @@ int main(int argc, char **argv) {
         uci_loop();
     }
 
+    /* Before tt_free(): a pooled thread that is still parked has a raw pointer to the
+     * table, and the search it is parked between could in principle be woken by nothing
+     * at all - but the ordering costs nothing and the reverse is a use-after-free. */
+    search_exit();
+
     syzygy_free();
     tt_free();
     return uci_exit_code();

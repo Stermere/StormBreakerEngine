@@ -253,7 +253,8 @@ This repository already satisfies the compliance requirements:
 - `make EXE=<name>` produces exactly `<name>`, and `CC=` is honoured
 - `./<binary> bench` prints `<nodes> nodes <nps> nps`
 - `Hash` and `Threads` UCI options are exposed
-- bench node counts are deterministic (fixed-seed Zobrist keys)
+- bench node counts are deterministic (fixed-seed Zobrist keys, and `bench`
+  pins one thread whatever `Threads` says)
 
 `make openbench-check` verifies all four. Keep it passing.
 

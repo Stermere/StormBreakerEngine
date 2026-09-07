@@ -18,6 +18,7 @@
  */
 #include "syzygy.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 
 #include "bitboard.h"
 #include "movegen.h"
+#include "thread.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -441,13 +443,20 @@ typedef struct {
     uint64_t key;
     uint8_t *data[2];
     TbMap mapping[2];
-    bool ready[2];
+
+    /*
+     * Atomic because every searching thread probes, and the mapping below happens on
+     * first use. `ready` is released after the table is fully parsed and acquired before
+     * anything is read out of it, which is what makes the rest of this struct - and the
+     * mapped pages it points at - safe to read without a lock.
+     */
+    atomic_bool ready[2];
 
     /* Latched when init_table() rejects this table, so a corrupt file is mapped and parsed
      * once rather than on every probe. It lives here rather than on the hash slot because
      * hash_add() gives an endgame TWO slots, and a marker on one would leave the other able
      * to re-enter init_table and leak the first mapping. */
-    bool failed[2];
+    atomic_bool failed[2];
     uint8_t num;
     bool symmetric, hasPawns, hasDtz;
     union {
@@ -479,6 +488,13 @@ typedef struct {
 
 static PieceEntry *PieceEntries;
 static PawnEntry *PawnEntries;
+
+/* Guards the lazy mapping in probe_table(), and nothing else. Initialised on the first
+ * syzygy_init() and never destroyed: a search thread parked between searches must be able
+ * to probe the moment the next one starts, and a mutex that outlives the tables costs one
+ * static object. */
+static Mutex TbInitMutex;
+static bool TbInitMutexReady;
 static HashEntry TbHash[1 << TB_HASHBITS];
 static int NumPieceEntries, NumPawnEntries;
 static int NumWdl, NumDtz;
@@ -1109,12 +1125,12 @@ static void init_tb(const char *name) {
     for (int i = 0; i < 16; ++i)
         be->num = (uint8_t)(be->num + pcs[i]);
 
-    be->ready[TB_WDL]  = false;
-    be->ready[TB_DTZ]  = false;
-    be->failed[TB_WDL] = false;
-    be->failed[TB_DTZ] = false;
-    be->data[TB_WDL]   = NULL;
-    be->data[TB_DTZ]   = NULL;
+    atomic_store(&be->ready[TB_WDL], false);
+    atomic_store(&be->ready[TB_DTZ], false);
+    atomic_store(&be->failed[TB_WDL], false);
+    atomic_store(&be->failed[TB_DTZ], false);
+    be->data[TB_WDL] = NULL;
+    be->data[TB_DTZ] = NULL;
 
     ++NumWdl;
     be->hasDtz = table_present(name, TbSuffix[TB_DTZ]);
@@ -1180,7 +1196,7 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
     }
 
     BaseEntry *be = TbHash[hashIdx].ptr;
-    if (be->failed[type]) {
+    if (atomic_load_explicit(&be->failed[type], memory_order_relaxed)) {
         *success = 0;
         return 0;
     }
@@ -1190,24 +1206,47 @@ static int probe_table(const Position *pos, int s, int *success, int type) {
         return 0;
     }
 
-    /* Mapped on first use rather than at startup: a generation touches a handful of
+    /*
+     * Mapped on first use rather than at startup: a generation touches a handful of
      * endgames, and mapping all 290 would be address space spent on tables nobody asks
-     * for. */
-    if (!be->ready[type]) {
-        char name[16];
-        table_name(pos, name, be->key != key);
-        if (!init_table(be, name, type)) {
-            /* Named rather than silent: a table that answers "not probable" forever is
-             * indistinguishable from one that is simply absent. `failed` latches, so this
-             * prints once per endgame. */
-            printf("info string syzygy: %s%s is unusable and will not be probed again\n", name,
-                   TbSuffix[type]);
-            fflush(stdout);
-            be->failed[type] = true;
-            *success         = 0;
+     * for.
+     *
+     * Which makes this the one place in the prober that several searching threads can
+     * WRITE, so it takes a lock. Two threads that both found the table unmapped would
+     * otherwise both map it - one mapping leaked, and worse, the loser reading a half
+     * parsed table through the pointers the winner is still filling in. The lock is
+     * outside the fast path by construction: it is taken once per endgame per run,
+     * never on a probe of a table already mapped.
+     */
+    if (!atomic_load_explicit(&be->ready[type], memory_order_acquire)) {
+        mutex_lock(&TbInitMutex);
+
+        /* Re-checked under the lock: the thread that waited for it is very often waiting
+         * for the very table it wanted. */
+        if (!atomic_load_explicit(&be->ready[type], memory_order_relaxed) &&
+            !atomic_load_explicit(&be->failed[type], memory_order_relaxed)) {
+            char name[16];
+            table_name(pos, name, be->key != key);
+
+            if (init_table(be, name, type)) {
+                atomic_store_explicit(&be->ready[type], true, memory_order_release);
+            } else {
+                /* Named rather than silent: a table that answers "not probable" forever is
+                 * indistinguishable from one that is simply absent. `failed` latches, so this
+                 * prints once per endgame. */
+                printf("info string syzygy: %s%s is unusable and will not be probed again\n", name,
+                       TbSuffix[type]);
+                fflush(stdout);
+                atomic_store_explicit(&be->failed[type], true, memory_order_relaxed);
+            }
+        }
+
+        mutex_unlock(&TbInitMutex);
+
+        if (!atomic_load_explicit(&be->ready[type], memory_order_acquire)) {
+            *success = 0;
             return 0;
         }
-        be->ready[type] = true;
     }
 
     bool bside, flip;
@@ -1499,6 +1538,11 @@ static int probe_dtz(Position *pos, int *success) {
 }
 
 bool syzygy_init(const char *path) {
+    if (!TbInitMutexReady) {
+        mutex_init(&TbInitMutex);
+        TbInitMutexReady = true;
+    }
+
     syzygy_free();
 
     if (path == NULL || *path == '\0')

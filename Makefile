@@ -18,6 +18,7 @@
 #    make debug           unoptimised + assertions (+ sanitizers on POSIX)
 #    make bench           build, then run the deterministic node-count benchmark
 #    make perft           build, then run the perft correctness suite
+#    make smp-test        build, then run the parallel-search gate
 #    make release         build every distributable ARCH into ./build/
 #    make clean
 #
@@ -258,7 +259,8 @@ endif
         tuner datagen datagen-test trainer-setup trainer-test sprt tune gauntlet \
         ratings snapshot \
         classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
-        syzygy-fetch syzygy-test chess960-test chess960-campaign unc-probe
+        syzygy-fetch syzygy-test chess960-test chess960-campaign unc-probe \
+        smp-test
 
 all: $(TARGET)
 
@@ -375,6 +377,13 @@ unc-probe: CFLAGS += -DUNC_PROBE
 unc-probe: $(EVALDEP)
 	$(CC) $(CFLAGS) $(SOURCES) -o $(EXE)-uncprobe$(SUFFIX) $(LDFLAGS)
 	./$(EXE)-uncprobe$(SUFFIX) probe unc $(PROBE_DEPTH) $(PROBE_ARGS)
+
+# The parallel-search gate. Bench pins one thread by design, so nothing it
+# measures says whether the pool starts, whether the helpers search, or whether a
+# session that used them can still be measured afterwards. THREADS= caps it; the
+# default is what the machine reports.
+smp-test: $(TARGET)
+	./$(TARGET) smp selftest $(THREADS)
 
 chess960-test: $(TARGET)
 	./$(TARGET) chess960 selftest
@@ -792,6 +801,7 @@ help:
 	@echo "make syzygy-fetch       download the 3-4-5-man Syzygy tablebases (~939 MB)"
 	@echo "make syzygy-test        probe known endgames against the fetched tables"
 	@echo "make unc-probe          build a probe binary; measure what unc_scale() reads"
+	@echo "make smp-test           parallel-search gate (THREADS= caps the pool)"
 	@echo "make chess960-test      Chess960 structural gate + its perft suites"
 	@echo "make chess960-campaign  differential perft vs ORACLE= (default stockfish)"
 	@echo "make net-publish        upload EVALFILE as a content-addressed release"

@@ -109,6 +109,14 @@ jobs:
           ./stormbreaker-debug perft suite tests/perft/standard.epd 4
           ./stormbreaker-debug perft suite tests/perft/tricky.epd
 
+      # The parallel search is where a sanitizer earns the most: a debug build
+      # also asserts the NNUE accumulator against a full recomputation at every
+      # evaluation, which is the check that catches a per-thread stack that has
+      # drifted. Four threads because a hosted runner has two cores and the
+      # point is concurrency, not throughput.
+      - name: Run the parallel-search gate under sanitizers
+        run: ./stormbreaker-debug smp selftest 4
+
   # The correctness gate for move generation, and the most important job in this
   # file: a wrong perft count means the engine plays or accepts illegal moves,
   # which forfeits tournament games and makes every Elo measurement noise.
@@ -123,6 +131,12 @@ jobs:
 
       - name: Perft suites
         run: make perft
+
+      # Bench pins one thread by design, so nothing else in this file says
+      # whether the thread pool starts, whether its helpers search, or whether a
+      # session that used them can still be measured afterwards.
+      - name: Parallel-search gate
+        run: make smp-test THREADS=4
 
   # The NNUE data pipeline's acceptance gate (docs/NNUE.md, Task 1) and the
   # trainer's test suite. Both are seconds, and both guard failures that have

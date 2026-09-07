@@ -118,19 +118,36 @@ a Chess960 position for the same reason.
 
 ## Threading
 
-`search_start()` hands the search to a worker thread and returns immediately;
-the main thread goes straight back to reading stdin.
+`search_start()` hands the search to a pool of worker threads and returns
+immediately; the main thread goes straight back to reading stdin.
 
 This allows the main thread to process `stop` and `ponderhit` while a search is
 running, which is required for correct UCI time control and pondering.
+
+The pool is created when `Threads` is set and **parked** between searches, on one
+mutex and one condition variable. That is not premature: each thread carries a
+little over 8 MB of history tables and accumulator stack, so creating them per `go`
+and faulting the memory back in would cost more than a whole move at blitz. The
+handshake is worth stating precisely, because the obvious version of it is
+wrong — whoever *starts* a search marks each thread busy, and each thread clears
+its own flag when it is done. A thread that marked itself busy on waking would
+leave a window in which the starter has already returned and a waiter sees an
+idle pool that has not begun, which is not a theoretical race: it makes `bench`
+read a node count of zero and start the next position on top of the last one.
 
 `thread.c` is a thin shim over Win32 threads and pthreads. C11 `<threads.h>` is
 deliberately avoided: MinGW-w64 does not ship it, and depending on winpthreads
 would mean shipping an extra DLL.
 
-The worker also honours a subtle protocol rule: during a ponder or an infinite
+Thread 0 also honours a subtle protocol rule: during a ponder or an infinite
 search it must **not** send `bestmove` until the GUI sends `stop` or
-`ponderhit`. Replying early desynchronises the GUI.
+`ponderhit`. Replying early desynchronises the GUI. The ordering around that
+hold is load-bearing — the flag that ends the hold is the same flag that stops
+the helper threads, so the helpers keep searching *through* it and are stopped
+only once the hold has been released.
+
+What each thread searches, and why more of them helps at all, is under
+[Parallel search](#parallel-search) below.
 
 ---
 
@@ -164,16 +181,68 @@ capture, so positions that differ by an unusable ep right share an entry.
 
 What is left is structural rather than incremental:
 
-- **The search is single-threaded.** `Threads` is advertised as `min 1 max 1`
-  and rejects anything else. Lazy SMP is the standard answer and needs the
-  ordering tables, which are currently file-scope, moved into a per-thread
-  block first.
+- **Lazy SMP has no work sharing beyond the table.** `Threads` runs N searches
+  of the same tree, and what they share is the transposition table and nothing
+  else (see below). That is the standard design and it scales, but the helpers
+  are steered only by a fixed skip pattern; which iterations they should be
+  given, and how the pool's results should be combined, are open questions with
+  measurable answers.
 - **Move generation is not staged.** Every node generates its whole move list
   and scores all of it, including at nodes where the transposition move cuts
   immediately. A staged picker — table move, then captures, then quiets,
   generated only when reached — avoids that work.
 - **No correction history.** Nothing feeds the difference between the static
   evaluation and the searched score back into later static evaluations.
+
+---
+
+## Parallel search
+
+`Threads` runs Lazy SMP: N threads search the whole tree from the same root, and
+the only structure they share is the transposition table. There is no splitting
+of work and no communication between threads beyond it.
+
+That sounds like it should not help, and the reason it does is the table. A
+thread that refutes a line writes the refutation where every other thread will
+find it, so the second thread to reach that subtree does not search it — the
+speedup is in the cutoffs the pool discovers for each other, not in dividing the
+work up. It follows that the threads have to be looking at *different* things,
+which is what the skip pattern in `thread_search()` is for: each helper sits out
+iterations on its own schedule, so at any moment the pool is spread over several
+depths rather than running one iteration in lockstep.
+
+Three consequences worth stating, because each is a rule elsewhere in this
+repository:
+
+- **Everything except the table is per-thread.** The ordering heuristics, the
+  correction history, the PV table, the search stack and the NNUE accumulator
+  stack all live in a `SearchThread` block, one per thread, a little over 8 MB
+  each.
+  Sharing a history table is not merely a race: it is two different searches
+  averaging their opinions into a table neither can then trust, and the ordering
+  that results is worse than either thread's alone.
+- **The table is shared and read racily, by design.** Entries are 16 bytes and
+  are not written atomically, so a probe can in principle return one write's
+  depth beside another's score. That is survivable only because of invariant 6 —
+  every move that comes out of the table is validated before it is played — and
+  it is the same bet every strong engine makes. A locked table would cost more
+  than the races do.
+- **A parallel search is not reproducible.** The threads reach the table in
+  whatever order the scheduler gives them, so the node count and even the move
+  can differ between two runs of the same position. `bench` therefore forces one
+  thread (invariant 1), and so does `search_run_sync`, which is what datagen
+  labels with.
+
+Thread 0 owns the clock, the `info` lines and the `bestmove`; the helpers only
+disturb the table. When a helper finishes a deeper iteration than thread 0 did,
+`best_thread()` plays ITS move — and prints its line first, so the last `info`
+the GUI saw agrees with the move that followed it.
+
+On Windows the pool also has to place itself. A process gets one **processor
+group**, 64 logical processors at most, unless a thread asks for another by
+name; `thread_bind()` fills the groups in turn with `SetThreadGroupAffinity` so
+a machine with more than 64 cores is actually used, and `GetActiveProcessorCount`
+counts every group rather than only the one the process started in.
 
 ---
 

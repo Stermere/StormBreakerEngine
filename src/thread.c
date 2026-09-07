@@ -14,6 +14,7 @@
 #include "thread.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 /* Each search frame carries a MAX_MOVES move list, so a line running to MAX_PLY needs
  * on the order of half a megabyte, more under a sanitizer - and the Win32 default of
@@ -60,10 +61,99 @@ void thread_join(ThreadHandle handle) {
     CloseHandle(handle);
 }
 
+/*
+ * Every processor group, not the one this process happens to be in. GetSystemInfo
+ * reports the CURRENT group only, so on a two-group 128-core machine it answers 64
+ * and the engine would size itself to half the box.
+ */
 int thread_hardware_concurrency(void) {
-    SYSTEM_INFO info;
-    GetSystemInfo(&info);
-    return info.dwNumberOfProcessors > 0 ? (int)info.dwNumberOfProcessors : 1;
+    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return n > 0 ? (int)n : 1;
+}
+
+/*
+ * The processor groups and their real affinity masks. Read from the OS rather than
+ * synthesised as the low `count` bits of a word: a group's active processors need
+ * not be contiguous once any of them is parked or offline, and a mask naming a
+ * processor that is not there is rejected outright, leaving the thread where it was.
+ */
+#define MAX_GROUPS 64
+
+typedef struct {
+    KAFFINITY mask;
+    int cpus;
+} ProcGroup;
+
+static ProcGroup Groups[MAX_GROUPS];
+static int GroupCount;
+static int GroupCpuTotal;
+static INIT_ONCE GroupsOnce = INIT_ONCE_STATIC_INIT;
+
+static void probe_groups(void) {
+    DWORD len = 0;
+
+    /* Asks for the size first: the record is variably sized, one entry per group. */
+    if (GetLogicalProcessorInformationEx(RelationGroup, NULL, &len) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return;
+
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info =
+        (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)malloc(len);
+    if (!info)
+        return;
+
+    if (GetLogicalProcessorInformationEx(RelationGroup, info, &len)) {
+        const int groups = (int)info->Group.ActiveGroupCount;
+
+        for (int g = 0; g < groups && g < MAX_GROUPS; ++g) {
+            Groups[GroupCount].mask = info->Group.GroupInfo[g].ActiveProcessorMask;
+            Groups[GroupCount].cpus = (int)info->Group.GroupInfo[g].ActiveProcessorCount;
+            GroupCpuTotal += Groups[GroupCount].cpus;
+            ++GroupCount;
+        }
+    }
+
+    free(info);
+}
+
+/* Threads are bound as they start, so several can reach this at once and the
+ * accumulation in probe_groups() is not something two of them may do at the same
+ * time. InitOnceExecuteOnce rather than a flag: a flag IS the race. */
+static BOOL CALLBACK probe_groups_once(PINIT_ONCE once, PVOID param, PVOID *context) {
+    (void)once;
+    (void)param;
+    (void)context;
+
+    probe_groups();
+    return TRUE;
+}
+
+void thread_bind(int index) {
+    InitOnceExecuteOnce(&GroupsOnce, probe_groups_once, NULL, NULL);
+
+    /* One group is the ordinary case, and there the default affinity already covers
+     * the whole machine - binding could only take choices away from the scheduler. */
+    if (GroupCount <= 1 || GroupCpuTotal <= 0)
+        return;
+
+    /* Fill each group in turn rather than interleaving: threads that share a group
+     * share a NUMA node on every machine that has more than one group, and the
+     * transposition table traffic between them is the whole cost of Lazy SMP. */
+    int slot = index % GroupCpuTotal;
+    for (int g = 0; g < GroupCount; ++g) {
+        if (slot < Groups[g].cpus) {
+            GROUP_AFFINITY affinity;
+            memset(&affinity, 0, sizeof(affinity));
+            affinity.Group = (WORD)g;
+            affinity.Mask  = Groups[g].mask;
+
+            /* Failure is survivable - the thread keeps the affinity it had, which is
+             * every processor in its own group - so nothing is reported here. */
+            SetThreadGroupAffinity(GetCurrentThread(), &affinity, NULL);
+            return;
+        }
+        slot -= Groups[g].cpus;
+    }
 }
 
 void thread_sleep_ms(int ms) { Sleep((DWORD)ms); }
@@ -126,6 +216,11 @@ int thread_hardware_concurrency(void) {
     const long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
 }
+
+/* Nothing to do: there is no equivalent of a processor group, so a thread can
+ * already be scheduled anywhere, and pinning it would only stop the kernel moving
+ * it off a core somebody else is using. */
+void thread_bind(int index) { (void)index; }
 
 /* nanosleep() rather than usleep(): POSIX.1-2008 removed the latter, so asking for
  * that level at the top of this file is precisely what makes it unavailable. */

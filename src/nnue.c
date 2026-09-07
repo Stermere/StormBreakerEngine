@@ -689,8 +689,11 @@ Value nnue_evaluate(const Position *pos) { return nnue_centipawns(nnue_raw(pos))
  * is the only thing that catches the class of bug whose symptom is rare unreproducible
  * blunders.
  *
- * TODO(engine): Lazy SMP needs one stack per thread. It is file-scope for the same
- * reason search.c's ordering tables are, and it moves when they do.
+ * One stack per searching thread, and thread-local rather than passed down because
+ * eval_evaluate() is reached from the tuner, datagen and the UCI `eval` command as
+ * well as from the search, and none of those has a search thread to hand it. It is
+ * a POINTER, not a block: at 2 MB a stack, 128 threads' worth in static thread-local
+ * storage is not something a thread creation should have to commit up front.
  */
 typedef struct {
     _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
@@ -705,8 +708,39 @@ typedef struct {
 
 /* The search returns at ply >= MAX_PLY - 1 before making a move, so the deepest push is
  * shallower than this; the slack is deliberate. */
-static Accumulator AccStack[MAX_PLY + 2];
-static int AccTop;
+#define ACC_LEVELS (MAX_PLY + 2)
+
+static _Thread_local Accumulator *AccStack;
+static _Thread_local int AccTop;
+
+/* Set once a thread's allocation has failed, so a machine short of memory pays for one
+ * failed calloc rather than one per evaluation. */
+static _Thread_local bool AccStackFailed;
+
+bool eval_state_alloc(void) {
+    if (AccStack)
+        return true;
+    if (AccStackFailed)
+        return false;
+
+    AccStack = (Accumulator *)calloc(ACC_LEVELS, sizeof(Accumulator));
+    if (!AccStack) {
+        AccStackFailed = true;
+        return false;
+    }
+
+    AccTop = 0;
+    return true;
+}
+
+size_t eval_state_bytes(void) { return ACC_LEVELS * sizeof(Accumulator); }
+
+void eval_state_free(void) {
+    free(AccStack);
+    AccStack       = NULL;
+    AccTop         = 0;
+    AccStackFailed = false;
+}
 
 typedef struct {
     Piece pc;
@@ -839,11 +873,21 @@ static void nnue_apply_delta(const int16_t *src, int16_t *dst, const int16_t *co
 
 void eval_state_clear(void) {
     AccTop = 0;
-    memset(&AccStack[0], 0, sizeof(AccStack[0]));
+    if (AccStack)
+        memset(&AccStack[0], 0, sizeof(AccStack[0]));
 }
 
+/*
+ * A thread with no stack skips the whole incremental path: push and pop become
+ * nothing, and every evaluation accumulates from the board. That is slow and it is
+ * CORRECT, which is the right way round for the one case that reaches it - a machine
+ * that could not spare the allocation.
+ */
 void eval_state_push(const Position *pos, Move m) {
-    assert(AccTop + 1 < (int)(sizeof(AccStack) / sizeof(AccStack[0])));
+    if (!AccStack)
+        return;
+
+    assert(AccTop + 1 < ACC_LEVELS);
 
     const Accumulator *const parent = &AccStack[AccTop];
     Accumulator *const child        = &AccStack[++AccTop];
@@ -893,7 +937,10 @@ void eval_state_push(const Position *pos, Move m) {
  * changed. The copy exists so the child level can carry that key: without a level of its
  * own, every node under a null move would find a mismatch and rebuild from scratch. */
 void eval_state_push_null(const Position *pos) {
-    assert(AccTop + 1 < (int)(sizeof(AccStack) / sizeof(AccStack[0])));
+    if (!AccStack)
+        return;
+
+    assert(AccTop + 1 < ACC_LEVELS);
 
     const Accumulator *const parent = &AccStack[AccTop];
     Accumulator *const child        = &AccStack[++AccTop];
@@ -909,13 +956,19 @@ void eval_state_push_null(const Position *pos) {
 }
 
 void eval_state_pop(void) {
+    if (!AccStack)
+        return;
+
     assert(AccTop > 0);
     --AccTop;
 }
 
 /* The level describing the board, with any perspective that cannot be trusted rebuilt
- * from it. */
+ * from it - or NULL on a thread with no stack, which is a full recomputation. */
 static const Accumulator *nnue_current(const Position *pos) {
+    if (!AccStack && !eval_state_alloc())
+        return NULL;
+
     Accumulator *const a = &AccStack[AccTop];
 
     if (a->key != pos->key) {
@@ -937,7 +990,10 @@ static const Accumulator *nnue_current(const Position *pos) {
  * which one the engine runs costs nothing at runtime. */
 Value eval_evaluate(const Position *pos) {
     const Accumulator *const a = nnue_current(pos);
-    const Color stm            = pos->sideToMove;
+    if (!a)
+        return nnue_centipawns(nnue_raw(pos));
+
+    const Color stm = pos->sideToMove;
 
     const int32_t raw = nnue_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos));
 
@@ -973,7 +1029,20 @@ static Value nnue_unc_centipawns(int32_t raw) {
 
 Value nnue_uncertainty(const Position *pos) {
     const Accumulator *const a = nnue_current(pos);
-    const Color stm            = pos->sideToMove;
+    if (!a) {
+        _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
+
+        for (Color c = WHITE; c <= BLACK; ++c) {
+            const Perspective p = nnue_perspective(pos, c);
+            nnue_accumulate(pos, &p, acc[c]);
+        }
+
+        const Color stm = pos->sideToMove;
+        return nnue_unc_centipawns(
+            nnue_unc_output(acc[stm], acc[stm ^ 1], nnue_output_bucket(pos)));
+    }
+
+    const Color stm = pos->sideToMove;
 
     return nnue_unc_centipawns(
         nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos)));

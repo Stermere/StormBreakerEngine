@@ -40,7 +40,7 @@ Stockfish's, so the two can be diffed directly.
 | Option | Type | Default | Range | Notes |
 |---|---|---|---|---|
 | `Hash` | spin | 16 | 1–65536 | transposition table size in MB |
-| `Threads` | spin | 1 | 1–1 | pinned to 1 until the search is parallel |
+| `Threads` | spin | 1 | 1–1024 | search threads (Lazy SMP); ~8 MB each |
 | `Ponder` | check | false | | the GUI drives pondering with `go ponder` |
 | `Move Overhead` | spin | 10 | 0–5000 | ms reserved for GUI/network latency |
 | `UCI_Chess960` | check | false | | Chess960 castling notation (see below) |
@@ -89,8 +89,28 @@ worth embedding. A load that fails leaves the previous net in place and says why
 on an `info string` — a typo in a GUI config must not leave the engine with no
 evaluation at all. `<internal>` is accepted and means "keep the embedded one".
 
-`Hash` and `Threads` are required for OpenBench compliance. `Threads` advertises
-`max 1` because the search is currently single-threaded.
+`Threads` runs the search on that many threads, sharing one transposition table
+(Lazy SMP — see [ARCHITECTURE.md](ARCHITECTURE.md)). The threads are created when
+the option is set and parked between searches, because each one carries a little
+over 8 MB of its own history tables and accumulator stack, and starting them per
+move would cost more than a move is worth at blitz. Setting it reports the pool's
+total on an `info string`, and reports again if the machine could not give it
+what was asked — a match quietly running at a fraction of the requested strength
+is worth more to know about than to hide.
+
+The default stays 1. That is the configuration every SPRT and every bench node
+count in [EXPERIMENTS.md](EXPERIMENTS.md) was measured in, and `bench` forces it
+regardless of the option: a parallel search reaches the shared table in whatever
+order the scheduler produces, so its node count is not reproducible even on one
+machine.
+
+On Windows the pool spreads itself across **processor groups**. A process is
+confined to one group — 64 logical processors — unless a thread asks for another
+by name, so without this a 128-core machine would run every thread on the first
+64 cores and report 64 as the machine size. Nothing equivalent is needed
+elsewhere.
+
+`Hash` and `Threads` are both required for OpenBench compliance.
 
 `MultiPV` is not advertised because the search currently reports one line.
 
@@ -110,6 +130,8 @@ Useful during development; GUIs ignore them.
 | `nnue` | which net is loaded: architecture, quantisation, hash, source |
 | `nnue eval` | the network's score for the current position, in centipawns |
 | `nnue verify <file>` | check the exported test vectors; exits non-zero on any mismatch |
+| `smp` | the pool's size and what it costs in memory |
+| `smp selftest [threads]` | the parallel-search gate: the pool starts, the helpers search, and one thread afterwards still reproduces its own node counts exactly (`make smp-test`) |
 | `syzygy` | how many men the loaded tablebases cover, if any |
 | `syzygy verify <dir>` | probe known endgames against the tables in `dir`; exits non-zero on any wrong answer (`make syzygy-test`) |
 | `syzygy manifest <dir> <file>` | re-derive every material configuration's probe checksum and compare against a sealed manifest; names the endgame that differs |

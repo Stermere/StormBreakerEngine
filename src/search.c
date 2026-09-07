@@ -29,14 +29,12 @@
 #include "tt.h"
 #include "uci.h"
 
-/* Root state, owned by the worker while a search runs. The main thread writes these
- * before the worker starts and reads them after it is joined, so no lock is needed. */
+/* Root state, shared by every searching thread: the position they all start from and
+ * the limits they all answer to. Written before the threads are released and read-only
+ * while they run, so no lock is needed. */
 static Position RootPos;
 static SearchLimits Limits;
 static TimeManager Timer;
-
-static ThreadHandle Worker;
-static bool WorkerStarted;
 
 /* Relaxed ordering would be enough for a stop flag, but sequential consistency costs
  * nothing at the rate these are polled. */
@@ -44,29 +42,23 @@ static atomic_bool Searching;
 static atomic_bool StopFlag;
 static atomic_bool Pondering;
 
-static atomic_ullong Nodes;
-
 /* When the clock the search is spending actually started running: normally the moment
  * `go` arrived, but a ponder search moves it forward on ponderhit, since the time spent
  * guessing was free. */
 static atomic_llong ClockOrigin;
 
-/* Touched only by the search thread, and published into the atomic `Nodes` periodically
- * rather than per node: an atomic increment in the innermost loop is a measurable cost
- * for a counter nothing reads at that granularity. */
-static uint64_t NodeCount;
-
 /* The piece-count gate, cached at search start so the per-node test is one comparison
- * against a local, plus the counter behind `info tbhits`. TbLimit is 0 whenever no
- * tablebases are loaded, which short-circuits every probe and keeps bench identical
- * across machines. */
+ * against a local. TbLimit is 0 whenever no tablebases are loaded, which short-circuits
+ * every probe and keeps bench identical across machines. */
 static int TbLimit;
-static uint64_t TbHits;
 
-/* Triangular PV table: PvTable[ply] is the principal variation from `ply` downwards, and
- * a child's line is copied up behind the move that produced it. */
-static Move PvTable[MAX_PLY][MAX_PLY];
-static int PvLength[MAX_PLY];
+/* Suppresses the `info` lines, for the duration of a synchronous search only: datagen
+ * runs millions of them and wants its own stdout. */
+static bool Silent;
+
+/* Late move reduction amounts by [depth][move number], built once by init_reductions().
+ * Read-only once a search starts, so one copy serves every thread. */
+static uint8_t Reductions[64][64];
 
 /* What is being searched at each ply. The child needs the move that led to it - for its
  * counter-move, and to refuse a second null move in a row - and the piece that made it,
@@ -81,81 +73,145 @@ typedef struct {
     Move excludedMove;
 } SearchStack;
 
-static SearchStack Stack[MAX_PLY];
-
-/* Nominal depth of the iteration currently running. Extensions are bounded relative to
- * it, so a line that can be extended indefinitely cannot grow the tree without limit. */
-static Depth RootDepth;
-
-/* The last completed iteration's score and depth, published for search_run_sync. The
- * UCI path reads the same numbers off the `info` lines. */
-static Value RootScore;
-static Depth CompletedDepth;
-
-/* Suppresses the `info` lines, for the duration of a synchronous search only: datagen
- * runs millions of them and wants its own stdout. */
-static bool Silent;
-
-/* Deepest ply any line reached this iteration, quiescence included. It is how a GUI
- * tells a search genuinely looking deep along forcing lines from one reporting a big
- * nominal depth after heavy reductions. */
-static int SelDepth;
-
-static inline void update_seldepth(int ply) {
-    if (ply > SelDepth)
-        SelDepth = ply;
-}
-
-/* Late move reduction amounts by [depth][move number], built once by
- * init_reductions(). */
-static uint8_t Reductions[64][64];
-
-/*
- * The ordering heuristics, declared here rather than beside their use because
- * search_clear() has to reset every one - anything carrying information from one search
- * into the next makes a result depend on what was searched before it.
- *
- * Killers are quiet moves that cut at this ply elsewhere in the tree, since siblings
- * tend to share refutations; History is how well a quiet move has been doing lately,
- * untied to a ply; CounterMoves is the quiet reply that most recently refuted this exact
- * move.
- */
-static Move Killers[MAX_PLY][2];
-static int16_t History[COLOR_NB][SQUARE_NB][SQUARE_NB];
-static Move CounterMoves[PIECE_NB][SQUARE_NB];
-
 #define CONT_SLOTS 3
 
 /* How far back each slot looks. Sized independently of CONT_SLOTS so lowering the slot
  * count is a one-flag change; only the first CONT_SLOTS entries are read. */
 static const int ContPlies[3] = {1, 2, 4};
 
-/*
- * Continuation history, [slot][previous piece][previous to][this piece][this to], 2 MB a
- * slot. Where CounterMoves remembers a single best reply, this scores EVERY reply
- * against the same context, which is what lets ordering understand plans rather than
- * one-move refutations.
- *
- * Three slots, keyed one, two and four plies back: the direct reply, the same side's own
- * previous move (so "knight to d2 then f1" scores as a unit), and the slower manoeuvres
- * a two-ply window reads as noise.
- */
-static int16_t ContHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
-
-/* Capture history, [moving piece][to][captured type]. MVV-LVA says what a capture takes
- * and SEE what it wins, and neither can separate two equal-looking exchanges; recent
- * success can, which in a sharp middlegame is most of them. */
-static int16_t CaptureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
-
 #define CORRHIST_SIZE       16384
 #define CORRHIST_GRAIN      256
 #define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32)
 #define CORRHIST_WEIGHT_MAX 256
 
-/* Correction history, [side to move][pawn key]. Three further keys were tried - minor
- * pieces, non-pawn material, and the move that led to the node - at two weightings, and
- * both measured slightly negative over 2076 games (E16). */
-static int16_t PawnCorrHist[COLOR_NB][CORRHIST_SIZE];
+/*
+ * Everything one searching thread owns.
+ *
+ * Lazy SMP is N threads searching the SAME tree with no work splitting. They diverge
+ * because they reach the shared transposition table in different orders and because the
+ * helpers skip iterations on their own schedule, and the entire gain is that a line one
+ * of them refutes cheaply is a line none of the others has to search again.
+ *
+ * Nothing below may be shared, and that is a stronger statement than "it would race".
+ * Two threads writing one history entry are two different searches averaging their
+ * opinions into a table neither can then trust, and the ordering that results is worse
+ * than either thread's alone. The transposition table is shared precisely because it is
+ * the one structure whose entries are self-describing enough to survive being written
+ * by somebody else: every hit is verified against the position and every move that
+ * comes back out of it is validated before it is played.
+ *
+ * The tables dominate the size: 6 MB of this block is continuation history, and the
+ * accumulator stack in nnue.c adds 2 MB beside it. Hence heap blocks claimed when
+ * `Threads` is set, rather than anything a `go` has to allocate.
+ */
+typedef struct {
+    /*
+     * The ordering heuristics, declared here rather than beside their use because
+     * search_clear() has to reset every one - anything carrying information from one
+     * search into the next makes a result depend on what was searched before it.
+     *
+     * Killers are quiet moves that cut at this ply elsewhere in the tree, since siblings
+     * tend to share refutations; history is how well a quiet move has been doing lately,
+     * untied to a ply; counterMoves is the quiet reply that most recently refuted this
+     * exact move.
+     */
+    Move killers[MAX_PLY][2];
+    int16_t history[COLOR_NB][SQUARE_NB][SQUARE_NB];
+    Move counterMoves[PIECE_NB][SQUARE_NB];
+
+    /*
+     * Continuation history, [slot][previous piece][previous to][this piece][this to], 2 MB
+     * a slot. Where counterMoves remembers a single best reply, this scores EVERY reply
+     * against the same context, which is what lets ordering understand plans rather than
+     * one-move refutations.
+     *
+     * Three slots, keyed one, two and four plies back: the direct reply, the same side's
+     * own previous move (so "knight to d2 then f1" scores as a unit), and the slower
+     * manoeuvres a two-ply window reads as noise.
+     */
+    int16_t contHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
+
+    /* Capture history, [moving piece][to][captured type]. MVV-LVA says what a capture
+     * takes and SEE what it wins, and neither can separate two equal-looking exchanges;
+     * recent success can, which in a sharp middlegame is most of them. */
+    int16_t captureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
+
+    /* Correction history, [side to move][pawn key]. Three further keys were tried - minor
+     * pieces, non-pawn material, and the move that led to the node - at two weightings,
+     * and both measured slightly negative over 2076 games (E16). */
+    int16_t pawnCorrHist[COLOR_NB][CORRHIST_SIZE];
+
+    /* Triangular PV table: pvTable[ply] is the principal variation from `ply` downwards,
+     * and a child's line is copied up behind the move that produced it. */
+    Move pvTable[MAX_PLY][MAX_PLY];
+    int pvLength[MAX_PLY];
+
+    SearchStack stack[MAX_PLY];
+
+    /* This thread's own board. Every thread starts from the same position and then plays
+     * its own moves on it, so the copy is not an optimisation. */
+    Position rootPos;
+
+    /* Nominal depth of the iteration currently running. Extensions are bounded relative
+     * to it, so a line that can be extended indefinitely cannot grow the tree without
+     * limit. */
+    Depth rootDepth;
+
+    /* Deepest ply any line reached this iteration, quiescence included. It is how a GUI
+     * tells a search genuinely looking deep along forcing lines from one reporting a big
+     * nominal depth after heavy reductions. */
+    int selDepth;
+
+    /* Touched only by the owning thread, and published into the atomics below
+     * periodically rather than per node: an atomic increment in the innermost loop is a
+     * measurable cost for a counter nothing reads at that granularity. */
+    uint64_t nodeCount;
+    uint64_t tbHits;
+
+    /* What any other thread is allowed to read, so `info nodes`, `info tbhits` and a node
+     * limit can see the whole search rather than one thread's share of it. */
+    atomic_ullong publishedNodes;
+    atomic_ullong publishedTbHits;
+
+    /* The last completed iteration's result. best_thread() compares these across the
+     * pool, and the winner's move is the one played. */
+    Move bestMove;
+    Move ponderMove;
+    Value rootScore;
+    Depth completedDepth;
+
+    /* The line that produced it, copied out of pvTable when the iteration completed.
+     * The copy is what makes it reportable: pvTable is live storage, so an iteration
+     * that was interrupted has already half-overwritten the line the finished one
+     * left there - and the thread whose move gets played is very often a thread that
+     * was interrupted. */
+    Move rootPv[MAX_PLY];
+    int rootPvLength;
+
+    /* Thread 0 owns the clock, the `info` lines and the `bestmove`; every other thread
+     * exists to disturb the shared table in a useful direction and nothing else. */
+    int id;
+
+    ThreadHandle handle;
+    bool started;
+
+    /* Guarded by ThreadMutex, and the reason it exists: the pool is parked between
+     * searches rather than created per `go`, because starting 128 threads and faulting in
+     * a gigabyte of fresh history tables costs more than a whole move at blitz. */
+    bool go;
+    bool exit;
+    bool searching;
+} SearchThread;
+
+static SearchThread **Threads;
+static int ThreadCount;
+
+/* One mutex and one condition variable for the whole pool. The events are a search
+ * starting and a thread finishing one - once per `go`, never per node - so waking every
+ * thread with a broadcast is the cheap thing to do rather than the expensive one. */
+static Mutex ThreadMutex;
+static CondVar ThreadCv;
+static bool PoolReady;
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -188,44 +244,96 @@ static const int LogFixed[64] = {
 /* clang-format on */
 
 static void init_reductions(void);
+static void thread_pool_set(int count);
 
 void search_init(void) {
     atomic_store(&Searching, false);
     atomic_store(&StopFlag, false);
     atomic_store(&Pondering, false);
-    atomic_store(&Nodes, 0);
     atomic_store(&ClockOrigin, 0);
     init_reductions();
     board_set_startpos(&RootPos);
+
+    mutex_init(&ThreadMutex);
+    cond_init(&ThreadCv);
+    PoolReady = true;
+
+    /* One block, and no thread yet - pool_start() makes them, at the first search that
+     * needs one. A single-threaded search then takes exactly the path it always did. */
+    thread_pool_set(1);
 }
 
 void search_clear(void) {
     tt_clear();
-    memset(Killers, 0, sizeof(Killers));
-    memset(History, 0, sizeof(History));
-    memset(CounterMoves, 0, sizeof(CounterMoves));
-    memset(ContHist, 0, sizeof(ContHist));
-    memset(CaptureHist, 0, sizeof(CaptureHist));
-    memset(PawnCorrHist, 0, sizeof(PawnCorrHist));
-    memset(Stack, 0, sizeof(Stack));
+
+    for (int i = 0; i < ThreadCount; ++i) {
+        SearchThread *const td = Threads[i];
+
+        memset(td->killers, 0, sizeof(td->killers));
+        memset(td->history, 0, sizeof(td->history));
+        memset(td->counterMoves, 0, sizeof(td->counterMoves));
+        memset(td->contHist, 0, sizeof(td->contHist));
+        memset(td->captureHist, 0, sizeof(td->captureHist));
+        memset(td->pawnCorrHist, 0, sizeof(td->pawnCorrHist));
+        memset(td->stack, 0, sizeof(td->stack));
+    }
+
     eval_state_clear();
 }
 
 bool search_running(void) { return atomic_load(&Searching); }
 bool search_stopped(void) { return atomic_load(&StopFlag); }
-uint64_t search_nodes(void) { return atomic_load(&Nodes); }
+
+/*
+ * What the whole pool has searched. Every thread publishes its own count every
+ * CHECK_INTERVAL nodes, so this trails the truth by at most that much per thread -
+ * which is why it is a report and a limit and never a decision inside the tree.
+ *
+ * With one thread it is exactly that thread's counter at its last publication, which is
+ * what the single-threaded engine always reported.
+ */
+uint64_t search_nodes(void) {
+    uint64_t total = 0;
+    for (int i = 0; i < ThreadCount; ++i)
+        total += atomic_load(&Threads[i]->publishedNodes);
+    return total;
+}
+
+/* The same sum with the caller's own live counters folded in, for the numbers it prints
+ * about a search it is in the middle of. */
+static uint64_t nodes_including(const SearchThread *td) {
+    uint64_t total = td->nodeCount;
+    for (int i = 0; i < ThreadCount; ++i)
+        if (Threads[i] != td)
+            total += atomic_load(&Threads[i]->publishedNodes);
+    return total;
+}
+
+static uint64_t tbhits_including(const SearchThread *td) {
+    uint64_t total = td->tbHits;
+    for (int i = 0; i < ThreadCount; ++i)
+        if (Threads[i] != td)
+            total += atomic_load(&Threads[i]->publishedTbHits);
+    return total;
+}
 
 static int64_t elapsed_ms(void) { return time_ms() - atomic_load(&ClockOrigin); }
 
-/* Enforces the limits the search cannot express structurally. Depth is handled by the
+/*
+ * Enforces the limits the search cannot express structurally. Depth is handled by the
  * iteration loop; node and time limits have to be noticed mid-tree, and an infinite or
  * pondering search ignores the clock entirely because UCI gives the GUI sole authority
- * over when those end. */
-static void check_limits(void) {
-    if (atomic_load(&StopFlag))
+ * over when those end.
+ *
+ * Thread 0 alone runs this. A helper reading the same clock would reach the same answer
+ * a moment later and set the same flag, and the node total it would have to sum is
+ * O(threads) - so the helpers poll StopFlag, which is the one thing they need to know.
+ */
+static void check_limits(SearchThread *td) {
+    if (td->id != 0 || atomic_load(&StopFlag))
         return;
 
-    if (Limits.nodes && NodeCount >= Limits.nodes) {
+    if (Limits.nodes && nodes_including(td) >= Limits.nodes) {
         atomic_store(&StopFlag, true);
         return;
     }
@@ -237,11 +345,17 @@ static void check_limits(void) {
         atomic_store(&StopFlag, true);
 }
 
-static inline void count_node(void) {
-    if ((++NodeCount & (CHECK_INTERVAL - 1)) == 0) {
-        atomic_store(&Nodes, NodeCount);
-        check_limits();
+static inline void count_node(SearchThread *td) {
+    if ((++td->nodeCount & (CHECK_INTERVAL - 1)) == 0) {
+        atomic_store(&td->publishedNodes, td->nodeCount);
+        atomic_store(&td->publishedTbHits, td->tbHits);
+        check_limits(td);
     }
+}
+
+static inline void update_seldepth(SearchThread *td, int ply) {
+    if (ply > td->selDepth)
+        td->selDepth = ply;
 }
 
 /*
@@ -636,15 +750,15 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
 /* The continuation-history slice for the move played `back` plies above `ply`, or NULL
  * when there is no such move - the top of the tree, or a null move, which is nobody's
  * plan and must not have continuations attributed to it. */
-static inline int16_t *cont_slice(int slot, int ply, int back) {
+static inline int16_t *cont_slice(SearchThread *td, int slot, int ply, int back) {
     if (ply < back)
         return NULL;
 
-    const Move prev = Stack[ply - back].move;
+    const Move prev = td->stack[ply - back].move;
     if (!is_ok_move(prev))
         return NULL;
 
-    return &ContHist[slot][Stack[ply - back].movedPiece][to_sq(prev)][0][0];
+    return &td->contHist[slot][td->stack[ply - back].movedPiece][to_sq(prev)][0][0];
 }
 
 static inline int cont_index(Piece pc, Square to) { return (int)pc * SQUARE_NB + (int)to; }
@@ -674,16 +788,16 @@ static inline PieceType victim_of(const Position *pos, Move m) {
 /* MVV-LVA for the tactical moves - most valuable victim, least valuable attacker - with
  * SEE deciding which band a capture lands in and capture history separating the ones SEE
  * calls equal. Quiet moves fall through to the heuristic tables. */
-static void score_moves(const Position *pos, ScoredMove *list, int count, Move ttMove, int ply,
-                        Move counter) {
+static void score_moves(SearchThread *td, const Position *pos, ScoredMove *list, int count,
+                        Move ttMove, int ply, Move counter) {
     const Color us     = pos->sideToMove;
-    const Move killer0 = Killers[ply][0];
-    const Move killer1 = Killers[ply][1];
+    const Move killer0 = td->killers[ply][0];
+    const Move killer1 = td->killers[ply][1];
 
     /* Context for continuation history: the moves that led to this node. */
     int16_t *slices[CONT_SLOTS];
     for (int i = 0; i < CONT_SLOTS; ++i)
-        slices[i] = cont_slice(i, ply, ContPlies[i]);
+        slices[i] = cont_slice(td, i, ply, ContPlies[i]);
 
     for (int i = 0; i < count; ++i) {
         const Move m      = list[i].m;
@@ -705,7 +819,7 @@ static void score_moves(const Position *pos, ScoredMove *list, int count, Move t
              * history is evidence about a capture, not a replacement for knowing what it
              * takes. A capture that loses material once the recaptures are played out is
              * worse than almost any quiet move, so it goes below them. */
-            const int capHist = CaptureHist[moved][to_sq(m)][victim] / CAPHIST_DIVISOR;
+            const int capHist = td->captureHist[moved][to_sq(m)][victim] / CAPHIST_DIVISOR;
 
             score =
                 (see_ge(pos, m, VALUE_ZERO) ? SCORE_CAPTURE : SCORE_BAD_CAPTURE) + mvvLva + capHist;
@@ -725,7 +839,7 @@ static void score_moves(const Position *pos, ScoredMove *list, int count, Move t
             else if (m == counter)
                 score = SCORE_COUNTER;
             else
-                score = History[us][from_sq(m)][to_sq(m)] + cont_score(slices, moved, to_sq(m));
+                score = td->history[us][from_sq(m)][to_sq(m)] + cont_score(slices, moved, to_sq(m));
         }
 
         list[i].score = score;
@@ -733,9 +847,10 @@ static void score_moves(const Position *pos, ScoredMove *list, int count, Move t
 }
 
 /* The counter-move registered against whatever was played to reach `ply`. */
-static Move counter_move(int ply) {
-    const Move prev = Stack[ply - 1].move;
-    return is_ok_move(prev) ? CounterMoves[Stack[ply - 1].movedPiece][to_sq(prev)] : MOVE_NONE;
+static Move counter_move(const SearchThread *td, int ply) {
+    const Move prev = td->stack[ply - 1].move;
+    return is_ok_move(prev) ? td->counterMoves[td->stack[ply - 1].movedPiece][to_sq(prev)]
+                            : MOVE_NONE;
 }
 
 /* A cutoff found deep in the tree is much stronger evidence than one next to the leaves,
@@ -763,11 +878,11 @@ static void history_update(int16_t *entry, int bonus) {
 }
 
 /* Credit or blame `pc -> to` in every continuation slot that exists here. */
-static void cont_hist_update(int ply, Piece pc, Square to, int bonus) {
+static void cont_hist_update(SearchThread *td, int ply, Piece pc, Square to, int bonus) {
     const int idx = cont_index(pc, to);
 
     for (int i = 0; i < CONT_SLOTS; ++i) {
-        int16_t *const slice = cont_slice(i, ply, ContPlies[i]);
+        int16_t *const slice = cont_slice(td, i, ply, ContPlies[i]);
         if (slice)
             history_update(&slice[idx], bonus);
     }
@@ -775,9 +890,9 @@ static void cont_hist_update(int ply, Piece pc, Square to, int bonus) {
 
 /* Keyed on what the capture takes, so the victim has to be read off the board - which
  * means this must run AFTER the move was undone. */
-static void capture_hist_update(const Position *pos, Move m, int bonus) {
+static void capture_hist_update(SearchThread *td, const Position *pos, Move m, int bonus) {
     const Piece moved = piece_on(pos, from_sq(m));
-    history_update(&CaptureHist[moved][to_sq(m)][victim_of(pos, m)], bonus);
+    history_update(&td->captureHist[moved][to_sq(m)][victim_of(pos, m)], bonus);
 }
 
 /*
@@ -790,39 +905,40 @@ static void capture_hist_update(const Position *pos, Move m, int bonus) {
  * failed; only the winner's own table is credited, since a capture teaches the quiet
  * heuristics nothing.
  */
-static void update_stats(const Position *pos, Move best, const Move *quiets, int quietCount,
-                         const Move *captures, int captureCount, Depth depth, int ply) {
+static void update_stats(SearchThread *td, const Position *pos, Move best, const Move *quiets,
+                         int quietCount, const Move *captures, int captureCount, Depth depth,
+                         int ply) {
     const Color us   = pos->sideToMove;
     const int bonus  = history_bonus(depth);
     const int malus  = history_malus(depth);
     const bool quiet = !is_tactical(pos, best);
 
     if (quiet) {
-        if (Killers[ply][0] != best) {
-            Killers[ply][1] = Killers[ply][0];
-            Killers[ply][0] = best;
+        if (td->killers[ply][0] != best) {
+            td->killers[ply][1] = td->killers[ply][0];
+            td->killers[ply][0] = best;
         }
 
-        history_update(&History[us][from_sq(best)][to_sq(best)], bonus);
-        cont_hist_update(ply, piece_on(pos, from_sq(best)), to_sq(best), bonus);
+        history_update(&td->history[us][from_sq(best)][to_sq(best)], bonus);
+        cont_hist_update(td, ply, piece_on(pos, from_sq(best)), to_sq(best), bonus);
 
-        const Move prev = Stack[ply - 1].move;
+        const Move prev = td->stack[ply - 1].move;
         if (is_ok_move(prev))
-            CounterMoves[Stack[ply - 1].movedPiece][to_sq(prev)] = best;
+            td->counterMoves[td->stack[ply - 1].movedPiece][to_sq(prev)] = best;
     } else {
-        capture_hist_update(pos, best, bonus);
+        capture_hist_update(td, pos, best, bonus);
     }
 
     for (int i = 0; i < quietCount; ++i) {
         if (quiets[i] == best)
             continue;
-        history_update(&History[us][from_sq(quiets[i])][to_sq(quiets[i])], -malus);
-        cont_hist_update(ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -malus);
+        history_update(&td->history[us][from_sq(quiets[i])][to_sq(quiets[i])], -malus);
+        cont_hist_update(td, ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -malus);
     }
 
     for (int i = 0; i < captureCount; ++i)
         if (captures[i] != best)
-            capture_hist_update(pos, captures[i], -malus);
+            capture_hist_update(td, pos, captures[i], -malus);
 }
 
 /* Anything but kings and pawns - the test that decides whether null-move pruning is
@@ -846,40 +962,41 @@ static void pick_move(ScoredMove *list, int count, int index) {
     }
 }
 
-static void update_pv(int ply, Move m) {
-    const int childLength = PvLength[ply + 1];
+static void update_pv(SearchThread *td, int ply, Move m) {
+    const int childLength = td->pvLength[ply + 1];
 
-    PvTable[ply][0] = m;
-    memcpy(&PvTable[ply][1], PvTable[ply + 1], (size_t)childLength * sizeof(Move));
-    PvLength[ply] = childLength + 1;
+    td->pvTable[ply][0] = m;
+    memcpy(&td->pvTable[ply][1], td->pvTable[ply + 1], (size_t)childLength * sizeof(Move));
+    td->pvLength[ply] = childLength + 1;
 }
 
 /* Correction history remembers how far the static evaluation and the search have been
  * running apart for a given pawn structure. Pawn structure is the key because it survives
  * the moves a search makes, so the bias it carries is worth learning. */
-static inline int16_t *corr_entry(const Position *pos) {
-    return &PawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
+static inline int16_t *corr_entry(SearchThread *td, const Position *pos) {
+    return &td->pawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
 }
 
 /* Nothing the search reports is corrected. The corrected value feeds `improving`, the
  * margins and the reductions - decisions that are already bets - while the table keeps the
  * raw evaluation, so a later probe re-corrects with whatever has been learned since. */
-static Value corrected_eval(const Position *pos, Value raw) {
+static Value corrected_eval(SearchThread *td, const Position *pos, Value raw) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
 
     /* Mate and tablebase scores are clamped away deliberately: a correction is evidence
      * about an evaluation, and letting one push a score into a range reserved for proven
      * results would have the search report a proof that nothing proved. */
-    const int v = raw + (CORR_W_PAWN * *corr_entry(pos) / CORR_W_UNIT) / CORRHIST_GRAIN;
+    const int v = raw + (CORR_W_PAWN * *corr_entry(td, pos) / CORR_W_UNIT) / CORRHIST_GRAIN;
     return (Value)iclamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 
 /* Folds one observation in as an exponential moving average, weighted by depth because a
  * deeper search is better evidence about the same question. What counts as an observation
  * is the decision that matters, and it is made at the call site. */
-static void corrhist_update(const Position *pos, Value searched, Value staticEval, Depth depth) {
-    int16_t *const e  = corr_entry(pos);
+static void corrhist_update(SearchThread *td, const Position *pos, Value searched, Value staticEval,
+                            Depth depth) {
+    int16_t *const e  = corr_entry(td, pos);
     const int weight  = imin(depth + 1, 16);
     const int diff    = (searched - staticEval) * CORRHIST_GRAIN;
     const int updated = (*e * (CORRHIST_WEIGHT_MAX - weight) + diff * weight) / CORRHIST_WEIGHT_MAX;
@@ -906,7 +1023,7 @@ static inline int unc_apply(int scale, int weight) {
  * corrhist defaults are centred rather than chosen, and a cold entry lands on the floor -
  * which is why the floor sits just under 100.
  */
-static inline int unc_scale(const Position *pos) {
+static inline int unc_scale(SearchThread *td, const Position *pos) {
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
         const int sigma = nnue_uncertainty(pos);
@@ -914,7 +1031,7 @@ static inline int unc_scale(const Position *pos) {
         return unc_probe(sigma, scale);
     }
 #endif
-    const int c     = *corr_entry(pos);
+    const int c     = *corr_entry(td, pos);
     const int ac    = (c < 0 ? -c : c) / CORRHIST_GRAIN;
     const int scale = imin(UNC_SCALE_BASE + ac * UNC_SCALE_SLOPE, UNC_SCALE_MAX);
     return unc_probe(ac, scale);
@@ -926,8 +1043,8 @@ static inline int unc_scale(const Position *pos) {
  * up saying about the same node. Read again here rather than carried down from
  * unc_scale() to keep the probe out of the search stack; it is the same number, being a
  * function of the position. */
-static void unc_probe_node(const Position *pos, Value searched, Value staticEval, Bound bound,
-                           Depth depth) {
+static void unc_probe_node(SearchThread *td, const Position *pos, Value searched, Value staticEval,
+                           Bound bound, Depth depth) {
     if (staticEval == VALUE_NONE)
         return;
 
@@ -938,7 +1055,7 @@ static void unc_probe_node(const Position *pos, Value searched, Value staticEval
     else
 #endif
     {
-        const int c = *corr_entry(pos);
+        const int c = *corr_entry(td, pos);
         signal      = (c < 0 ? -c : c) / CORRHIST_GRAIN;
     }
 
@@ -967,8 +1084,9 @@ void search_unc_mapping(UncMapping *out) {
     out->sigma = false;
 }
 #else
-static inline void unc_probe_node(const Position *pos, Value searched, Value staticEval,
-                                  Bound bound, Depth depth) {
+static inline void unc_probe_node(SearchThread *td, const Position *pos, Value searched,
+                                  Value staticEval, Bound bound, Depth depth) {
+    (void)td;
     (void)pos;
     (void)searched;
     (void)staticEval;
@@ -984,15 +1102,15 @@ static inline void unc_probe_node(const Position *pos, Value searched, Value sta
  * optimisation, it is the difference between an engine that plays chess and one that does
  * not.
  */
-static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
-    count_node();
-    update_seldepth(ply);
+static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, int ply) {
+    count_node(td);
+    update_seldepth(td, ply);
 
     if (search_stopped())
         return VALUE_ZERO;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(pos, eval_evaluate(pos));
+        return corrected_eval(td, pos, eval_evaluate(pos));
 
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
@@ -1032,8 +1150,8 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
          * every reply must be searched. */
         rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
-        staticEval = corrected_eval(pos, rawEval);
-        uncScale   = unc_scale(pos);
+        staticEval = corrected_eval(td, pos, rawEval);
+        uncScale   = unc_scale(td, pos);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1049,7 +1167,7 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
 
     /* No counter-move: quiescence only reaches quiet moves when answering a check, and an
      * evasion is dictated by the check rather than by whatever the opponent played. */
-    score_moves(pos, moves, count, ttMove, ply, MOVE_NONE);
+    score_moves(td, pos, moves, count, ttMove, ply, MOVE_NONE);
 
     Move bestMove = MOVE_NONE;
     int legal     = 0;
@@ -1082,14 +1200,14 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
         /* Quiescence maintains the stack too, so a node below it reads the move that
          * actually led there rather than whatever the main search left at this ply on an
          * earlier visit. */
-        Stack[ply].move       = m;
-        Stack[ply].movedPiece = piece_on(pos, from_sq(m));
-        Stack[ply].staticEval = staticEval;
+        td->stack[ply].move       = m;
+        td->stack[ply].movedPiece = piece_on(pos, from_sq(m));
+        td->stack[ply].staticEval = staticEval;
 
         board_do_move(pos, m);
         eval_state_push(pos, m);
         tt_prefetch(pos->key);
-        const Value v = -qsearch(pos, -beta, -alpha, ply + 1);
+        const Value v = -qsearch(td, pos, -beta, -alpha, ply + 1);
         eval_state_pop();
         board_undo_move(pos, m);
 
@@ -1127,16 +1245,17 @@ static Value qsearch(Position *pos, Value alpha, Value beta, int ply) {
  * wrong about it is safe, since everything it feeds either re-searches or is bounded by
  * depth.
  */
-static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int ply, bool cutNode) {
+static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, Value beta, int ply,
+                     bool cutNode) {
     /* Cleared here rather than at each use, so a child that never extends the PV leaves a
      * length of zero behind. */
-    PvLength[ply] = 0;
+    td->pvLength[ply] = 0;
 
     if (depth <= 0)
-        return qsearch(pos, alpha, beta, ply);
+        return qsearch(td, pos, alpha, beta, ply);
 
-    count_node();
-    update_seldepth(ply);
+    count_node(td);
+    update_seldepth(td, ply);
 
     if (search_stopped())
         return VALUE_ZERO;
@@ -1144,9 +1263,9 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
     /* Read and clear in one step. A singular search sets this immediately before re-entering
      * at the same ply, and every other entry must see MOVE_NONE - including a later,
      * unrelated visit that would otherwise inherit an exclusion. */
-    const Move excluded     = Stack[ply].excludedMove;
-    Stack[ply].excludedMove = MOVE_NONE;
-    const bool isExcluded   = excluded != MOVE_NONE;
+    const Move excluded         = td->stack[ply].excludedMove;
+    td->stack[ply].excludedMove = MOVE_NONE;
+    const bool isExcluded       = excluded != MOVE_NONE;
 
     /* The root is handled by search_root, so this is never ply 0 - which is what lets the
      * draw and mate-distance tests below run unconditionally. */
@@ -1156,7 +1275,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         return VALUE_DRAW;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(pos, eval_evaluate(pos));
+        return corrected_eval(td, pos, eval_evaluate(pos));
 
     /* Determined before mate distance pruning narrows the window: a node is a PV node
      * because of where it sits in the tree, and must keep being treated as one even if the
@@ -1224,7 +1343,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         popcount(occupied_bb(pos)) <= TbLimit) {
         const Value tbValue = syzygy_probe_wdl(pos, ply);
         if (tbValue != VALUE_NONE) {
-            ++TbHits;
+            ++td->tbHits;
             const Bound tbBound = tbValue > VALUE_DRAW   ? BOUND_LOWER
                                   : tbValue < VALUE_DRAW ? BOUND_UPPER
                                                          : BOUND_EXACT;
@@ -1254,18 +1373,18 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                               : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
                                                                             : eval_evaluate(pos));
 
-    const Value staticEval = corrected_eval(pos, rawEval);
-    const int uncScale     = inCheck ? 100 : unc_scale(pos);
+    const Value staticEval = corrected_eval(td, pos, rawEval);
+    const int uncScale     = inCheck ? 100 : unc_scale(td, pos);
 
-    Stack[ply].staticEval = staticEval;
+    td->stack[ply].staticEval = staticEval;
 
     /* Is this side's position getting better? Compared against the GRANDPARENT, because that
      * is the last node where the same side was to move. A rising evaluation is more likely
      * to produce the fail high pruning is betting on, and a falling one deserves the benefit
      * of the doubt; in check and at the top of the tree it defaults to false, which prunes
      * less. */
-    const bool improving = !inCheck && ply >= 2 && Stack[ply - 2].staticEval != VALUE_NONE &&
-                           staticEval > Stack[ply - 2].staticEval;
+    const bool improving = !inCheck && ply >= 2 && td->stack[ply - 2].staticEval != VALUE_NONE &&
+                           staticEval > td->stack[ply - 2].staticEval;
 
     /* Reverse futility pruning: the static evaluation is so far above beta that conceding a
      * pawn-and-a-bit per remaining ply would not bring it down, so the node is not going to
@@ -1283,7 +1402,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * agrees. */
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
         staticEval + RAZOR_MARGIN * depth * unc_apply(uncScale, UNC_W_RAZOR) / 100 < alpha) {
-        const Value v = qsearch(pos, alpha - 1, alpha, ply);
+        const Value v = qsearch(td, pos, alpha - 1, alpha, ply);
         if (v < alpha)
             return v;
     }
@@ -1294,17 +1413,17 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * the position, and a side that would love to pass will "prove" a cutoff it cannot
      * achieve. Refusing two null moves in a row matters for the same reason. */
     if (!pvNode && !inCheck && !isExcluded && depth >= 3 && staticEval >= beta &&
-        Stack[ply - 1].move != MOVE_NULL && has_non_pawn_material(pos, us)) {
+        td->stack[ply - 1].move != MOVE_NULL && has_non_pawn_material(pos, us)) {
         const Depth r = NMP_BASE + depth / NMP_DEPTH_DIVISOR +
                         imin((staticEval - beta) / NMP_EVAL_DIVISOR, NMP_EVAL_MAX);
 
-        Stack[ply].move       = MOVE_NULL;
-        Stack[ply].movedPiece = NO_PIECE;
+        td->stack[ply].move       = MOVE_NULL;
+        td->stack[ply].movedPiece = NO_PIECE;
 
         board_do_null_move(pos);
         eval_state_push_null(pos);
         tt_prefetch(pos->key);
-        const Value v = -negamax(pos, depth - r, -beta, -beta + 1, ply + 1, !cutNode);
+        const Value v = -negamax(td, pos, depth - r, -beta, -beta + 1, ply + 1, !cutNode);
         eval_state_pop();
         board_undo_null_move(pos);
 
@@ -1339,7 +1458,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         /* No counter-move: the list is captures, which the quiet heuristics have no opinion
          * about. The capture has to reach the raised bound on material alone - one needing
          * the search to find compensation is not what this is looking for. */
-        score_moves(pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE);
+        score_moves(td, pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE);
 
         for (int i = 0; i < pcCount; ++i) {
             pick_move(pcMoves, pcCount, i);
@@ -1351,16 +1470,16 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             if (!movegen_is_legal(pos, m))
                 continue;
 
-            Stack[ply].move       = m;
-            Stack[ply].movedPiece = piece_on(pos, from_sq(m));
+            td->stack[ply].move       = m;
+            td->stack[ply].movedPiece = piece_on(pos, from_sq(m));
 
             board_do_move(pos, m);
             eval_state_push(pos, m);
             tt_prefetch(pos->key);
 
-            Value v = -qsearch(pos, -probCutBeta, -probCutBeta + 1, ply + 1);
+            Value v = -qsearch(td, pos, -probCutBeta, -probCutBeta + 1, ply + 1);
             if (v >= probCutBeta)
-                v = -negamax(pos, depth - PROBCUT_REDUCTION, -probCutBeta, -probCutBeta + 1,
+                v = -negamax(td, pos, depth - PROBCUT_REDUCTION, -probCutBeta, -probCutBeta + 1,
                              ply + 1, !cutNode);
 
             eval_state_pop();
@@ -1380,7 +1499,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
 
     ScoredMove moves[MAX_MOVES];
     const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_ALL, moves);
-    score_moves(pos, moves, count, ttMove, ply, counter_move(ply));
+    score_moves(td, pos, moves, count, ttMove, ply, counter_move(td, ply));
 
     /* Moves already tried here, so the one that eventually cuts can penalise them. Bounded:
      * a node with more than this many is one where the ordering statistics were not going to
@@ -1395,7 +1514,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
      * doubt that its position in the list denies it. */
     int16_t *slices[CONT_SLOTS];
     for (int i = 0; i < CONT_SLOTS; ++i)
-        slices[i] = cont_slice(i, ply, ContPlies[i]);
+        slices[i] = cont_slice(td, i, ply, ContPlies[i]);
 
     Value best    = -VALUE_INFINITE;
     Move bestMove = MOVE_NONE;
@@ -1512,14 +1631,14 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             /* The verification searches this ply again and writes the PV table as it goes.
              * Nothing has been recorded here yet - the table move always sorts first - but
              * restoring it keeps that an observation rather than a dependency. */
-            const int savedPvLength = PvLength[ply];
+            const int savedPvLength = td->pvLength[ply];
 
-            Stack[ply].excludedMove = m;
+            td->stack[ply].excludedMove = m;
             const Value v =
-                negamax(pos, singularDepth, singularBeta - 1, singularBeta, ply, cutNode);
-            Stack[ply].excludedMove = MOVE_NONE;
+                negamax(td, pos, singularDepth, singularBeta - 1, singularBeta, ply, cutNode);
+            td->stack[ply].excludedMove = MOVE_NONE;
 
-            PvLength[ply] = savedPvLength;
+            td->pvLength[ply] = savedPvLength;
 
             if (search_stopped())
                 return VALUE_ZERO;
@@ -1532,8 +1651,8 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
                 extension = -2;
         }
 
-        Stack[ply].move       = m;
-        Stack[ply].movedPiece = moved;
+        td->stack[ply].move       = m;
+        td->stack[ply].movedPiece = moved;
 
         board_do_move(pos, m);
         eval_state_push(pos, m);
@@ -1546,7 +1665,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
          * live there. Bounded by ply so a perpetual cannot extend forever, and never stacked
          * on a singular extension: one ply is the answer to "this line is forced", however
          * many reasons there are to think so. */
-        if (extension == 0 && givesCheck && ply < 2 * RootDepth)
+        if (extension == 0 && givesCheck && ply < 2 * td->rootDepth)
             extension = 1;
 
         const Depth childDepth = depth - 1 + extension;
@@ -1577,7 +1696,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             /* A quiet move the history tables like is not "late" in any sense that matters,
              * whatever its position in the list. Both tables get a say: the butterfly history
              * knows the move, the continuation tables know the move in this context. */
-            r -= History[us][from_sq(m)][to_sq(m)] / LMR_HIST_DIVISOR;
+            r -= td->history[us][from_sq(m)][to_sq(m)] / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
             if (r < 0)
@@ -1591,17 +1710,17 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
          * window answers far more cheaply. A reduced null-window search is a bet that the
          * move fails low, so the child is by definition expected to fail high. */
         if (r > 0) {
-            v = -negamax(pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
+            v = -negamax(td, pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
             if (v > alpha)
-                v = -negamax(pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
+                v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         } else if (!pvNode || moveCount > 1) {
-            v = -negamax(pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
+            v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
 
         /* A full-window search is never a cut node: the whole point is that its value is
          * wanted exactly, not as a bound. */
         if (pvNode && (moveCount == 1 || (v > alpha && v < beta)))
-            v = -negamax(pos, childDepth, -beta, -alpha, ply + 1, false);
+            v = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
 
         eval_state_pop();
         board_undo_move(pos, m);
@@ -1615,12 +1734,13 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             if (v > alpha) {
                 alpha       = v;
                 raisedAlpha = true;
-                update_pv(ply, m);
+                update_pv(td, ply, m);
                 if (v >= beta) {
                     /* Fail high: the opponent would avoid this line. The move that cut is
                      * credited in whichever table describes it, and everything tried before it
                      * is blamed in both. */
-                    update_stats(pos, m, quiets, quietCount, captures, captureCount, depth, ply);
+                    update_stats(td, pos, m, quiets, quietCount, captures, captureCount, depth,
+                                 ply);
                     break;
                 }
             }
@@ -1654,7 +1774,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
         tt_store(key, bestMove, best, rawEval, depth, bound, ttPv, ply);
 
         /* Compiled out entirely unless UNC_PROBE; see test/uncprobe.h. */
-        unc_probe_node(pos, best, staticEval, bound, depth);
+        unc_probe_node(td, pos, best, staticEval, bound, depth);
 
         /*
          * Learn from this node only where the search genuinely contradicted the static
@@ -1670,7 +1790,7 @@ static Value negamax(Position *pos, Depth depth, Value alpha, Value beta, int pl
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
             !(bound == BOUND_LOWER && best <= staticEval) &&
             !(bound == BOUND_UPPER && best >= staticEval))
-            corrhist_update(pos, best, staticEval, depth);
+            corrhist_update(td, pos, best, staticEval, depth);
     }
 
     return best;
@@ -1722,18 +1842,18 @@ static void sort_root_moves(ScoredMove *roots, int count) {
  * between iterations so it can be reordered, and score every move rather than cutting off.
  * Returns VALUE_NONE if the iteration was interrupted, in which case its partial result
  * must be discarded. */
-static Value search_root(Position *pos, ScoredMove *roots, int count, Depth depth, Value alpha,
-                         Value beta, Move *bestMove) {
+static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int count, Depth depth,
+                         Value alpha, Value beta, Move *bestMove) {
     Value best = -VALUE_INFINITE;
 
-    PvLength[0] = 0;
+    td->pvLength[0] = 0;
 
     for (int i = 0; i < count; ++i) {
         const Move m = roots[i].m;
 
-        Stack[0].move       = m;
-        Stack[0].movedPiece = piece_on(pos, from_sq(m));
-        Stack[0].staticEval = VALUE_NONE;
+        td->stack[0].move       = m;
+        td->stack[0].movedPiece = piece_on(pos, from_sq(m));
+        td->stack[0].staticEval = VALUE_NONE;
 
         board_do_move(pos, m);
         eval_state_push(pos, m);
@@ -1741,15 +1861,15 @@ static Value search_root(Position *pos, ScoredMove *roots, int count, Depth dept
 
         Value v;
         if (i == 0) {
-            v = -negamax(pos, depth - 1, -beta, -alpha, 1, false);
+            v = -negamax(td, pos, depth - 1, -beta, -alpha, 1, false);
         } else {
             /* As in negamax: the first root move establishes alpha with the full window, and
              * every later one only has to answer whether it beats that. The ones that do -
              * rare, once the list is sorted by the previous iteration - pay for a re-search,
              * and the null-window expectation is that the child fails high on its own terms. */
-            v = -negamax(pos, depth - 1, -alpha - 1, -alpha, 1, true);
+            v = -negamax(td, pos, depth - 1, -alpha - 1, -alpha, 1, true);
             if (v > alpha && v < beta && !search_stopped())
-                v = -negamax(pos, depth - 1, -beta, -alpha, 1, false);
+                v = -negamax(td, pos, depth - 1, -beta, -alpha, 1, false);
         }
 
         eval_state_pop();
@@ -1763,7 +1883,7 @@ static Value search_root(Position *pos, ScoredMove *roots, int count, Depth dept
         if (v > best) {
             best      = v;
             *bestMove = m;
-            update_pv(0, m);
+            update_pv(td, 0, m);
 
             if (v > alpha)
                 alpha = v;
@@ -1790,36 +1910,41 @@ static int mate_in_moves(Value v) {
  * `info depth 12 seldepth 18 readyok`, which is neither a parsable info line nor a
  * readyok. One fputs of a complete line cannot be split that way.
  */
-static void print_iteration(Depth depth, Value value, int64_t elapsed, bool chess960) {
+static void print_iteration(const SearchThread *td, Depth depth, Value value, int64_t elapsed,
+                            bool chess960) {
     /* Cannot be outgrown: the fixed prefix is under 200 characters and the PV is at most
      * MAX_PLY moves of five characters plus a space. */
     char line[256 + MAX_PLY * 6];
     char buf[8];
     size_t n = 0;
 
-    n +=
-        (size_t)snprintf(line + n, sizeof(line) - n, "info depth %d seldepth %d ", depth, SelDepth);
+    n += (size_t)snprintf(line + n, sizeof(line) - n, "info depth %d seldepth %d ", depth,
+                          td->selDepth);
 
     if (is_mate_score(value))
         n += (size_t)snprintf(line + n, sizeof(line) - n, "score mate %d ", mate_in_moves(value));
     else
         n += (size_t)snprintf(line + n, sizeof(line) - n, "score cp %d ", value);
 
+    /* The whole pool's nodes, not this thread's share: a GUI showing one thread's nps on a
+     * 64-thread search is reporting a number that describes nothing. */
+    const uint64_t nodes = nodes_including(td);
+
     /* Clamped so a sub-millisecond iteration cannot divide by zero. */
     const int64_t ms = elapsed > 0 ? elapsed : 1;
     n += (size_t)snprintf(line + n, sizeof(line) - n, "nodes %llu nps %llu time %lld hashfull %d",
-                          (unsigned long long)NodeCount,
-                          (unsigned long long)((NodeCount * 1000ULL) / (uint64_t)ms),
+                          (unsigned long long)nodes,
+                          (unsigned long long)((nodes * 1000ULL) / (uint64_t)ms),
                           (long long)elapsed, tt_hashfull());
     if (TbLimit != 0)
         n += (size_t)snprintf(line + n, sizeof(line) - n, " tbhits %llu",
-                              (unsigned long long)TbHits);
+                              (unsigned long long)tbhits_including(td));
 
     n += (size_t)snprintf(line + n, sizeof(line) - n, " pv");
 
-    for (int i = 0; i < PvLength[0]; ++i)
+    for (int i = 0; i < td->rootPvLength; ++i)
         n += (size_t)snprintf(line + n, sizeof(line) - n, " %s",
-                              move_to_str(PvTable[0][i], chess960, buf));
+                              move_to_str(td->rootPv[i], chess960, buf));
 
     assert(n < sizeof(line) - 1);
     line[n++] = '\n';
@@ -1829,14 +1954,55 @@ static void print_iteration(Depth depth, Value value, int64_t elapsed, bool ches
     fflush(stdout);
 }
 
-static Move iterative_deepening(Position *pos, Move *ponderMove) {
-    *ponderMove = MOVE_NONE;
+/*
+ * Which iterations a helper thread skips.
+ *
+ * Lazy SMP only pays when the threads are looking at DIFFERENT things: N threads
+ * running the same iteration in lockstep mostly re-derive each other's cutoffs and the
+ * speedup collapses towards one. Each helper takes a phase and a period out of these
+ * tables and sits out the iterations that fall the wrong side of it, so at any moment
+ * the pool is spread over several depths and the table is being filled from several
+ * distances at once. The pattern repeats every 20 helpers, which is why it needs no
+ * relation to the thread count.
+ *
+ * The tables are Stockfish's, from the years its search used this scheme; they are
+ * kept because they are known to work, not because these particular numbers were
+ * derived here.
+ */
+/* clang-format off */
+static const int SkipSize[]  = {1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4};
+static const int SkipPhase[] = {0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7};
+/* clang-format on */
 
-    RootScore      = VALUE_NONE;
-    CompletedDepth = 0;
+#define SKIP_PATTERNS ((int)(sizeof(SkipSize) / sizeof(SkipSize[0])))
 
-    timeman_init(&Timer, &Limits, pos->sideToMove, pos->gamePly);
-    tt_new_search();
+/* One thread's iterative deepening over its own copy of the root. Thread 0 owns the
+ * clock, the `info` lines and the aspiration schedule the engine is judged on; a helper
+ * runs the same loop with the time management taken out and its own skip pattern in. */
+static void thread_search(SearchThread *td) {
+    Position *const pos = &td->rootPos;
+    const bool isMain   = td->id == 0;
+
+    /*
+     * This thread's accumulator stack starts empty. It has to: a level keeps the key of
+     * the position it describes and reuses its accumulator when the key matches, so a
+     * level left over from the previous search would be reused verbatim if this search
+     * starts from the same position - which is exactly what happens when `setoption name
+     * EvalFile` swapped the net in between. One accumulation per search per thread is
+     * nothing; a whole search scored by the net that was replaced is a silent loss.
+     */
+    eval_state_clear();
+
+    td->bestMove       = MOVE_NONE;
+    td->ponderMove     = MOVE_NONE;
+    td->rootScore      = VALUE_NONE;
+    td->completedDepth = 0;
+    td->rootPvLength   = 0;
+
+    if (isMain) {
+        timeman_init(&Timer, &Limits, pos->sideToMove, pos->gamePly);
+        tt_new_search();
+    }
 
     ScoredMove roots[MAX_MOVES];
     int rootCount = collect_root_moves(pos, roots);
@@ -1844,7 +2010,7 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
     /* Checkmate, stalemate, or a `searchmoves` list with nothing legal in it. MOVE_NONE
      * prints as `bestmove 0000`, which is what GUIs expect. */
     if (rootCount == 0)
-        return MOVE_NONE;
+        return;
 
     Value tbRootValue = VALUE_NONE;
 
@@ -1863,7 +2029,7 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
     if (TbLimit != 0 && Limits.searchmovesCount == 0) {
         const SyzygyRoot tb = syzygy_probe_root(pos);
         if (tb.value != VALUE_NONE) {
-            ++TbHits;
+            ++td->tbHits;
             tbRootValue = tb.value;
         }
         if (tb.move != MOVE_NONE && rootCount > 1) {
@@ -1877,21 +2043,31 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
         }
     }
 
-    Move best = roots[0].m;
+    /* Something legal to play from the first moment, so a `stop` that arrives before any
+     * iteration completes still produces a move rather than `bestmove 0000`. */
+    td->bestMove = roots[0].m;
 
     const Depth maxDepth = Limits.depth > 0 && Limits.depth < MAX_PLY ? Limits.depth : MAX_PLY - 1;
 
     Value prevScore = VALUE_NONE;
 
     /* Consecutive completed iterations that agreed on the best move, feeding the time
-     * manager. Tracked against its own previous value rather than against `best`, which
-     * starts out holding an unsearched move. */
+     * manager. Tracked against its own previous value rather than against the best move,
+     * which starts out holding an unsearched move. */
     int stability = 0;
     Move prevBest = MOVE_NONE;
 
+    /* The helper's seat in the skip tables. Offset by the root's ply so two searches from
+     * different positions in the same game do not hand every thread the same schedule. */
+    const int pattern = isMain ? -1 : (td->id - 1) % SKIP_PATTERNS;
+
     for (Depth depth = 1; depth <= maxDepth; ++depth) {
-        RootDepth          = depth;
-        SelDepth           = 0;
+        if (pattern >= 0 &&
+            ((depth + pos->gamePly + SkipPhase[pattern]) / SkipSize[pattern]) % 2 != 0)
+            continue;
+
+        td->rootDepth      = depth;
+        td->selDepth       = 0;
         Move iterationBest = MOVE_NONE;
 
         Value alpha = -VALUE_INFINITE;
@@ -1908,7 +2084,7 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
 
         Value value;
         for (;;) {
-            value = search_root(pos, roots, rootCount, depth, alpha, beta, &iterationBest);
+            value = search_root(td, pos, roots, rootCount, depth, alpha, beta, &iterationBest);
 
             if (search_stopped())
                 break;
@@ -1938,19 +2114,25 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
          * while everything outward-facing reports the proof. */
         const Value reported = tbRootValue != VALUE_NONE ? tbRootValue : value;
 
-        prevScore      = value;
-        best           = iterationBest;
-        RootScore      = reported;
-        CompletedDepth = depth;
+        prevScore          = value;
+        td->bestMove       = iterationBest;
+        td->rootScore      = reported;
+        td->completedDepth = depth;
+
+        td->rootPvLength = td->pvLength[0];
+        memcpy(td->rootPv, td->pvTable[0], (size_t)td->rootPvLength * sizeof(Move));
 
         /* Cleared, not left alone, when this iteration has no second PV move: the stale entry
          * belongs to a line the search has abandoned, and pondering on a move that no longer
          * follows `best` wastes the ponder search and desynchronises the GUI on ponderhit. */
-        *ponderMove = PvLength[0] > 1 ? PvTable[0][1] : MOVE_NONE;
+        td->ponderMove = td->rootPvLength > 1 ? td->rootPv[1] : MOVE_NONE;
 
-        if (!Silent)
-            print_iteration(depth, reported, elapsed_ms(), pos->chess960);
+        if (isMain && !Silent)
+            print_iteration(td, depth, reported, elapsed_ms(), pos->chess960);
         sort_root_moves(roots, rootCount);
+
+        if (!isMain)
+            continue;
 
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)
             break;
@@ -1963,69 +2145,361 @@ static Move iterative_deepening(Position *pos, Move *ponderMove) {
             break;
     }
 
-    atomic_store(&Nodes, NodeCount);
+    atomic_store(&td->publishedNodes, td->nodeCount);
+    atomic_store(&td->publishedTbHits, td->tbHits);
+}
+
+/*
+ * Whose move gets played.
+ *
+ * Deeper first, and on a tie the better score. Depth first because a thread that
+ * completed depth 20 examined everything the depth-18 thread did and more; score second
+ * because at equal depth the threads searched the same tree with different move orders,
+ * and the one that found more was looking in a better place. A thread that never
+ * completed an iteration has nothing to offer and is skipped outright.
+ *
+ * Stockfish weighs votes across threads instead, which is a real and different rule -
+ * it protects against one thread's single deep fluke - and swapping this for it is a
+ * change with its own SPRT, not a refactor.
+ */
+static SearchThread *best_thread(void) {
+    SearchThread *best = Threads[0];
+
+    for (int i = 1; i < ThreadCount; ++i) {
+        SearchThread *const td = Threads[i];
+
+        if (td->completedDepth == 0 || td->bestMove == MOVE_NONE)
+            continue;
+
+        if (best->completedDepth == 0 || best->bestMove == MOVE_NONE ||
+            td->completedDepth > best->completedDepth ||
+            (td->completedDepth == best->completedDepth && td->rootScore > best->rootScore))
+            best = td;
+    }
+
     return best;
 }
 
-/* One search over RootPos under Limits, shared by the worker thread and search_run_sync so
- * the two can never drift apart. */
-static Move run_search(Move *ponderMove) {
-    NodeCount = 0;
-    SelDepth  = 0;
-    TbLimit   = syzygy_max_pieces();
-    TbHits    = 0;
-    /* Per-search state, not per-game: a stale excluded move or grandparent evaluation left
-     * here by the previous search would make this one depend on it. */
-    atomic_store(&Nodes, 0);
+/* Everything a thread must forget between searches: a stale excluded move or grandparent
+ * evaluation left here by the previous search would make this one depend on it. */
+static void thread_prepare(SearchThread *td) {
+    td->rootPos   = RootPos;
+    td->nodeCount = 0;
+    td->tbHits    = 0;
+    td->selDepth  = 0;
 
-    memset(Stack, 0, sizeof(Stack));
+    atomic_store(&td->publishedNodes, 0);
+    atomic_store(&td->publishedTbHits, 0);
 
-    *ponderMove = MOVE_NONE;
-    return iterative_deepening(&RootPos, ponderMove);
+    memset(td->stack, 0, sizeof(td->stack));
 }
 
-static void worker_entry(void *arg) {
-    (void)arg;
-
-    Move ponderMove;
-    Move best = run_search(&ponderMove);
-
+/*
+ * Thread 0's work once its own iterations are done: hold if UCI says it must, stop the
+ * helpers, wait for them, and announce the result.
+ *
+ * The order is load-bearing. StopFlag is what ends a helper's search, and it is also
+ * what the hold below is waiting for, so setting it early would end the hold as well and
+ * send `bestmove` during a `go infinite` - which UCI forbids and which GUIs report as a
+ * lost game rather than as a protocol error.
+ */
+static void finish_search(void) {
     /* UCI forbids sending `bestmove` during a ponder or an infinite search: the GUI owns that
      * decision and will send `stop` or `ponderhit` first. Replying early desynchronises the
-     * GUI and shows up as spurious losses. */
+     * GUI and shows up as spurious losses. The helpers keep searching throughout, which is
+     * the only useful thing anyone can do with the time. */
     while (!atomic_load(&StopFlag) && (atomic_load(&Pondering) || Limits.infinite))
         thread_sleep_ms(1);
 
+    atomic_store(&StopFlag, true);
+
+    mutex_lock(&ThreadMutex);
+    for (;;) {
+        bool anyRunning = false;
+        for (int i = 1; i < ThreadCount; ++i)
+            anyRunning = anyRunning || Threads[i]->searching;
+
+        if (!anyRunning)
+            break;
+
+        cond_wait(&ThreadCv, &ThreadMutex);
+    }
+    mutex_unlock(&ThreadMutex);
+
+    const SearchThread *const best = best_thread();
+
+    /* A GUI's last `info` line is where its evaluation display comes from, and it has
+     * been thread 0's all search. When somebody else's iteration wins, saying so is the
+     * difference between a coherent report and a PV that does not start with the move
+     * the engine just played. */
+    if (best->id != 0 && best->completedDepth > 0 && !Silent)
+        print_iteration(best, best->completedDepth, best->rootScore, elapsed_ms(),
+                        RootPos.chess960);
+
     atomic_store(&Searching, false);
-    uci_print_bestmove(best, ponderMove);
+    uci_print_bestmove(best->bestMove, best->ponderMove);
+}
+
+/* A pooled thread's whole life: park, search, park again. Created once when `Threads`
+ * is set and joined only when it changes or the engine exits. */
+static void thread_entry(void *arg) {
+    SearchThread *const td = (SearchThread *)arg;
+
+    thread_bind(td->id);
+
+    /* Without one the evaluation is still correct and several times slower, so it is
+     * worth saying which thread is running that way rather than leaving an unexplained
+     * collapse in nps. */
+    if (!eval_state_alloc())
+        printf("info string thread %d: no accumulator stack; its evaluation will be slow\n",
+               td->id);
+
+    for (;;) {
+        mutex_lock(&ThreadMutex);
+        while (!td->go && !td->exit)
+            cond_wait(&ThreadCv, &ThreadMutex);
+
+        if (td->exit) {
+            mutex_unlock(&ThreadMutex);
+            break;
+        }
+
+        td->go = false;
+        mutex_unlock(&ThreadMutex);
+
+        thread_search(td);
+
+        if (td->id == 0)
+            finish_search();
+
+        /* Cleared here and SET by whoever started the search, which is the whole
+         * handshake: a thread that marked itself busy on waking would leave a window
+         * in which the starter has already returned and a waiter sees an idle pool
+         * that has not begun. That window is not theoretical - it makes `bench` read
+         * a node count of zero and start the next position on top of this one. */
+        mutex_lock(&ThreadMutex);
+        td->searching = false;
+        cond_broadcast(&ThreadCv);
+        mutex_unlock(&ThreadMutex);
+    }
+
+    eval_state_free();
+}
+
+/* Blocks until no pooled thread is searching. `bestmove` is printed by thread 0 before
+ * it clears its own flag, so a caller that returns from here has seen it. */
+static void pool_wait(void) {
+    if (!PoolReady)
+        return;
+
+    mutex_lock(&ThreadMutex);
+    for (;;) {
+        bool anyRunning = false;
+        for (int i = 0; i < ThreadCount; ++i)
+            anyRunning = anyRunning || Threads[i]->searching;
+
+        if (!anyRunning)
+            break;
+
+        cond_wait(&ThreadCv, &ThreadMutex);
+    }
+    mutex_unlock(&ThreadMutex);
+}
+
+static void pool_destroy(void) {
+    if (ThreadCount == 0)
+        return;
+
+    mutex_lock(&ThreadMutex);
+    for (int i = 0; i < ThreadCount; ++i)
+        Threads[i]->exit = true;
+    cond_broadcast(&ThreadCv);
+    mutex_unlock(&ThreadMutex);
+
+    for (int i = 0; i < ThreadCount; ++i) {
+        if (Threads[i]->started)
+            thread_join(Threads[i]->handle);
+        free(Threads[i]);
+    }
+
+    free(Threads);
+    Threads     = NULL;
+    ThreadCount = 0;
+}
+
+/*
+ * Allocates the pool's blocks. Every one is about 8 MB, so this is where a `Threads`
+ * setting is paid for - once, rather than on every `go`, which is the whole reason the
+ * threads are parked between searches instead of created per search.
+ *
+ * A block that cannot be allocated ends the pool where it is: the engine runs with fewer
+ * threads than asked rather than failing to start a search. It never ends with none,
+ * because thread 0's block is the one a synchronous search runs in too.
+ */
+static void thread_pool_set(int count) {
+    pool_destroy();
+
+    if (count < 1)
+        count = 1;
+    if (count > SEARCH_MAX_THREADS)
+        count = SEARCH_MAX_THREADS;
+
+    free(Threads);
+    Threads = (SearchThread **)calloc((size_t)count, sizeof(SearchThread *));
+    if (!Threads) {
+        printf("info string could not allocate the thread table; searching with 1 thread\n");
+        return;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        SearchThread *const td = (SearchThread *)calloc(1, sizeof(SearchThread));
+        if (!td) {
+            printf("info string could not allocate thread %d (%zu MB each); using %d\n", i,
+                   sizeof(SearchThread) / (1024 * 1024), i);
+            break;
+        }
+
+        td->id      = i;
+        Threads[i]  = td;
+        ThreadCount = i + 1;
+    }
+}
+
+/*
+ * Starts whatever is not running yet, and answers whether anything is.
+ *
+ * Separate from the allocation above, and that separation is the whole point: a process
+ * that only ever runs SYNCHRONOUS searches then never gains a second thread at all.
+ * tools/datagen.c is that process, and it forks - and fork() in a multithreaded program
+ * is a far narrower contract than in a single-threaded one, for a thread it was never
+ * going to use.
+ */
+static bool pool_start(void) {
+    for (int i = 0; i < ThreadCount; ++i) {
+        SearchThread *const td = Threads[i];
+
+        if (!td->started)
+            td->started = thread_create(&td->handle, thread_entry, td);
+
+        if (td->started)
+            continue;
+
+        /* Everything above this index is unstarted too, since they are started in order,
+         * so the pool becomes what did start. Thread 0's BLOCK is kept whether or not its
+         * thread was: it is where an inline search runs, and where a synchronous one
+         * always runs. */
+        const int kept = i > 0 ? i : 1;
+        printf("info string could not start thread %d; using %d\n", i, kept);
+
+        for (int j = kept; j < ThreadCount; ++j) {
+            free(Threads[j]);
+            Threads[j] = NULL;
+        }
+        ThreadCount = kept;
+        break;
+    }
+
+    return ThreadCount > 0 && Threads[0]->started;
+}
+
+int search_threads(void) { return ThreadCount; }
+
+void search_set_threads(int count) {
+    search_stop();
+    search_wait();
+
+    if (count == ThreadCount)
+        return;
+
+    thread_pool_set(count);
+
+    /* Started here rather than at the first `go`: a GUI that asks for 128 threads should
+     * pay for them where it asked, not in the middle of the first move's clock. */
+    pool_start();
+    search_clear();
+}
+
+size_t search_thread_bytes(void) { return sizeof(SearchThread) + eval_state_bytes(); }
+
+void search_exit(void) {
+    search_stop();
+    search_wait();
+    pool_destroy();
+
+    if (PoolReady) {
+        mutex_destroy(&ThreadMutex);
+        cond_destroy(&ThreadCv);
+        PoolReady = false;
+    }
+}
+
+/* Common to both entry points: everything that must be true before the threads run. */
+static void search_setup(const Position *pos, const SearchLimits *limits, bool silent) {
+    RootPos = *pos;
+    Limits  = *limits;
+    Silent  = silent;
+
+    /* Read once here rather than per node, and once for the whole pool: a `SyzygyPath`
+     * that changed mid-search would otherwise mean two threads disagreeing about how many
+     * pieces a probe is legal at. */
+    TbLimit = syzygy_max_pieces();
+
+    atomic_store(&StopFlag, false);
+    atomic_store(&ClockOrigin, limits->startTime);
+    atomic_store(&Searching, true);
+
+    for (int i = 0; i < ThreadCount; ++i)
+        thread_prepare(Threads[i]);
 }
 
 void search_start(const Position *pos, const SearchLimits *limits) {
-    /* Only one search at a time, so the previous worker has to be joined - but joining is not
-     * enough on its own. A `go infinite` worker parks until StopFlag is set, so a bare join
+    /* Only one search at a time, so the previous one has to be finished - but waiting is not
+     * enough on its own. A `go infinite` search parks until StopFlag is set, so a bare wait
      * would block the UCI thread inside `go` while the `stop` that would release it can only
      * arrive on that same thread. Asking it to stop first makes the wait bounded. */
     search_stop();
     search_wait();
 
-    RootPos = *pos;
-    Limits  = *limits;
+    if (ThreadCount == 0) {
+        /* Not one block could be allocated, so there is nowhere to search. Answering the
+         * protocol is all that is left - a GUI that gets no `bestmove` at all hangs until
+         * it times the engine out, which hides the reason. */
+        printf("info string no search thread could be allocated; cannot search\n");
+        atomic_store(&Searching, false);
+        uci_print_bestmove(MOVE_NONE, MOVE_NONE);
+        return;
+    }
 
-    atomic_store(&StopFlag, false);
+    search_setup(pos, limits, false);
     atomic_store(&Pondering, limits->ponder);
-    atomic_store(&ClockOrigin, limits->startTime);
-    atomic_store(&Searching, true);
-    Silent = false;
 
-    WorkerStarted = thread_create(&Worker, worker_entry, NULL);
-    if (!WorkerStarted) {
-        /* Searching inline still produces a legal game - it just cannot be interrupted - which
-         * beats not moving at all. The ponder/infinite hold has to be dropped with it: that
-         * loop waits for a `stop` only the UCI thread can deliver, and the UCI thread is the
-         * one about to run the search. */
+    /* The first `go` of a session is where the default pool is actually created. One
+     * thread costs tens of microseconds; a pool the GUI asked for was started when it
+     * asked. */
+    const bool released = pool_start();
+
+    mutex_lock(&ThreadMutex);
+    if (released)
+        for (int i = 0; i < ThreadCount; ++i)
+            if (Threads[i]->started) {
+                Threads[i]->go        = true;
+                Threads[i]->searching = true;
+            }
+    cond_broadcast(&ThreadCv);
+    mutex_unlock(&ThreadMutex);
+
+    if (!released) {
+        /* No pooled thread to run it, so the UCI thread searches inline. It still produces a
+         * legal game - it just cannot be interrupted - which beats not moving at all. The
+         * ponder/infinite hold has to be dropped with it: that loop waits for a `stop` only
+         * the UCI thread can deliver, and the UCI thread is the one about to search. */
         Limits.infinite = false;
         atomic_store(&Pondering, false);
-        worker_entry(NULL);
+
+        thread_search(Threads[0]);
+        atomic_store(&StopFlag, true);
+        atomic_store(&Searching, false);
+        uci_print_bestmove(Threads[0]->bestMove, Threads[0]->ponderMove);
     }
 }
 
@@ -2034,28 +2508,38 @@ void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResu
     search_stop();
     search_wait();
 
-    RootPos = *pos;
-    Limits  = *limits;
+    if (ThreadCount == 0) {
+        printf("info string no search thread could be allocated; cannot search\n");
+        out->best  = MOVE_NONE;
+        out->score = VALUE_NONE;
+        out->depth = 0;
+        out->nodes = 0;
+        return;
+    }
 
-    atomic_store(&StopFlag, false);
+    search_setup(pos, limits, true);
 
     /* A synchronous ponder search would wait for a `stop` that no one is around to send, so
      * the flag is dropped rather than honoured. */
     atomic_store(&Pondering, false);
-    atomic_store(&ClockOrigin, limits->startTime);
-    atomic_store(&Searching, true);
-    Silent = true;
 
-    Move ponderMove;
-    const Move best = run_search(&ponderMove);
+    /*
+     * One thread, on the caller's own stack, whatever `Threads` says. Everything that calls
+     * this - datagen above all - wants a search that is a function of its position, its seed
+     * and its node limit and of nothing else, and a parallel search is not: the pool reaches
+     * the shared table in an order the operating system chooses, so the same position would
+     * label differently on two runs of the same shard.
+     */
+    SearchThread *const td = Threads[0];
+    thread_search(td);
 
     Silent = false;
     atomic_store(&Searching, false);
 
-    out->best  = best;
-    out->score = RootScore;
-    out->depth = CompletedDepth;
-    out->nodes = NodeCount;
+    out->best  = td->bestMove;
+    out->score = td->rootScore;
+    out->depth = td->completedDepth;
+    out->nodes = td->nodeCount;
 }
 
 void search_stop(void) { atomic_store(&StopFlag, true); }
@@ -2075,9 +2559,4 @@ void search_ponderhit(void) {
     atomic_store(&Pondering, false);
 }
 
-void search_wait(void) {
-    if (WorkerStarted) {
-        thread_join(Worker);
-        WorkerStarted = false;
-    }
-}
+void search_wait(void) { pool_wait(); }

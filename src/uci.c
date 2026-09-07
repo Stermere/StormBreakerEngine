@@ -21,6 +21,7 @@
 #include "search.h"
 #include "syzygy.h"
 #include "test/chess960test.h"
+#include "test/smptest.h"
 #include "test/syzygytest.h"
 #ifdef UNC_PROBE
 #include "test/uncprobe.h"
@@ -163,10 +164,10 @@ static void cmd_uci(void) {
 
     printf("option name Hash type spin default %d min %d max %d\n", OPT_HASH_DEFAULT, OPT_HASH_MIN,
            OPT_HASH_MAX);
-    /* Hash and Threads are mandatory for OpenBench compliance. Threads is pinned to 1
-     * until the search is actually parallel - advertising a range the engine cannot
-     * honour makes test clients run games that are silently single-threaded. */
-    printf("option name Threads type spin default 1 min 1 max 1\n");
+    /* Hash and Threads are mandatory for OpenBench compliance. The default stays 1
+     * because that is the configuration every SPRT and every bench node count in
+     * docs/EXPERIMENTS.md was measured in; a GUI that wants the machine has to ask. */
+    printf("option name Threads type spin default 1 min 1 max %d\n", SEARCH_MAX_THREADS);
     printf("option name Ponder type check default false\n");
     printf("option name Move Overhead type spin default %d min %d max %d\n", OPT_OVERHEAD_DEFAULT,
            OPT_OVERHEAD_MIN, OPT_OVERHEAD_MAX);
@@ -255,11 +256,21 @@ static void cmd_setoption(char *args) {
         if (!tt_resize((size_t)OptHash))
             printf("info string failed to allocate %d MB hash\n", OptHash);
     } else if (strcmp(name, "Threads") == 0 && value) {
-        const int threads = atoi(value);
-        if (threads != 1)
-            printf("info string only 1 thread is supported; ignoring Threads=%d\n", threads);
-        /* Accepted and ignored on purpose: the option exists so a GUI will send
-         * `go ponder`, and it is that command the search acts on. */
+        const int threads = spin_value(name, value, 1, SEARCH_MAX_THREADS, search_threads());
+
+        end_search_for_option(name);
+        search_set_threads(threads);
+
+        /* Said out loud in both directions. A pool costs a little over 8 MB a thread, so
+         * the difference between 8 and 512 is the difference between nothing and four
+         * gigabytes; and if the machine could not give us what the GUI asked for, a
+         * match that is quietly running at a third of the requested strength is worth
+         * more to know about than it is to hide. */
+        printf("info string threads: %d (%zu MB)\n", search_threads(),
+               (search_thread_bytes() * (size_t)search_threads()) / (1024 * 1024));
+        if (search_threads() != threads)
+            printf("info string could not allocate %d threads; using %d\n", threads,
+                   search_threads());
     } else if (strcmp(name, "Ponder") == 0 && value) {
     } else if (strcmp(name, "Move Overhead") == 0 && value) {
         OptMoveOverhead =
@@ -545,6 +556,26 @@ static void cmd_chess960(char *args) {
     fflush(stdout);
 }
 
+/* `smp selftest [threads]` is the parallel-search gate; test/smptest.c says what it
+ * checks that a node count cannot. It resizes the pool and clears the table, so it is
+ * a developer command and not something to run in the middle of a game. */
+static void cmd_smp(char *args) {
+    char *cursor = args;
+    char *tok    = next_token(&cursor);
+
+    if (token_is(tok, "selftest")) {
+        char *n = next_token(&cursor);
+        if (smp_selftest(n ? atoi(n) : 0) != 0)
+            ExitCode = 1;
+    } else if (!tok) {
+        printf("smp: %d threads, %zu MB of per-thread state\n", search_threads(),
+               (search_thread_bytes() * (size_t)search_threads()) / (1024 * 1024));
+    } else {
+        printf("usage: smp [selftest [max threads]]\n");
+    }
+    fflush(stdout);
+}
+
 /* `syzygy verify <path>` is the tablebase acceptance gate. It loads and releases its
  * own tables, so it does not disturb whatever SyzygyPath a running session had set. */
 static void cmd_syzygy(char *args) {
@@ -643,6 +674,8 @@ bool uci_execute(const char *line) {
         cmd_syzygy(cursor);
     } else if (strcmp(cmd, "chess960") == 0) {
         cmd_chess960(cursor);
+    } else if (strcmp(cmd, "smp") == 0) {
+        cmd_smp(cursor);
 #ifdef UNC_PROBE
     } else if (strcmp(cmd, "probe") == 0) {
         cmd_probe(cursor);

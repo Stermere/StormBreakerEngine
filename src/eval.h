@@ -7,6 +7,9 @@
 #ifndef EVAL_H
 #define EVAL_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #include "board.h"
 #include "types.h"
 
@@ -30,8 +33,22 @@ void eval_trace(const Position *pos);
  * The network's accumulator stack: push after a move is played, pop before it is
  * retracted. Correctness does not depend on these being called - each level
  * rebuilds from the board when its stored key does not match - but speed does.
+ *
+ * One stack per THREAD, held in thread-local storage. eval_state_alloc() claims the
+ * calling thread's, and every searching thread must call it: without one the
+ * evaluation still answers correctly, from a full accumulation at every node, which
+ * is several times slower. It is allocated lazily by the first evaluation on a
+ * thread that skipped it, so a tool that only wants a score need not know about any
+ * of this.
  */
 #ifdef EVAL_NNUE
+
+bool eval_state_alloc(void);
+void eval_state_free(void);
+
+/* What one thread's stack costs, so a `Threads` setting can be reported before it is
+ * multiplied by a hundred. */
+size_t eval_state_bytes(void);
 
 void eval_state_clear(void);
 void eval_state_push(const Position *pos, Move m);
@@ -39,6 +56,10 @@ void eval_state_push_null(const Position *pos);
 void eval_state_pop(void);
 
 #else
+
+static inline bool eval_state_alloc(void) { return true; }
+static inline void eval_state_free(void) {}
+static inline size_t eval_state_bytes(void) { return 0; }
 
 static inline void eval_state_clear(void) {}
 static inline void eval_state_push(const Position *pos, Move m) {

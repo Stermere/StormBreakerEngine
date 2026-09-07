@@ -72,6 +72,16 @@ void bench_run(int depth) {
     /* Fixed hash size, so the node count cannot depend on whatever Hash was set to. */
     tt_resize(16);
 
+    /*
+     * And fixed at one thread, for the same reason and a stronger one. A parallel search
+     * reaches the shared table in whatever order the scheduler produces, so its node count
+     * is not reproducible even on one machine - and invariant 1 is what makes every
+     * measurement in this repository comparable. `bench` is a measurement, not a benchmark
+     * of the machine.
+     */
+    const int threads = search_threads();
+    search_set_threads(1);
+
     uint64_t totalNodes = 0;
     const int64_t start = time_ms();
 
@@ -105,6 +115,8 @@ void bench_run(int depth) {
         elapsed = 1;
 
     const uint64_t nps = (uint64_t)((double)totalNodes * 1000.0 / (double)elapsed);
+
+    search_set_threads(threads);
 
     printf("\n===========================\n");
     printf("Positions  : %d\n", BENCH_POSITION_COUNT);

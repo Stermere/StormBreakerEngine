@@ -16,6 +16,13 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+/* Processor groups are a Windows 7 API, and a machine with more than 64 logical
+ * processors cannot be used without them - so the declarations are not optional
+ * here, however old a default the toolchain picks. */
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0601
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
 #include <windows.h>
 
 typedef HANDLE ThreadHandle;
@@ -37,7 +44,20 @@ bool thread_create(ThreadHandle *handle, ThreadEntry fn, void *arg);
 
 void thread_join(ThreadHandle handle);
 
+/* Logical processors this process may use - every processor group on Windows, not
+ * just the one it was launched into. */
 int thread_hardware_concurrency(void);
+
+/*
+ * Places the CALLING thread, which must be worker number `index`, on the machine.
+ *
+ * Only Windows does anything: a process is confined to a single processor group
+ * unless a thread asks for another by name, so on a 128-core machine every thread
+ * would pile onto the first 64 cores and half the machine would sit idle. Every
+ * other platform schedules across the whole machine already, and pinning there
+ * would take away the scheduler's ability to migrate a thread off a busy core.
+ */
+void thread_bind(int index);
 
 /* Only for parking a thread on an external event, such as a `stop` that has not
  * arrived - never inside the search. */
