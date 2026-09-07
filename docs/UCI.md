@@ -33,6 +33,34 @@ All standard arguments are parsed:
 `go perft <depth>` prints a per-move node breakdown in the same format as
 Stockfish's, so the two can be diffed directly.
 
+### What `info` reports as a score
+
+| Situation | Reported as |
+|---|---|
+| an evaluation | `score cp <n>`, the engine's own centipawns |
+| a mate the search proved | `score mate <moves>`, negative when being mated |
+| a tablebase win or loss | `score cp ±(20000 - plies to the tablebase result)` |
+| a tablebase draw, cursed win or blessed loss | `score cp 0` |
+
+The tablebase band is Stockfish's convention, so a GUI displays it the same way
+for both engines. It is deliberately not `score mate`: a proven win is not a
+mate in a known number of moves, and a GUI told otherwise counts down to a mate
+that never arrives. Where the search *does* prove a mate under a tablebase root,
+the mate score is what gets reported — it is the stronger of the two proofs,
+since it names the distance.
+
+A root position found in the tables also prints its distance-to-zero once,
+before the first iteration:
+
+```
+info string syzygy: win at the root (dtz 23)
+```
+
+`dtz` is plies to the next capture or pawn move under optimal play, signed from
+the side to move's point of view. That is what the score cannot carry, and it is
+why a won position can still report `score cp 0`: `draw by the fifty-move rule`
+means the win is real but does not fit in the halfmoves left.
+
 ---
 
 ## Options

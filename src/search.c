@@ -1904,6 +1904,25 @@ static int mate_in_moves(Value v) {
 }
 
 /*
+ * What a proven tablebase result is reported as, in centipawns.
+ *
+ * The internal band sits directly below the mate scores, so printing one raw gives
+ * `score cp 31753` - a number that means nothing to whoever is reading it and looks like
+ * the engine has lost its mind. Two hundred pawns is clear of anything the evaluation
+ * produces and clear of the mate band, which is what "won, no mate in sight yet" should
+ * look like; it is the convention Stockfish reports tablebase scores in, so GUIs already
+ * display it the way people expect.
+ */
+enum { TB_REPORT_CP = 20000 };
+
+/* Keeping the ply offset the probe put on the score, so a conversion that is nearer still
+ * reads as better than one further away. */
+static int tb_in_cp(Value v) {
+    const int ply = VALUE_TB_WIN - (v > 0 ? v : -v);
+    return v > 0 ? TB_REPORT_CP - ply : ply - TB_REPORT_CP;
+}
+
+/*
  * The line is assembled in full and written once. main.c makes stdout unbuffered and the
  * UCI thread answers `isready` while this worker searches, so a sequence of printf calls
  * lets another thread's output land in the middle: the GUI sees
@@ -1923,6 +1942,8 @@ static void print_iteration(const SearchThread *td, Depth depth, Value value, in
 
     if (is_mate_score(value))
         n += (size_t)snprintf(line + n, sizeof(line) - n, "score mate %d ", mate_in_moves(value));
+    else if (is_decisive_score(value))
+        n += (size_t)snprintf(line + n, sizeof(line) - n, "score cp %d ", tb_in_cp(value));
     else
         n += (size_t)snprintf(line + n, sizeof(line) - n, "score cp %d ", value);
 
@@ -2031,6 +2052,18 @@ static void thread_search(SearchThread *td) {
         if (tb.value != VALUE_NONE) {
             ++td->tbHits;
             tbRootValue = tb.value;
+
+            /* The one thing a centipawn score cannot carry: how far the win is from a
+             * capture or a pawn move, and - when a won position scores as a draw anyway -
+             * why. Printed once, because the root probe cannot change under the search,
+             * and only by the thread that owns the output. */
+            if (isMain && !Silent)
+                printf("info string syzygy: %s at the root (dtz %d)\n",
+                       tb.value > VALUE_DRAW   ? "win"
+                       : tb.value < VALUE_DRAW ? "loss"
+                       : tb.dtz != 0           ? "draw by the fifty-move rule"
+                                               : "draw",
+                       tb.dtz);
         }
         if (tb.move != MOVE_NONE && rootCount > 1) {
             for (int i = 0; i < rootCount; ++i) {
@@ -2111,8 +2144,15 @@ static void thread_search(SearchThread *td) {
 
         /* A proven result outranks the tree's opinion of it. `prevScore` keeps the tree's own
          * number so the next aspiration window is centred on something the tree can return,
-         * while everything outward-facing reports the proof. */
-        const Value reported = tbRootValue != VALUE_NONE ? tbRootValue : value;
+         * while everything outward-facing reports the proof.
+         *
+         * A mate the tree has actually found is the exception, because it is the stronger
+         * proof of the two: it names the distance, where the tablebase value only says
+         * "won". The search knows the fifty-move rule, so a mate it returns is one that
+         * really arrives before the counter does. Without this a mate in one under a
+         * five-man root reports as "won by tablebase". */
+        const Value reported =
+            tbRootValue != VALUE_NONE && !is_mate_score(value) ? tbRootValue : value;
 
         prevScore          = value;
         td->bestMove       = iterationBest;
