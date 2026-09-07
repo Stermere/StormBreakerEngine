@@ -355,7 +355,7 @@ TUNABLE(CORR_W_PAWN, 132);
  * slope are centred values, and cannot be swept against a net with an uncertainty head
  * because unc_scale() returns on the sigma branch before reading them. */
 TUNABLE(UNC_SCALE_BASE, 89);
-TUNABLE(UNC_SCALE_SLOPE, 1);
+TUNABLE(UNC_SCALE_SLOPE, 2);
 TUNABLE(UNC_SCALE_MAX, 144);
 
 /* The same mapping for a net carrying the trained uncertainty head, whose signal is

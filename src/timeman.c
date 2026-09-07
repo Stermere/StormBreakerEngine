@@ -58,8 +58,21 @@ int64_t time_ms(void) {
  * whole clock late in a game. */
 #define MAX_NOMINAL_MULT 5
 
-/* Past this many moves to the control the horizon stops mattering, and treating it
- * as sudden death allocates better than dividing by a huge N. */
+/*
+ * What the clock is divided by when nothing narrows it: the cap on `movestogo`, and
+ * the whole horizon without one. Not a guess at the game's length - a fraction of what
+ * is *left* is spent every move, so this is the rate the clock decays at.
+ *
+ * Twenty decayed too fast in both directions. With no increment it is a geometric
+ * slide - 2.5s on move 1 at 60+0, 11ms by move 80 - so the phase that has to be
+ * converted is played on moves too short to search. With one it drains the bank to
+ * about `moves / 4` times the increment, 400ms at 8+0.08, and every sharp position
+ * after that gets whatever the increment happens to pay.
+ *
+ * Fifty spends under half as much before move 20 and more than twenty did on every
+ * move after about 25, because the time is still there to spend. The opening pays for
+ * it, which is where the phase curve below already says the least is at stake.
+ */
 #define MOVESTOGO_CAP 50
 
 static int64_t clamp64(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -123,13 +136,12 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
         return;
     }
 
-    /* Sudden death plus increment: assume about twenty moves left. With a move count to
-     * the next control, divide by that instead - but cap it, because dividing by 40
-     * early in a long control wastes time on moves that do not decide the game. */
-    const int64_t moves =
-        limits->movestogo > 0
-            ? (limits->movestogo < MOVESTOGO_CAP ? limits->movestogo : MOVESTOGO_CAP)
-            : 20;
+    /* A move count to the next control divides the clock directly, capped because
+     * dividing by 40 early in a long control wastes time on moves that do not decide the
+     * game. Without one, that cap is the horizon. */
+    const int64_t moves = limits->movestogo > 0 && limits->movestogo < MOVESTOGO_CAP
+                              ? limits->movestogo
+                              : MOVESTOGO_CAP;
 
     const int64_t clock    = limits->time[us];
     const int64_t overhead = uci_move_overhead();
@@ -138,9 +150,9 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
     /*
      * Move Overhead is owed on every move still to be played, not only on this one.
      * Spending `remaining / moves + 3/4 inc` and being paid `inc` back is a
-     * contraction, so the clock converges rather than decays - on about five times the
-     * increment, which at 8+0.08 is 400ms with every later move's latency still to come
-     * out of it.
+     * contraction, so the clock converges rather than decays - on `moves / 4` times the
+     * increment, which at 8+0.08 is a second with every later move's latency still to
+     * come out of it.
      *
      * Reserving the latency up front moves that convergence point up by the whole
      * reserve, so a declared 100ms overhead buys a wide margin without anyone asking.

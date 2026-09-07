@@ -66,6 +66,8 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
 | Chess960: per-position castling geometry, both FEN spellings, unambiguous notation | shipped; verified against an independent engine (E25) |
+| Time management: the sudden-death horizon was a decay rate, 20 -> 50 | **+271.84 ± 31.03** (E29) |
+| **Time management: LTC confirmation (E29 is STC-only)** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`

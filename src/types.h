@@ -17,7 +17,7 @@
 #endif
 
 #define ENGINE_NAME    "StormBreaker"
-#define ENGINE_VERSION "0.3.0-dev"
+#define ENGINE_VERSION "0.4.0"
 #define ENGINE_AUTHOR  "Collin Kees"
 
 enum {

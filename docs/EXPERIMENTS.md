@@ -2046,3 +2046,87 @@ measurable. **Coverage, not capacity, is still the binding constraint** - which
 is what E18 concluded from the other direction and what item 1 of the roadmap
 already says. A wider net is not the way to spend the next generation; more
 varied data is.
+
+---
+
+### E29 - Time management: the sudden-death horizon was a decay rate
+
+**Date** 2026-09-06 · **Commit** `7b3d7c0` · **Baseline** `sb_old.exe`, which is
+that same build with `src/timeman.c` reverted to `4e1ee5b`. Both binaries report
+`StormBreaker 0.4.0` and both bench 220800, so `timeman.c` is the only variable -
+including the `UNC_SCALE_SLOPE` 1 -> 2 reset that rode in on the same commit,
+which was present identically on both sides.
+
+E28 is deliberately skipped: E27 already refers forward to it for the
+uncertainty-head split.
+
+**The defect.** `timeman_init()` divided the clock by 20 whenever `movestogo`
+was absent. That is not an estimate of how long the game runs. A twentieth of
+what is *left* is spent every move, so the divisor is the rate the clock decays
+at, and the right rate depends entirely on whether an increment refills it. The
+file's own comment shows the design was reasoned only about the increment case -
+"being paid `inc` back is a contraction, so the clock converges". With `inc = 0`
+that contraction does not exist and the clock decays geometrically to nothing;
+with one it converges on `moves / 4` times the increment, which at 8+0.08 is
+400ms.
+
+**The change.** One line - reuse `MOVESTOGO_CAP` (50) as the horizon when
+`movestogo` says nothing, instead of 20.
+
+**Allocation, read out of `timeman_init()` directly** rather than inferred from
+games, so these are exact:
+
+| 8+0.08 | old opt / clock | new opt / clock |
+|---|---|---|
+| move 1 | 381 / 8000 | 177 / 8000 |
+| move 20 | 196 / 2619 | 169 / 5235 |
+| move 40 | 88 / 712 | **116** / **3099** |
+| move 60 | 61 / 346 | **81** / **2087** |
+| move 80 | 54 / 338 | **66** / **1681** |
+
+The point that makes this a fix rather than a preference: it spends *more* per
+move from about move 25 onward **and** holds six times the reserve. Only the
+first twenty moves pay for it, which is where `PhasePercent` already says the
+least is at stake. At 60+0 a played-out 50-move game ended with 164ms on the old
+clock against 13.6s on the new.
+
+| vs `sb_old`, STC 8+0.08, bounds [0, 5], UHO_Lichess_4852_v1 | |
+|---|---|
+| Games | 318 |
+| W/L/D | 218 / 10 / 90 |
+| Ptnml(0-2) | [0, 1, 14, 79, 65] |
+| **Elo** | **+271.84 ± 31.03** (nElo +491.80 ± 38.19) |
+| LLR | 2.59 (87.8%) of (-2.94, 2.94) |
+
+Recorded at the 318-game snapshot, where the LLR had not yet crossed 2.94. LOS
+was 100% and the lower bound sat 240 Elo above the H1 threshold, so the verdict
+was not in question, but the entry records what was actually observed.
+
+**Why the number is this large, and what it is not.** E23 removed every
+adjudication rule, so games run to natural termination - median 68 moves across
+the 281 games in the run PGN, 83% of them past move 50. Overlaid on the table
+above, the baseline was spending at or below its own 80ms increment for roughly
+the last two thirds of every game. All 281 games terminated `normal`; there
+were **zero time forfeits**, so this is play quality under starvation rather
+than flagging, and the score recomputed independently from the PGN (82.97%)
+matches what fastchess reported.
+
+That also bounds the claim. +272 Elo is measured against an opponent with
+exactly the weakness the patch removes, under conditions that maximise it - an
+unbalanced book and no adjudication, so every game plays deep into the starved
+regime. It does **not** predict +272 against the field. Earlier entries are not
+invalidated, because both sides of those tests carried the same allocator and
+the handicap was symmetric, but the engine's *absolute* strength has been
+understated wherever it was measured against outside opposition, E11's +238
+included.
+
+**Owed: confirmation at LTC.** Not yet run. The decay is scale-invariant, so
+40+0.4 should show the same shape rather than washing out - at move 60 the old
+allocator sits at 325ms with 1.5s left - but `docs/TESTING.md` wants a patch
+this size confirmed at long time control before the Elo claim is leaned on, and
+STC exercises the deep-endgame regime least.
+
+**Two follow-ups, each its own test.** 50 was reasoned, not fitted, and given
+the size of this effect there may be more in 55-60. And `MAX_NOMINAL_MULT` and
+the `PhasePercent` curve were both chosen against a divisor of 20; they now sit
+on a different base and are plausible SPSA targets.
