@@ -82,7 +82,7 @@ literature and used by many other engines:
 | Pruning | null move, reverse futility, futility, razoring, ProbCut, SEE pruning, late move pruning, delta pruning |
 | Reductions | late move reductions, internal iterative reduction |
 | Extensions | singular extensions, multi-cut, negative extensions |
-| Ordering | MVV-LVA, killers, counter-moves, butterfly, capture, and continuation history |
+| Ordering | MVV-LVA, killers, counter-moves, butterfly, capture, continuation, and pawn-structure history |
 | Evaluation | tapered evaluation, HalfKA-style NNUE features, SCReLU, output buckets |
 | Correction | pawn-structure-keyed correction history |
 | Tables | magic/PEXT sliding attacks, Zobrist hashing, lockless transposition table |

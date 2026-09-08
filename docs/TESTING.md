@@ -145,6 +145,23 @@ SPRT rather than a timing comparison alone.
 and machines. Zobrist keys use a fixed seed for exactly this reason. OpenBench
 rejects engines that fail this.
 
+### Pawn-history gate
+
+`make history-test` checks pawn-history indexing, per-thread ownership, signed
+weighting, clearing and pre-move context across real make/undo operations,
+including pawn moves, captures, promotions and Chess960 castling. This is run
+by CI and its sanitizer job; `make smp-test` additionally checks the search
+resets its actual per-thread state after parallel use.
+
+Rescue credit and evidence-depth penalties default to weights of 25/25 and add
+arithmetic, guard, rounding and retry-state cases to the same gate. Check their
+search integration with each option alone, both enabled and both disabled;
+an off-path bench cannot cover the enabled paths.
+
+Results and baseline identities belong in
+[EXPERIMENTS.md](EXPERIMENTS.md#e31-pawn-structure-move-history), one short entry
+per experiment. A passing history gate is not evidence of playing strength.
+
 ---
 
 ## 3. SPRT — Elo

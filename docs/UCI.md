@@ -160,6 +160,7 @@ Useful during development; GUIs ignore them.
 | `nnue verify <file>` | check the exported test vectors; exits non-zero on any mismatch |
 | `smp` | the pool's size and what it costs in memory |
 | `smp selftest [threads]` | the parallel-search gate: the pool starts, the helpers search, and one thread afterwards still reproduces its own node counts exactly (`make smp-test`) |
+| `history selftest` | pawn-history context, ownership, weights and make/undo (`make history-test`) |
 | `syzygy` | how many men the loaded tablebases cover, if any |
 | `syzygy verify <dir>` | probe known endgames against the tables in `dir`; exits non-zero on any wrong answer (`make syzygy-test`) |
 | `syzygy manifest <dir> <file>` | re-derive every material configuration's probe checksum and compare against a sealed manifest; names the endgame that differs |

@@ -49,6 +49,8 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | `make unc-probe`: the sigma distribution the margin scaling is centred on | built (NNUE.md 5c) |
 | The mapping re-centred onto the gen-5 net (`UncSigmaBase` 57, `UncSigmaSlope` 12) | tried, **-7.4 ± 20.0** (E27), rejected |
 | Search: sigma-scaled LMR (`LmrSigmaLo` / `LmrSigmaHi`) | tried, **-29.9 ± 29.6** (E27), reverted |
+| Search: surprise-weighted quiet rewards | stopped inconclusive, **-1.40 ± 11.94** at 1238 games; code removed ([E30](EXPERIMENTS.md#e30-surprise-weighted-quiet-history)) |
+| Search: pawn-structure move history | experimental; **SPRT running** ([E31](EXPERIMENTS.md#e31-pawn-structure-move-history)) |
 | NNUE: a wider net (h1024) on the gen-5 corpus | tried, **-7.0 ± 11.3** (E27), rejected |
 | **Uncertainty scaling split per margin (8 weights, no-op at defaults)** | **built, sweep running** |
 | NNUE: the default evaluation is the network (`make`; `make classical` for the other one) | complete (E11) |

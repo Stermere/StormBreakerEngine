@@ -260,7 +260,7 @@ endif
         ratings snapshot \
         classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
         syzygy-fetch syzygy-test chess960-test chess960-campaign unc-probe \
-        smp-test
+        smp-test history-test
 
 all: $(TARGET)
 
@@ -384,6 +384,9 @@ unc-probe: $(EVALDEP)
 # default is what the machine reports.
 smp-test: $(TARGET)
 	./$(TARGET) smp selftest $(THREADS)
+
+history-test: $(TARGET)
+	./$(TARGET) history selftest
 
 chess960-test: $(TARGET)
 	./$(TARGET) chess960 selftest

@@ -20,6 +20,7 @@
 
 #include "bitboard.h"
 #include "eval.h"
+#include "history.h"
 #include "movegen.h"
 #include "nnue.h"
 #include "syzygy.h"
@@ -100,8 +101,8 @@ static const int ContPlies[3] = {1, 2, 4};
  * by somebody else: every hit is verified against the position and every move that
  * comes back out of it is validated before it is played.
  *
- * The tables dominate the size: 6 MB of this block is continuation history, and the
- * accumulator stack in nnue.c adds 2 MB beside it. Hence heap blocks claimed when
+ * The tables dominate the size: 6 MB of continuation history and 1 MB of pawn history,
+ * with the accumulator stack in nnue.c beside them. Hence heap blocks claimed when
  * `Threads` is set, rather than anything a `go` has to allocate.
  */
 typedef struct {
@@ -117,6 +118,7 @@ typedef struct {
      */
     Move killers[MAX_PLY][2];
     int16_t history[COLOR_NB][SQUARE_NB][SQUARE_NB];
+    PawnHistory pawnHistory;
     Move counterMoves[PIECE_NB][SQUARE_NB];
 
     /*
@@ -271,6 +273,7 @@ void search_clear(void) {
 
         memset(td->killers, 0, sizeof(td->killers));
         memset(td->history, 0, sizeof(td->history));
+        memset(&td->pawnHistory, 0, sizeof(td->pawnHistory));
         memset(td->counterMoves, 0, sizeof(td->counterMoves));
         memset(td->contHist, 0, sizeof(td->contHist));
         memset(td->captureHist, 0, sizeof(td->captureHist));
@@ -554,6 +557,17 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * the search and is equally true of evidence pointing either way. */
 TUNABLE(HIST_MALUS_MUL, 9);
 
+/* Structure-specific evidence supplements the global move history in both ordering
+ * and LMR. 128 is one full share; zero disables reads AND learning for an exact A/B. */
+TUNABLE(PAWN_HIST_WEIGHT, 128);
+
+/* Retained together at 25/25 after an inconclusive positive test (E32/E33).
+ * Rescue credit belongs only to the winning pawn context; reduced-only failures
+ * receive a smaller pawn malus. Zero weights disable the respective adjustments. */
+TUNABLE(PAWN_RESCUE_WEIGHT, 25);
+TUNABLE(PAWN_RESCUE_FLOOR, 32);
+TUNABLE(PAWN_EVIDENCE_WEIGHT, 25);
+
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 11);
 
@@ -608,6 +622,10 @@ static const struct {
     {"HistBonusMul", &HIST_BONUS_MUL, 1, 24},
     {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 32},
     {"HistMalusMul", &HIST_MALUS_MUL, 1, 32},
+    {"PawnHistWeight", &PAWN_HIST_WEIGHT, 0, 256},
+    {"PawnRescueWeight", &PAWN_RESCUE_WEIGHT, 0, 100},
+    {"PawnRescueFloor", &PAWN_RESCUE_FLOOR, 1, 256},
+    {"PawnEvidenceWeight", &PAWN_EVIDENCE_WEIGHT, 0, 100},
     {"LmpBase", &LMP_BASE, 1, 24},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
@@ -785,6 +803,12 @@ static inline PieceType victim_of(const Position *pos, Move m) {
     }
 }
 
+static inline int pawn_history_score(SearchThread *td, Key key, Piece pc, Square to) {
+    if (PAWN_HIST_WEIGHT == 0)
+        return 0;
+    return history_pawn_score(history_pawn_entry(&td->pawnHistory, key, pc, to), PAWN_HIST_WEIGHT);
+}
+
 /* MVV-LVA for the tactical moves - most valuable victim, least valuable attacker - with
  * SEE deciding which band a capture lands in and capture history separating the ones SEE
  * calls equal. Quiet moves fall through to the heuristic tables. */
@@ -839,7 +863,9 @@ static void score_moves(SearchThread *td, const Position *pos, ScoredMove *list,
             else if (m == counter)
                 score = SCORE_COUNTER;
             else
-                score = td->history[us][from_sq(m)][to_sq(m)] + cont_score(slices, moved, to_sq(m));
+                score = td->history[us][from_sq(m)][to_sq(m)] +
+                        cont_score(slices, moved, to_sq(m)) +
+                        pawn_history_score(td, pos->pawnKey, moved, to_sq(m));
         }
 
         list[i].score = score;
@@ -906,8 +932,8 @@ static void capture_hist_update(SearchThread *td, const Position *pos, Move m, i
  * heuristics nothing.
  */
 static void update_stats(SearchThread *td, const Position *pos, Move best, const Move *quiets,
-                         int quietCount, const Move *captures, int captureCount, Depth depth,
-                         int ply) {
+                         const int *quietPawnMaluses, int quietCount, const Move *captures,
+                         int captureCount, Depth depth, int ply, int pawnExtraCredit) {
     const Color us   = pos->sideToMove;
     const int bonus  = history_bonus(depth);
     const int malus  = history_malus(depth);
@@ -921,6 +947,10 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
 
         history_update(&td->history[us][from_sq(best)][to_sq(best)], bonus);
         cont_hist_update(td, ply, piece_on(pos, from_sq(best)), to_sq(best), bonus);
+        if (PAWN_HIST_WEIGHT != 0)
+            history_update(history_pawn_entry(&td->pawnHistory, pos->pawnKey,
+                                              piece_on(pos, from_sq(best)), to_sq(best)),
+                           bonus + pawnExtraCredit);
 
         const Move prev = td->stack[ply - 1].move;
         if (is_ok_move(prev))
@@ -934,6 +964,10 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
             continue;
         history_update(&td->history[us][from_sq(quiets[i])][to_sq(quiets[i])], -malus);
         cont_hist_update(td, ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -malus);
+        if (PAWN_HIST_WEIGHT != 0)
+            history_update(history_pawn_entry(&td->pawnHistory, pos->pawnKey,
+                                              piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i])),
+                           -(PAWN_EVIDENCE_WEIGHT != 0 ? quietPawnMaluses[i] : malus));
     }
 
     for (int i = 0; i < captureCount; ++i)
@@ -1023,11 +1057,17 @@ static inline int unc_apply(int scale, int weight) {
  * corrhist defaults are centred rather than chosen, and a cold entry lands on the floor -
  * which is why the floor sits just under 100.
  */
-static inline int unc_scale(SearchThread *td, const Position *pos) {
+/* Optional uncapped head output for rescue learning. Keeping it local to the node
+ * avoids another inference and survives child searches without shared state. */
+static inline int unc_scale(SearchThread *td, const Position *pos, int *errorEstimate) {
+    if (errorEstimate)
+        *errorEstimate = -1;
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
         const int sigma = nnue_uncertainty(pos);
         const int scale = imin(UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16, UNC_SCALE_MAX);
+        if (errorEstimate)
+            *errorEstimate = sigma;
         return unc_probe(sigma, scale);
     }
 #endif
@@ -1151,7 +1191,7 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         rawEval =
             ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
         staticEval = corrected_eval(td, pos, rawEval);
-        uncScale   = unc_scale(td, pos);
+        uncScale   = unc_scale(td, pos, NULL);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1374,7 +1414,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                                                                             : eval_evaluate(pos));
 
     const Value staticEval = corrected_eval(td, pos, rawEval);
-    const int uncScale     = inCheck ? 100 : unc_scale(td, pos);
+    int evalError          = -1;
+    const int uncScale =
+        inCheck ? 100
+                : unc_scale(td, pos,
+                            PAWN_HIST_WEIGHT != 0 && PAWN_RESCUE_WEIGHT != 0 ? &evalError : NULL);
 
     td->stack[ply].staticEval = staticEval;
 
@@ -1505,6 +1549,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * a node with more than this many is one where the ordering statistics were not going to
      * be decisive anyway. */
     Move quiets[64];
+    int quietPawnMaluses[64];
     int quietCount = 0;
     Move captures[32];
     int captureCount = 0;
@@ -1543,6 +1588,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         /* How the plan-aware tables rate this move. Only meaningful for quiet moves - the
          * tactical ones are scored by what they win. */
         const int contScore = tactical ? 0 : cont_score(slices, moved, to_sq(m));
+        const int pawnScore = tactical ? 0 : pawn_history_score(td, pos->pawnKey, moved, to_sq(m));
 
         /* Shallow-depth pruning of quiet moves, guarded on `best` beating a forced mate:
          * until the node has found something that is not losing outright, every remaining
@@ -1596,10 +1642,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             }
         }
 
-        if (!tactical) {
-            if (quietCount < (int)(sizeof(quiets) / sizeof(quiets[0])))
-                quiets[quietCount++] = m;
-        } else if (captureCount < (int)(sizeof(captures) / sizeof(captures[0]))) {
+        if (tactical && captureCount < (int)(sizeof(captures) / sizeof(captures[0]))) {
             captures[captureCount++] = m;
         }
 
@@ -1671,11 +1714,9 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         const Depth childDepth = depth - 1 + extension;
         Value v                = VALUE_NONE;
 
-        /* Late move reductions: ordering is good enough that a quiet move tried this late is
-         * very unlikely to be best, so search it shallower. The safety net is the re-search -
-         * anything that beats alpha despite the reduction is searched again at full depth, so
-         * a reduction can cost time but cannot lose a move. Forcing moves are excluded,
-         * because reducing a forcing line is how an engine walks into a tactic. */
+        /* LMR retries reduced fail-highs at normal depth, but a false fail-low can still
+         * hide a move. Forcing moves are exempt; failed-move learning below distinguishes
+         * a reduced-only rejection from one that received a normal-depth search. */
         Depth r = 0;
         if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && !givesCheck) {
             r = Reductions[imin(depth, 63)][imin(moveCount, 63)];
@@ -1693,10 +1734,9 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             if (!improving)
                 ++r;
 
-            /* A quiet move the history tables like is not "late" in any sense that matters,
-             * whatever its position in the list. Both tables get a say: the butterfly history
-             * knows the move, the continuation tables know the move in this context. */
-            r -= td->history[us][from_sq(m)][to_sq(m)] / LMR_HIST_DIVISOR;
+            /* Add structure-specific history BEFORE dividing: a context entry need not
+             * earn a whole ply by itself to influence the existing history adjustment. */
+            r -= (td->history[us][from_sq(m)][to_sq(m)] + pawnScore) / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
             if (r < 0)
@@ -1709,24 +1749,43 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
          * the rest the only question worth asking is whether anything BEATS it, which a null
          * window answers far more cheaply. A reduced null-window search is a bet that the
          * move fails low, so the child is by definition expected to fail high. */
+        bool fullDepthSearch = r == 0;
         if (r > 0) {
             v = -negamax(td, pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
-            if (v > alpha)
+            if (v > alpha) {
+                fullDepthSearch = true;
                 v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
+            }
         } else if (!pvNode || moveCount > 1) {
             v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
 
         /* A full-window search is never a cut node: the whole point is that its value is
          * wanted exactly, not as a bound. */
-        if (pvNode && (moveCount == 1 || (v > alpha && v < beta)))
-            v = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
+        if (pvNode && (moveCount == 1 || (v > alpha && v < beta))) {
+            fullDepthSearch = true;
+            v               = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
+        }
 
         eval_state_pop();
         board_undo_move(pos, m);
 
         if (search_stopped())
             return VALUE_ZERO;
+
+        /* Only completed attempts enter the list. Global histories retain the original
+         * malus; the optional pawn malus remembers how much evidence was requested. */
+        if (!tactical && quietCount < (int)(sizeof(quiets) / sizeof(quiets[0]))) {
+            quiets[quietCount] = m;
+            if (PAWN_HIST_WEIGHT != 0 && PAWN_EVIDENCE_WEIGHT != 0) {
+                const Depth evidence =
+                    history_pawn_evidence_depth(depth, childDepth, r, fullDepthSearch);
+                quietPawnMaluses[quietCount] =
+                    history_pawn_evidence_malus(history_malus(depth), history_malus(evidence),
+                                                isExcluded ? 0 : PAWN_EVIDENCE_WEIGHT);
+            }
+            ++quietCount;
+        }
 
         if (v > best) {
             best     = v;
@@ -1739,8 +1798,14 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                     /* Fail high: the opponent would avoid this line. The move that cut is
                      * credited in whichever table describes it, and everything tried before it
                      * is blamed in both. */
-                    update_stats(td, pos, m, quiets, quietCount, captures, captureCount, depth,
-                                 ply);
+                    const int pawnExtraCredit =
+                        PAWN_HIST_WEIGHT != 0 && !tactical
+                            ? history_pawn_rescue_credit(history_bonus(depth), staticEval, beta, v,
+                                                         evalError, isExcluded, PAWN_RESCUE_WEIGHT,
+                                                         PAWN_RESCUE_FLOOR)
+                            : 0;
+                    update_stats(td, pos, m, quiets, quietPawnMaluses, quietCount, captures,
+                                 captureCount, depth, ply, pawnExtraCredit);
                     break;
                 }
             }

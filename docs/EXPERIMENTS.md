@@ -305,7 +305,7 @@ Preparing a 500M-position dataset. The trainer gained a chunked loader above
 ~2 GB, int32 feature indices, fused AdamW, virtual epochs and `--resume`.
 
 **End to end**, `--hidden 1024 --output-buckets 4 --batch-size 16384
---workers 6`, on `gen-012.cnn` (8.14 GB, 254M records), RTX 3070. Steady-state
+--workers 6`, on `gen-012.cnn` (8.14 GB, 254M records). Steady-state
 rate between batch 200 and batch 1200, so startup is excluded; run in both
 orders to control for the page cache:
 
@@ -2130,3 +2130,122 @@ STC exercises the deep-endgame regime least.
 the size of this effect there may be more in 55-60. And `MAX_NOMINAL_MULT` and
 the `PhasePercent` curve were both chosen against a divisor of 20; they now sit
 on a different base and are plausible SPSA targets.
+
+---
+
+### E30: Surprise-weighted quiet history
+
+**Date** 2026-09-07 · **Baseline** `pre-surprise-512`, commit `3449337` ·
+**Net** 512-wide `34aaa009f3db` on both sides · **Status** stopped inconclusive;
+implementation, options and dedicated tests subsequently removed.
+
+Scaled winning quiet moves' butterfly/continuation rewards by
+`1 + 0.5 * clamp((beta - staticEval) / (sigma + 32), -1, 1)`; penalties unchanged.
+Bench d7/d12: **220800/3081372 -> 235643/3124197**.
+
+| STC 8+0.08, 1 thread, 16 MB, UHO, normalized bounds [0,5] | Result |
+|---|---|
+| User-reported snapshot | 1238 games: 310W / 315L / 613D |
+| Elo / nElo | **-1.40 +/- 11.94** / -2.28 +/- 19.35 |
+| LLR / Ptnml | **-0.24** / [20, 159, 265, 156, 19] |
+
+Neither boundary was reached; no demonstrated gain, not an H0 acceptance.
+The stopped PGN has 1257 completed games (316W/319L/622D), all normal; the
+snapshot's LLR/error bar must not be attached to that later count.
+
+The d12 diagnostic reduced rewards 3.2 times as often as it raised them,
+leaving 92.9% of ordinary positive credit with unchanged penalties. Cutoff rank
+improved, but reductions increased; different trees do not prove causation.
+Likely design weaknesses: position difficulty is not move difficulty, and
+RFP/null-move pruning select which cutoffs ever reach learning. Any rescue-only
+contextual reward or depth-aware penalty follow-up must be a separate test.
+
+### E31: Pawn-structure move history
+
+**Date** 2026-09-07 · **Baseline/net** same as E30 · **Status** retained by
+user decision after an unfinished, mildly positive SPRT; no H1 verdict.
+E30 was disabled in the tested binary and is now removed from source.
+
+Adds a per-thread `int16[512][16][64]` table keyed by parent pawn hash, colored
+piece and destination: **1 MiB/thread**, cleared with all other history.
+Existing gravity rewards/maluses train quiet moves; context contributes to
+ordering and `(butterfly + pawnScore) / LmrHistDivisor`. `PawnHistWeight` is
+128/128 by default, range 0..256; zero disables reads/learning, not allocation.
+No new evaluation, network, pruning-margin or time-management change.
+
+| STC 8+0.08, 1 thread, 16 MB, UHO_Lichess_4852_v1.epd, normalized bounds [0,5] | Result |
+|---|---|
+| Games / W-L-D | **2320** / 626-583-1111 |
+| Elo / nElo | **+6.44 +/- 8.46** / +10.77 +/- 14.14 |
+| Score / LOS | 1181.5 points (50.93%) / 93.23% |
+| LLR / boundaries | **0.79** / [-2.94, 2.94] |
+| Ptnml | [30, 270, 521, 305, 34] |
+
+Neither SPRT boundary was reached and the Elo interval includes zero. This
+snapshot supersedes the early approximately +30 Elo estimate at 500 games;
+retaining the feature is a development decision, not a demonstrated gain.
+
+Bench d7/d12: **220800/3081372 -> 204300/3200251**. Before cleanup, repeated
+GCC/Clang, native/scalar and debug searches agreed; weight zero reproduced
+every baseline iteration and PV. Perft/Chess960, SMP reset, UCI, history and
+10000-position NNUE equivalence checks passed. Post-cleanup executable
+regression checks remain pending.
+
+The d12 context opposed global history on 459525 lookups. Median time over
+eight alternating runs/seat was **1570 -> 1706ms** (+8.7%), throughput -4.4%:
+an overhead warning, not strength evidence. LTC confirmation remains pending.
+
+### E32: Rescue-only pawn-history credit
+
+**Status** retained with E33 at weights **25/25** by user decision; combined
+SPRT inconclusive (below). Unlike E30, successes never lose ordinary credit and
+only the winning quiet move's **pawn** entry gets extra credit.
+Butterfly/continuation rewards and all maluses are untouched.
+
+Extra credit is `bonus * weight/100 * clamp((beta - eval)/(error + floor), 0, 1)`,
+truncated in int64. `PawnRescueWeight` defaults to **25** (range 0..100; zero
+disables it), `PawnRescueFloor` **32cp** (range 1..256). Reuses the existing
+uncapped head output; no credit in check, excluded searches, without a head,
+or for decisive eval/window/result scores. Raw-error versus corrected-eval
+calibration remains an approximation. A survivor needs uniform-credit and
+constant-denominator controls before attributing a gain to the head.
+
+### E33: Requested-depth pawn-history penalties
+
+**Status** retained with E32 at weights **25/25**; no H1 verdict. Record a quiet
+move only after its search completes. A reduced-only failure gets evidence depth
+`clamp(childDepth - reduction + 1, 0, parentDepth)`; any normal-depth retry
+restores the ordinary penalty. This is requested depth, not guaranteed work:
+TT hits and internal pruning can still return early.
+
+Blend the ordinary and evidence-depth maluses only in pawn history, using
+`ordinary - (ordinary - shallow) * weight/100`. `PawnEvidenceWeight` defaults
+to **25** (range 0..100; zero disables it). Non-reduced and excluded-search
+attempts keep their ordinary penalties. Pruned/uncompleted moves teach nothing;
+global/capture histories are unchanged. No new persistent or shared state.
+
+**Combined E32 + E33 result:** user reports the individual trials looked even;
+no separate figures supplied. The retained combination is
+`PawnRescueWeight=25,PawnEvidenceWeight=25` with `PawnRescueFloor=32` unchanged,
+against the same build's then-default **0/0** control.
+
+| STC 8+0.08, 1 thread, 16 MB, UHO_Lichess_4852_v1.epd, normalized bounds [0,5] | Tuned vs default |
+|---|---|
+| Games / W-L-D | **4080** / 1107-1034-1939 |
+| Elo / nElo | **+6.22 +/- 6.27** / +10.57 +/- 10.66 |
+| Score / LOS | 2076.5 points (50.89%) / 97.40% |
+| LLR / boundaries | **1.36** / [-2.94, 2.94] |
+| Ptnml | [42, 484, 933, 521, 60] |
+
+Neither boundary was reached; the Elo interval narrowly includes zero. Retained
+as a mildly positive development choice, not a demonstrated gain or evidence
+that either adjustment helps independently. Total-gain and LTC confirmation
+remain pending; this estimate must not be added to E31's as a measured total.
+
+Regression checks should verify both weights at zero reproduce E31's d7/d12
+**204300/3200251** and per-iteration scores/PVs. Run history, perft/Chess960,
+SMP and debug gates with each option and both enabled, including classical/headless
+compatibility. At `PawnHistWeight=0` neither experiment should have any effect.
+
+Future ablations must explicitly set both weights: new builds default to
+25/25, so a default seat is no longer the original 0/0 control.
