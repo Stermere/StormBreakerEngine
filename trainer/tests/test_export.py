@@ -27,9 +27,12 @@ torch = pytest.importorskip("torch")
 
 from export_net import (  # noqa: E402
     HEADER_BYTES,
+    NETS_DIR,
     check_ranges,
     forward,
     quantise,
+    resolve_checkpoint,
+    resolve_out,
     trunc_div,
 )
 from nnue.format import (  # noqa: E402
@@ -257,6 +260,50 @@ def test_an_unrepresentable_net_is_refused_rather_than_wrapped():
     q["qb"] = QB
     with pytest.raises(SystemExit, match="int16"):
         check_ranges(q, QA)
+
+
+@pytest.fixture
+def tree(tmp_path, monkeypatch):
+    """A repo-shaped cwd: the resolvers are relative to it, as make runs them."""
+    (tmp_path / NETS_DIR).mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_a_bare_checkpoint_name_resolves_under_the_nets_directory(tree):
+    (tree / NETS_DIR / "net-fact.pt").write_bytes(b"")
+
+    assert resolve_checkpoint("net-fact") == f"{NETS_DIR}/net-fact.pt"
+    assert resolve_checkpoint("net-fact.pt") == f"{NETS_DIR}/net-fact.pt"
+    assert resolve_checkpoint(f"{NETS_DIR}/net-fact.pt") == f"{NETS_DIR}/net-fact.pt"
+
+
+def test_a_checkpoint_that_exists_as_typed_wins_over_the_nets_directory(tree):
+    """The search is a convenience, not a redirect. A file the caller actually
+    named is the file they meant, even when a same-named one sits in nets/."""
+    (tree / NETS_DIR / "cand.pt").write_bytes(b"nets")
+    (tree / "cand.pt").write_bytes(b"cwd")
+
+    assert resolve_checkpoint("cand.pt") == "cand.pt"
+
+
+def test_a_checkpoint_that_is_nowhere_names_everything_it_tried(tree):
+    with pytest.raises(SystemExit) as error:
+        resolve_checkpoint("missing")
+
+    message = str(error.value)
+    assert "missing.pt" in message and f"{NETS_DIR}/missing.pt" in message
+
+
+@pytest.mark.parametrize("name", ["cand.nnue", "./cand.nnue", f"{NETS_DIR}/net.nnue"])
+def test_an_output_that_looks_like_a_path_is_written_exactly_there(name):
+    """The one that matters is the bare `cand.nnue`: moving a spelled-out output
+    into nets/ would let this write one file while the build embeds another."""
+    assert resolve_out(name) == name
+
+
+def test_a_bare_output_stem_becomes_a_nnue_in_the_nets_directory():
+    assert resolve_out("cand") == f"{NETS_DIR}/cand.nnue"
 
 
 def test_the_accumulator_bound_is_sound_over_every_legal_position():

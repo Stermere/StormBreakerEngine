@@ -55,7 +55,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
-from .format import RECORD_DTYPE, SRC_MASK, unpack
+from .format import RECORD_DTYPE, SOURCE_NAMES, SRC_MASK, unpack
 
 # Feature indices top out at NUM_FEATURES = 24576. int32 is not a trade here,
 # it is the same numbers in half the bytes: 2.1 MB per perspective per batch
@@ -95,7 +95,11 @@ def _shard_lengths(paths):
 
 
 def _source_filter(sources):
-    return None if not sources else np.array(sorted(set(sources)), dtype=np.uint8)
+    if not sources:
+        return None
+    if any(s < 0 or s >= len(SOURCE_NAMES) for s in sources):
+        raise ValueError(f"source tags must be in 0..{len(SOURCE_NAMES) - 1}")
+    return np.array(sorted(set(sources)), dtype=np.uint8)
 
 
 def _tensors(records: np.ndarray, index_dtype) -> dict:
@@ -140,10 +144,20 @@ class ShardBatches(Dataset):
 
         self.index = []  # (file, start, length)
         self.records = 0
+        self.input_records = sum(counts)
         for f, n in enumerate(counts):
-            self.records += n
+            # Index only non-empty filtered slices. Substituting a record when
+            # a slice is empty leaks an explicitly excluded source into training.
+            records = (np.memmap(self.paths[f], dtype=RECORD_DTYPE, mode="r")
+                       if self.sources is not None and n else None)
             for start in range(0, n, self.batch_size):
-                self.index.append((f, start, min(self.batch_size, n - start)))
+                length = min(self.batch_size, n - start)
+                kept = (int(np.isin(records["flags"][start:start + length] & SRC_MASK,
+                                    self.sources).sum()) if records is not None else length)
+                if kept:
+                    self.index.append((f, start, length))
+                    self.records += kept
+            del records
 
     # A memmap is reopened per worker process rather than pickled across the
     # fork/spawn boundary - on Windows the DataLoader spawns, and a handle that
@@ -172,7 +186,7 @@ class ShardBatches(Dataset):
             keep = np.isin(records["flags"] & SRC_MASK, self.sources)
             records = records[keep]
             if len(records) == 0:
-                records = self._map(file_index)[start:start + 1]  # never yield empty
+                raise RuntimeError("shard changed after its filtered batch index was built")
 
         return _tensors(records, self.index_dtype)
 
@@ -328,6 +342,8 @@ def make_loader(paths, batch_size: int = 16384, workers: int = 4,
 
     dataset = ShardBatches(paths, batch_size=batch_size, sources=sources,
                            index_dtype=index_dtype)
+    if not len(dataset):
+        raise ValueError("no records remain after source filtering")
     return DataLoader(dataset, batch_size=1, shuffle=shuffle,
                       collate_fn=identity_collate, **shared)
 

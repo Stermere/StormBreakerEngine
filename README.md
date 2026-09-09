@@ -170,7 +170,7 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 
 | Command | Purpose |
 |---|---|
-| `make nnue-export` | quantise `NET` (default `external/nets/net.pt`) into `EVALFILE` + test vectors |
+| `make nnue-export` | quantise a checkpoint into `external/nets/net.nnue` + test vectors. `ARGS="<checkpoint> [-o <net>] [-f]"`, where a bare name means `external/nets/<name>`; defaults to `net.pt` -> `net.nnue` |
 | `make net-fetch` | download the pinned net (`NET_SHA256` in the Makefile), hash-checked. The default build runs this for you when `EVALFILE` is missing |
 | `make nnue-info` | report the embedded net and its hash |
 | `make unc-probe` | build `stormbreaker-uncprobe` and measure the σ distribution `unc_scale()` is centred on, scaling held neutral. `PROBE_ARGS="-o <csv>"` records it, `-ref <csv>` solves for the constants that reproduce an older net's, `-live` measures the tree the mapping shapes instead |

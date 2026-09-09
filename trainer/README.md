@@ -85,6 +85,9 @@ cd trainer
 # Gen 5 ~3350 -> ~3450 (net-34aaa009f3db)
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.4 --lambda-pieces -0.2 --score-clip 2000
 
+# Gen 5 + factorization + finish pass ~3450 -> ~3500 (net-6e5d89a32b73)
+.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --checkpoint-every 1 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.2 --lambda-pieces -0.0 --score-clip 2000 --unc-weight 0.01 --feature-factorization --finish-epochs 1 --finish-lr 0.00001
+
 
 
 # 6. quantise the checkpoint into the file the engine embeds
@@ -165,15 +168,43 @@ is not. See [../docs/NNUE.md](../docs/NNUE.md#position-sources).
 
 ## Getting the net into the engine
 
-Steps 6 and 7 need no arguments because step 5's `--out ..\external\nets\net`
-lands on their defaults: `make nnue-export` quantises `NET`
-(`external/nets/net.pt`) into `EVALFILE` (`external/nets/net.nnue`) and writes
-`.vectors` and `.sha256` beside it. Another run has to name both, and the
-variables carry into the sub-make:
+**Use a distinct output prefix for each experiment.** New training runs refuse
+to overwrite an existing run; use `--resume` only to continue that run, or
+`--init-from` with a new prefix to start a different recipe. Do not reuse
+`net.pt` while leaving an older `net.nnue` beside it and assume they match.
+
+Each run writes `<prefix>-run.json` with a run ID, resolved data paths,
+file sizes/mtimes and generation-manifest hashes, trainer source hashes,
+PyTorch version, arguments, and the current checkpoint SHA-256. The large
+training shards themselves are **not** content-hashed. Checkpoint and optimizer
+state are cross-checked by epoch, run ID, and checkpoint hash on resume.
+
+The export JSON links the **checkpoint SHA-256** to the **network SHA-256**,
+architecture, stage, factorization setting, and metrics. Default header tags
+include a checkpoint hash prefix. Re-exporting the same checkpoint is allowed;
+replacing a different/unverified export requires explicit `-f`/`--overwrite`,
+through make as `ARGS="-f"`. Prefer unique file names instead.
+
+On a fresh output path, steps 6 and 7 need no arguments because step 5's `--out ..\external\nets\net`
+lands on their defaults: `make nnue-export` quantises `external/nets/net.pt`
+into `external/nets/net.nnue` and writes `.vectors` and `.sha256` beside it.
+
+Another run is named through `ARGS`, which reaches `tools/export_net.py`
+unchanged — the first word is the checkpoint, `-o` the net, and a bare name on
+either side means `external/nets/<name>`:
 
 ```powershell
-make nnue-export NET=external/nets/run7.pt EVALFILE=external/nets/run7.nnue
-make nnue-test   NET=external/nets/run7.pt EVALFILE=external/nets/run7.nnue
+make nnue-export ARGS="run7 -o run7"                 # run7.pt -> run7.nnue
+make nnue-export ARGS="run7 -f"                      # ... or straight onto net.nnue
+```
+
+`make nnue-test` exports to `EVALFILE` and then verifies *that* file's vectors,
+so a candidate net names the checkpoint in `ARGS` and the net in `EVALFILE` —
+both carry into its sub-make. Do not redirect the export with `-o` there, or it
+checks a different file than it wrote:
+
+```powershell
+make nnue-test   ARGS="run7" EVALFILE=external/nets/run7.nnue
 make             EVALFILE=external/nets/run7.nnue    # stormbreaker.exe
 ```
 
@@ -181,8 +212,9 @@ Forward slashes and no spaces: `EVALFILE` is embedded as an assembler string
 literal, so a Windows path breaks it — `\net` becomes a newline rather than a
 directory.
 
-**The net is linked in, not loaded at run time.** Re-exporting therefore does
-nothing at all to a binary that already exists. `make` gets this right —
+**The default net is linked in.** Re-exporting therefore does nothing at all
+to a binary that already exists unless its UCI `EvalFile` is explicitly pointed
+at the new network. `make` gets the embedded case right —
 `EVALFILE` is a prerequisite of the engine — but nothing stops you from
 exporting and then benching yesterday's `stormbreaker.exe`. `make
 nnue-info` prints the hash the exporter printed; if those two disagree, the
@@ -380,6 +412,10 @@ typo, and nothing else in the run would report it.
 | `--seed 1` | shuffling and initialisation, so a run repeats |
 | `--positions-per-epoch 50M` | see [Datasets too big for one epoch](#datasets-too-big-for-one-epoch) |
 | `--resume` | continue an interrupted run from its last epoch |
+| `--init-from CHECKPOINT` | new run from weights, fresh optimizer; architecture inherited |
+| `--feature-factorization` | share piece-square learning across king squares; no inference cost |
+| `--finish-epochs 1` | one extra full data pass after the main epochs; default 0 disables |
+| `--finish-lr 0.00001` | constant LR for finishing, independent of the main LR decay |
 | `--chunk-records 0` | force memmap slices at any dataset size |
 | `--lambda-progress -0.2` | trust the game result more as the game's end approaches |
 | `--lambda-source human=1.0` | train a source on its search score alone, without dropping it |
@@ -395,6 +431,100 @@ positions/s is only 38 MB/s of records, and the work is `unpack()` on the CPU
 rather than anything the drive does. So raise `--workers` until it stops
 helping, which is four to six, and then stop: past that the numbers that move
 are `--batch-size` (32768 is worth about 7% over 16384) and `--hidden`.
+
+---
+
+## Feature factorization and a low-LR finish
+
+Both changes are **opt-in**, so they can be tested independently. None of the
+lambda, source-weight, or uncertainty-weight defaults change.
+
+### Training-only feature factorization
+
+With `--feature-factorization`, each input embedding is
+`king_specific[king, piece, square] + shared[piece, square]`. The additional
+768 rows (plus a zero padding row) share piece-square information across all
+32 normalized king locations. They start at zero, preserving the unfactorized
+initial function and RNG state. Both perspectives use the existing normalization.
+
+Clipping bounds the **sum**, rather than clipping each term independently and
+hoping their sum fits. Export folds the two float terms **before rounding**.
+The engine still runs the same HalfKA-32sq SCReLU net: identical file layout,
+feature count, hidden width and inference cost. Training does extra embedding
+work; the size of the strength gain must be measured, not assumed.
+
+A short same-batch GPU diagnostic on the RTX 3070 (512 wide, batch 16,384,
+fused AdamW, 5 warm-up + 20 timed steps) measured about 639k positions/s without
+factorization and 422k with it. This excludes loading/validation/checkpointing
+and is not a sustained throughput benchmark, but budget for additional training
+time. The exported engine still pays **no extra inference cost**.
+
+Old checkpoints still load/export. `--init-from` can add a zero shared factor
+to an old checkpoint; a factorized checkpoint automatically retains its factor.
+For measuring factorization's learning benefit, prefer a from-scratch control
+and factorized run with matching seed, data, update budget and loss settings.
+
+### Finishing stage
+
+`--epochs 10 --finish-epochs 1 --finish-lr 0.00001` means ten main epochs, then
+**one additional whole pass** at LR 1e-5. Adam moments are retained, the main
+exponential scheduler stops, and lambda is held at `--lambda-end` with the same
+per-record adjustments. `--positions-per-epoch` affects only the main stage;
+the finishing pass is not silently shortened to that virtual-epoch size.
+`--limit-batches` still truncates both stages for smoke tests.
+
+`<prefix>-pre-finish.pt` is always saved when finishing is enabled, allowing
+the finishing pass to be tested against its exact starting weights. The final
+checkpoint remains `<prefix>.pt`. `--checkpoint-every 1` additionally saves
+each epoch, with the finishing epochs continuing the main epoch numbering.
+
+Resume with the original recipe and `--resume`. The saved optimizer, LR stage,
+and RNG state are restored; changed schedule/loss/data settings are rejected.
+For a run begun with `--init-from`, remove that flag when resuming and explicitly
+pass the inherited `--hidden`, `--output-buckets`, `--uncertainty` (if present),
+and `--feature-factorization` (if present) recorded in its run manifest.
+Loader prefetch state is not saved: **a resumed virtual epoch starts a fresh
+shuffled pass**, so resume does not promise batch-for-batch equivalence to an
+uninterrupted run. A finishing pass interrupted before its checkpoint is replayed
+from the last completed checkpoint, rather than being partially skipped.
+
+For an already trained checkpoint, use a **new output prefix**,
+`--init-from CHECKPOINT --epochs 0 --finish-epochs 1 --finish-lr 0.00001`.
+This reads the architecture and weights but creates a **fresh optimizer**.
+Repeat the desired target/loss flags explicitly: those are not inherited from
+the parent. The parent checkpoint path and hash are recorded in provenance.
+
+For your existing command, append these flags and replace `--out` with a fresh
+prefix such as `gen5-factor-finish`:
+
+```text
+--feature-factorization --finish-epochs 1 --finish-lr 0.00001
+```
+
+### Reading the new metrics
+
+Train and validation now both report value MSE, raw uncertainty L1, its weighted
+contribution, and total loss. Weighted value metrics use the **global sum of
+record weights**, not an average of differently weighted batch means. Training
+metrics remain online measurements while weights change; validation is at the
+end-of-epoch checkpoint.
+
+Fixed `score_mse` and `wdl_mse` diagnostics use K=400, no source weights, no score
+clip, and no lambda schedule. WDL includes only known results. These support
+comparisons across recipes on the same validation set; they are not extra losses
+and do not replace engine matches. `lambda_applied` includes the forced lambda=1
+for unknown WDL records.
+
+History/checkpoints carry `metrics_version: 2`. Legacy `train`/`train_loss` fields
+now mean **value-only**, matching `val`/`val_loss`; older uncertainty runs stored
+the combined training objective there. Do not overlay those old/new fields
+without accounting for the version. Missing validation/WDL metrics are JSON
+`null`, not a misleading zero.
+
+Source filtering never substitutes an excluded record for an empty batch.
+All-excluded datasets fail explicitly instead of training on the wrong source
+or looping forever. Chunked-loader startup counts are upper bounds when filtering;
+epoch metrics report the number of records actually consumed.
 
 ---
 
@@ -428,6 +558,12 @@ What they actually check:
   model, the loss has a gradient, the optimiser reduces it, the padding slot
   stays pinned at zero, and a net fitted on a symmetric target scores flipped
   positions as negatives of each other.
+- **`test_factorization.py`** — shared gradients, zero padding, folded-weight
+  clipping, old checkpoints, and folding before quantization without a shape change.
+- **`test_training.py`** — filtering with multiple workers, metric denominators,
+  fixed diagnostics, low-LR stage boundaries, weights-only initialization and resume.
+- **`test_provenance.py`** — checkpoint/network hashes, stale export protection,
+  dataset inventory, and mixed-checkpoint/optimizer rejection.
 
 They run in a few seconds and need no GPU.
 

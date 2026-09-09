@@ -2249,3 +2249,100 @@ compatibility. At `PawnHistWeight=0` neither experiment should have any effect.
 
 Future ablations must explicitly set both weights: new builds default to
 25/25, so a default seat is no longer the original 0/0 control.
+
+---
+
+### E34: Factorized NNUE training recipe with a low-LR finish
+
+**Date** 2026-09-08 · **Baseline** `stormbreaker-base.exe`, embedded net
+`34aaa009f3db` · **Dev** `stormbreaker.exe`, embedded net `6e5d89a32b73` ·
+**Status** **H1 accepted at STC**; the new net is pinned in the Makefile.
+LTC confirmation and individual training-change ablations remain pending.
+
+The gen-5 corpus retrained at the same **512x2 hidden width, 8 output buckets,
+HalfKA-32sq SCReLU, with uncertainty head**. Training adds a shared 768-row
+piece-square factor to the king-specific transformer. Export folds their sum
+before quantization, so the engine receives the same feature count, architecture,
+and **25,199,776-byte** network format with no additional inference work.
+
+This is a **combined recipe result, not +44 Elo attributed to factorization
+alone**. Relative to the documented original gen-5 recipe, it also reduces the
+uncertainty-loss coefficient from 0.05 to 0.01, changes the progress lambda
+adjustment from -0.4 to -0.2, removes the -0.2 piece-count adjustment, and adds
+one low-learning-rate pass. Filtering and metric/provenance fixes were included
+in the trainer; this run did not select or reweight sources. No new positions
+were generated for the run.
+
+#### Training and export identity
+
+The saved run manifest, rather than a remembered command, records:
+
+| Setting | Value |
+|---|---|
+| Training / validation records | **548,696,001** gen-005 self-play / **251,882** held-out |
+| Initialization / seed | From scratch / 0 |
+| Batch size / workers | 16,384 / 4 |
+| Main training | 4 full passes, AdamW, LR 0.0005, per-epoch gamma 0.8, weight decay 0 |
+| Finishing stage | 1 additional full pass at **0.00001**, retaining Adam moments |
+| Feature factorization | Enabled; training-only shared piece-square embeddings |
+| Uncertainty coefficient | **0.01** |
+| Lambda | Base **0.95**, progress **-0.2**, piece-count **0**; mean applied **0.86685** |
+| Sigmoid K / score clip | 400 / 2000 cp |
+| Exported checkpoint | Epoch **5**, stage **finish**; QA=255, QB=64, scale=400 |
+| Training code / environment | `e9b6c47` with local changes; PyTorch `2.13.0+cu126`, CUDA |
+
+Run ID: `dbe42f3af76d4b3ba383225bda1c5af9`.
+
+- Checkpoint SHA-256: `1946e344c13a0bbe7bc25dcd4dadaa541602d6946170a49bea5f7b4e0035ca06`.
+- Network SHA-256: `6e5d89a32b736d74e76d679899aa312031c4ce65650d1e9fc04b012f0f3be7ca`.
+- Header tag: `e5-h512-1946e344c13a`.
+- Checkpoint: `C:/Users/colli/Desktop/Small_programing_stuff/ChessEngine/external/nets/net-fact.pt`.
+- Run manifest: `C:/Users/colli/Desktop/Small_programing_stuff/ChessEngine/external/nets/net-fact-run.json`.
+- Export manifest: `C:/Users/colli/Desktop/Small_programing_stuff/ChessEngine/external/nets/net.json`.
+
+The checkpoint and deployed network hashes were checked against the export
+manifest, and both match. Querying the two executables confirmed the embedded
+net identities above: **this test is against `stormbreaker-base`, not the
+automatically selected `pre-surprise-512` from the earlier mis-invoked command**.
+
+#### Match result
+
+The user's fastchess acceptance snapshot:
+
+| STC 8+0.08, 1 thread, 16 MB, UHO_Lichess_4852_v1.epd, normalized bounds [0,5] | Dev vs baseline |
+|---|---|
+| **Result** | **H1 accepted**, LLR **2.95** across upper boundary **2.94** |
+| Games / W-L-D | **1,142** / **408-265-469** |
+| **Elo / nElo** | **+43.74 +/- 13.35** / **+66.75 +/- 20.15** |
+| Score / LOS | **642.5 points (56.26%)** / **100.00%** |
+| Ptnml | **[12, 107, 224, 182, 46]** |
+| DrawRatio / PairsRatio | 39.23% / 1.92 |
+| WL/DD ratio | 1.49 |
+
+Saved PGN:
+`C:/Users/colli/Desktop/Small_programing_stuff/ChessEngine/external/games/20260908-174042-STC.pgn`.
+Its final contents contain **1,144 games: 409W/266L/469D**, two more than the
+acceptance snapshot. Keep the reported LLR and Elo/error bars attached to
+**1,142**, not that later count. The PGN contains **three time forfeits** and
+1,141 normal terminations; do not describe it as a forfeit-free run. Earlier
+same-seat PGNs are separate runs and are not pooled into this result.
+
+#### Validation and attribution limits
+
+The actual exported net passed **10,000 positions with exact C/quantized-Python
+agreement** when this entry was recorded. The export reports float-to-integer
+drift of **8.81 cp mean absolute / 52.65 cp maximum** on its vector set; this
+is a diagnostic, not an additional Elo measurement.
+
+Held-out value MSE went from **0.00309570** at epoch 4 to **0.00303827** after
+the finishing pass; fixed score MSE went from **0.00262030** to **0.00256248**.
+Those comparisons use this run's unchanged target policy. They support testing
+the finish, but do not establish its independent strength gain. Old gen-5
+validation losses used a different target policy and must not be read as a
+like-for-like improvement in value prediction.
+
+The saved pre-finish checkpoint permits an epoch-4 versus epoch-5 match. A
+matched-budget, same-recipe run without factorization is needed to isolate the
+shared factor; uncertainty and lambda changes likewise need their own controls.
+What this test establishes is the **new combined net's STC gain against the
+named baseline**, not a per-feature attribution or an LTC result.

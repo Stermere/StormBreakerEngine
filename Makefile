@@ -52,7 +52,6 @@ ARCH ?= native
 EVAL             ?= nnue
 DEFAULT_EVALFILE := external/nets/net.nnue
 EVALFILE         ?= $(DEFAULT_EVALFILE)
-NET              ?= external/nets/net.pt
 
 # ------------------------------------------------------------- net pinning --
 #  Which net a build fetches when it has none. `make net-fetch` downloads
@@ -66,8 +65,8 @@ NET              ?= external/nets/net.pt
 #  docs/EXPERIMENTS.md records WHY that one was adopted, beside the SPRT that
 #  adopted it. Bump them together. tools/publish-net.ps1 uploads a net and
 #  prints the replacement lines.
-NET_TAG    ?= net-34aaa009f3db
-NET_SHA256 ?= 34aaa009f3db86f2da0530b2829cc19ea1f2686bc98d3db6537e07814192b574
+NET_TAG    ?= net-6e5d89a32b73
+NET_SHA256 ?= 6e5d89a32b736d74e76d679899aa312031c4ce65650d1e9fc04b012f0f3be7ca
 NET_URL    ?= https://github.com/Stermere/StormBreakerEngine/releases/download/$(NET_TAG)/net.nnue
 
 # `CC ?= gcc` would NOT work here: make predefines CC as `cc`, so the variable
@@ -284,7 +283,7 @@ ifeq ($(EVALFILE),$(DEFAULT_EVALFILE))
 	@$(MAKE) --no-print-directory net-fetch
 else
 	@echo "EVALFILE '$(EVALFILE)' does not exist. Either:" >&2
-	@echo "  quantise one:   make nnue-export NET=<checkpoint> EVALFILE=$(EVALFILE)" >&2
+	@echo "  quantise one:   make nnue-export ARGS=\"<checkpoint> -o $(EVALFILE)\"" >&2
 	@echo "  the pinned net: make net-fetch, and drop EVALFILE" >&2
 	@echo "  no net at all:  make EVAL=classical" >&2
 	@exit 1
@@ -678,8 +677,21 @@ snapshot:
 # Quantise a trained checkpoint into the file the engine embeds, plus the
 # test vectors and the SHA-256 sidecar. Needs the trainer's venv (torch reads
 # the checkpoint); the engine itself needs none of it.
+#
+#   make nnue-export                          net.pt      -> net.nnue
+#   make nnue-export ARGS="net-fact -f"       net-fact.pt -> net.nnue
+#   make nnue-export ARGS="net-fact -o cand"  net-fact.pt -> cand.nnue
+#
+# ARGS goes to export_net.py unchanged: the first word is the checkpoint, and a
+# later -o/--output overrides the -o below because argparse keeps the last
+# occurrence. Bare names resolve under external/nets; anything carrying a
+# directory or an extension is taken as typed.
 nnue-export:
-	$(PYTHON) tools/export_net.py $(NET) -o $(EVALFILE)
+	@[ -z "$(NET)" ] || { \
+	    echo "NET= is not read any more. Name the checkpoint in ARGS instead:" >&2; \
+	    echo "  make nnue-export ARGS=\"$(NET)\"" >&2; \
+	    exit 1; }
+	$(PYTHON) tools/export_net.py -o $(EVALFILE) $(ARGS)
 
 # The Task 3 acceptance gate: export, then require the C inference to
 # reproduce the quantised Python reference EXACTLY on every vector. Exact,
@@ -688,8 +700,16 @@ nnue-export:
 #
 # EVAL=nnue explicitly, not just by default: this gate must test the network
 # even when it is invoked from a shell that has EVAL=classical in the
-# environment. It rebuilds $(TARGET), and it re-exports EVALFILE from NET - run
+# environment. It rebuilds $(TARGET), and it re-exports EVALFILE - run
 # `make net-fetch` afterwards to put the pinned net back.
+#
+# A candidate net goes through EVALFILE, which this both exports to and then
+# verifies, with ARGS naming the checkpoint. ARGS carries into the sub-make:
+#
+#   make nnue-test ARGS="run7" EVALFILE=external/nets/run7.nnue
+#
+# Do NOT redirect the export with ARGS="-o ..." here: the verify line below
+# reads $(EVALFILE).vectors, so that exports one net and checks another.
 nnue-test:
 	@$(MAKE) --no-print-directory nnue-export
 	@$(MAKE) --no-print-directory all EVAL=nnue
@@ -797,7 +817,8 @@ help:
 	@echo "make gauntlet           play a field (or Stockfish alone), Elo table"
 	@echo "make ratings            re-read a gauntlet PGN onto the CCRL scale"
 	@echo "make snapshot           freeze this build as a baseline"
-	@echo "make nnue-export        quantise NET into EVALFILE (+ test vectors)"
+	@echo "make nnue-export        quantise a checkpoint into net.nnue (+ test vectors)"
+	@echo "                        ARGS=\"<checkpoint> [-o <net>]\", both bare names ok"
 	@echo "make nnue-test          C inference == quantised Python reference"
 	@echo "make nnue-info          which net a build is carrying, by hash"
 	@echo "make net-fetch          download the pinned net into EVALFILE"

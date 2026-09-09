@@ -43,6 +43,8 @@ from .format import (
     NET_TO_CP,
     NUM_FEATURES,
     PAD_INDEX,
+    PIECE_PLANES,
+    SQUARES,
     SOURCE_NAMES,
     WEIGHT_CLIP,
     check_output_buckets,
@@ -58,12 +60,34 @@ DEFAULT_HIDDEN = 1024
 # no net anyone would train. Refusing here rather than at load is the
 # difference between a flag error and an overnight run that cannot be exported.
 WIDTH_MULTIPLE = 16
+SHARED_FEATURES = PIECE_PLANES * SQUARES
+SHARED_PAD_INDEX = SHARED_FEATURES
+
+
+def effective_feature_weights(state: dict, factorized: bool) -> torch.Tensor:
+    """Fold the training-only PSQT factor BEFORE quantisation, never after it."""
+    ft = state["ft.weight"]
+    if ft.ndim != 2 or ft.shape[0] != NUM_FEATURES + 1:
+        raise ValueError("feature transformer has the wrong shape")
+    if torch.count_nonzero(ft[PAD_INDEX]):
+        raise ValueError("the padding embedding drifted off zero")
+    if ("ft_shared.weight" in state) != factorized:
+        raise ValueError("feature_factorization metadata disagrees with the shared weights")
+    if not factorized:
+        return ft
+    shared = state["ft_shared.weight"]
+    if shared.shape != (SHARED_FEATURES + 1, ft.shape[1]):
+        raise ValueError("shared feature transformer has the wrong shape")
+    if torch.count_nonzero(shared[SHARED_PAD_INDEX]):
+        raise ValueError("the shared padding embedding drifted off zero")
+    folded = ft[:-1].reshape(-1, SHARED_FEATURES, ft.shape[1]) + shared[:-1]
+    return torch.cat((folded.reshape(-1, ft.shape[1]), ft[-1:]), dim=0)
 
 
 class NNUE(nn.Module):
     def __init__(self, hidden: int = DEFAULT_HIDDEN,
                  output_buckets: int = DEFAULT_OUTPUT_BUCKETS,
-                 uncertainty: bool = False):
+                 uncertainty: bool = False, feature_factorization: bool = False):
         super().__init__()
         if hidden < 1 or hidden % WIDTH_MULTIPLE:
             raise ValueError(f"hidden width must be a multiple of {WIDTH_MULTIPLE}, "
@@ -72,6 +96,7 @@ class NNUE(nn.Module):
         self.hidden = hidden
         self.output_buckets = check_output_buckets(output_buckets)
         self.uncertainty = bool(uncertainty)
+        self.feature_factorization = bool(feature_factorization)
 
         # One extra row for the padding slot. padding_idx pins it to zero and
         # keeps it there: it takes no gradient, so a record with 12 pieces
@@ -106,6 +131,14 @@ class NNUE(nn.Module):
         with torch.no_grad():
             self.ft.weight[PAD_INDEX].zero_()
 
+        if self.feature_factorization:
+            # Zero starts from the same function AND RNG state as the control.
+            # The factor learns common piece-square effects across king slots.
+            with torch.random.fork_rng(devices=[]):
+                self.ft_shared = nn.EmbeddingBag(SHARED_FEATURES + 1, hidden, mode="sum",
+                                                padding_idx=SHARED_PAD_INDEX)
+            nn.init.zeros_(self.ft_shared.weight)
+
     # ------------------------------------------------------------ shape ----
 
     @property
@@ -124,12 +157,14 @@ class NNUE(nn.Module):
             "features": FEATURE_SET_NAME,
             "activation": ACTIVATION_NAME,
             "uncertainty": self.uncertainty,
+            "feature_factorization": self.feature_factorization,
         }
 
     def describe(self) -> str:
         return (f"{NUM_FEATURES} -> {self.hidden}x2 -> {self.output_buckets}, "
                 f"{ACTIVATION_NAME}, {FEATURE_SET_NAME}"
-                + (", +uncertainty" if self.uncertainty else ""))
+                + (", +uncertainty" if self.uncertainty else "")
+                + (", +training-only PSQT factor" if self.feature_factorization else ""))
 
     # -------------------------------------------------------- the forward --
 
@@ -149,7 +184,22 @@ class NNUE(nn.Module):
         Exposed because the exporter and the C incremental-update assert both
         need to compare against exactly this quantity.
         """
-        return self.ft(white) + self.ft_bias, self.ft(black) + self.ft_bias
+        return self._accumulate(white), self._accumulate(black)
+
+    def _accumulate(self, features: torch.Tensor) -> torch.Tensor:
+        acc = self.ft(features) + self.ft_bias
+        if self.feature_factorization:
+            shared = torch.where(features == PAD_INDEX, SHARED_PAD_INDEX,
+                                 features % SHARED_FEATURES)
+            acc = acc + self.ft_shared(shared)
+        return acc
+
+    def folded_state_dict(self) -> dict:
+        """Weights for the unchanged engine architecture; does not mutate this model."""
+        state = self.state_dict()
+        state["ft.weight"] = effective_feature_weights(state, self.feature_factorization)
+        state.pop("ft_shared.weight", None)
+        return state
 
     def forward(self, white: torch.Tensor, black: torch.Tensor, stm: torch.Tensor,
                 piece_count: torch.Tensor | None = None) -> torch.Tensor:
@@ -221,7 +271,17 @@ class NNUE(nn.Module):
         that is 0.1% worse than its float self and one that has weights lopped
         off it at the end.
         """
-        self.ft.weight.clamp_(-bound, bound)
+        if self.feature_factorization:
+            residual = self.ft.weight[:-1].view(-1, SHARED_FEATURES, self.hidden)
+            shared = self.ft_shared.weight[:-1]
+            effective = (residual + shared).clamp_(-bound, bound)
+            # Bound the decomposition too, without changing its effective sum.
+            # Clipping the two terms independently would not bound that sum.
+            shared.clamp_(-bound, bound)
+            residual.copy_(effective - shared)
+            self.ft_shared.weight[SHARED_PAD_INDEX].zero_()
+        else:
+            self.ft.weight.clamp_(-bound, bound)
         self.ft_bias.clamp_(-bound, bound)
         self.out.weight.clamp_(-bound, bound)
         # The uncertainty head multiplies the same QA-clamped activation as the
@@ -269,6 +329,7 @@ def arch_from_checkpoint(state: dict) -> dict:
         # contain an `unc.*` tensor or they do not, and load_state_dict cross
         # checks it against this flag either way.
         "uncertainty": bool(arch.get("uncertainty", False)),
+        "feature_factorization": bool(arch.get("feature_factorization", False)),
     }
 
 
@@ -281,7 +342,8 @@ def from_checkpoint(state: dict) -> NNUE:
     """
     arch = arch_from_checkpoint(state)
     model = NNUE(hidden=arch["hidden"], output_buckets=arch["output_buckets"],
-                 uncertainty=arch["uncertainty"])
+                 uncertainty=arch["uncertainty"],
+                 feature_factorization=arch["feature_factorization"])
     model.load_state_dict(state["model"])
     return model
 

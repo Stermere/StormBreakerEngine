@@ -1,7 +1,8 @@
 """Quantise a trained checkpoint into a .nnue file, and write the test vectors
 that prove src/nnue.c reproduces it exactly.
 
-    python tools/export_net.py external/nets/net.pt
+    python tools/export_net.py            # external/nets/net.pt -> net.nnue
+    python tools/export_net.py net-fact   # a bare name resolves under external/nets
 
 Two outputs and one gate:
 
@@ -64,7 +65,8 @@ from nnue.format import (  # noqa: E402
     record_to_fen,
     unpack,
 )
-from nnue.model import arch_from_checkpoint  # noqa: E402
+from nnue.model import arch_from_checkpoint, effective_feature_weights  # noqa: E402
+from nnue.provenance import sha256_file, write_json  # noqa: E402
 
 # ------------------------------------------------------------------ format --
 
@@ -107,6 +109,47 @@ ENGINE_MAX_PIECES = 64
 INT16_MAX = 32767
 INT32_MAX = 2**31 - 1
 
+# ------------------------------------------------------------------- paths --
+NETS_DIR = "external/nets"
+DEFAULT_CHECKPOINT = NETS_DIR + "/net.pt"
+DEFAULT_OUT = NETS_DIR + "/net.nnue"  # what the default build embeds
+
+
+def resolve_checkpoint(name: str) -> str:
+    """A checkpoint by path, or by the bare name of one in external/nets.
+
+    An INPUT can be searched for, because the answer is checked against the
+    filesystem: a literal path that exists always wins, and nothing is guessed
+    when a guess could be wrong. The output side below cannot do this and does
+    not try.
+    """
+    candidates = [name]
+    if not os.path.splitext(name)[1]:
+        candidates.append(name + ".pt")
+    if not os.path.dirname(name):
+        candidates += [f"{NETS_DIR}/{c}" for c in candidates]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    tried = "\n  ".join(candidates)
+    raise SystemExit(f"no checkpoint at any of:\n  {tried}")
+
+
+def resolve_out(name: str) -> str:
+    """The .nnue to write. Only a BARE STEM is expanded.
+
+    `-o cand` means external/nets/cand.nnue, but anything already shaped like a
+    path or a file - `cand.nnue`, `./cand.nnue`, the EVALFILE make passes - is
+    taken verbatim. Moving an output the caller spelled out would let the file
+    this writes and the file the engine embeds be two different files, which is
+    invariant 8's failure mode arriving through the back door.
+    """
+    if os.path.dirname(name) or os.path.splitext(name)[1]:
+        return name
+    return f"{NETS_DIR}/{name}.nnue"
+
 
 def trunc_div(num: np.ndarray, den: int) -> np.ndarray:
     """Integer division that TRUNCATES toward zero, as C's ``/`` does.
@@ -139,7 +182,11 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
     """
     buckets = arch["output_buckets"]
 
-    ft_w = state["ft.weight"].detach().cpu().numpy().astype(np.float64)
+    try:
+        ft = effective_feature_weights(state, bool(arch.get("feature_factorization", False)))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    ft_w = ft.detach().cpu().numpy().astype(np.float64)
     ft_b = state["ft_bias"].detach().cpu().numpy().astype(np.float64)
     out_w = state["out.weight"].detach().cpu().numpy().astype(np.float64)
     out_b = state["out.bias"].detach().cpu().numpy().astype(np.float64).reshape(-1)
@@ -472,11 +519,20 @@ def write_net(path: str, q: dict, args, tag: str) -> bytes:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("checkpoint", help="a .pt written by nnue.train")
-    parser.add_argument("-o", "--out", default=None,
-                        help="output .nnue (default: the checkpoint with a .nnue suffix)")
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""examples (through make, which adds the venv python):
+
+  make nnue-export                          {DEFAULT_CHECKPOINT} -> {DEFAULT_OUT}
+  make nnue-export ARGS="net-fact -f"       {NETS_DIR}/net-fact.pt -> {DEFAULT_OUT}
+  make nnue-export ARGS="net-fact -o cand"  ... -> {NETS_DIR}/cand.nnue
+  make nnue-test   ARGS="net-fact" EVALFILE={NETS_DIR}/cand.nnue
+""")
+    parser.add_argument("checkpoint", nargs="?", default=None,
+                        help=f"a .pt written by nnue.train, or the bare name of one in "
+                             f"{NETS_DIR} (default: {DEFAULT_CHECKPOINT})")
+    parser.add_argument("-o", "--out", "--output", default=None, dest="out",
+                        help=f"output .nnue; a bare name lands in {NETS_DIR} "
+                             f"(default: {DEFAULT_OUT}, which is what the engine embeds)")
     parser.add_argument("--positions", default=None,
                         help="a .cnn shard to draw test positions from")
     parser.add_argument("--fens", default=None, help="a file of FENs, one per line, instead")
@@ -488,15 +544,34 @@ def main() -> None:
                         help="centipawns per unit of float output")
     parser.add_argument("--tag", default=None,
                         help="up to 32 bytes of provenance stamped into the header")
+    parser.add_argument("-f", "--overwrite", action="store_true",
+                        help="explicitly replace an existing export from a different checkpoint")
     args = parser.parse_args()
 
-    out = args.out or (os.path.splitext(args.checkpoint)[0] + ".nnue")
+    checkpoint = resolve_checkpoint(args.checkpoint or DEFAULT_CHECKPOINT)
+    out = resolve_out(args.out or DEFAULT_OUT)
     vectors = args.vectors or (out + ".vectors")
+    manifest_path = os.path.splitext(out)[0] + ".json"
+    checkpoint_path = os.path.abspath(checkpoint)
+    checkpoint_hash = sha256_file(checkpoint_path)
+    if os.path.exists(out) and not args.overwrite:
+        previous = None
+        if os.path.exists(manifest_path):
+            with open(manifest_path, encoding="utf-8") as f:
+                previous = json.load(f)
+        if (not previous or previous.get("sha256") != sha256_file(out)
+                or previous.get("checkpoint_sha256") != checkpoint_hash):
+            was = (previous or {}).get("checkpoint", "an unverified export")
+            raise SystemExit(
+                f"{out} is {os.path.basename(was)}, not {os.path.basename(checkpoint)}\n"
+                f"replacing it needs -f/--overwrite, or name a distinct -o path")
 
     # Imported here so that --help works without a torch install.
     import torch
 
-    state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if sha256_file(checkpoint_path) != checkpoint_hash:
+        raise SystemExit("checkpoint changed while being loaded; export a saved epoch checkpoint")
     arch = arch_from_checkpoint(state)
     q = quantise(state["model"], arch, args.qa, args.qb)
     q["qb"] = args.qb
@@ -505,7 +580,7 @@ def main() -> None:
         raise SystemExit("checkpoint's hidden field disagrees with its own weights")
 
     limits = check_ranges(q, args.qa)
-    tag = args.tag or f"epoch{state.get('epoch', '?')}-h{q['hidden']}"
+    tag = args.tag or f"e{state.get('epoch', '?')}-h{q['hidden']}-{checkpoint_hash[:12]}"
 
     blob = write_net(out, q, args, tag)
     digest = hashlib.sha256(blob).hexdigest()
@@ -513,6 +588,10 @@ def main() -> None:
         f.write(f"{digest}  {os.path.basename(out)}\n")
 
     print(f"wrote {out}  ({len(blob):,} bytes)")
+    # The checkpoint as RESOLVED, not as typed: `net-fact` and the default both
+    # arrive here as a path, and which one they arrived as is the first thing
+    # anyone re-reading this output wants to know.
+    print(f"  from      {checkpoint}  ({checkpoint_hash[:12]})")
     print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2 -> {q['buckets']}, "
           f"screlu, {FEATURE_SET_NAME}"
           + (", +uncertainty" if q["uncertainty"] else ""))
@@ -571,7 +650,12 @@ def main() -> None:
     manifest = {
         "net": os.path.basename(out),
         "sha256": digest,
-        "checkpoint": os.path.basename(args.checkpoint),
+        "checkpoint": checkpoint_path,
+        "checkpoint_sha256": checkpoint_hash,
+        "run_id": state.get("run_id"),
+        "stage": state.get("stage", "main"),
+        "feature_factorization": arch["feature_factorization"],
+        "metrics": state.get("metrics"),
         "epoch": state.get("epoch"),
         "val_loss": state.get("val_loss"),
         "format_version": FORMAT_VERSION,
@@ -590,8 +674,7 @@ def main() -> None:
         "vector_count": len(fens),
         "quantisation_drift_cp": {"mean": float(drift.mean()), "max": float(drift.max())},
     }
-    with open(os.path.splitext(out)[0] + ".json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+    write_json(manifest_path, manifest)
 
 
 if __name__ == "__main__":

@@ -48,14 +48,16 @@ import json
 import math
 import os
 import time
+import uuid
 
 import torch
 
 from . import sanity
 from .dataset import make_loader, set_epoch, to_device
-from .format import DEFAULT_OUTPUT_BUCKETS, SOURCE_NAMES
+from .format import DEFAULT_OUTPUT_BUCKETS, NET_TO_CP, SOURCE_NAMES
 from .model import (DEFAULT_HIDDEN, NNUE, TargetPolicy, arch_from_checkpoint, blended_target,
-                    loss_fn, uncertainty_loss_fn)
+                    from_checkpoint, loss_fn, uncertainty_loss_fn)
+from .provenance import code_identity, dataset_identity, sha256_file, write_json
 
 # The evaluation's sigmoid scale, in centipawns. Keeping it equal to the value
 # tools/tuner.c fitted is what keeps the target in the same win-probability
@@ -152,11 +154,20 @@ def forever(loader):
     every worker.
     """
     while True:
-        yield from loader
+        yielded = False
+        for batch in loader:
+            yielded = True
+            yield batch
+        if not yielded:
+            raise ValueError("no training records remain after source filtering")
 
 
 def load_resume(args, model, optimiser, scheduler, device):
-    """Put a run back exactly where it stopped. Returns (next epoch, history)."""
+    """Restore saved training state; returns (next epoch, history, checkpoint).
+
+    Loader prefetch/cursor state is not checkpointed. A resumed virtual epoch
+    starts a fresh shuffled pass, not the exact next batch of the old iterator.
+    """
     net_path, state_path = f"{args.out}.pt", f"{args.out}{RESUME_SUFFIX}"
     for path in (net_path, state_path):
         if not os.path.exists(path):
@@ -166,6 +177,25 @@ def load_resume(args, model, optimiser, scheduler, device):
 
     checkpoint = torch.load(net_path, map_location=device, weights_only=False)
     state = torch.load(state_path, map_location=device, weights_only=False)
+    if state["epoch"] != checkpoint["epoch"] or state.get("run_id") != checkpoint.get("run_id"):
+        raise SystemExit("--resume: checkpoint and optimiser belong to different saves")
+    if state.get("checkpoint_sha256") and state["checkpoint_sha256"] != sha256_file(net_path):
+        raise SystemExit("--resume: checkpoint hash does not match the optimiser state")
+    if checkpoint.get("run_id"):
+        # Changing the main-stage length moves the lambda schedule and the
+        # finishing boundary. Fine-tuning is --init-from, not an ambiguous resume.
+        fixed = ("epochs", "finish_epochs", "finish_lr", "positions_per_epoch",
+                 "lr", "lr_gamma", "weight_decay", "batch_size", "seed", "workers",
+                 "chunk_records", "limit_batches", "sigmoid_k", "score_clip", "unc_weight",
+                 "lambda_start", "lambda_end", "lambda_progress", "lambda_pieces",
+                 "lambda_source", "lambda_min", "lambda_max", "source_weight", "sources",
+                 "no_weight_clip")
+        for key in fixed:
+            if checkpoint["args"].get(key) != getattr(args, key):
+                raise SystemExit(f"--resume: {key} changed; use --init-from for a new recipe")
+        if checkpoint.get("data") != {"train": dataset_identity(args.train),
+                                      "val": dataset_identity(args.val)}:
+            raise SystemExit("--resume: training/validation data identity changed")
 
     # Same rule as everywhere else the shape is read rather than assumed: the
     # architecture comes out of the file, and a disagreement names the field.
@@ -173,7 +203,8 @@ def load_resume(args, model, optimiser, scheduler, device):
     # are wrong, which is the failure mode worth being loud about.
     arch = arch_from_checkpoint(checkpoint)
     for field, asked in (("hidden", args.hidden), ("output_buckets", args.output_buckets),
-                         ("uncertainty", args.uncertainty)):
+                         ("uncertainty", args.uncertainty),
+                         ("feature_factorization", args.feature_factorization)):
         if arch[field] != asked:
             raise SystemExit(f"--resume: {net_path} has {field} {arch[field]}, this run "
                              f"asks for {asked}. Pass the flags the original run used, or "
@@ -196,43 +227,120 @@ def load_resume(args, model, optimiser, scheduler, device):
 
     print(f"resumed from {net_path} at epoch {done} "
           f"(train {checkpoint.get('train_loss', float('nan')):.6f})")
-    return done + 1, history
+    return done + 1, history, checkpoint
 
 
-def evaluate(model, loader, device, policy, lam, limit=None) -> float:
+class Metrics:
+    """Global denominators: averaging weighted batch means biases validation.
+
+    score_mse and wdl_mse use a fixed K=400 with raw labels, no mixture weights
+    or lambda schedule. They are diagnostic comparisons, not training targets.
+    """
+
+    def __init__(self, device, unc_weight):
+        self.sums = torch.zeros(7, device=device, dtype=torch.float64)
+        self.unc_weight = unc_weight
+
+    @torch.no_grad()
+    def update(self, prediction, unc, batch, target, policy):
+        probability = torch.sigmoid(prediction.detach() * NET_TO_CP / policy.sigmoid_k)
+        squared = (probability - target) ** 2
+        weights = policy.weights(batch)
+        n = prediction.numel()
+        mass = squared.new_tensor(n) if weights is None else weights.sum()
+        value_sum = squared.sum() if weights is None else (squared * weights).sum()
+        unc_sum = (squared.new_zeros(()) if unc is None else
+                   (unc.detach() - (policy.score(batch) / NET_TO_CP
+                                    - prediction.detach()).abs()).abs().sum())
+        fixed = torch.sigmoid(prediction.detach() * NET_TO_CP / DEFAULT_SIGMOID_K)
+        score_sum = ((fixed - torch.sigmoid(batch["score"] / DEFAULT_SIGMOID_K)) ** 2).sum()
+        known = batch["wdl"] <= 2
+        result = batch["wdl"].float().clamp_max(2) / 2
+        wdl_sum = (((fixed - result) ** 2) * known).sum()
+        self.sums += torch.stack((value_sum, mass, unc_sum, squared.new_tensor(n),
+                                  score_sum, wdl_sum, known.sum()))
+
+    def report(self):
+        value, mass, unc, n, score, wdl, known = self.sums.tolist()
+        if n == 0:
+            raise ValueError("no records remain after source filtering")
+        if not all(math.isfinite(x) for x in (value, mass, unc, n, score, wdl, known)):
+            raise ValueError("non-finite training/validation metrics; refusing to save a bad net")
+        value /= max(mass, 1e-8)
+        unc /= n
+        return {"value": value, "uncertainty": unc,
+                "weighted_uncertainty": self.unc_weight * unc,
+                "total": value + self.unc_weight * unc,
+                "score_mse": score / n, "wdl_mse": wdl / known if known else None,
+                "positions": int(n), "known_results": int(known)}
+
+
+def evaluate(model, loader, device, policy, lam, limit=None, unc_weight=0.05) -> dict:
     """Held-out loss under the SAME target policy the training loop used.
 
     Scoring the validation set against a different target would make the two
     curves incomparable, which is the only thing a validation curve is for.
     """
+    was_training = model.training
     model.eval()
     # Accumulated on the device: see the note in train() on why a .item() per
     # batch is not free.
-    total, seen = torch.zeros((), device=device), 0
+    metrics = Metrics(device, unc_weight)
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if limit and i >= limit:
                 break
             batch = to_device(batch, device)
-            prediction = model(batch["white"], batch["black"], batch["stm"],
-                               batch["piece_count"])
+            if model.uncertainty:
+                prediction, unc = model.forward_heads(batch["white"], batch["black"],
+                                                      batch["stm"], batch["piece_count"])
+            else:
+                prediction = model(batch["white"], batch["black"], batch["stm"],
+                                   batch["piece_count"])
+                unc = None
             target = policy.target(batch, lam)
-            n = prediction.numel()
-            total += loss_fn(prediction, target, policy.sigmoid_k, policy.weights(batch)) * n
-            seen += n
-    model.train()
-    return total.item() / max(seen, 1)
+            metrics.update(prediction, unc, batch, target, policy)
+    model.train(was_training)
+    return metrics.report()
 
 
 def train(args) -> None:
+    existing = [f"{args.out}{suffix}" for suffix in (".pt", RESUME_SUFFIX, "-history.json",
+                                                   "-run.json", "-pre-finish.pt", ".nnue", ".json")]
+    if not args.resume and any(os.path.exists(p) for p in existing):
+        raise SystemExit("output prefix already belongs to a run; choose a new --out or --resume")
     torch.manual_seed(args.seed)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"device: {device}"
           f"{' (' + torch.cuda.get_device_name(0) + ')' if device.type == 'cuda' else ''}")
 
-    model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
-                 uncertainty=args.uncertainty).to(device)
+    parent = None
+    if args.init_from:
+        source_path = os.path.abspath(args.init_from)
+        source_hash = sha256_file(source_path)
+        source = torch.load(source_path, map_location="cpu", weights_only=False)
+        if sha256_file(source_path) != source_hash:
+            raise SystemExit("--init-from checkpoint changed while being loaded")
+        original = from_checkpoint(source)
+        args.hidden, args.output_buckets = original.hidden, original.output_buckets
+        args.uncertainty = original.uncertainty
+        args.feature_factorization = args.feature_factorization or original.feature_factorization
+        model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
+                     uncertainty=args.uncertainty,
+                     feature_factorization=args.feature_factorization)
+        weights = original.state_dict()
+        if args.feature_factorization and not original.feature_factorization:
+            weights["ft_shared.weight"] = model.ft_shared.weight.detach().clone()
+        model.load_state_dict(weights)
+        parent = {"checkpoint": source_path, "sha256": source_hash,
+                  "run_id": source.get("run_id")}
+        del original, source, weights
+    else:
+        model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
+                     uncertainty=args.uncertainty,
+                     feature_factorization=args.feature_factorization)
+    model = model.to(device)
     print(f"net:    {model.describe()}")
 
     train_loader = make_loader(args.train, args.batch_size, args.workers, shuffle=True,
@@ -246,7 +354,10 @@ def train(args) -> None:
     print(f"train: {train_loader.dataset.records:,} records "
           f"in {len(train_loader):,} batches of {args.batch_size:,}")
     print(f"load:  {train_loader.dataset.describe()}, {args.workers} worker(s)")
-    if val_loader:
+    if args.sources and hasattr(train_loader.dataset, "chunks"):
+        print("       chunked source filtering: input counts above are upper bounds; "
+              "epoch metrics report the records actually used")
+    if val_loader is not None:
         print(f"val:   {val_loader.dataset.records:,} records")
 
     optimiser, flavour = make_optimiser(model, args, device)
@@ -268,14 +379,44 @@ def train(args) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
 
     first_epoch, history = 1, []
+    run_id = uuid.uuid4().hex
+    data = {"train": dataset_identity(args.train), "val": dataset_identity(args.val)}
+    provenance = {"code": code_identity(), "torch": str(torch.__version__),
+                  "device": str(device), "parent": parent}
     if args.resume:
-        first_epoch, history = load_resume(args, model, optimiser, scheduler, device)
-        if first_epoch > args.epochs:
-            print(f"nothing to do: already at epoch {first_epoch - 1} of {args.epochs}")
+        first_epoch, history, restored = load_resume(args, model, optimiser, scheduler, device)
+        run_id = restored.get("run_id", run_id)
+        current_environment = provenance
+        provenance = restored.get("provenance", provenance)
+        if first_epoch > args.epochs + args.finish_epochs:
+            print(f"nothing to do: already at epoch {first_epoch - 1} "
+                  f"of {args.epochs + args.finish_epochs}")
             return
+        provenance.setdefault("resumes", []).append({
+            "after_epoch": first_epoch - 1, "code": current_environment["code"],
+            "torch": current_environment["torch"], "device": current_environment["device"]})
         # The chunked loader shuffles from an epoch counter it owns, so it has
         # to be told which pass this is or the resumed run replays epoch 1.
         set_epoch(train_loader, first_epoch - 1)
+        if args.positions_per_epoch and first_epoch <= args.epochs:
+            print("resume: virtual-epoch loader restarts from a fresh shuffled pass; "
+                  "prefetched batches and the mid-pass cursor are not checkpointed")
+        del restored
+    write_json(f"{args.out}-run.json", {"run_id": run_id, "arch": model.arch,
+                                       "args": vars(args), "data": data,
+                                       "provenance": provenance})
+    print(f"run:    {run_id}  ({os.path.abspath(args.out)})")
+    if args.init_from:
+        print("init:   architecture/weights inherited; optimizer is new. Target and loss "
+              "settings come from this command, not the parent checkpoint")
+    if args.finish_epochs:
+        print(f"finish: {args.finish_epochs} full pass(es) at lr {args.finish_lr:g}; "
+              "lambda held at --lambda-end, Adam moments retained")
+        if first_epoch == 1 and args.epochs == 0:
+            save_atomically({"model": model.state_dict(), "arch": model.arch,
+                             "hidden": args.hidden, "epoch": 0, "stage": "pre-finish",
+                             "run_id": run_id, "args": vars(args), "data": data,
+                             "provenance": provenance}, f"{args.out}-pre-finish.pt")
 
     # An epoch is one pass over the data, and the pass ENDING is what ends it -
     # not a batch count, because with --sources len(loader) is an upper bound
@@ -283,18 +424,36 @@ def train(args) -> None:
     # epoch. --positions-per-epoch is the other case: there an epoch is a
     # position count, passes and epochs stop lining up, and the loader has to
     # be re-entered across the boundary.
-    endless = forever(train_loader) if args.positions_per_epoch else None
-    planned = (math.ceil(args.positions_per_epoch / args.batch_size)
-               if args.positions_per_epoch else len(train_loader))
-    if args.limit_batches:
-        planned = min(planned, args.limit_batches)
+    endless = (forever(train_loader)
+               if args.positions_per_epoch and first_epoch <= args.epochs else None)
 
-    for epoch in range(first_epoch, args.epochs + 1):
+    for epoch in range(first_epoch, args.epochs + args.finish_epochs + 1):
+        finishing = epoch > args.epochs
+        stage = "finish" if finishing else "main"
+        if finishing:
+            # Do not let the main exponential scheduler overwrite the final LR.
+            for group in optimiser.param_groups:
+                group["lr"] = args.finish_lr
+            if endless is not None:
+                # A finish is a WHOLE new pass, even after partial virtual epochs.
+                endless = None
+                del arriving
+                train_loader = make_loader(args.train, args.batch_size, args.workers,
+                                           shuffle=True, sources=args.sources,
+                                           chunk_records=args.chunk_records, seed=args.seed)
+                set_epoch(train_loader, epoch - 1)
+        position_limit = 0 if finishing else args.positions_per_epoch
+        planned = (math.ceil(position_limit / args.batch_size)
+                   if position_limit else len(train_loader))
+        if args.limit_batches:
+            planned = min(planned, args.limit_batches)
+        used_lr = optimiser.param_groups[0]["lr"]
         # Anneal lambda toward the game result: early epochs distil the search,
         # later ones let the outcome pull the net off the teacher's systematic
         # errors. Both ends are hyperparameters worth two or three runs.
         span = max(args.epochs - 1, 1)
-        lam = args.lambda_start + (args.lambda_end - args.lambda_start) * (epoch - 1) / span
+        lam = (args.lambda_end if finishing else
+               args.lambda_start + (args.lambda_end - args.lambda_start) * (epoch - 1) / span)
 
         started = time.time()
         # The running loss stays a device tensor rather than being read back
@@ -304,6 +463,7 @@ def train(args) -> None:
         # stops being free exactly where the GPU is NOT saturated (--hidden
         # 512, a bigger batch, a faster card), and it costs nothing to avoid.
         running = torch.zeros((), device=device)
+        metrics = Metrics(device, args.unc_weight)
         # The lambda that was actually applied, averaged over the epoch. With a
         # schedule this is the only number that says what the run did: the flags
         # say what was asked for, and the mixture decides what that came out as.
@@ -314,7 +474,7 @@ def train(args) -> None:
         while True:
             if args.limit_batches and batches >= args.limit_batches:
                 break
-            if args.positions_per_epoch and seen >= args.positions_per_epoch:
+            if position_limit and seen >= position_limit:
                 break
             try:
                 batch = next(arriving)
@@ -336,6 +496,7 @@ def train(args) -> None:
                 loss = loss_fn(prediction, target, args.sigmoid_k, weight) \
                     + args.unc_weight * uncertainty_loss_fn(unc, prediction, score)
             else:
+                unc = None
                 prediction = model(batch["white"], batch["black"], batch["stm"],
                                    batch["piece_count"])
                 loss = loss_fn(prediction, target, args.sigmoid_k, weight)
@@ -351,8 +512,10 @@ def train(args) -> None:
                 model.clip_weights()
 
             n = prediction.numel()
+            metrics.update(prediction, unc, batch, target, policy)
             running += loss.detach() * n
-            lam_sum += lambdas.detach().sum()
+            lam_sum += torch.where(batch["wdl"] <= 2, lambdas,
+                                   torch.ones_like(lambdas)).detach().sum()
             seen += n
             batches += 1
 
@@ -366,25 +529,40 @@ def train(args) -> None:
                       f"loss {running.item() / seen:.6f}  {rate:,.0f} pos/s  "
                       f"eta {left / 60:.1f}m", flush=True)
 
-        scheduler.step()
         elapsed = time.time() - started
-        train_loss = running.item() / max(seen, 1)
+        train_metrics = metrics.report()
+        if not finishing:
+            scheduler.step()
+        train_loss = train_metrics["value"]
         applied = lam_sum.item() / max(seen, 1)
-        val_loss = (evaluate(model, val_loader, device, policy, lam,
-                             args.limit_batches) if val_loader else float("nan"))
+        val_metrics = (evaluate(model, val_loader, device, policy, lam,
+                                args.limit_batches, args.unc_weight)
+                       if val_loader is not None else None)
+        val_loss = val_metrics["value"] if val_metrics else None
 
         # Both lambdas: the one the schedule asked for, and the one the data
         # actually got. They differ by whatever the deltas and the overrides
         # did, and a run whose applied lambda is not where it was meant to be
         # is a flag typo that nothing else would report.
         applied_note = "" if abs(applied - lam) < 5e-4 else f" (applied {applied:.3f})"
-        print(f"epoch {epoch:>3}  lambda {lam:.2f}{applied_note}  "
-              f"lr {scheduler.get_last_lr()[0]:.2e}  "
-              f"train {train_loss:.6f}  val {val_loss:.6f}  "
+        val_text = f"{val_loss:.6f}" if val_loss is not None else "none"
+        print(f"epoch {epoch:>3} [{stage}]  lambda {lam:.2f}{applied_note}  "
+              f"lr {used_lr:.2e}  "
+              f"train value {train_loss:.6f}  val value {val_text}  "
               f"{seen / max(elapsed, 1e-6):,.0f} pos/s  {elapsed:.0f}s", flush=True)
+        for label, values in (("train", train_metrics), ("val", val_metrics)):
+            if values is not None:
+                wdl_text = (f"{values['wdl_mse']:.6f}" if values["wdl_mse"] is not None
+                            else "none")
+                print(f"  {label}: unc L1 {values['uncertainty']:.6f}  "
+                      f"weighted unc {values['weighted_uncertainty']:.6f}  "
+                      f"total {values['total']:.6f}  fixed score MSE {values['score_mse']:.6f}  "
+                      f"fixed WDL MSE {wdl_text}")
 
-        history.append({"epoch": epoch, "lambda": lam, "lambda_applied": applied,
-                        "train": train_loss, "val": val_loss, "positions": seen})
+        history.append({"epoch": epoch, "stage": stage, "lr": used_lr,
+                        "lambda": lam, "lambda_applied": applied, "metrics_version": 2,
+                        "train": train_loss, "val": val_loss, "positions": seen,
+                        "metrics": {"train": train_metrics, "val": val_metrics}})
 
         print()
         sanity.report(model, device)
@@ -399,18 +577,29 @@ def train(args) -> None:
             "arch": model.arch,
             "hidden": args.hidden,
             "epoch": epoch,
+            "stage": stage,
+            "run_id": run_id,
+            "data": data,
+            "provenance": provenance,
+            "metrics_version": 2,
+            "metrics": {"train": train_metrics, "val": val_metrics},
             "sigmoid_k": args.sigmoid_k,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "args": vars(args),
         }
         save_atomically(checkpoint, f"{args.out}.pt")
+        checkpoint_hash = sha256_file(f"{args.out}.pt")
+        if args.finish_epochs and epoch == args.epochs:
+            save_atomically(checkpoint, f"{args.out}-pre-finish.pt")
         if args.checkpoint_every and epoch % args.checkpoint_every == 0:
             save_atomically(checkpoint, f"{args.out}-epoch{epoch}.pt")
 
         if not args.no_resume_state:
             save_atomically({
                 "epoch": epoch,
+                "run_id": run_id,
+                "checkpoint_sha256": checkpoint_hash,
                 "arch": model.arch,
                 "optimiser": optimiser.state_dict(),
                 "scheduler": scheduler.state_dict(),
@@ -419,8 +608,11 @@ def train(args) -> None:
                              if torch.cuda.is_available() else None),
             }, f"{args.out}{RESUME_SUFFIX}")
 
-        with open(f"{args.out}-history.json", "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        write_json(f"{args.out}-history.json", history)
+        write_json(f"{args.out}-run.json", {"run_id": run_id, "arch": model.arch,
+                   "args": vars(args), "data": data, "provenance": provenance,
+                   "checkpoint": os.path.abspath(f"{args.out}.pt"),
+                   "checkpoint_sha256": checkpoint_hash, "epoch": epoch, "stage": stage})
 
     print(f"wrote {args.out}.pt")
 
@@ -433,11 +625,20 @@ def parse_args(argv=None):
     parser.add_argument("--out", default="external/nets/net", help="checkpoint prefix")
 
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--finish-epochs", type=int, default=0,
+                        help="extra full data passes at --finish-lr after the main epochs; "
+                             "0 disables. Unaffected by --positions-per-epoch")
+    parser.add_argument("--finish-lr", type=float, default=1e-5,
+                        help="constant LR for the finishing passes; retains Adam moments "
+                             "and holds the target at --lambda-end (default: 1e-5)")
     parser.add_argument("--batch-size", type=int, default=16384)
     parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN,
                         help="hidden width per perspective; a multiple of 16")
     parser.add_argument("--output-buckets", type=int, default=DEFAULT_OUTPUT_BUCKETS,
                         help="output rows, selected by piece count; must divide 32")
+    parser.add_argument("--feature-factorization", action="store_true",
+                        help="train shared piece-square embeddings alongside the king-specific "
+                             "transformer; folded at export with no engine inference cost")
     parser.add_argument("--uncertainty", action="store_true",
                         help="add the uncertainty head: a second output layer predicting "
                              "|search score - value| per bucket, which search.c uses to "
@@ -512,6 +713,11 @@ def parse_args(argv=None):
     parser.add_argument("--resume", action="store_true",
                         help="continue the run at --out from its last completed epoch, "
                              "restoring optimiser, scheduler and RNG state")
+    parser.add_argument("--init-from", default=None, metavar="CHECKPOINT",
+                        help="start a NEW run from checkpoint weights, with a fresh optimizer. "
+                             "Reads architecture from the file; --feature-factorization may "
+                             "add a zero shared factor to an unfactorized checkpoint. "
+                             "Use --epochs 0 --finish-epochs 1 for a finishing-only run")
     parser.add_argument("--no-resume-state", action="store_true",
                         help=f"do not write {{out}}{RESUME_SUFFIX}. It is about twice the "
                              f"size of the net, so this is worth it only for short runs "
@@ -532,7 +738,26 @@ def parse_args(argv=None):
                         help="stop each epoch after N batches (smoke tests)")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--checkpoint-every", type=int, default=0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.resume and args.init_from:
+        parser.error("--resume and --init-from are mutually exclusive")
+    if args.epochs < 0 or args.finish_epochs < 0 or args.epochs + args.finish_epochs < 1:
+        parser.error("need a positive number of main or finishing epochs")
+    if args.epochs == 0 and not (args.init_from or args.resume):
+        parser.error("--epochs 0 needs --init-from (or --resume for that run)")
+    for name in ("lr", "lr_gamma", "finish_lr", "sigmoid_k"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive and finite")
+    if args.batch_size < 1 or args.workers < 0:
+        parser.error("--batch-size must be positive and --workers non-negative")
+    for name in ("positions_per_epoch", "limit_batches", "checkpoint_every"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    if args.chunk_records is not None and args.chunk_records < 0:
+        parser.error("--chunk-records must be non-negative")
+    if args.sources and any(s < 0 or s >= len(SOURCE_NAMES) for s in args.sources):
+        parser.error(f"--sources must be in 0..{len(SOURCE_NAMES) - 1}")
+    return args
 
 
 def main() -> None:

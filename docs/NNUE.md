@@ -869,7 +869,7 @@ a position that matters.
 ### Running it
 
 ```sh
-make nnue-export    # quantise NET into EVALFILE, + vectors + .sha256 + manifest
+make nnue-export    # quantise net.pt into net.nnue, + vectors + .sha256 + manifest
 make                # the engine with the network - this IS the default build
 make nnue-test      # export, build, and require exact equality on every vector
 make nnue-info      # which net a build is carrying, by hash
@@ -880,9 +880,17 @@ make net-publish    # upload this net, and print the pin that names it
 ```
 make EVAL=classical                             # any target, without the network
 make EVALFILE=external/nets/cand.nnue           # a specific net
-make nnue-export NET=external/nets/run7.pt      # a specific checkpoint
+make nnue-export ARGS="run7 -f"                 # a specific checkpoint, onto net.nnue
+make nnue-export ARGS="run7 -o cand"            # ... and onto a net of its own
 python tools/export_net.py --help               # QA, QB, SCALE, vector count
 ```
+
+`ARGS` is passed straight through to `tools/export_net.py`: the first word is
+the checkpoint, `-o`/`--output` names the net. A bare name on either side means
+`external/nets/<name>` with the obvious extension, and anything carrying a
+directory or an extension is used exactly as written. Replacing a `net.nnue`
+that was exported from a *different* checkpoint needs `-f`, which is the one
+thing standing between a candidate export and a silently mismatched pair.
 
 `EVAL=classical` produces the engine that existed before the network did — no
 net, none of `src/nnue.c` compiled — and `make classical` builds it as

@@ -347,6 +347,7 @@ def test_a_checkpoint_describes_its_own_architecture():
         "hidden": 48, "output_buckets": 4,
         "features": "halfka-32sq", "activation": "screlu",
         "uncertainty": False,
+        "feature_factorization": False,
     }
 
     restored = from_checkpoint(state)
