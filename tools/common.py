@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -251,15 +252,33 @@ def section(title: str) -> None:
 
 
 def ok(msg: str) -> None:
-    print(_c("32", f"  [ok]   {msg}"))
+    print(oktext(msg))
 
 
 def warn(msg: str) -> None:
-    print(_c("33", f"  [warn] {msg}"))
+    print(warntext(msg))
 
 
 def fail(msg: str) -> None:
-    print(_c("31", f"  [fail] {msg}"))
+    print(failtext(msg))
+
+
+# The same three, formatted but not printed. A live panel owns the cursor while
+# it is up, so anything printed underneath it lands in the middle of the
+# display; these let a caller hand the text to the panel's own log() instead of
+# writing it out from wherever it was produced.
+
+
+def oktext(msg: str) -> str:
+    return _c("32", f"  [ok]   {msg}")
+
+
+def warntext(msg: str) -> str:
+    return _c("33", f"  [warn] {msg}")
+
+
+def failtext(msg: str) -> str:
+    return _c("31", f"  [fail] {msg}")
 
 
 def stamp() -> str:
@@ -344,14 +363,19 @@ def print_command(exe: str, args: list[str]) -> None:
     print()
 
 
-def run_match(exe: str, args: list[str], *, stream: bool = True) -> tuple[int, str]:
+def run_match(exe: str, args: list[str], *, stream: bool = True, on_line=None) -> tuple[int, str]:
     """Runs fastchess. Returns (exit code, captured stdout).
 
     `stream=True` echoes as it goes, which is what a human watching an SPRT
     wants; the tuner captures instead, because it runs thousands of these and
     only reads the final tally.
+
+    `on_line` takes the echo over: it is handed every line as it arrives and
+    decides what reaches the terminal, which is how the live panels replace the
+    raw stream. The full output is still captured and returned either way -
+    the panel is a view of the run, never the only copy of it.
     """
-    if stream:
+    if stream or on_line is not None:
         proc = subprocess.Popen(
             args=[exe] + args,
             stdout=subprocess.PIPE,
@@ -364,8 +388,11 @@ def run_match(exe: str, args: list[str], *, stream: bool = True) -> tuple[int, s
         chunks = []
         assert proc.stdout is not None
         for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            if on_line is not None:
+                on_line(line.rstrip("\n"))
+            else:
+                sys.stdout.write(line)
+                sys.stdout.flush()
             chunks.append(line)
         proc.wait()
         return proc.returncode, "".join(chunks)
@@ -383,12 +410,40 @@ def run_match(exe: str, args: list[str], *, stream: bool = True) -> tuple[int, s
 
 # --------------------------------------------------------------- parsing ----
 
+# fastchess's own format strings, which is where these patterns come from
+# rather than from a remembered sample of its output:
+#
+#   Started game {} of {} ({} vs {})
+#   Finished game {} ({} vs {}): {} {{{}}}
+#   Results of {} vs {} ({}, {}, {}{}):
+#   Elo: {}, nElo: {}
+#   LOS: {}, DrawRatio: {:.2f} %{}          <- the tail is ", PairsRatio: {:.2f}"
+#   Games: {}, Wins: {}, Losses: {}, Draws: {}, Points: {:.1f} ({:.2f} %)
+#   Ptnml(0-2): {}, {}
+#   LLR: {:.2f} ({:.1f}%) {} {}
+#
+# Read them back out of the binary with `grep -ao` if a fastchess upgrade ever
+# makes a panel go blank; a pattern that stops matching costs a display, and
+# the numbers underneath it are still in the captured output.
 _RE_GAMES = re.compile(
     r"Games:\s*(\d+),\s*Wins:\s*(\d+),\s*Losses:\s*(\d+),\s*Draws:\s*(\d+),\s*"
     r"Points:\s*([\d.]+)\s*\(([\d.]+)\s*%\)"
 )
-_RE_ELO = re.compile(r"Elo:\s*(-?[\d.]+)\s*\+/-\s*([\d.]+)")
+
+# The lookbehind is not decoration. Elo and nElo share one line, "nElo:" ends in
+# the same four characters as "Elo:", and an unanchored pattern therefore
+# matches twice per block - so taking the last match reported the NORMALISED
+# Elo under the plain Elo's name, on every result this file has ever parsed.
+_RE_ELO = re.compile(r"(?<![A-Za-z])Elo:\s*(-?[\d.]+)\s*\+/-\s*([\d.]+)")
+_RE_NELO = re.compile(r"nElo:\s*(-?[\d.]+)\s*\+/-\s*([\d.]+)")
 _RE_LLR = re.compile(r"LLR:\s*(-?[\d.]+)")
+_RE_LOS = re.compile(r"LOS:\s*([\d.]+)\s*%")
+_RE_DRAWRATIO = re.compile(r"DrawRatio:\s*([\d.]+)\s*%")
+_RE_PAIRSRATIO = re.compile(r"PairsRatio:\s*([\d.]+)")
+_RE_PTNML = re.compile(r"Ptnml\(0-2\):\s*\[([^\]]*)\]")
+_RE_PAIRING = re.compile(r"Results of\s+(.+?)\s+vs\s+(.+?)\s*\(")
+_RE_STARTED = re.compile(r"Started game\s+(\d+)\s+of\s+(\d+)\b")
+_RE_FINISHED = re.compile(r"Finished game\s+(\d+)\s+\((.+?)\s+vs\s+(.+?)\):\s*(\S+)\s*\{(.*)\}")
 
 
 class MatchResult:
@@ -407,6 +462,16 @@ class MatchResult:
         self.points = points
         self.elo = elo
         self.llr = llr
+        # Everything below is for the live panel. None means fastchess has not
+        # printed a block carrying it yet, which is different from zero and is
+        # displayed differently.
+        self.elo_err = None
+        self.nelo = None
+        self.nelo_err = None
+        self.los = None
+        self.draw_ratio = None
+        self.pairs_ratio = None
+        self.ptnml = None
 
     @property
     def score(self) -> float:
@@ -436,12 +501,190 @@ def parse_result(output: str) -> MatchResult:
     elos = list(_RE_ELO.finditer(output))
     if elos:
         r.elo = float(elos[-1].group(1))
+        r.elo_err = float(elos[-1].group(2))
 
     llrs = list(_RE_LLR.finditer(output))
     if llrs:
         r.llr = float(llrs[-1].group(1))
 
+    nelos = list(_RE_NELO.finditer(output))
+    if nelos:
+        r.nelo = float(nelos[-1].group(1))
+        r.nelo_err = float(nelos[-1].group(2))
+
+    for pattern, field in ((_RE_LOS, "los"), (_RE_DRAWRATIO, "draw_ratio"),
+                           (_RE_PAIRSRATIO, "pairs_ratio")):
+        found = list(pattern.finditer(output))
+        if found:
+            setattr(r, field, float(found[-1].group(1)))
+
+    ptnml = list(_RE_PTNML.finditer(output))
+    if ptnml:
+        try:
+            r.ptnml = [int(x) for x in ptnml[-1].group(1).replace(",", " ").split()]
+        except ValueError:
+            r.ptnml = None
+
     return r
+
+
+class MatchMonitor:
+    """Reads fastchess's output one line at a time, for the live panels.
+
+    parse_result() re-reads the whole capture and stays what a final verdict is
+    taken from. This is the same format knowledge applied incrementally, so a
+    panel can redraw on every line without re-parsing megabytes each time.
+
+    It also decides what still SCROLLS. A crash, a restart, an illegal move or
+    a warning is not repetition and must not be folded into a display that
+    overwrites itself - `feed` hands those back to the caller to print, and
+    swallows only the counters and the periodic result block.
+    """
+
+    # Deliberately broad. A line this matches costs one row of scrollback; a
+    # line it misses costs a diagnostic nobody sees, and the two are not
+    # remotely the same mistake.
+    _ANOMALY = re.compile(
+        r"warning|illegal|disconnect|restarting|crash|exception|error|"
+        r"stopping|not respond|timeout|invalid",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, record_games: bool = False):
+        self.result = MatchResult()
+        self.started_at = time.time()
+        self.games = 0  # games fastchess has reported finishing
+        self.total = 0  # games it says are planned; 0 until it says so
+        self.pairing = None  # ("dev", "base") of the newest result block
+        self.seats: dict[str, list[int]] = {}  # name -> [wins, losses, draws]
+        self.time_losses = 0
+        self.anomalies = 0
+        # A gauntlet rates its field as it goes and needs the games themselves,
+        # in the shape ratings.py reads out of a PGN. An SPRT does not, and at
+        # 40000 rounds the list would be tens of thousands of dicts nothing ever
+        # looks at - so it is off unless asked for.
+        self.record_games = record_games
+        self.games_log: list[dict] = []
+        self._pair_seen: dict[tuple, int] = {}
+
+    # -- reading ----------------------------------------------------------
+
+    def feed(self, line: str) -> str | None:
+        """Consume one line. Returns it when it deserves to scroll, else None."""
+        text = line.strip()
+        if not text:
+            return None
+
+        started = _RE_STARTED.search(text)
+        if started:
+            self.total = int(started.group(2))
+
+        finished = _RE_FINISHED.search(text)
+        if finished:
+            self._finished(finished)
+            # Fall through: the reason may still be an anomaly worth printing.
+
+        self._block(text)
+
+        if self._ANOMALY.search(text):
+            self.anomalies += 1
+            return text
+        return None
+
+    def _finished(self, m: "re.Match") -> None:
+        self.games += 1
+        white, black, result = m.group(2).strip(), m.group(3).strip(), m.group(4)
+        if "loses on time" in m.group(5).lower():
+            self.time_losses += 1
+        # Index 0 wins, 1 losses, 2 draws - from that seat's own point of view,
+        # so the two seats of one game update different columns.
+        for name in (white, black):
+            self.seats.setdefault(name, [0, 0, 0])
+        if result == "1-0":
+            self.seats[white][0] += 1
+            self.seats[black][1] += 1
+        elif result == "0-1":
+            self.seats[black][0] += 1
+            self.seats[white][1] += 1
+        else:
+            self.seats[white][2] += 1
+            self.seats[black][2] += 1
+
+        if self.record_games and result in ("1-0", "0-1", "1/2-1/2"):
+            # `Round` groups the colour-reversed pair that shares an opening.
+            # ratings.py takes its pair variance over that grouping, and a
+            # synthesised key has to reproduce it: -repeat plays the two games
+            # of a pair back to back, so every second game of a pairing closes
+            # one round.
+            pair = tuple(sorted((white, black)))
+            seen = self._pair_seen.get(pair, 0)
+            self._pair_seen[pair] = seen + 1
+            self.games_log.append({
+                "White": white, "Black": black, "Result": result,
+                "Round": f"{pair[0]}|{pair[1]}|{seen // 2}",
+            })
+
+    def _block(self, text: str) -> None:
+        """Absorb whatever a periodic result block carries on this line."""
+        r = self.result
+
+        pairing = _RE_PAIRING.search(text)
+        if pairing:
+            self.pairing = (pairing.group(1).strip(), pairing.group(2).strip())
+
+        games = _RE_GAMES.search(text)
+        if games:
+            r.games = int(games.group(1))
+            r.wins = int(games.group(2))
+            r.losses = int(games.group(3))
+            r.draws = int(games.group(4))
+            r.points = float(games.group(5))
+
+        elo = _RE_ELO.search(text)
+        if elo:
+            r.elo, r.elo_err = float(elo.group(1)), float(elo.group(2))
+        nelo = _RE_NELO.search(text)
+        if nelo:
+            r.nelo, r.nelo_err = float(nelo.group(1)), float(nelo.group(2))
+        llr = _RE_LLR.search(text)
+        if llr:
+            r.llr = float(llr.group(1))
+        for pattern, field in ((_RE_LOS, "los"), (_RE_DRAWRATIO, "draw_ratio"),
+                               (_RE_PAIRSRATIO, "pairs_ratio")):
+            found = pattern.search(text)
+            if found:
+                setattr(r, field, float(found.group(1)))
+        ptnml = _RE_PTNML.search(text)
+        if ptnml:
+            try:
+                r.ptnml = [int(x) for x in ptnml[1].replace(",", " ").split()]
+            except ValueError:
+                pass
+
+    # -- derived ----------------------------------------------------------
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.started_at
+
+    @property
+    def played(self) -> int:
+        """Games played: fastchess's own tally when it has printed one, else the
+        lines counted here. The two agree; the block is just coarser."""
+        return max(self.games, self.result.games)
+
+    def games_per_hour(self) -> float:
+        return self.played / self.elapsed * 3600.0 if self.elapsed > 1e-9 else 0.0
+
+    def eta(self) -> float | None:
+        """Seconds to `total`, or None when there is no finish line to aim at.
+
+        An SPRT runs until a bound is crossed, so it HAS no ETA and inventing
+        one would be worse than leaving the field blank.
+        """
+        if not self.total or self.played <= 0:
+            return None
+        return self.elapsed / self.played * max(0, self.total - self.played)
 
 
 def require(value, message: str):

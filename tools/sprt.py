@@ -12,6 +12,9 @@ field, a rated ladder or a Stockfish rung, see gauntlet.py.
 Read docs/TESTING.md before trusting a result. The short version: one change
 per test, do not read the number early, and a result whose interval spans zero
 has not shown anything however good the point estimate looks.
+
+Progress is a panel that redraws in place (see progress.py); `--raw` streams
+fastchess's own output instead, which is what this did before.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import sys
 from pathlib import Path
 
 import common as c
+import progress
 
 # The SPRT's error rates. Named once because both the fastchess arguments and
 # the verdict below are derived from them: hard-coding 0.05 in one place and
@@ -67,6 +71,97 @@ def parse_options(text: str) -> dict:
     return out
 
 
+def panel(m: c.MatchMonitor, *, dev: str, base: str, tc: str, tc_label: str,
+          elo0: float, elo1: float, sprt: bool) -> list[str]:
+    """The five-or-six rows that replace fastchess's stream.
+
+    Every number here also exists in the captured output, so a pattern that
+    stops matching after a fastchess upgrade costs a blank field and nothing
+    else - the verdict at the end is parsed separately from the same capture.
+    """
+    r = m.result
+    rows = []
+
+    head = f"== SPRT  {dev} vs {base}   {tc} ({tc_label})"
+    if sprt:
+        head += f"   bounds [{elo0}, {elo1}]"
+    rows.append(head)
+
+    played = m.played
+    counts = f"W{r.wins} L{r.losses} D{r.draws}" if r.games else "W- L- D-"
+    games = f"{played:,}"
+    if m.total:
+        games = f"{played:,}/{m.total:,} {progress.bar(played / m.total, 12)}"
+    score = f"{r.score:6.2%}" if r.games else "     -"
+    rows.append(f"   games   {games}  {counts}  {score}"
+                f"   {m.games_per_hour():,.0f} games/h")
+
+    eta = m.eta()
+    timing = f"   elapsed {progress.hms(m.elapsed)}"
+    if eta is None:
+        timing += "   eta -"
+    elif sprt:
+        # The countdown is to the --rounds CAP, and an SPRT normally stops long
+        # before it by crossing a bound. Presented as a plain ETA it would read
+        # as "this run will take eight hours" when the honest statement is "at
+        # most eight hours, probably far less".
+        timing += f"   eta <= {progress.hms(eta)} (cap)"
+    else:
+        timing += f"   eta {progress.hms(eta)}"
+    rows.append(timing)
+
+    if r.elo is None:
+        rows.append("   Elo     waiting for the first result block ...")
+    else:
+        elo = f"{r.elo:+.2f} +/- {r.elo_err:.2f}"
+        nelo = f"{r.nelo:+.2f} +/- {r.nelo_err:.2f}" if r.nelo is not None else "-"
+        los = f"{r.los:.1f}%" if r.los is not None else "-"
+        rows.append(f"   Elo     {elo}    nElo {nelo}    LOS {los}")
+
+    if sprt:
+        if r.llr is None:
+            rows.append("   LLR     -")
+        else:
+            rows.append(f"   LLR     {r.llr:+.3f}  "
+                        f"{progress.span_bar(r.llr, llr_lower(), llr_upper(), 21)}  "
+                        f"stop at {llr_lower():+.3f} / {llr_upper():+.3f}")
+
+    tail = "   ptnml   " + (str(r.ptnml) if r.ptnml else "-")
+    if r.draw_ratio is not None:
+        tail += f"   draw {r.draw_ratio:.1f}%"
+    if r.pairs_ratio is not None:
+        tail += f"   pairs {r.pairs_ratio:.2f}"
+    if m.time_losses:
+        tail += f"   TIME LOSSES {m.time_losses}"
+    rows.append(tail)
+
+    return rows
+
+
+def run_watched(fastchess: str, fc_args: list[str], **panel_kwargs) -> tuple[int, str]:
+    """Run the match behind a panel that redraws in place.
+
+    Anomalies - a restarted engine, an illegal move, a warning - are printed
+    above the panel and stay there. Only the repetition is collapsed.
+    """
+    monitor = c.MatchMonitor()
+    live = progress.Live()
+
+    def on_line(line: str) -> None:
+        scroll = monitor.feed(line)
+        if scroll:
+            live.log(f"  [fastchess] {scroll}")
+        live.update(panel(monitor, **panel_kwargs))
+
+    live.update(panel(monitor, **panel_kwargs), force=True)
+    try:
+        return c.run_match(fastchess, fc_args, on_line=on_line)
+    finally:
+        # Also the Ctrl-C path, which is how a long SPRT usually ends: the
+        # cursor has to come back whatever happened.
+        live.finish(panel(monitor, **panel_kwargs))
+
+
 def options_from_state(path: str) -> dict:
     """The current parameter values out of a tune.py checkpoint.
 
@@ -99,6 +194,8 @@ def main() -> int:
     ap.add_argument("--dev-from",
                     help="read dev's options from a tune.py state file (external/tune/spsa.json)")
     ap.add_argument("--smoke", action="store_true", help="verify the pipeline with two quick games")
+    ap.add_argument("--raw", action="store_true",
+                    help="stream fastchess's output instead of the live panel")
     ap.add_argument("--dry-run", action="store_true", help="print the command and exit")
     args = ap.parse_args()
 
@@ -194,7 +291,14 @@ def main() -> int:
         c.print_command(fastchess, fc_args)
         return 0
 
-    code, output = c.run_match(fastchess, fc_args, stream=True)
+    if args.raw:
+        code, output = c.run_match(fastchess, fc_args, stream=True)
+    else:
+        code, output = run_watched(
+            fastchess, fc_args,
+            dev=dev_name, base=base_name, tc=tc, tc_label=tc_label,
+            elo0=elo0, elo1=elo1, sprt=not args.smoke,
+        )
 
     print()
     if args.smoke:
@@ -205,6 +309,9 @@ def main() -> int:
                 c.ok(f"{games} games written to {pgn}")
         else:
             c.fail(f"Smoke test failed (exit {code}).")
+            if not args.raw:
+                for line in output.strip().splitlines()[-15:]:
+                    print("    " + line)
         return code
 
     r = c.parse_result(output)
@@ -238,6 +345,13 @@ def main() -> int:
         # The verdict is the result; it belongs in the exit status.
         if code == 0 and verdict == "REJECTED":
             return 1
+    elif not args.raw:
+        # No result block came back. The panel showed a run going nowhere and
+        # the raw output was never echoed, so print the tail of it - a silent
+        # failure here would be a worse trade than the scrolling it replaced.
+        c.fail(f"fastchess produced no result block (exit {code}).")
+        for line in output.strip().splitlines()[-15:]:
+            print("    " + line)
 
     return code
 

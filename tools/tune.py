@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 import common as c
+import progress
 
 # Standard SPSA exponents (Spall). These are not worth tuning; the per-parameter
 # c_end and r_end below are.
@@ -299,8 +300,14 @@ class Tuner:
         k = self.iteration
         return a / (A + k + 1) ** ALPHA, c0 / (k + 1) ** GAMMA
 
-    def step(self, fastchess: str) -> bool:
-        """One SPSA iteration. Returns False if the match failed."""
+    def step(self, fastchess: str, on_line=None, log=None) -> bool:
+        """One SPSA iteration. Returns False if the match failed.
+
+        `on_line` is handed each line of the iteration's match, so the display
+        can move while a 16-game match runs rather than freezing for a minute
+        at a time and looking hung. `log` takes the failure diagnostics, which
+        have to go through the panel rather than around it.
+        """
         deltas = [1 if self.rng.random() < 0.5 else -1 for _ in self.params]
         gains = [self.gains(p) for p in self.params]
 
@@ -324,12 +331,13 @@ class Tuner:
             depth=self.depth,
         )
 
-        code, output = c.run_match(fastchess, fc_args, stream=False)
+        code, output = c.run_match(fastchess, fc_args, stream=False, on_line=on_line)
         r = c.parse_result(output)
         if code != 0 or r.games == 0:
-            c.fail(f"match failed at iteration {self.iteration} (exit {code})")
+            emit = log or print
+            emit(c.failtext(f"match failed at iteration {self.iteration} (exit {code})"))
             for line in output.strip().splitlines()[-8:]:
-                print("    " + line)
+                emit("    " + line)
             return False
 
         self.wins += r.wins
@@ -362,16 +370,83 @@ class Tuner:
         self.log_row(result, r.score)
         return True
 
-    def report(self) -> None:
-        c.section("Parameters")
-        print(f"  {'name':<20} {'start':>8} {'now':>8} {'delta':>8}   range")
-        print(f"  {'-' * 20} {'-' * 8} {'-' * 8} {'-' * 8}   -----")
+    def table(self) -> list[str]:
+        """The parameter table, as rows. Shared by the live panel and the final
+        report so the two cannot drift into showing different things."""
+        rows = [f"  {'name':<20} {'start':>8} {'now':>8} {'delta':>8}   range",
+                f"  {'-' * 20} {'-' * 8} {'-' * 8} {'-' * 8}   -----"]
         for p in self.params:
             now = int(round(p.value))
-            print(
+            rows.append(
                 f"  {p.name:<20} {int(p.start):>8} {now:>8} {now - int(p.start):>+8}"
                 f"   [{int(p.lo)}, {int(p.hi)}]"
             )
+        return rows
+
+    def compact(self) -> list[str]:
+        """Every parameter, in as few rows as the window can be made to hold.
+
+        EVERY parameter: a tuning run is watched to see which values are
+        moving, and a display that hides eight of twenty-one because the
+        terminal is short is hiding exactly the ones that might be the answer.
+        So when the full table will not fit, the columns give way rather than
+        the rows - name, current value and travel, laid out side by side.
+        """
+        def cells(name_width: int | None, delta: bool) -> list[str]:
+            out = []
+            for p in self.params:
+                now = int(round(p.value))
+                name = p.name if name_width is None else p.name[:name_width]
+                out.append(f"{name} {now}" + (f" ({now - int(p.start):+d})" if delta else ""))
+            return out
+
+        # Two header rows above the grid, inside fit_height's own budget.
+        available = max(1, progress.terminal_size().lines - 4)
+        # Progressively less per cell, so more of them fit on a row: the travel
+        # goes first (it is in the CSV and in the final report), then the names
+        # are clipped. Only a window too small for even the last of these can
+        # hide a parameter.
+        laid_out = []
+        for name_width, delta in ((None, True), (None, False), (12, False), (8, False)):
+            laid_out = progress.grid(cells(name_width, delta), available)
+            if len(laid_out) <= available:
+                break
+        return laid_out
+
+    def panel(self, elapsed: float, iter_games: int = 0) -> list[str]:
+        """The in-place display: progress, then every parameter being tuned.
+
+        The table IS the panel rather than a summary of it, because the whole
+        question during a tuning run is which parameters are moving - which the
+        old one-line-per-iteration output could only answer by scrolling back
+        and diffing two lines by eye.
+        """
+        done = self.iteration
+        frac = done / max(1, self.iterations)
+        # No ETA before an iteration has finished: at that point the only rate
+        # available is one derived from zero completed work.
+        eta = (elapsed / done) * (self.iterations - done) if done else None
+        search = f"depth {self.depth}" if self.depth else f"{self.tc} ({self.tc_label})"
+        played = self.wins + self.losses + self.draws
+
+        rows = [
+            f"== SPSA  {done:,}/{self.iterations:,} {progress.bar(frac, 20)} {frac:5.1%}"
+            f"   elapsed {progress.hms(elapsed)}   eta {progress.hms(eta)}",
+            f"   games {played:,}  W{self.wins} L{self.losses} D{self.draws}"
+            f"   {self.games_per_iter}/iter"
+            + (f" ({iter_games} in flight)" if iter_games else "")
+            + f"   {search}   conc {self.concurrency}   seed {self.seed}",
+        ]
+        # The wide table when the window has room for all of it, the compact
+        # layout when it does not. Either way every parameter is on screen.
+        if len(rows) + len(self.params) + 2 <= max(6, progress.terminal_size().lines - 2):
+            return rows + self.table()
+        return rows + self.compact()
+
+    def report(self) -> None:
+        c.section("Parameters")
+        for row in self.table():
+            print(row)
         print()
         print("  As UCI options:")
         print("    " + " ".join(f"option.{p.name}={int(round(p.value))}" for p in self.params))
@@ -405,6 +480,8 @@ def main() -> int:
     ap.add_argument("--state", default=str(c.TUNE_DIR / "spsa.json"))
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--list", action="store_true", help="show what the engine exposes and exit")
+    ap.add_argument("--raw", action="store_true",
+                    help="one line per iteration, as before, instead of the live panel")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -507,29 +584,47 @@ def main() -> int:
 
     start = time.time()
     interrupted = False
+    live = progress.Live(enabled=False if args.raw else None)
+
     try:
         while t.iteration < t.iterations:
-            if not t.step(fastchess):
+            # One monitor per iteration: what is wanted here is progress THROUGH
+            # this iteration's match, not a running total across the run.
+            monitor = c.MatchMonitor()
+
+            def watch(line: str, monitor=monitor) -> None:
+                scroll = monitor.feed(line)
+                if scroll:
+                    live.log(f"  [fastchess] {scroll}")
+                live.update(t.panel(time.time() - start, monitor.played))
+
+            if not args.raw:
+                live.update(t.panel(time.time() - start), force=True)
+            if not t.step(fastchess, on_line=None if args.raw else watch,
+                          log=None if args.raw else live.log):
+                live.close()
                 t.save()
                 return 1
 
-            elapsed = time.time() - start
-            done = t.iteration
-            rate = elapsed / max(1, done)
-            eta = rate * (t.iterations - done)
-            print(
-                f"  [{done:>5}/{t.iterations}] "
-                f"{t.wins}W/{t.losses}L/{t.draws}D  "
-                f"eta {eta / 3600:.1f}h  "
-                + "  ".join(f"{p.name}={int(round(p.value))}" for p in t.params),
-                flush=True,
-            )
+            if args.raw:
+                print(
+                    f"  [{t.iteration:>5}/{t.iterations}] "
+                    f"{t.wins}W/{t.losses}L/{t.draws}D  "
+                    + "  ".join(f"{p.name}={int(round(p.value))}" for p in t.params),
+                    flush=True,
+                )
+            else:
+                live.update(t.panel(time.time() - start), force=True)
             t.save()
     except KeyboardInterrupt:
         interrupted = True
+        live.close(clear=True)
         print()
         c.warn("interrupted - state saved, resume with: python tools/tune.py --resume")
 
+    # The report below prints the same table the panel was drawing; leaving both
+    # on screen would show it twice, once stale.
+    live.close(clear=True)
     t.save()
     t.report()
     if not interrupted and t.iteration >= t.iterations:

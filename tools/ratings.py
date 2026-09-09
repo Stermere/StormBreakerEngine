@@ -322,8 +322,42 @@ def print_head_to_head(t: Table, focus: str) -> None:
     print()
 
 
-def print_ratings(t: Table, theta: list[float], cov, anchors: dict[str, tuple[int, int]],
-                  bounded: set[str]) -> None:
+class Rating:
+    """One seat on both scales: this field's internal Elo, and the CCRL one.
+
+    `estimate` is None when the field carries no rated seat, because there is
+    then nothing to anchor to and a number would be the internal one wearing a
+    label it has not earned.
+    """
+
+    def __init__(self, name, games, internal, internal_pm,
+                 ccrl=None, estimate=None, estimate_pm=None, bound=False):
+        self.name = name
+        self.games = games
+        self.internal = internal
+        self.internal_pm = internal_pm
+        self.ccrl = ccrl
+        self.estimate = estimate
+        self.estimate_pm = estimate_pm
+        self.bound = bound
+
+    @property
+    def resid(self) -> float | None:
+        """What this seat's games here say about it, minus its published rating."""
+        if self.ccrl is None or self.estimate is None:
+            return None
+        return self.estimate - self.ccrl
+
+
+def rate(t: Table, theta: list[float], cov, anchors: dict[str, tuple[int, int]],
+         bounded: set[str] = frozenset()) -> tuple[list[Rating], dict]:
+    """Per-seat ratings on both scales, plus the anchoring diagnostics.
+
+    Split out of the printing because gauntlet.py's live panel shows the same
+    two numbers while the match runs. Two implementations of an Elo estimate
+    would eventually disagree, and the one on screen during the run is the one
+    someone would quote.
+    """
     p = len(t.names)
     elo = [x * SCALE for x in theta]
     se = [math.sqrt(max(cov[i][i], 0.0)) for i in range(p)]
@@ -349,38 +383,88 @@ def print_ratings(t: Table, theta: list[float], cov, anchors: dict[str, tuple[in
         var += sum((u[k] * anchors[t.names[k]][1] / Z95) ** 2 for k in keys)
         return math.sqrt(max(var, 0.0))
 
-    c.section("Ratings on the CCRL Blitz scale (bars are 95%)")
-    if not keys:
-        c.warn("no rated engine in this field - the internal column is all there is.")
-    print(f"  {'engine':<18}{'games':>7}{'internal':>14}{'CCRL':>8}{'estimate':>16}{'resid':>8}")
+    rows = []
     for i in sorted(range(p), key=lambda k: -elo[k]):
         rated = anchors.get(t.names[i])
-        est = elo[i] + offset
-        resid = f"{est - rated[0]:>+8.0f}" if rated else f"{'':>8}"
-        ccrl = f"{rated[0]:>8}" if rated else f"{'-':>8}"
-        internal = f"{elo[i]:+.0f} +-{Z95 * se[i]:.0f}"
-        estimate = f"{est:.0f} +-{Z95 * anchored_se(i):.0f}" if keys else ""
-        # A seat that swept or was swept has no maximum-likelihood rating at
-        # all, only a bound - and a bound printed with a tight-looking bar
-        # beside six real measurements is exactly how it gets read as one.
-        mark = " (bound)" if t.names[i] in bounded else ""
-        print(f"  {t.names[i]:<18}{t.played(i):>7}{internal:>14}{ccrl}{estimate:>16}"
-              f"{resid}{mark}")
+        rows.append(Rating(
+            name=t.names[i],
+            games=t.played(i),
+            internal=elo[i],
+            internal_pm=Z95 * se[i],
+            ccrl=rated[0] if rated else None,
+            estimate=elo[i] + offset if keys else None,
+            estimate_pm=Z95 * anchored_se(i) if keys else None,
+            # A seat that swept or was swept has no maximum-likelihood rating
+            # at all, only a bound - and a bound printed with a tight-looking
+            # bar beside six real measurements is exactly how it gets read as
+            # one.
+            bound=t.names[i] in bounded,
+        ))
+
+    info = {"anchors": len(keys), "offset": offset if keys else None,
+            "slope": None, "rms": None}
+    if keys:
+        # Offset-only assumes the two pools stretch Elo the same way. They need
+        # not: a faster time control and a narrower field both compress the
+        # spread, and a compressed spread biases every estimate away from the
+        # anchors' centre. The fitted slope is the check, and it costs one line
+        # to print.
+        mr = sum(weight[i] * elo[i] for i in keys) / total_w
+        mc = sum(weight[i] * anchors[t.names[i]][0] for i in keys) / total_w
+        num = sum(weight[i] * (elo[i] - mr) * (anchors[t.names[i]][0] - mc) for i in keys)
+        den = sum(weight[i] * (elo[i] - mr) ** 2 for i in keys)
+        info["slope"] = num / den if den > 0 else float("nan")
+        info["rms"] = math.sqrt(
+            sum((elo[i] + offset - anchors[t.names[i]][0]) ** 2 for i in keys) / len(keys))
+    return rows, info
+
+
+def rate_games(games: list[dict], anchors: dict | None = None,
+               prior: float = 0.0) -> tuple[list[Rating], dict]:
+    """The whole pipeline, from games to ratings.
+
+    For callers that hold games rather than a PGN on disk - which is the live
+    panel's situation, since the PGN is still being written.
+    """
+    t = Table(games)
+    if len(t.names) < 2:
+        return [], {"anchors": 0, "offset": None, "slope": None, "rms": None}
+    if anchors is None:
+        anchors = {}
+        for name in t.names:
+            rated = c.ccrl_rating(name)
+            if rated:
+                anchors[name] = rated
+    degenerate = {n for i, n in enumerate(t.names)
+                  if t.score(i) == 0.0 or t.score(i) == float(t.played(i))}
+    if degenerate and prior == 0.0:
+        prior = 1.0
+    theta = fit_bradley_terry(t, prior)
+    return rate(t, theta, covariance(t, theta), anchors, degenerate)
+
+
+def print_ratings(t: Table, theta: list[float], cov, anchors: dict[str, tuple[int, int]],
+                  bounded: set[str]) -> None:
+    rows, info = rate(t, theta, cov, anchors, bounded)
+
+    c.section("Ratings on the CCRL Blitz scale (bars are 95%)")
+    if not info["anchors"]:
+        c.warn("no rated engine in this field - the internal column is all there is.")
+    print(f"  {'engine':<18}{'games':>7}{'internal':>14}{'CCRL':>8}{'estimate':>16}{'resid':>8}")
+    for r in rows:
+        resid = f"{r.resid:>+8.0f}" if r.resid is not None else f"{'':>8}"
+        ccrl = f"{r.ccrl:>8}" if r.ccrl is not None else f"{'-':>8}"
+        internal = f"{r.internal:+.0f} +-{r.internal_pm:.0f}"
+        estimate = f"{r.estimate:.0f} +-{r.estimate_pm:.0f}" if r.estimate is not None else ""
+        mark = " (bound)" if r.bound else ""
+        print(f"  {r.name:<18}{r.games:>7}{internal:>14}{ccrl}{estimate:>16}{resid}{mark}")
     print()
-    if not keys:
+    if not info["anchors"]:
         return
 
-    # Offset-only assumes the two pools stretch Elo the same way. They need not:
-    # a faster time control and a narrower field both compress the spread, and a
-    # compressed spread biases every estimate away from the anchors' centre. The
-    # fitted slope is the check, and it costs one line to print.
-    mr = sum(weight[i] * elo[i] for i in keys) / total_w
-    mc = sum(weight[i] * anchors[t.names[i]][0] for i in keys) / total_w
-    num = sum(weight[i] * (elo[i] - mr) * (anchors[t.names[i]][0] - mc) for i in keys)
-    den = sum(weight[i] * (elo[i] - mr) ** 2 for i in keys)
-    slope = num / den if den > 0 else float("nan")
-    rms = math.sqrt(sum((elo[i] + offset - anchors[t.names[i]][0]) ** 2 for i in keys) / len(keys))
-    print(f"  offset {offset:+.0f} Elo, fitted on {len(keys)} anchors, residual rms {rms:.0f} Elo")
+    offset, slope, rms = info["offset"], info["slope"], info["rms"]
+    print(f"  offset {offset:+.0f} Elo, fitted on {info['anchors']} anchors, "
+          f"residual rms {rms:.0f} Elo")
     print(f"  anchor slope {slope:.2f}  (1.00 = this field stretches Elo exactly as CCRL's does)")
     print("  resid is what an anchor's own games here say about it, minus its published")
     print("  rating; a rung far from 0 is one this field disagrees with.")

@@ -89,7 +89,6 @@ cd trainer
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --checkpoint-every 1 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.2 --lambda-pieces -0.0 --score-clip 2000 --unc-weight 0.01 --feature-factorization --finish-epochs 1 --finish-lr 0.00001
 
 
-
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..
 make nnue-export        # net.pt -> net.nnue, plus .vectors and .sha256

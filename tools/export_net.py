@@ -559,12 +559,24 @@ def main() -> None:
         if os.path.exists(manifest_path):
             with open(manifest_path, encoding="utf-8") as f:
                 previous = json.load(f)
-        if (not previous or previous.get("sha256") != sha256_file(out)
-                or previous.get("checkpoint_sha256") != checkpoint_hash):
-            was = (previous or {}).get("checkpoint", "an unverified export")
+        # Name what actually differs. Re-exporting an epoch overwrites the checkpoint in
+        # place, so the two paths are routinely the same file and only the hashes tell
+        # them apart - a message built from basenames reads "x is net.pt, not net.pt".
+        was = (previous or {}).get("checkpoint")
+        if not previous:
+            reason = f"{out} has no manifest beside it, so what wrote it cannot be checked"
+        elif previous.get("sha256") != sha256_file(out):
+            reason = f"{out} has changed since {os.path.basename(manifest_path)} described it"
+        elif previous.get("checkpoint_sha256") != checkpoint_hash:
+            reason = (f"{out} is {was} ({str(previous.get('checkpoint_sha256'))[:12]}), "
+                      f"not {checkpoint_path} ({checkpoint_hash[:12]})")
+        else:
+            reason = None
+        if reason:
             raise SystemExit(
-                f"{out} is {os.path.basename(was)}, not {os.path.basename(checkpoint)}\n"
-                f"replacing it needs -f/--overwrite, or name a distinct -o path")
+                f"{reason}\n"
+                f"replacing a different or unverified export needs -f/--overwrite, "
+                f"or name a distinct -o path")
 
     # Imported here so that --help works without a torch install.
     import torch
