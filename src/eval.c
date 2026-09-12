@@ -494,7 +494,10 @@ Value eval_classical(const Position *pos) {
  * reachable by name in every build: `eval` traces it, tools/tuner.c fits it, and it is
  * the reference a net has to beat. */
 #ifndef EVAL_NNUE
-Value eval_evaluate(const Position *pos) { return eval_classical(pos); }
+Value eval_evaluate(EvalState *es, const Position *pos) {
+    (void)es;
+    return eval_classical(pos);
+}
 #endif
 
 void eval_trace(const Position *pos) {

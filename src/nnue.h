@@ -17,6 +17,10 @@
 #include "board.h"
 #include "types.h"
 
+/* Declared in eval.h, which this header does not need in full: the uncertainty head
+ * reads the same per-thread state the value head does. */
+typedef struct EvalState EvalState;
+
 #ifdef EVAL_NNUE
 
 /* The accumulator is a stack array, so the width needs a compile-time bound; 2048
@@ -130,7 +134,7 @@ bool nnue_has_uncertainty(void);
 /* The head's prediction of the evaluation's own |error| in centipawns, >= 0, for one
  * extra output pass over an accumulator the evaluation already keeps. Asserted
  * against on a net without the head - check nnue_has_uncertainty() first. */
-Value nnue_uncertainty(const Position *pos);
+Value nnue_uncertainty(EvalState *es, const Position *pos);
 
 /* Short hex prefix of the loaded net's SHA-256, for the bench header: a node count
  * that cannot be attributed to a specific net is not a measurement. */

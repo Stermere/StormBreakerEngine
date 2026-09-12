@@ -1797,6 +1797,165 @@ show up in an inference microbenchmark at all - it removes wasted inference
 rather than making inference cheaper - which is exactly why it is worth stating
 separately.
 
+### A second pass: +25.6% nps, and none of it where the first pass looked
+
+The section above ends by naming lazy accumulator updates as the remaining
+headroom. It was the wrong thing to name. A second pass found **+25.6% nps**
+without touching the delta at all, and the two changes that produced most of it
+were not arithmetic: they were a **storage class** and an **alignment**.
+
+Everything below is a pure speedup in the sense invariant 1 requires - `bench
+13` returns **5,016,992 nodes** before and after, every time - so all of it is a
+measurement of the same tree searched faster. Twelve interleaved rounds against
+a clean build of the previous commit:
+
+| | HEAD | after | |
+|---|---|---|---|
+| best of 12 | 2,010,818 | **2,524,907** | **+25.6%** |
+| mean of 12 | 1,992,238 | **2,502,661** | **+25.6%** |
+
+#### A thread-local is a function call on this toolchain
+
+`AccStack`, `AccTop`, the refresh cache and four more were each their own
+`_Thread_local`. On the Windows toolchain this engine builds with - mingw-w64
+GCC configured `--enable-threads=posix` - a thread-local is **not an address the
+compiler can form**. Every reference compiles into a call to
+`__emutls_get_address()`, and nnue.c was making roughly eight of them per node
+on the hottest path there is.
+
+It is worth being precise about how hidden this is. Nothing in the source says
+"call"; the generated code does. What pointed at it was an unexplained **196
+cycles inside `nnue_current()`**, a function whose fast path is a key comparison
+and a return. `nm` on the binary then names it outright:
+
+```
+__emutls_v.AccStack   __emutls_v.AccTop   __emutls_v.RefreshCache   ...
+```
+
+Neither `__thread` nor `_Thread_local` avoids it here, and `__declspec(thread)`
+is **silently ignored** - it compiles to a plain global, which would be a
+correctness bug under `Threads > 1`, not a speedup.
+
+Two changes, in order:
+
+1. **Eight thread-locals became one object**, so a function pays one lookup and
+   reads fields at fixed offsets from it. **+6.3%.**
+2. **The object stopped being reached for at all.** It is now passed: `EvalState
+   *`, claimed once per thread in `thread_entry()`, held in `SearchThread`, and
+   handed to `eval_evaluate()`, `eval_state_push()`, `eval_state_pop()` and
+   `nnue_uncertainty()`. **+9.8%**, which was the whole of what a non-thread-local
+   build could reach.
+
+The second is the one to keep in mind for anything similar. It reads as a
+refactor and it is: per-thread state is per-thread either way, so **invariant 11
+is unchanged** - but it is now visible in the signatures rather than implied by a
+storage class, and it costs nothing on a platform where TLS is cheap.
+
+#### The header is 112 bytes, which is not a multiple of 64
+
+The net is embedded `.balign 64`. The payload starts behind a 112-byte header,
+and 112 is not a multiple of a cache line - so **every feature row began 48 bytes
+into one**, and half of every 32-byte load over the weights was split across two
+lines. The accumulator delta and the refresh both walk whole rows and both are
+bound by loads rather than arithmetic.
+
+Sixteen bytes of lead-in before the blob puts `blob + sizeof(NnueHeader)` on the
+boundary instead. **+3.8%**, for sixteen bytes. `nnue_load_file()` does the same
+by over-allocating and sliding the blob, keeping the malloc base for `free()`, so
+a net loaded through `setoption EvalFile` is aligned like the embedded one.
+
+The accumulators were checked for the same defect and did not have it: they are
+`_Alignas(64)` and the `calloc` that backs them returns page-aligned memory at
+that size. Worth checking rather than assuming - `calloc` guarantees only
+fundamental alignment, and extended alignment is not part of the contract.
+
+#### The uncertainty head, asked for only when it is wanted
+
+`unc_scale()` is a second inference through the net, and it was run at every
+non-check node. Most nodes never reach a margin that wants it. Deferring it to
+first use cannot change a decision - it is a function of the position, not of
+when it is read - and it removed **1,157,720 of 4,279,194** inferences for
+**+2.8%**. Quiescence was the bulk of it: the value was computed *before* the
+stand-pat test that returns without ever using it.
+
+Then the margins themselves were made to ask more cheaply. Each of reverse
+futility, razoring, futility and delta pruning compares an evaluation against a
+bound with a **non-negative** margin, which can only make the test harder to
+satisfy. Testing the margin-free form first is exactly equivalent and skips the
+inference entirely where the answer was never in doubt:
+
+```c
+if (... && staticEval >= beta &&          /* cannot be rescued by any scale */
+    staticEval - RFP_MARGIN * (depth - improving) * unc_apply(...) / 100 >= beta)
+```
+
+Together these took the uncertainty head from **10.5% of the search to 6.1%**.
+
+#### The rest
+
+**The refresh prefetches its rows.** A refresh runs because the king moved and
+that side reindexed, so the rows it wants are in a part of a 25 MB table nothing
+has touched - cold by construction. The diff scan that finds them takes a few
+hundred cycles, which is enough to cover the first misses if they are asked for
+early. **+1.0%**, consistent across eight rounds.
+
+**Scoring reports its own winner.** `score_moves()` already compares every score;
+returning the index of the best one costs one comparison per move and removes the
+longest scan there is - the first selection in the move loop, over the whole
+list. **+0.8%.**
+
+#### What measured worse, or was not a speedup at all
+
+**Staged generation - the table move before anything is generated.** SCORE_TT is
+above every other band, so the table move is always searched first, and trying it
+before generating looks like a pure win: half of all fail highs happen on the
+first move. It measured **+3% nps on a 5.3% smaller tree** - and that tree is the
+point. The moves behind the table move get scored **after** its subtree has run,
+so they are ordered by a history table that has since been updated. The node
+count moved, which makes it a behavioural change needing an SPRT rather than a
+speedup. E15 reached the same place from a different direction.
+
+**Reusing the history scores the move loop recomputes.** The loop reads
+`cont_score()` and `pawn_history_score()` for every move it searches, and
+`score_moves()` has already read both. Caching them is **not** a duplicate
+removal: the loop's read is later, and deliberately sees what the earlier
+siblings' subtrees wrote. Caching made the tree **7% bigger**. The apparent
+redundancy is load-bearing.
+
+**A vectorised `pick_move()`.** Eight scores compared at once, each carrying its
+index, with a three-round reduction that keeps the first of equals. Exact - the
+node count held - and **0.6% slower**: the reduction costs more than the scan it
+replaces at the list lengths this search actually sees (~15 moves).
+
+**PGO** measured **-5.6%** and **LTO** measured neutral. Neither is in the tree.
+
+#### Where the time goes now
+
+Measured with `rdtsc` at `bench 13`, corrected for the ~32 cycles a wrapped call
+adds, against a total of 7.47G cycles:
+
+| | share | calls | cycles/call |
+|---|---|---|---|
+| `eval_evaluate` | 18.0% | 3,448,346 | 390 |
+| `score_moves` | 14.2% | 1,876,200 | 566 |
+| `eval_state_push` | 11.7% | 4,605,882 | 190 |
+| `nnue_uncertainty` | 6.5% | 2,905,953 | 166 |
+| `movegen_generate` | 5.1% | 1,876,240 | 201 |
+| `pick_move` | 4.4% | 14,109,673 | 23 |
+| `board_do_move` | 3.1% | 4,605,882 | 50 |
+| `see_ge` | 2.9% | 7,067,016 | 31 |
+| node bodies | ~37% | | |
+
+`eval_state_pop()` and `movegen_is_legal()` are now **too cheap to measure** -
+both came out under 0.1% once the instrumentation's own cost was taken out.
+
+Lazy accumulator updates remain unbuilt, and the earlier estimate of what they
+are worth should be revised down. Of 4,863,825 pushes, **966,847 (19.9%)** belong
+to subtrees that never evaluate - but deferring one means storing its delta and
+its perspective, which is added cost on the 80% that are used. The honest
+estimate is **1-1.5%**, not the quarter the raw push-versus-evaluate ratio
+suggests.
+
 ### Follow-ups this opens, each its own experiment
 
 - **Pairwise multiplication on the FT output** - multiply the two halves of

@@ -155,6 +155,11 @@ typedef struct {
      * its own moves on it, so the copy is not an optimisation. */
     Position rootPos;
 
+    /* This thread's accumulator stack and refresh cache, claimed once in thread_entry().
+     * Held here rather than looked up per node - see EvalState in eval.h. NULL is legal
+     * and means the allocation failed: correct, and several times slower. */
+    EvalState *es;
+
     /* Nominal depth of the iteration currently running. Extensions are bounded relative
      * to it, so a line that can be extended indefinitely cannot grow the tree without
      * limit. */
@@ -282,7 +287,9 @@ void search_clear(void) {
         memset(td->stack, 0, sizeof(td->stack));
     }
 
-    eval_state_clear();
+    /* The calling thread's, which is the one that has been evaluating outside a search.
+     * Every worker clears its own at the top of thread_search(). */
+    eval_state_clear(eval_state());
 }
 
 bool search_running(void) { return atomic_load(&Searching); }
@@ -813,8 +820,15 @@ static inline int pawn_history_score(SearchThread *td, Key key, Piece pc, Square
 /* MVV-LVA for the tactical moves - most valuable victim, least valuable attacker - with
  * SEE deciding which band a capture lands in and capture history separating the ones SEE
  * calls equal. Quiet moves fall through to the heuristic tables. */
-static void score_moves(SearchThread *td, const Position *pos, ScoredMove *list, int count,
-                        Move ttMove, int ply, Move counter) {
+/*
+ * Returns the index of the highest-scoring move, taking the FIRST of equals - which is
+ * exactly what pick_move() would have selected, generation order being the tie-break the
+ * tree depends on. Handing it back costs one comparison per move on a loop that is
+ * already touching every score, and saves the longest scan there is: the first selection
+ * in the loop below, over the whole list.
+ */
+static int score_moves(SearchThread *td, const Position *pos, ScoredMove *list, int count,
+                       Move ttMove, int ply, Move counter) {
     const Color us     = pos->sideToMove;
     const Move killer0 = td->killers[ply][0];
     const Move killer1 = td->killers[ply][1];
@@ -871,6 +885,13 @@ static void score_moves(SearchThread *td, const Position *pos, ScoredMove *list,
 
         list[i].score = score;
     }
+
+    int best = 0;
+    for (int i = 1; i < count; ++i)
+        if (list[i].score > list[best].score)
+            best = i;
+
+    return best;
 }
 
 /* The counter-move registered against whatever was played to reach `ply`. */
@@ -984,6 +1005,15 @@ static inline bool has_non_pawn_material(const Position *pos, Color c) {
 
 /* Selection sort, one move at a time: a beta cutoff usually lands within the first few
  * moves, so sorting the whole list up front is mostly wasted work. */
+/* The first selection, which score_moves() already worked out. */
+static inline void pick_first(ScoredMove *list, int best) {
+    if (best != 0) {
+        const ScoredMove tmp = list[0];
+        list[0]              = list[best];
+        list[best]           = tmp;
+    }
+}
+
 static void pick_move(ScoredMove *list, int count, int index) {
     int best = index;
     for (int i = index + 1; i < count; ++i)
@@ -1065,7 +1095,7 @@ static inline int unc_scale(SearchThread *td, const Position *pos, int *errorEst
         *errorEstimate = -1;
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
-        const int sigma = nnue_uncertainty(pos);
+        const int sigma = nnue_uncertainty(td->es, pos);
         const int scale = imin(UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16, UNC_SCALE_MAX);
         if (errorEstimate)
             *errorEstimate = sigma;
@@ -1076,6 +1106,41 @@ static inline int unc_scale(SearchThread *td, const Position *pos, int *errorEst
     const int ac    = (c < 0 ? -c : c) / CORRHIST_GRAIN;
     const int scale = imin(UNC_SCALE_BASE + ac * UNC_SCALE_SLOPE, UNC_SCALE_MAX);
     return unc_probe(ac, scale);
+}
+
+/*
+ * The signal above is a second inference through the net, and most nodes never reach a
+ * margin that wants it: quiescence that stands pat, a PV node - every consumer below is
+ * non-PV only - or a node whose tests are all gated off by depth. Deferring it to first
+ * use cannot change a decision, because it is a function of the position and not of when
+ * it is read, and it removes the inference outright wherever nothing asks.
+ *
+ * UNC_PENDING is the "not yet asked" state; 100 is "neutral, never ask", which is what a
+ * node in check wants, since every consumer is disabled there.
+ */
+#define UNC_PENDING (-1)
+
+/* Eager under UNC_PROBE on purpose: the probe's population is the set of nodes that READ
+ * the signal, and deferring would silently resample it against the very mapping it exists
+ * to re-centre. */
+static inline int unc_start(bool neutral, int *errorEstimate, SearchThread *td,
+                            const Position *pos) {
+    if (neutral)
+        return 100;
+#ifdef UNC_PROBE
+    return unc_scale(td, pos, errorEstimate);
+#else
+    (void)errorEstimate;
+    (void)td;
+    (void)pos;
+    return UNC_PENDING;
+#endif
+}
+
+static inline int unc_get(int *cache, int *errorEstimate, SearchThread *td, const Position *pos) {
+    if (*cache == UNC_PENDING)
+        *cache = unc_scale(td, pos, errorEstimate);
+    return *cache;
 }
 
 #ifdef UNC_PROBE
@@ -1092,7 +1157,7 @@ static void unc_probe_node(SearchThread *td, const Position *pos, Value searched
     int signal = 0;
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty())
-        signal = nnue_uncertainty(pos);
+        signal = nnue_uncertainty(td->es, pos);
     else
 #endif
     {
@@ -1151,7 +1216,7 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         return VALUE_ZERO;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(td, pos, eval_evaluate(pos));
+        return corrected_eval(td, pos, eval_evaluate(td->es, pos));
 
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
@@ -1189,10 +1254,10 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         /* Stand pat: the side to move is never obliged to capture, so the static evaluation
          * is a lower bound on what it can achieve. In check there is no such option and
          * every reply must be searched. */
-        rawEval =
-            ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte) : eval_evaluate(pos);
+        rawEval    = ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
+                                                                : eval_evaluate(td->es, pos);
         staticEval = corrected_eval(td, pos, rawEval);
-        uncScale   = unc_scale(td, pos, NULL);
+        uncScale   = unc_start(false, NULL, td, pos);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1208,13 +1273,14 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
 
     /* No counter-move: quiescence only reaches quiet moves when answering a check, and an
      * evasion is dictated by the check rather than by whatever the opponent played. */
-    score_moves(td, pos, moves, count, ttMove, ply, MOVE_NONE);
+    pick_first(moves, score_moves(td, pos, moves, count, ttMove, ply, MOVE_NONE));
 
     Move bestMove = MOVE_NONE;
     int legal     = 0;
 
     for (int i = 0; i < count; ++i) {
-        pick_move(moves, count, i);
+        if (i > 0)
+            pick_move(moves, count, i);
         const Move m = moves[i].m;
 
         /* Drop the losing captures. score_moves already ran SEE and put them in the only
@@ -1228,11 +1294,19 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
          * of the sequence swings, leaves the score short of alpha, and standing pat already
          * beats that. Skipped for promotions, whose gain is the new piece rather than the
          * captured one, and in check, where there is no stand pat. */
-        if (!inCheck && type_of_move(m) != MT_PROMOTION && !is_mate_score(alpha) &&
-            staticEval + PieceValues[victim_of(pos, m)] +
-                    DELTA_MARGIN * unc_apply(uncScale, UNC_W_DELTA) / 100 <=
-                alpha)
-            continue;
+        if (!inCheck && type_of_move(m) != MT_PROMOTION && !is_mate_score(alpha)) {
+            /* What the move wins outright, before any allowance for what the rest of the
+             * sequence might swing. The allowance is added, so a capture that clears alpha
+             * on material alone is never pruned whatever the head says - and most do, which
+             * is what keeps the second inference out of quiescence. */
+            const Value bare = staticEval + PieceValues[victim_of(pos, m)];
+
+            if (bare <= alpha &&
+                bare + DELTA_MARGIN * unc_apply(unc_get(&uncScale, NULL, td, pos), UNC_W_DELTA) /
+                            100 <=
+                    alpha)
+                continue;
+        }
 
         if (!movegen_is_legal(pos, m))
             continue;
@@ -1246,10 +1320,10 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         td->stack[ply].staticEval = staticEval;
 
         board_do_move(pos, m);
-        eval_state_push(pos, m);
+        eval_state_push(td->es, pos, m);
         tt_prefetch(pos->key);
         const Value v = -qsearch(td, pos, -beta, -alpha, ply + 1);
-        eval_state_pop();
+        eval_state_pop(td->es);
         board_undo_move(pos, m);
 
         if (search_stopped())
@@ -1316,7 +1390,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         return VALUE_DRAW;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(td, pos, eval_evaluate(pos));
+        return corrected_eval(td, pos, eval_evaluate(td->es, pos));
 
     /* Determined before mate distance pruning narrows the window: a node is a PV node
      * because of where it sits in the tree, and must keep being treated as one even if the
@@ -1409,17 +1483,18 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * says nothing useful, and every heuristic that would consume it is disabled while in
      * check anyway. The table keeps `rawEval`; everything below reasons with the corrected
      * one. */
-    const Value rawEval = inCheck
-                              ? VALUE_NONE
-                              : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
-                                                                            : eval_evaluate(pos));
+    const Value rawEval =
+        inCheck ? VALUE_NONE
+                : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
+                                                              : eval_evaluate(td->es, pos));
 
     const Value staticEval = corrected_eval(td, pos, rawEval);
     int evalError          = -1;
-    const int uncScale =
-        inCheck ? 100
-                : unc_scale(td, pos,
-                            PAWN_HIST_WEIGHT != 0 && PAWN_RESCUE_WEIGHT != 0 ? &evalError : NULL);
+
+    /* Where the error estimate is wanted, unchanged: unc_scale() leaves it at -1 when it is
+     * not asked for, and the rescue credit reads -1 as "no head". */
+    int *const errSink = PAWN_HIST_WEIGHT != 0 && PAWN_RESCUE_WEIGHT != 0 ? &evalError : NULL;
+    int uncScale       = unc_start(inCheck, errSink, td, pos);
 
     td->stack[ply].staticEval = staticEval;
 
@@ -1436,7 +1511,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * fail low. The depth limit keeps it honest - deep enough searches find swings of any
      * size - and it is restricted to non-PV nodes, where a bound was all anyone wanted. */
     if (!pvNode && !inCheck && depth <= RFP_DEPTH && !is_mate_score(beta) &&
-        staticEval - RFP_MARGIN * (depth - improving) * unc_apply(uncScale, UNC_W_RFP) / 100 >=
+        /* The margin is subtracted, so failing this cannot be rescued by any scale the
+         * head could report - and asking it is a whole inference. */
+        staticEval >= beta &&
+        staticEval - RFP_MARGIN * (depth - improving) *
+                         unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_RFP) / 100 >=
             beta)
         return staticEval;
 
@@ -1446,7 +1525,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * node is worth a cheap second opinion, and the node is dropped only if that opinion
      * agrees. */
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
-        staticEval + RAZOR_MARGIN * depth * unc_apply(uncScale, UNC_W_RAZOR) / 100 < alpha) {
+        /* Added, so no scale can bring this under alpha if the bare evaluation is not. */
+        staticEval < alpha &&
+        staticEval + RAZOR_MARGIN * depth *
+                         unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_RAZOR) / 100 <
+            alpha) {
         const Value v = qsearch(td, pos, alpha - 1, alpha, ply);
         if (v < alpha)
             return v;
@@ -1466,10 +1549,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         td->stack[ply].movedPiece = NO_PIECE;
 
         board_do_null_move(pos);
-        eval_state_push_null(pos);
+        eval_state_push_null(td->es, pos);
         tt_prefetch(pos->key);
         const Value v = -negamax(td, pos, depth - r, -beta, -beta + 1, ply + 1, !cutNode);
-        eval_state_pop();
+        eval_state_pop(td->es);
         board_undo_null_move(pos);
 
         if (search_stopped())
@@ -1492,10 +1575,17 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * is already past the raised bound: the SEE filter's threshold would go negative and
      * admit every capture on the board.
      */
-    const Value probCutBeta = beta + PROBCUT_MARGIN * unc_apply(uncScale, UNC_W_PROBCUT) / 100;
+    /* The gates that do not depend on the margin are tested first, so a node that could
+     * not probcut whatever the margin came to never reads the uncertainty head for it. */
+    const bool probCutGate =
+        !pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta);
+    const Value probCutBeta =
+        probCutGate
+            ? beta + PROBCUT_MARGIN *
+                         unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_PROBCUT) / 100
+            : VALUE_NONE;
 
-    if (!pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta) &&
-        !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
+    if (probCutGate && !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
         !(ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth - 3 && ttValue < probCutBeta)) {
         ScoredMove pcMoves[MAX_MOVES];
         const int pcCount = movegen_generate(pos, GEN_CAPTURES, pcMoves);
@@ -1503,10 +1593,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         /* No counter-move: the list is captures, which the quiet heuristics have no opinion
          * about. The capture has to reach the raised bound on material alone - one needing
          * the search to find compensation is not what this is looking for. */
-        score_moves(td, pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE);
+        pick_first(pcMoves, score_moves(td, pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE));
 
         for (int i = 0; i < pcCount; ++i) {
-            pick_move(pcMoves, pcCount, i);
+            if (i > 0)
+                pick_move(pcMoves, pcCount, i);
             const Move m = pcMoves[i].m;
 
             if (!see_ge(pos, m, probCutBeta - staticEval))
@@ -1519,7 +1610,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             td->stack[ply].movedPiece = piece_on(pos, from_sq(m));
 
             board_do_move(pos, m);
-            eval_state_push(pos, m);
+            eval_state_push(td->es, pos, m);
             tt_prefetch(pos->key);
 
             Value v = -qsearch(td, pos, -probCutBeta, -probCutBeta + 1, ply + 1);
@@ -1527,7 +1618,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 v = -negamax(td, pos, depth - PROBCUT_REDUCTION, -probCutBeta, -probCutBeta + 1,
                              ply + 1, !cutNode);
 
-            eval_state_pop();
+            eval_state_pop(td->es);
             board_undo_move(pos, m);
 
             if (search_stopped())
@@ -1544,7 +1635,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
     ScoredMove moves[MAX_MOVES];
     const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_ALL, moves);
-    score_moves(td, pos, moves, count, ttMove, ply, counter_move(td, ply));
+    pick_first(moves, score_moves(td, pos, moves, count, ttMove, ply, counter_move(td, ply)));
 
     /* Moves already tried here, so the one that eventually cuts can penalise them. Bounded:
      * a node with more than this many is one where the ordering statistics were not going to
@@ -1573,7 +1664,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     bool raisedAlpha = false;
 
     for (int i = 0; i < count; ++i) {
-        pick_move(moves, count, i);
+        if (i > 0)
+            pick_move(moves, count, i);
         const Move m = moves[i].m;
 
         if (m == excluded)
@@ -1607,8 +1699,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
              * wins no material by definition, cannot close the gap in the depth remaining.
              * This prunes the whole quiet TAIL rather than one move, since the test does not
              * depend on which move it is; captures keep being searched, which is the point. */
-            if (depth <= FUTILITY_DEPTH &&
-                staticEval + FUTILITY_MARGIN * depth * unc_apply(uncScale, UNC_W_FUTILITY) / 100 <=
+            if (depth <= FUTILITY_DEPTH && staticEval <= alpha &&
+                staticEval + FUTILITY_MARGIN * depth *
+                                 unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_FUTILITY) /
+                                 100 <=
                     alpha)
                 continue;
         }
@@ -1633,10 +1727,14 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
              * bounds 120 * 246 * 246 * 500 does not fit in the int a Value is. Identical
              * pruning either way - see_ge() was never reached when the guard was false. */
             if (depth <= seeDepth) {
-                const Value seeMargin = tactical ? -SEE_CAPTURE_MARGIN * depth *
-                                                       unc_apply(uncScale, UNC_W_SEE_CAPTURE) / 100
-                                                 : -SEE_QUIET_MARGIN * depth * depth *
-                                                       unc_apply(uncScale, UNC_W_SEE_QUIET) / 100;
+                const Value seeMargin =
+                    tactical
+                        ? -SEE_CAPTURE_MARGIN * depth *
+                              unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SEE_CAPTURE) /
+                              100
+                        : -SEE_QUIET_MARGIN * depth * depth *
+                              unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SEE_QUIET) /
+                              100;
 
                 if (!see_ge(pos, m, seeMargin))
                     continue;
@@ -1669,7 +1767,9 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             !is_mate_score(ttValue) && (tt_entry_bound(&tte) & BOUND_LOWER) &&
             tt_entry_depth(&tte) >= depth - 3) {
             const Value singularBeta =
-                ttValue - SINGULAR_MARGIN * depth * unc_apply(uncScale, UNC_W_SINGULAR) / 100 / 16;
+                ttValue - SINGULAR_MARGIN * depth *
+                              unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SINGULAR) /
+                              100 / 16;
             const Depth singularDepth = (depth - 1) / 2;
 
             /* The verification searches this ply again and writes the PV table as it goes.
@@ -1699,7 +1799,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         td->stack[ply].movedPiece = moved;
 
         board_do_move(pos, m);
-        eval_state_push(pos, m);
+        eval_state_push(td->es, pos, m);
         tt_prefetch(pos->key);
 
         const bool givesCheck = board_checkers(pos) != BB_EMPTY;
@@ -1768,7 +1868,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             v               = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
         }
 
-        eval_state_pop();
+        eval_state_pop(td->es);
         board_undo_move(pos, m);
 
         if (search_stopped())
@@ -1799,12 +1899,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                     /* Fail high: the opponent would avoid this line. The move that cut is
                      * credited in whichever table describes it, and everything tried before it
                      * is blamed in both. */
-                    const int pawnExtraCredit =
-                        PAWN_HIST_WEIGHT != 0 && !tactical
-                            ? history_pawn_rescue_credit(history_bonus(depth), staticEval, beta, v,
-                                                         evalError, isExcluded, PAWN_RESCUE_WEIGHT,
-                                                         PAWN_RESCUE_FLOOR)
-                            : 0;
+                    /* The only consumer that wants the signal rather than the scale, and
+                     * the one place the deferred read has to be forced. Same number
+                     * whenever it is taken. */
+                    int pawnExtraCredit = 0;
+                    if (PAWN_HIST_WEIGHT != 0 && !tactical) {
+                        unc_get(&uncScale, errSink, td, pos);
+                        pawnExtraCredit = history_pawn_rescue_credit(
+                            history_bonus(depth), staticEval, beta, v, evalError, isExcluded,
+                            PAWN_RESCUE_WEIGHT, PAWN_RESCUE_FLOOR);
+                    }
                     update_stats(td, pos, m, quiets, quietPawnMaluses, quietCount, captures,
                                  captureCount, depth, ply, pawnExtraCredit);
                     break;
@@ -1922,7 +2026,7 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
         td->stack[0].staticEval = VALUE_NONE;
 
         board_do_move(pos, m);
-        eval_state_push(pos, m);
+        eval_state_push(td->es, pos, m);
         tt_prefetch(pos->key);
 
         Value v;
@@ -1938,7 +2042,7 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
                 v = -negamax(td, pos, depth - 1, -beta, -alpha, 1, false);
         }
 
-        eval_state_pop();
+        eval_state_pop(td->es);
         board_undo_move(pos, m);
 
         if (search_stopped())
@@ -2078,7 +2182,7 @@ static void thread_search(SearchThread *td) {
      * EvalFile` swapped the net in between. One accumulation per search per thread is
      * nothing; a whole search scored by the net that was replaced is a silent loss.
      */
-    eval_state_clear();
+    eval_state_clear(td->es);
 
     td->bestMove       = MOVE_NONE;
     td->ponderMove     = MOVE_NONE;
@@ -2356,7 +2460,8 @@ static void thread_entry(void *arg) {
     /* Without one the evaluation is still correct and several times slower, so it is
      * worth saying which thread is running that way rather than leaving an unexplained
      * collapse in nps. */
-    if (!eval_state_alloc())
+    td->es = eval_state();
+    if (!td->es)
         printf("info string thread %d: no accumulator stack; its evaluation will be slow\n",
                td->id);
 

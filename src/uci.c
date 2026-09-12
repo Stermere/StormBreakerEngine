@@ -303,7 +303,7 @@ static void cmd_setoption(char *args) {
                  * stack was built from its weights, and every TT entry carries a static
                  * eval it produced. Without this, a net-vs-net comparison driven through
                  * this option is partly scored by the net that was replaced. */
-                eval_state_clear();
+                eval_state_clear(eval_state());
                 tt_clear();
                 nnue_print_info();
             }

@@ -39,6 +39,18 @@
  * contract rather than an implementation detail: a field that made the compiler insert
  * padding would shift every weight by a few bytes, and the failure would look like a net
  * that trained badly rather than one that loaded wrong. */
+/*
+ * How far the blob is led in so that the PAYLOAD lands on a cache line.
+ *
+ * It is the payload the vector loops read, not the header, and the header is 112 bytes -
+ * not a multiple of 64. A blob placed on a 64-byte boundary therefore starts every
+ * feature row 48 bytes into a line, and half of the 32-byte loads over it are split
+ * across two lines: the accumulator delta and the refresh both walk whole rows, and both
+ * are bound by loads rather than by arithmetic. Sixteen bytes of lead-in costs sixteen
+ * bytes and puts `blob + sizeof(NnueHeader)` on the boundary instead.
+ */
+#define NNUE_PAYLOAD_LEAD ((64u - (unsigned)(sizeof(NnueHeader) & 63u)) & 63u)
+
 _Static_assert(sizeof(NnueHeader) == 112, "NnueHeader must stay 112 bytes; see HEADER_FMT in "
                                           "tools/export_net.py");
 
@@ -185,7 +197,11 @@ static void sha256_hex(const void *data, size_t len, char *out) {
 
 /* clang-format off */
 __asm__(NNUE_RODATA
+        /* .balign then the lead-in, so the payload behind the header is the thing that
+         * ends up 64-byte aligned. Kept in step with NNUE_PAYLOAD_LEAD by the assert
+         * below, which is what pins the header at 112 bytes. */
         ".balign 64\n"
+        ".space 16\n"
         ".globl " NNUE_SYM("nnueEmbeddedStart") "\n"
         NNUE_SYM("nnueEmbeddedStart") ":\n"
         ".incbin \"" NNUE_EVALFILE "\"\n"
@@ -548,23 +564,28 @@ bool nnue_load_file(const char *path) {
         return false;
     }
 
-    unsigned char *blob = (unsigned char *)malloc((size_t)size);
-    if (!blob) {
+    /* 64 bytes of slack so the blob can be slid to wherever puts its PAYLOAD on a cache
+     * line - see NNUE_PAYLOAD_LEAD. `owned` stays the pointer free() is owed. */
+    unsigned char *const owned = (unsigned char *)malloc((size_t)size + 64u);
+    if (!owned) {
         printf("info string EvalFile: out of memory reading %s\n", path);
         fflush(stdout);
         fclose(f);
         return false;
     }
 
+    unsigned char *const blob =
+        owned + ((64u - (((uintptr_t)owned + sizeof(NnueHeader)) & 63u)) & 63u);
+
     const size_t got = fread(blob, 1, (size_t)size, f);
     fclose(f);
 
     if (got != (size_t)size || !nnue_validate(blob, got, path)) {
-        free(blob);
+        free(owned);
         return false;
     }
 
-    nnue_adopt(blob, got, blob, path);
+    nnue_adopt(blob, got, owned, path);
     return true;
 }
 
@@ -1196,36 +1217,61 @@ typedef struct {
  * bias is 32 rows and bounded, while a diff against a distant position is neither. */
 #define REFRESH_MAX_ROWS 24
 
-static _Thread_local Accumulator *AccStack;
-static _Thread_local TrunkLevel *TrunkStack;
-static _Thread_local int AccTop;
+/*
+ * Everything a thread keeps for itself, in one object rather than eight.
+ *
+ * This is a layout decision forced by the platform, and it is worth stating because the
+ * obvious spelling is much slower. A thread-local is not an address the compiler can
+ * form on the Windows toolchain this engine is built with: every reference compiles to a
+ * call to __emutls_get_address(), and the eight separate variables this replaced were
+ * making roughly eight such calls per node on the hottest path there is. One object is
+ * one call, and every field after it is a fixed offset from what that call returned -
+ * which is why the functions below take `nt` as a parameter rather than reaching for it
+ * again. Native TLS would make the whole question disappear; this toolchain does not
+ * have it, for `_Thread_local` or `__thread`, and ignores `__declspec(thread)` outright.
+ *
+ * Invariant 11 is unaffected: this is still per-thread state, and nothing here is shared.
+ */
+struct EvalState {
+    Accumulator *accStack;
+    TrunkLevel *trunkStack;
+    int accTop;
 
-/* Sized by the net rather than by NNUE_MAX_HIDDEN: 128 entries at the maximum width
- * would be half a megabyte a thread to hold a net four times narrower. RefreshWidth is
- * what a net swap to a different width is noticed by. */
-static _Thread_local RefreshEntry *RefreshCache;
-static _Thread_local int16_t *RefreshAcc;
-static _Thread_local uint32_t RefreshWidth;
-static _Thread_local bool RefreshFailed;
+    /* Sized by the net rather than by NNUE_MAX_HIDDEN: 128 entries at the maximum width
+     * would be half a megabyte a thread to hold a net four times narrower. `refreshWidth`
+     * is what a net swap to a different width is noticed by. */
+    RefreshEntry *refreshCache;
+    int16_t *refreshAcc;
+    uint32_t refreshWidth;
+    bool refreshFailed;
 
-/* Set once a thread's allocation has failed, so a machine short of memory pays for one
- * failed calloc rather than one per evaluation. */
-static _Thread_local bool AccStackFailed;
+    /* Set once a thread's allocation has failed, so a machine short of memory pays for
+     * one failed calloc rather than one per evaluation. */
+    bool accFailed;
+};
 
-bool eval_state_alloc(void) {
-    if (AccStack)
-        return true;
-    if (AccStackFailed)
-        return false;
+/* The engine's one thread-local, and it is read once per thread per search rather than
+ * once per node: eval_state() hands the pointer out and the search carries it from
+ * there. See the type's declaration in eval.h for why that distinction is worth the
+ * parameter it costs. */
+static _Thread_local EvalState NnueTls;
 
-    AccStack = (Accumulator *)calloc(ACC_LEVELS, sizeof(Accumulator));
-    if (!AccStack) {
-        AccStackFailed = true;
-        return false;
+EvalState *eval_state(void) {
+    EvalState *const nt = &NnueTls;
+
+    if (nt->accStack)
+        return nt;
+    if (nt->accFailed)
+        return NULL;
+
+    nt->accStack = (Accumulator *)calloc(ACC_LEVELS, sizeof(Accumulator));
+    if (!nt->accStack) {
+        nt->accFailed = true;
+        return NULL;
     }
 
-    AccTop = 0;
-    return true;
+    nt->accTop = 0;
+    return nt;
 }
 
 size_t eval_state_bytes(void) {
@@ -1234,18 +1280,20 @@ size_t eval_state_bytes(void) {
 }
 
 void eval_state_free(void) {
-    free(AccStack);
-    free(TrunkStack);
-    free(RefreshCache);
-    free(RefreshAcc);
-    AccStack       = NULL;
-    TrunkStack     = NULL;
-    RefreshCache   = NULL;
-    RefreshAcc     = NULL;
-    RefreshWidth   = 0;
-    AccStackFailed = false;
-    RefreshFailed  = false;
-    AccTop         = 0;
+    EvalState *const nt = &NnueTls;
+
+    free(nt->accStack);
+    free(nt->trunkStack);
+    free(nt->refreshCache);
+    free(nt->refreshAcc);
+    nt->accStack      = NULL;
+    nt->trunkStack    = NULL;
+    nt->refreshCache  = NULL;
+    nt->refreshAcc    = NULL;
+    nt->refreshWidth  = 0;
+    nt->accFailed     = false;
+    nt->refreshFailed = false;
+    nt->accTop        = 0;
 }
 
 typedef struct {
@@ -1413,6 +1461,24 @@ static void nnue_apply_delta(const int16_t *src, int16_t *dst, const int16_t *co
  * The two callers want different code anyway - two rows against as many as
  * REFRESH_MAX_ROWS - so they get different functions.
  */
+/*
+ * Start the rows arriving while the diff is still being worked out.
+ *
+ * These rows are cold by construction and that is the whole point of them: this path runs
+ * because the king moved and the side reindexed, so the features it now wants are in a
+ * part of a 25 MB table nothing has touched. The scan that finds them takes a few hundred
+ * cycles, which is enough to cover the first misses if they are asked for early. Four
+ * lines, not the whole row - after that the sequential prefetcher has the stream.
+ */
+static inline void nnue_prefetch_row(const int16_t *row) {
+#ifdef NNUE_AVX2
+    for (int i = 0; i < 4; ++i)
+        _mm_prefetch((const char *)(row + i * 32), _MM_HINT_T0);
+#else
+    (void)row;
+#endif
+}
+
 static void nnue_refresh_rows(int16_t *acc, int16_t *dst, const int16_t *const *add, int addCount,
                               const int16_t *const *sub, int subCount, uint32_t hidden) {
 #ifdef NNUE_AVX2
@@ -1453,30 +1519,30 @@ static void nnue_refresh_rows(int16_t *acc, int16_t *dst, const int16_t *const *
  * Reallocated rather than reused when the width changes, because `setoption EvalFile` can
  * name a net of a different shape and the entries are laid out by the old one.
  */
-static bool nnue_refresh_alloc(void) {
+static bool nnue_refresh_alloc(EvalState *nt) {
     const uint32_t hidden = Loaded.hot.hidden;
 
-    if (RefreshAcc && RefreshWidth == hidden)
+    if (nt->refreshAcc && nt->refreshWidth == hidden)
         return true;
-    if (RefreshFailed)
+    if (nt->refreshFailed)
         return false;
 
-    free(RefreshCache);
-    free(RefreshAcc);
-    RefreshCache = (RefreshEntry *)calloc(REFRESH_SLOTS, sizeof(RefreshEntry));
-    RefreshAcc   = (int16_t *)calloc((size_t)REFRESH_SLOTS * hidden, sizeof(int16_t));
+    free(nt->refreshCache);
+    free(nt->refreshAcc);
+    nt->refreshCache = (RefreshEntry *)calloc(REFRESH_SLOTS, sizeof(RefreshEntry));
+    nt->refreshAcc   = (int16_t *)calloc((size_t)REFRESH_SLOTS * hidden, sizeof(int16_t));
 
-    if (!RefreshCache || !RefreshAcc) {
-        free(RefreshCache);
-        free(RefreshAcc);
-        RefreshCache  = NULL;
-        RefreshAcc    = NULL;
-        RefreshWidth  = 0;
-        RefreshFailed = true;
+    if (!nt->refreshCache || !nt->refreshAcc) {
+        free(nt->refreshCache);
+        free(nt->refreshAcc);
+        nt->refreshCache  = NULL;
+        nt->refreshAcc    = NULL;
+        nt->refreshWidth  = 0;
+        nt->refreshFailed = true;
         return false;
     }
 
-    RefreshWidth = hidden;
+    nt->refreshWidth = hidden;
     return true;
 }
 
@@ -1490,19 +1556,19 @@ static bool nnue_refresh_alloc(void) {
  * also what the debug assert in eval_evaluate() compares against, so a cache that ever
  * disagreed with a full accumulation would fail the gate rather than lose Elo quietly.
  */
-static void nnue_refresh(const Position *pos, Color c, int16_t *dst) {
+static void nnue_refresh(EvalState *nt, const Position *pos, Color c, int16_t *dst) {
     const Square king     = king_square(pos, c);
     const Perspective p   = nnue_perspective_of(c, king);
     const uint32_t hidden = Loaded.hot.hidden;
 
-    if (!nnue_refresh_alloc()) {
+    if (!nnue_refresh_alloc(nt)) {
         nnue_accumulate(pos, &p, dst);
         return;
     }
 
     const size_t idx      = (size_t)c * SQUARE_NB + (size_t)king;
-    RefreshEntry *const e = &RefreshCache[idx];
-    int16_t *const acc    = RefreshAcc + idx * hidden;
+    RefreshEntry *const e = &nt->refreshCache[idx];
+    int16_t *const acc    = nt->refreshAcc + idx * hidden;
 
     const int16_t *add[REFRESH_MAX_ROWS];
     const int16_t *sub[REFRESH_MAX_ROWS];
@@ -1529,12 +1595,20 @@ static void nnue_refresh(const Position *pos, Color c, int16_t *dst) {
 
             const Piece pc = make_piece(side, pt);
 
-            while (gained)
-                add[addCount++] = Loaded.hot.ftWeight +
-                                  (size_t)nnue_feature_index(&p, pop_lsb(&gained), pc) * hidden;
-            while (lost)
-                sub[subCount++] = Loaded.hot.ftWeight +
-                                  (size_t)nnue_feature_index(&p, pop_lsb(&lost), pc) * hidden;
+            while (gained) {
+                const int16_t *const row =
+                    Loaded.hot.ftWeight +
+                    (size_t)nnue_feature_index(&p, pop_lsb(&gained), pc) * hidden;
+                nnue_prefetch_row(row);
+                add[addCount++] = row;
+            }
+            while (lost) {
+                const int16_t *const row =
+                    Loaded.hot.ftWeight +
+                    (size_t)nnue_feature_index(&p, pop_lsb(&lost), pc) * hidden;
+                nnue_prefetch_row(row);
+                sub[subCount++] = row;
+            }
         }
 
     if (diff) {
@@ -1550,10 +1624,13 @@ static void nnue_refresh(const Position *pos, Color c, int16_t *dst) {
     e->valid = true;
 }
 
-void eval_state_clear(void) {
-    AccTop = 0;
-    if (AccStack)
-        memset(&AccStack[0], 0, sizeof(AccStack[0]));
+void eval_state_clear(EvalState *nt) {
+    if (!nt)
+        return;
+
+    nt->accTop = 0;
+    if (nt->accStack)
+        memset(&nt->accStack[0], 0, sizeof(nt->accStack[0]));
 
     /*
      * Everything below holds values the PREVIOUS net produced, and nothing about a key or
@@ -1562,10 +1639,10 @@ void eval_state_clear(void) {
      * level is validated by position key, and the root of the next search is very often
      * the position the last one ended at.
      */
-    if (RefreshCache)
-        memset(RefreshCache, 0, REFRESH_SLOTS * sizeof(RefreshEntry));
-    if (TrunkStack)
-        memset(TrunkStack, 0, ACC_LEVELS * sizeof(TrunkLevel));
+    if (nt->refreshCache)
+        memset(nt->refreshCache, 0, REFRESH_SLOTS * sizeof(RefreshEntry));
+    if (nt->trunkStack)
+        memset(nt->trunkStack, 0, ACC_LEVELS * sizeof(TrunkLevel));
 }
 
 /*
@@ -1574,14 +1651,14 @@ void eval_state_clear(void) {
  * CORRECT, which is the right way round for the one case that reaches it - a machine
  * that could not spare the allocation.
  */
-void eval_state_push(const Position *pos, Move m) {
-    if (!AccStack)
+void eval_state_push(EvalState *nt, const Position *pos, Move m) {
+    if (!nt || !nt->accStack)
         return;
 
-    assert(AccTop + 1 < ACC_LEVELS);
+    assert(nt->accTop + 1 < ACC_LEVELS);
 
-    const Accumulator *const parent = &AccStack[AccTop];
-    Accumulator *const child        = &AccStack[++AccTop];
+    const Accumulator *const parent = &nt->accStack[nt->accTop];
+    Accumulator *const child        = &nt->accStack[++nt->accTop];
 
     /* The key the parent must be describing if its accumulator is to be worth carrying
      * forward: do_move recorded the pre-move key on the Undo. */
@@ -1627,14 +1704,14 @@ void eval_state_push(const Position *pos, Move m) {
 /* A null move moves no piece, so both accumulators are already right and only the key
  * changed. The copy exists so the child level can carry that key: without a level of its
  * own, every node under a null move would find a mismatch and rebuild from scratch. */
-void eval_state_push_null(const Position *pos) {
-    if (!AccStack)
+void eval_state_push_null(EvalState *nt, const Position *pos) {
+    if (!nt || !nt->accStack)
         return;
 
-    assert(AccTop + 1 < ACC_LEVELS);
+    assert(nt->accTop + 1 < ACC_LEVELS);
 
-    const Accumulator *const parent = &AccStack[AccTop];
-    Accumulator *const child        = &AccStack[++AccTop];
+    const Accumulator *const parent = &nt->accStack[nt->accTop];
+    Accumulator *const child        = &nt->accStack[++nt->accTop];
     const uint32_t hidden           = Loaded.hot.hidden;
 
     child->key = pos->key;
@@ -1646,21 +1723,21 @@ void eval_state_push_null(const Position *pos) {
     }
 }
 
-void eval_state_pop(void) {
-    if (!AccStack)
+void eval_state_pop(EvalState *nt) {
+    if (!nt || !nt->accStack)
         return;
 
-    assert(AccTop > 0);
-    --AccTop;
+    assert(nt->accTop > 0);
+    --nt->accTop;
 }
 
 /* The level describing the board, with any perspective that cannot be trusted rebuilt
  * from it - or NULL on a thread with no stack, which is a full recomputation. */
-static const Accumulator *nnue_current(const Position *pos) {
-    if (!AccStack && !eval_state_alloc())
+static const Accumulator *nnue_current(EvalState *const nt, const Position *pos) {
+    if (!nt || !nt->accStack)
         return NULL;
 
-    Accumulator *const a = &AccStack[AccTop];
+    Accumulator *const a = &nt->accStack[nt->accTop];
 
     if (a->key != pos->key) {
         a->key             = pos->key;
@@ -1669,7 +1746,7 @@ static const Accumulator *nnue_current(const Position *pos) {
 
     for (Color c = WHITE; c <= BLACK; ++c)
         if (!a->computed[c]) {
-            nnue_refresh(pos, c, a->acc[c]);
+            nnue_refresh(nt, pos, c, a->acc[c]);
             a->computed[c] = true;
         }
 
@@ -1683,7 +1760,8 @@ static const Accumulator *nnue_current(const Position *pos) {
  * accumulators directly. The debug assert in eval_evaluate() is what proves the cache
  * agrees with a from-scratch computation, since that is exactly what it compares against.
  */
-static const int16_t *nnue_cached_trunk(const Accumulator *a, const Position *pos, int bucket) {
+static const int16_t *nnue_cached_trunk(EvalState *const nt, const Accumulator *a,
+                                        const Position *pos, int bucket) {
     if (!Loaded.hot.l1Size)
         return NULL;
 
@@ -1691,13 +1769,13 @@ static const int16_t *nnue_cached_trunk(const Accumulator *a, const Position *po
      * and a thread that first searched with a flat net has no stack to shadow. A failed
      * allocation is not fatal: the heads fall back to building their own trunk, which is
      * the slow-and-correct path the from-scratch code already is. */
-    if (!TrunkStack) {
-        TrunkStack = (TrunkLevel *)calloc(ACC_LEVELS, sizeof(TrunkLevel));
-        if (!TrunkStack)
+    if (!nt->trunkStack) {
+        nt->trunkStack = (TrunkLevel *)calloc(ACC_LEVELS, sizeof(TrunkLevel));
+        if (!nt->trunkStack)
             return NULL;
     }
 
-    TrunkLevel *const t = &TrunkStack[AccTop];
+    TrunkLevel *const t = &nt->trunkStack[nt->accTop];
 
     if (!t->valid || t->key != pos->key) {
         const Color stm = pos->sideToMove;
@@ -1711,14 +1789,14 @@ static const int16_t *nnue_cached_trunk(const Accumulator *a, const Position *po
 
 /* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is not set, so
  * which one the engine runs costs nothing at runtime. */
-Value eval_evaluate(const Position *pos) {
-    const Accumulator *const a = nnue_current(pos);
+Value eval_evaluate(EvalState *es, const Position *pos) {
+    const Accumulator *const a = nnue_current(es, pos);
     if (!a)
         return nnue_centipawns(nnue_raw(pos));
 
     const Color stm            = pos->sideToMove;
     const int bucket           = nnue_output_bucket(pos);
-    const int16_t *const trunk = nnue_cached_trunk(a, pos, bucket);
+    const int16_t *const trunk = nnue_cached_trunk(es, a, pos, bucket);
 
     const int32_t raw =
         trunk ? nnue_trunk_head(trunk, Loaded.hot.outWeight, Loaded.hot.outBias, bucket)
@@ -1754,8 +1832,8 @@ static Value nnue_unc_centipawns(int32_t raw) {
     return (Value)cp;
 }
 
-Value nnue_uncertainty(const Position *pos) {
-    const Accumulator *const a = nnue_current(pos);
+Value nnue_uncertainty(EvalState *es, const Position *pos) {
+    const Accumulator *const a = nnue_current(es, pos);
     if (!a) {
         _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
 
@@ -1771,7 +1849,7 @@ Value nnue_uncertainty(const Position *pos) {
 
     const Color stm            = pos->sideToMove;
     const int bucket           = nnue_output_bucket(pos);
-    const int16_t *const trunk = nnue_cached_trunk(a, pos, bucket);
+    const int16_t *const trunk = nnue_cached_trunk(es, a, pos, bucket);
 
     /* The trunk the value head just built, almost always: unc_scale() asks at very nearly
      * every node the evaluation is asked at, and building L1 twice for that was the whole
@@ -1878,7 +1956,7 @@ int nnue_verify_vectors(const char *path) {
         if (wantUnc) {
             /* Through the same accumulators the value just used, exactly as the reference
              * computes both heads from one activation. */
-            const Accumulator *const a = nnue_current(&pos);
+            const Accumulator *const a = nnue_current(eval_state(), &pos);
             const Color stm            = pos.sideToMove;
 
             uncRaw = nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(&pos));
