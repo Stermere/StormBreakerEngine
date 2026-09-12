@@ -89,6 +89,68 @@ static int GroupCount;
 static int GroupCpuTotal;
 static INIT_ONCE GroupsOnce = INIT_ONCE_STATIC_INIT;
 
+/*
+ * The physical cores, in the order the OS reports them - which is group by group, so
+ * indexing this fills a group before moving to the next one, the same policy the group
+ * binding below follows.
+ *
+ * `mask` is the logical processors that share this core. On a machine with SMT there are
+ * two, and they share everything that matters to a search: the level 1 and 2 caches, and
+ * the execution units the evaluation's vector work is bound by.
+ */
+/* 64 groups of 64 logical processors is the most Windows addresses, so this covers
+ * every core on the largest machine that can exist even without SMT. */
+#define MAX_CORES 4096
+
+typedef struct {
+    WORD group;
+    KAFFINITY mask;
+} PhysCore;
+
+static PhysCore Cores[MAX_CORES];
+static int CoreCount;
+
+static void probe_cores(void) {
+    DWORD len = 0;
+
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return;
+
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *const info =
+        (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)malloc(len);
+    if (!info)
+        return;
+
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+        /* One variable-sized record per core, walked by its own Size field - unlike the
+         * RelationGroup query above, which answers with a single record. */
+        const char *const end = (const char *)info + len;
+
+        const char *at = (const char *)info;
+
+        while (at < end && CoreCount < MAX_CORES) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *const e =
+                (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(const void *)at;
+
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount >= 1) {
+                Cores[CoreCount].group = e->Processor.GroupMask[0].Group;
+                Cores[CoreCount].mask  = e->Processor.GroupMask[0].Mask;
+                ++CoreCount;
+            }
+            at += e->Size;
+        }
+
+        /* If the list did not fit, CoreCount is a lie: it would read as a small machine
+         * and strand the pool on the cores that happened to fit. Disable core binding and
+         * let the group binding below place these threads. */
+        if (at < end)
+            CoreCount = 0;
+    }
+
+    free(info);
+}
+
 static void probe_groups(void) {
     DWORD len = 0;
 
@@ -125,14 +187,97 @@ static BOOL CALLBACK probe_groups_once(PINIT_ONCE once, PVOID param, PVOID *cont
     (void)context;
 
     probe_groups();
+    probe_cores();
     return TRUE;
 }
 
-void thread_bind(int index) {
+/*
+ * Give this thread a physical core of its own.
+ *
+ * Left to itself the scheduler will seat two search threads on the two halves of one
+ * physical core while another core sits idle, and eight threads on eight cores measured
+ * 9% slower when it does: the pair share a level 1 cache and the vector units the
+ * network runs on, so the second thread is not getting a core, it is getting a share of
+ * one.
+ *
+ * SetThreadIdealProcessorEx is asked first and is not enough on its own - it is accepted,
+ * reports success, and changes the placement by 0.1%, which is to say not at all. The
+ * affinity below is what actually moves the threads apart; the hint is kept because it
+ * tells the scheduler which half of the core to prefer, which the mask does not say.
+ *
+ * `index / CoreCount` is which sibling: every core gets a thread before any core gets a
+ * second one, which is the order that matters on a pool the size of the machine.
+ */
+static bool bind_to_core(int index) {
+    if (CoreCount <= 0)
+        return false;
+
+    const PhysCore *const core = &Cores[index % CoreCount];
+
+    int siblings = 0;
+    for (int i = 0; i < 64; ++i)
+        if (core->mask & ((KAFFINITY)1 << i))
+            ++siblings;
+
+    if (siblings <= 0)
+        return false;
+
+    int want = (index / CoreCount) % siblings;
+
+    for (int i = 0; i < 64; ++i) {
+        if (!(core->mask & ((KAFFINITY)1 << i)))
+            continue;
+
+        if (want-- == 0) {
+            PROCESSOR_NUMBER pn;
+            memset(&pn, 0, sizeof(pn));
+            pn.Group  = core->group;
+            pn.Number = (BYTE)i;
+
+            /* Survivable either way: a refused hint leaves the thread exactly where the
+             * scheduler would have put it anyway. */
+            SetThreadIdealProcessorEx(GetCurrentThread(), &pn, NULL);
+
+            /*
+             * The mask is the whole physical core rather than the one logical processor
+             * named above, which costs nothing - no two threads are given the same core
+             * until every core has one - and leaves the pair free for the thread to move
+             * between, so a processor busy with device interrupts does not stall it.
+             */
+            GROUP_AFFINITY ga;
+            memset(&ga, 0, sizeof(ga));
+            ga.Group = core->group;
+            ga.Mask  = core->mask;
+
+            return SetThreadGroupAffinity(GetCurrentThread(), &ga, NULL) != 0;
+        }
+    }
+
+    return false;
+}
+
+void thread_bind(int index, int poolSize) {
     InitOnceExecuteOnce(&GroupsOnce, probe_groups_once, NULL, NULL);
 
+    /*
+     * Only once the pool is at least as large as the machine.
+     *
+     * Below that there are cores to spare, and the scheduler spreading threads over all
+     * of them, with the idle ones' thermal headroom - beats confining them to
+     * the first few: a pool of four on eight cores measured 6% SLOWER bound than free,
+     * and a pool of one is the whole engine on one thread (bench, datagen, one SPRT
+     * game) with nothing to be separated from in any case.
+     *
+     * At or above the core count binding leaves no core idle, which is also what makes
+     * it safe when the engine does not own the machine: index % CoreCount spreads every
+     * instance across all the cores evenly, so two engines running at once oversubscribe
+     * the way the scheduler would have anyway rather than piling onto the first core.
+     */
+    if (CoreCount > 0 && poolSize >= CoreCount && bind_to_core(index))
+        return; /* That mask already names a group; the one below would only widen it. */
+
     /* One group is the ordinary case, and there the default affinity already covers
-     * the whole machine - binding could only take choices away from the scheduler. */
+     * the whole machine - a mask could only take choices away from the scheduler. */
     if (GroupCount <= 1 || GroupCpuTotal <= 0)
         return;
 
@@ -220,7 +365,10 @@ int thread_hardware_concurrency(void) {
 /* Nothing to do: there is no equivalent of a processor group, so a thread can
  * already be scheduled anywhere, and pinning it would only stop the kernel moving
  * it off a core somebody else is using. */
-void thread_bind(int index) { (void)index; }
+void thread_bind(int index, int poolSize) {
+    (void)index;
+    (void)poolSize;
+}
 
 /* nanosleep() rather than usleep(): POSIX.1-2008 removed the latter, so asking for
  * that level at the top of this file is precisely what makes it unavailable. */

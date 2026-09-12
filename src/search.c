@@ -2190,10 +2190,8 @@ static void thread_search(SearchThread *td) {
     td->completedDepth = 0;
     td->rootPvLength   = 0;
 
-    if (isMain) {
+    if (isMain)
         timeman_init(&Timer, &Limits, pos->sideToMove, pos->gamePly);
-        tt_new_search();
-    }
 
     ScoredMove roots[MAX_MOVES];
     int rootCount = collect_root_moves(pos, roots);
@@ -2455,7 +2453,7 @@ static void finish_search(void) {
 static void thread_entry(void *arg) {
     SearchThread *const td = (SearchThread *)arg;
 
-    thread_bind(td->id);
+    thread_bind(td->id, ThreadCount);
 
     /* Without one the evaluation is still correct and several times slower, so it is
      * worth saying which thread is running that way rather than leaving an unexplained
@@ -2658,6 +2656,14 @@ static void search_setup(const Position *pos, const SearchLimits *limits, bool s
     atomic_store(&StopFlag, false);
     atomic_store(&ClockOrigin, limits->startTime);
     atomic_store(&Searching, true);
+
+    /* Here rather than inside thread 0's iterations, which is where it used to be: the
+     * helpers are woken at the same moment thread 0 is, so a bump made from inside the
+     * search is a bump made while the rest of the pool is already storing. Those entries
+     * get stamped with the previous generation and are born one search stale, which puts
+     * the helpers' contribution - the entire point of Lazy SMP - first in line for
+     * replacement. Nothing is running yet at this point in the setup. */
+    tt_new_search();
 
     for (int i = 0; i < ThreadCount; ++i)
         thread_prepare(Threads[i]);

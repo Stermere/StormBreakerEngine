@@ -2346,3 +2346,167 @@ matched-budget, same-recipe run without factorization is needed to isolate the
 shared factor; uncertainty and lambda changes likewise need their own controls.
 What this test establishes is the **new combined net's STC gain against the
 named baseline**, not a per-feature attribution or an LTC result.
+
+### E35: Lazy SMP — one throughput win and four measured refusals
+
+**Date** 2026-09-12 · **Baseline** `abd646d` · **Machine** Ryzen 7 5800X,
+8 physical cores / 16 logical, Windows 11 · **Status** the binding change is
+in; everything else here is a negative result kept so it is not tried again.
+
+Bench node count is **5,016,992 before and after**, so nothing below is a
+behavioural change. Two instruments were used, and the difference between them
+is most of what this entry is about:
+
+- **nps at fixed movetime** — throughput alone, spread about ±3% per round.
+- **time-to-depth at fixed depth** — the metric that tracks strength, and at
+  eight threads it has a per-round spread of **±40%**, because whether thread 0
+  finishes an iteration quickly depends on whether some helper happened to seed
+  the entry it needed. Nothing under ~15% is measurable with it at all.
+
+Every comparison below is interleaved A/B/A/B, because the machine's clocks
+drift enough over a few minutes to manufacture a result on their own.
+
+#### Where the parallel search actually stands
+
+Time-to-depth at depth 17 over twelve middlegames, each thread count pinned to
+one logical processor per physical core so the numbers describe the pool rather
+than the scheduler's mood:
+
+| threads | median TTD | speedup | nodes | nps |
+|---|---|---|---|---|
+| 1 | 7.020s | 1.00x | 15.3M | 2.17M |
+| 2 | 5.540s | 1.27x | 19.6M | 3.51M |
+| 4 | 4.092s | 1.72x | 29.3M | 7.20M |
+| 8 | 3.756s | 1.87x | 39.5M | 10.95M |
+
+The speedup factors as **throughput scaling divided by node overhead**: 5.04x
+of nps against 2.59x more nodes for the same depth. Both halves are worth
+attacking, but only the first can be measured without games.
+
+#### What went in: a physical core per thread
+
+Windows will seat two search threads on the two halves of one physical core
+while another core is idle. It costs about a tenth of the search - the pair
+share an L1 and the vector units the network runs on, so the second thread is
+not getting a core, it is getting half of one.
+
+`thread_bind()` previously did nothing on a single-group machine, on the
+reasoning that the default affinity already covers it and a mask could only
+take choices away from the scheduler. That reasoning is measurably wrong. The
+same binary, unpinned against pinned one-per-core, interleaved:
+
+| | min | median | max |
+|---|---|---|---|
+| free | 13,382,702 | 14,393,042 | 14,948,297 |
+| pinned | 14,766,898 | **15,660,151** | 16,069,514 |
+
+**+8.8% median, and pinned won all ten rounds.**
+
+Three things had to be got right before that became shippable.
+
+**`SetThreadIdealProcessorEx` is not enough.** It is accepted, returns success,
+and moves the number by **+0.1%** - the scheduler takes the hint and places the
+thread wherever it likes. A real affinity mask is what moves the threads apart.
+The hint is still issued, because it names which half of the core to prefer and
+the mask does not.
+
+**The mask is the whole physical core, not one logical processor.** Binding to
+a single processor measured **+5.6%** at eight threads; binding to both halves
+of the core measured **+6.8% to +9.2%** across three runs. Naming one processor
+buys nothing - no two threads are given the same core until every core has one -
+and it stops the thread stepping aside from a processor busy with interrupts.
+
+**It is gated on `poolSize >= CoreCount`, and that gate is not a detail.** Below
+the core count, binding is actively harmful: a pool of four on eight cores
+measured **-6.2%**, because confining four threads to the first four cores gives
+up the idle cores' thermal headroom. A pool of one measured **-5.1%** bound, and
+a pool of one is what bench, datagen and a single SPRT game all run on. The gate
+also removes the reason not to do this by default: at or above the core count no
+core is left idle, and `index % CoreCount` spreads every instance evenly, so two
+engines running at once oversubscribe the way the scheduler would have anyway
+rather than piling onto processor 0.
+
+Final, unpinned, eight threads, complete change set: **+6.8% median nps, ten
+rounds out of ten.** At sixteen threads it is neutral (-1.0% median, inside the
+spread). One thread is untouched - the code does not run.
+
+Time-to-depth over sixteen rounds of the same change set came out at **-3.1%
+median** - the right direction, and below what that instrument resolves. Do not
+quote it as the result; the throughput number is the measured one.
+
+#### Also in: the generation was a data race, and helper entries were born stale
+
+`tt_new_search()` ran inside thread 0's iterations, and every thread in the pool
+is woken at the same moment - so the bump happened while the helpers were
+already storing. Their entries got stamped with the *previous* generation, which
+makes them look one search old immediately and puts the helpers' contribution -
+the entire point of Lazy SMP - first in line for replacement. It now runs in
+`search_setup()`, before anything is released.
+
+`Generation` itself was a plain `uint8_t` read by every thread on every probe and
+every store while another thread wrote it. It is now `_Atomic` and read relaxed,
+which on x86 is the same instruction: a thread that reads the old value stamps
+one entry one generation early, and that is a heuristic allowed to be
+approximate. The replacement scan now reads it once instead of once per entry.
+
+#### Refused: guarding the generation refresh in `tt_probe`
+
+`tt_probe` writes `genBound` on every hit. Instrumented over a search, the
+fraction of those writes that **change the byte** is **0.0%** - a hit on an entry
+from an earlier search is rare, and once the first hit refreshes one, every later
+hit finds the generation already current. 6.85M pointless stores to shared lines
+per eight-thread search.
+
+Guarding them measured **-0.28% at one thread** and could not be resolved at
+eight. The reason is that the probe and the store land on the **same cluster at
+the same node**: `tt_store` dirties that line on the way out regardless, so
+skipping the refresh saves no cache transaction at all. The guarded field writes
+in `tt_store` are worse - they only help when the value block is skipped, and
+cost a compare every time it is not. Neither is in the tree.
+
+#### Refused: removing the depth-skipping schedule
+
+The skip tables are Stockfish's from the years its search used them, and modern
+Stockfish has none - so they are an obvious thing to delete. Deleting them costs
+**31% more nodes for the same depth** (54.7M against 41.9M at depth 17, eight
+threads), with time-to-depth unchanged because nps rises to match. They are
+earning their place; leave them.
+
+#### Refused: letting helpers pass the depth limit
+
+With `go depth N` the limit binds every thread, and because the helpers skip
+depths they reach it **first** - they stop searching and park while thread 0 is
+still grinding through the deepest and most expensive iteration. Stockfish
+applies its limit to the main thread only, for exactly this reason.
+
+Making the limit thread 0's alone gave the helpers **54% more nodes** (62.9M
+against 40.9M), which confirms they really were idling about a third of the
+search. Time-to-depth did not move: **+1.9% median over 14 rounds.** Helper work
+beyond thread 0's current depth is worthless - it fills the table with entries
+for depths thread 0 has not reached and evicts the ones it needs. It also lets a
+helper's depth-19 result be played in answer to `go depth 17`. Reverted.
+
+Nothing here affects a timed search, where the limit is `MAX_PLY` and no helper
+ever runs out.
+
+#### Refused: independent processes as a scaling ceiling
+
+Eight single-threaded engines, one per core, were run to establish what the
+machine can give before the pool's own costs. They reached 14.7M nps aggregate
+on bench against 2.44M for one - but the construction is invalid and the number
+must not be quoted as a ceiling. Eight processes carry **eight private 25 MB
+copies of the network** against a 32 MB L3, where the pool shares one. On the
+middlegame set the pool beat them outright, which is the tell.
+
+#### Still open, and each needs games rather than a stopwatch
+
+- **Node overhead is 2.59x at eight threads.** This is where the remaining
+  speedup is, and no throughput measurement can see it.
+- `best_thread()` picks by depth then score; Stockfish votes across the pool.
+- `TTEntry` spends **5 of its 16 bytes on padding**. Packing to 10 would fit six
+  entries in a cache line instead of four - half again as much table for the same
+  memory, which matters most under SMP, where the table is under the most
+  pressure. Changes replacement, so it is an SPRT.
+- `search_clear()` memsets every thread's 8 MB of history from the calling
+  thread, which on a NUMA machine puts all of it on one node. Not measurable
+  here - this box has one.

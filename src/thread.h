@@ -49,15 +49,22 @@ void thread_join(ThreadHandle handle);
 int thread_hardware_concurrency(void);
 
 /*
- * Places the CALLING thread, which must be worker number `index`, on the machine.
+ * Places the CALLING thread, which must be worker number `index` of a pool of
+ * `poolSize`, on the machine.
  *
- * Only Windows does anything: a process is confined to a single processor group
- * unless a thread asks for another by name, so on a 128-core machine every thread
- * would pile onto the first 64 cores and half the machine would sit idle. Every
- * other platform schedules across the whole machine already, and pinning there
- * would take away the scheduler's ability to migrate a thread off a busy core.
+ * Only Windows does anything, for two reasons. A process is confined to a single
+ * processor group unless a thread asks for another by name, so on a 128-core machine
+ * every thread would pile onto the first 64 cores and half the machine would sit idle.
+ * And its scheduler will seat two search threads on the two halves of one physical core
+ * while another core is idle, which costs about a tenth of the search. Every other
+ * platform schedules across the whole machine already, and pinning there would only take
+ * away the kernel's ability to migrate a thread off a core somebody else is using.
+ *
+ * `poolSize` is why this is not simply an affinity mask: see thread.c. A pool smaller
+ * than the machine is left alone, and that includes the pool of one that bench, datagen
+ * and a single SPRT game all run on.
  */
-void thread_bind(int index);
+void thread_bind(int index, int poolSize);
 
 /* Only for parking a thread on an external event, such as a `stop` that has not
  * arrived - never inside the search. */

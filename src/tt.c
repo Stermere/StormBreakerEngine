@@ -2,6 +2,7 @@
 #include "tt.h"
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,7 +18,19 @@ typedef struct {
 static TTCluster *Table;
 static size_t ClusterCount;
 static size_t SizeMb;
-static uint8_t Generation;
+/*
+ * Read by every thread on every probe and every store, and written once per search by
+ * whoever starts one - so it is shared mutable state and has to say so. Relaxed, and
+ * deliberately: a thread that reads the previous value stamps its entry one generation
+ * old, which costs that entry some replacement priority and nothing else. Ordering this
+ * would put a fence on the hottest shared path in the engine to protect a heuristic that
+ * is allowed to be approximate.
+ */
+static _Atomic uint8_t Generation;
+
+static inline uint8_t generation(void) {
+    return atomic_load_explicit(&Generation, memory_order_relaxed);
+}
 
 /* The generation lives in the top 6 bits of genBound, so it advances in steps of 4
  * and wraps after 64 searches. Ages are computed modulo that cycle. */
@@ -89,7 +102,7 @@ bool tt_resize(size_t mb) {
     Table        = fresh;
     ClusterCount = clusters;
     SizeMb       = mb;
-    Generation   = 0;
+    atomic_store_explicit(&Generation, 0, memory_order_relaxed);
     return true;
 }
 
@@ -103,10 +116,12 @@ void tt_free(void) {
 void tt_clear(void) {
     if (Table)
         memset(Table, 0, ClusterCount * sizeof(TTCluster));
-    Generation = 0;
+    atomic_store_explicit(&Generation, 0, memory_order_relaxed);
 }
 
-void tt_new_search(void) { Generation += GENERATION_DELTA; }
+void tt_new_search(void) {
+    atomic_fetch_add_explicit(&Generation, GENERATION_DELTA, memory_order_relaxed);
+}
 
 size_t tt_size_mb(void) { return SizeMb; }
 
@@ -139,7 +154,7 @@ bool tt_probe(Key key, TTEntry *out) {
         if (e->key16 == key16 && (e->genBound & 3) != BOUND_NONE) {
             /* An entry the search keeps hitting is worth more than its depth suggests, so
              * drag it forward to the current generation and out of replacement's sights. */
-            e->genBound = (uint8_t)(Generation | (e->genBound & 3));
+            e->genBound = (uint8_t)(generation() | (e->genBound & 3));
             *out        = *e;
             return true;
         }
@@ -148,12 +163,14 @@ bool tt_probe(Key key, TTEntry *out) {
 }
 
 /* How many searches ago this entry was written, modulo the generation cycle. */
-static inline int entry_age(const TTEntry *e) {
-    return (int)((uint8_t)(Generation - (e->genBound & GENERATION_MASK)) / GENERATION_DELTA);
+static inline int entry_age(const TTEntry *e, uint8_t gen) {
+    return (int)((uint8_t)(gen - (e->genBound & GENERATION_MASK)) / GENERATION_DELTA);
 }
 
 /* Depth discounted by age, so a deep entry from three searches ago cannot squat. */
-static inline int replace_priority(const TTEntry *e) { return (int)e->depth - 8 * entry_age(e); }
+static inline int replace_priority(const TTEntry *e, uint8_t gen) {
+    return (int)e->depth - 8 * entry_age(e, gen);
+}
 
 void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound, bool pv,
               int ply) {
@@ -165,6 +182,7 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
 
     TTCluster *const cluster = &Table[cluster_index(key)];
     const uint16_t key16     = key_verifier(key);
+    const uint8_t gen        = generation();
 
     TTEntry *replace = &cluster->entry[0];
 
@@ -176,7 +194,7 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
             replace = e;
             break;
         }
-        if (replace_priority(e) < replace_priority(replace))
+        if (replace_priority(e, gen) < replace_priority(replace, gen))
             replace = e;
     }
 
@@ -204,7 +222,7 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
         replace->value    = (int16_t)stored;
         replace->eval     = (int16_t)eval;
         replace->depth    = (uint8_t)(depth > 255 ? 255 : depth);
-        replace->genBound = (uint8_t)(Generation | (unsigned)bound);
+        replace->genBound = (uint8_t)(gen | (unsigned)bound);
     }
 }
 
