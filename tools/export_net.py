@@ -54,11 +54,15 @@ from nnue.format import (  # noqa: E402
     ACTIVATION_TAG,
     FEATURE_SET_NAME,
     FEATURE_SET_TAG,
+    L1_SHIFT,
+    L2_SHIFT,
+    L3_SCALE,
     NUM_FEATURES,
     PAD_INDEX,
     QA,
     QB,
     SCALE,
+    STACK_QA,
     output_bucket,
     pack_fens,
     read_shard,
@@ -71,16 +75,17 @@ from nnue.provenance import sha256_file, write_json  # noqa: E402
 # ------------------------------------------------------------------ format --
 
 MAGIC = b"CKNNUE\0\0"
-# Must equal NNUE_FORMAT_VERSION in src/nnue.h. 2 is the single-architecture
-# format: every v1 net fails on the version rather than being read with tags
-# that have since been renumbered.
-FORMAT_VERSION = 2
+# Must equal NNUE_FORMAT_VERSION in src/nnue.h. 3 added the four layer-stack
+# fields; every v1 and v2 net fails on the version rather than being read with
+# a header that has since grown.
+FORMAT_VERSION = 3
 
-# 8 bytes magic, eight u32, one i32 (scale), one u32 (payload), 32-byte tag,
-# 16 reserved. Must stay identical to NnueHeader in src/nnue.h, which carries a
-# _Static_assert on its size for exactly this reason.
-HEADER_FMT = "<8s8IiI32s16s"
-HEADER_BYTES = 96
+# 8 bytes magic, eight u32, one i32 (scale), one u32 (payload), four u32 of
+# stack shape, 32-byte tag, 16 reserved. Must stay identical to NnueHeader in
+# src/nnue.h, which carries a _Static_assert on its size for exactly this
+# reason.
+HEADER_FMT = "<8s8IiI4I32s16s"
+HEADER_BYTES = 112
 assert struct.calcsize(HEADER_FMT) == HEADER_BYTES
 
 # Defaults from nnue/format.py, which is also where the TRAINER reads them:
@@ -97,14 +102,17 @@ DEFAULT_SCALE = SCALE
 # so it is visible when a net starts creeping toward the clamp.
 EVAL_LIMIT = 20000
 
-# The most men src/board.c will accept on a board, which is NOT the trainer's
-# MAX_PIECES: that one is the widest a TRAINING position gets (32, a legal
-# game) and it also sets the phase blend and the feature-batch width, so it
-# cannot be reused as the engine's limit. The accumulator bound below is the
-# one place the two meet - the engine will evaluate any diagram its FEN parser
-# accepts, so the proof that int16 cannot wrap has to cover that many rows, not
-# the 32 a legal game reaches. Keep this equal to the cap in board_set_fen.
-ENGINE_MAX_PIECES = 64
+# The most men src/board.c will accept on a board. The accumulator bound below
+# is what it is for: the engine will evaluate any diagram its FEN parser
+# accepts, so the proof that int16 cannot wrap has to cover that many rows.
+#
+# It was 64 - "a board has 64 squares" - which reserved half the accumulator's
+# range for diagrams no legal game can reach, put the shipped net at 99.5% of
+# int16, and forced the feature transformer's weight clip down to a bound that
+# belongs to the output layer. Task 6 step 1 in docs/NNUE.md. KEEP THIS EQUAL
+# TO THE CAP IN board_set_fen: the two are one decision, and a proof covering
+# fewer men than the parser accepts is not a proof.
+ENGINE_MAX_PIECES = 32
 
 INT16_MAX = 32767
 INT32_MAX = 2**31 - 1
@@ -168,6 +176,25 @@ def trunc_div(num: np.ndarray, den: int) -> np.ndarray:
 # ------------------------------------------------------------ quantisation --
 
 
+def resolve_scales(args, arch: dict) -> None:
+    """Fill in --qa/--qb from the architecture when they were not given.
+
+    Both defaults are properties of the shape rather than preferences. A
+    STACKED net needs a power-of-two qa, because its activation shifts by
+    log2(qa) per element instead of dividing once at the end; and its final
+    layer can carry a much finer scale than 64, because the int16 SIMD product
+    that caps a flat output weight at 128 levels is not in its path at all.
+    Those are the two numbers the quantisation block in trainer/nnue/format.py
+    is written against, so taking them from anywhere else is how the trainer's
+    clips stop matching what the export actually does.
+    """
+    stacked = bool(arch.get("l1_size", 0))
+    if args.qa is None:
+        args.qa = STACK_QA if stacked else DEFAULT_QA
+    if args.qb is None:
+        args.qb = L3_SCALE if stacked else DEFAULT_QB
+
+
 def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
     """Round the float weights onto the integer grid the engine reads.
 
@@ -182,14 +209,37 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
     """
     buckets = arch["output_buckets"]
 
+    l1_size = int(arch.get("l1_size", 0))
+    l2_size = int(arch.get("l2_size", 0))
+
+    # A stacked net's activation is `(x * x) >> log2(qa)` rather than a divide
+    # by qa, because it is applied per element instead of once at the end of a
+    # fused dot product. src/nnue.c rejects a stacked net whose qa is not a
+    # power of two; saying so here turns that into a flag error.
+    if l1_size and (qa & (qa - 1)):
+        raise SystemExit(
+            f"qa {qa} is not a power of two, which a net with a layer stack requires: its "
+            f"activation shifts by log2(qa) per element rather than dividing once. "
+            f"Re-export with --qa {1 << (qa.bit_length())} (the default for a stacked "
+            f"checkpoint), or train without the stack."
+        )
+
     try:
         ft = effective_feature_weights(state, bool(arch.get("feature_factorization", False)))
     except ValueError as error:
         raise SystemExit(str(error)) from error
     ft_w = ft.detach().cpu().numpy().astype(np.float64)
     ft_b = state["ft_bias"].detach().cpu().numpy().astype(np.float64)
-    out_w = state["out.weight"].detach().cpu().numpy().astype(np.float64)
-    out_b = state["out.bias"].detach().cpu().numpy().astype(np.float64).reshape(-1)
+
+    def tensor(name):
+        return state[name].detach().cpu().numpy().astype(np.float64)
+
+    # The final layer is `out.*` without a stack and `l3.*` with one - the same
+    # (buckets, trunk) shape either way, because both architectures end in one
+    # linear layer per bucket over whatever the heads read.
+    head = "l3" if l1_size else "out"
+    out_w = tensor(f"{head}.weight")
+    out_b = tensor(f"{head}.bias").reshape(-1)
 
     # The padding row exists only so a batch can be a dense (B, 32) matrix. It
     # is pinned to zero in training and is not part of the model.
@@ -203,10 +253,11 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
     ft_w = ft_w[:NUM_FEATURES]
 
     hidden = int(ft_w.shape[1])
-    if out_w.shape != (buckets, 2 * hidden) or out_b.shape != (buckets,):
+    trunk = (l2_size or l1_size) if l1_size else 2 * hidden
+    if out_w.shape != (buckets, trunk) or out_b.shape != (buckets,):
         raise SystemExit(
             f"output layer is {out_w.shape}/{out_b.shape}, expected "
-            f"{(buckets, 2 * hidden)}/{(buckets,)} for {buckets} output buckets"
+            f"{(buckets, trunk)}/{(buckets,)} for {buckets} output buckets"
         )
 
     q = {
@@ -216,8 +267,35 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
         "out_b": np.rint(out_b * qa * qb).astype(np.int32),
         "hidden": hidden,
         "buckets": buckets,
+        "trunk": trunk,
+        "l1_size": l1_size,
+        "l2_size": l2_size,
+        "l1_shift": L1_SHIFT if l1_size else 0,
+        "l2_shift": L2_SHIFT if l2_size else 0,
         "uncertainty": bool(arch.get("uncertainty", False)),
     }
+
+    # The stack. Each stage's weights ride a scale of 2**shift and its bias
+    # `qa * 2**shift`, which is what makes `sum >> shift` land back in [0, qa]
+    # with no factor folded into the weights - see the block under WEIGHT_CLIP
+    # in trainer/nnue/format.py, and Task 6 in docs/NNUE.md for the whole
+    # arithmetic. torch stores a per-bucket layer as (buckets * width, inputs);
+    # the engine reads [bucket][unit][input], which is the same bytes in the
+    # same order.
+    if l1_size:
+        l1_scale = 1 << L1_SHIFT
+        q["l1_w"] = np.rint(tensor("l1.weight") * l1_scale).astype(np.int32)
+        q["l1_b"] = np.rint(tensor("l1.bias") * qa * l1_scale).astype(np.int32)
+        if q["l1_w"].shape != (buckets * l1_size, 2 * hidden):
+            raise SystemExit(
+                f"L1 is {q['l1_w'].shape}, expected {(buckets * l1_size, 2 * hidden)}")
+        if l2_size:
+            l2_scale = 1 << L2_SHIFT
+            q["l2_w"] = np.rint(tensor("l2.weight") * l2_scale).astype(np.int32)
+            q["l2_b"] = np.rint(tensor("l2.bias") * qa * l2_scale).astype(np.int32)
+            if q["l2_w"].shape != (buckets * l2_size, l1_size):
+                raise SystemExit(
+                    f"L2 is {q['l2_w'].shape}, expected {(buckets * l2_size, l1_size)}")
 
     # The head's presence is claimed twice - by the arch record and by the
     # weights themselves - and the two must agree, because the exporter that
@@ -231,12 +309,12 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
         )
 
     if q["uncertainty"]:
-        unc_w = state["unc.weight"].detach().cpu().numpy().astype(np.float64)
-        unc_b = state["unc.bias"].detach().cpu().numpy().astype(np.float64).reshape(-1)
-        if unc_w.shape != (buckets, 2 * hidden) or unc_b.shape != (buckets,):
+        unc_w = tensor("unc.weight")
+        unc_b = tensor("unc.bias").reshape(-1)
+        if unc_w.shape != (buckets, trunk) or unc_b.shape != (buckets,):
             raise SystemExit(
                 f"uncertainty layer is {unc_w.shape}/{unc_b.shape}, expected "
-                f"{(buckets, 2 * hidden)}/{(buckets,)} for {buckets} output buckets"
+                f"{(buckets, trunk)}/{(buckets,)} for {buckets} output buckets"
             )
         # The same grid as the value head: the C forward runs both heads
         # through the same SCReLU arithmetic, so they must be quantised the
@@ -281,12 +359,16 @@ def check_ranges(q: dict, qa: int) -> dict:
     limits = {}
 
     names = ["ft_w", "ft_b", "out_w", "out_b"]
+    if q["l1_size"]:
+        names += ["l1_w", "l1_b"]
+        if q["l2_size"]:
+            names += ["l2_w", "l2_b"]
     if q["uncertainty"]:
         names += ["unc_w", "unc_b"]
     for name in names:
         peak = int(np.abs(q[name]).max())
         limits[f"{name}_peak"] = peak
-        if name not in ("out_b", "unc_b") and peak > INT16_MAX:
+        if name not in ("out_b", "unc_b", "l1_b", "l2_b") and peak > INT16_MAX:
             raise SystemExit(
                 f"{name} quantises to {peak}, which does not fit int16. The net is "
                 f"unusable at this QA/QB; retrain with weight clipping or lower the scale."
@@ -309,16 +391,46 @@ def check_ranges(q: dict, qa: int) -> dict:
 
     # The uncertainty head rides the same int16 SIMD multiply as the value
     # head, so its weights live under the same bound.
-    activation_product = qa * max(limits["out_w_peak"], limits.get("unc_w_peak", 0))
-    limits["activation_product_bound"] = activation_product
-    if activation_product > INT16_MAX:
-        raise SystemExit(
-            f"QA * max|out_w| is {activation_product}, past int16. The engine's SCReLU "
-            f"multiplies the clamped activation by the weight as int16, so this net would "
-            f"wrap in play. Retrain with weight clipping - the bound is "
-            f"{INT16_MAX // qa} quantised units, {INT16_MAX // qa / q['qb']:.3f} in float, "
-            f"which is WEIGHT_CLIP in trainer/nnue/format.py - or lower QA."
-        )
+    #
+    # ONLY THE FLAT ARCHITECTURE HAS THIS BOUND, and removing it is the point of
+    # the stack. `nnue_flat_head()` forms `v * w` as int16 before a widening
+    # madd, so `QA * max|w|` has to fit int16 - which caps a quantised output
+    # weight at 128 however much range the layer wants. A stacked net's dot
+    # products are plain `madd_epi16`, whose products are formed in 32 bits, so
+    # there is no intermediate to overflow and the only bound is the int32 sum
+    # checked below.
+    if not q["l1_size"]:
+        activation_product = qa * max(limits["out_w_peak"], limits.get("unc_w_peak", 0))
+        limits["activation_product_bound"] = activation_product
+        if activation_product > INT16_MAX:
+            raise SystemExit(
+                f"QA * max|out_w| is {activation_product}, past int16. The engine's SCReLU "
+                f"multiplies the clamped activation by the weight as int16, so this net "
+                f"would wrap in play. Retrain with weight clipping - the bound is "
+                f"{INT16_MAX // qa} quantised units, {INT16_MAX // qa / q['qb']:.3f} in "
+                f"float, which is WEIGHT_CLIP in trainer/nnue/format.py - or lower QA."
+            )
+
+    # Each stack stage's int32 sum, bounded the same way: every input is at
+    # most QA, so the worst case is `|bias| + QA * sum|w|` per unit. This is the
+    # bound src/nnue.c's `nnue_dot()` relies on, and it covers a SIMD lane's
+    # partial sum as well as the total, because a subset of those terms cannot
+    # exceed their own absolute sum.
+    for stage, weights, biases in (("l1", "l1_w", "l1_b"), ("l2", "l2_w", "l2_b")):
+        if weights not in q:
+            continue
+        # The rounding half nnue_requantise() adds before shifting is part of
+        # what has to fit, so it is part of the bound.
+        half = 1 << (q[f"{stage}_shift"] - 1)
+        per_unit = np.abs(q[weights]).sum(axis=1, dtype=np.int64)
+        bound = int((np.abs(q[biases]).reshape(-1) + qa * per_unit).max()) + half
+        limits[f"{stage}_bound"] = bound
+        if bound > INT32_MAX:
+            raise SystemExit(
+                f"the {stage.upper()} sum can reach {bound}, past int32. Retrain with a "
+                f"tighter {stage.upper()}_CLIP in trainer/nnue/format.py, or narrow the "
+                f"layer feeding it."
+            )
 
     # |raw| over every possible activation vector. SCReLU's extra factor of QA
     # is divided back out before the bias is added, so the bound is QA * the
@@ -340,6 +452,58 @@ def check_ranges(q: dict, qa: int) -> dict:
 
 
 # --------------------------------------------------------- reference model --
+
+
+def requantise(sums: np.ndarray, shift: int, ceiling: int) -> np.ndarray:
+    """One stack stage's int32 sum, back into [0, ceiling].
+
+    CLAMP BEFORE THE SHIFT, as src/nnue.c does. `>>` on a negative int32 is
+    implementation-defined in C17, and clamping to zero first is what makes the
+    C line, numpy's `>>` and a floor division all agree on every value. Written
+    this way rather than shifting first and clamping after specifically because
+    the two differ, and only on the negatives - which is exactly the class of
+    disagreement a tolerance would hide.
+
+    The half-shift ROUNDS TO NEAREST. A bare shift truncates, and truncating at
+    every stage of every unit is a systematic downward bias rather than noise:
+    it compounds across the stack and leaves the quantised net uniformly more
+    pessimistic than the trained one.
+    """
+    return np.minimum((np.maximum(sums, 0) + (1 << (shift - 1))) >> shift, ceiling)
+
+
+def stack_trunk(q: dict, x: np.ndarray, buckets: np.ndarray, qa: int) -> np.ndarray:
+    """The vector both output heads read, for a chunk of positions.
+
+    Grouped by bucket rather than gathering per-position weights: a
+    (positions, units, inputs) temporary is 33 MB a chunk and there are at most
+    32 distinct buckets, so the group-by is both smaller and faster. It changes
+    nothing about the arithmetic - each position still meets exactly its own
+    bucket's weights.
+    """
+    act_shift = qa.bit_length() - 1
+    assert 1 << act_shift == qa, "a stacked net's qa must be a power of two"
+
+    # The SCReLU output as the int16 vector L1 reads. The flat path never
+    # materialises this - it fuses the square into its own dot product and
+    # divides by qa once at the end - which is why `>> act_shift` appears here
+    # and nowhere above.
+    a = (x * x) >> act_shift
+
+    hidden2, l1_size, l2_size = a.shape[1], q["l1_size"], q["l2_size"]
+    l1_w = q["l1_w"].astype(np.int64).reshape(-1, l1_size, hidden2)
+    l1_b = q["l1_b"].astype(np.int64).reshape(-1, l1_size)
+
+    out = np.empty((x.shape[0], l2_size or l1_size), dtype=np.int64)
+    for b in np.unique(buckets):
+        rows = buckets == b
+        h = requantise(a[rows] @ l1_w[b].T + l1_b[b], q["l1_shift"], qa)
+        if l2_size:
+            l2_w = q["l2_w"].astype(np.int64).reshape(-1, l2_size, l1_size)
+            l2_b = q["l2_b"].astype(np.int64).reshape(-1, l2_size)
+            h = requantise(h @ l2_w[b].T + l2_b[b], q["l2_shift"], qa)
+        out[rows] = h
+    return out
 
 
 def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 256) -> tuple:
@@ -387,15 +551,29 @@ def forward(q: dict, fields: dict, qa: int, qb: int, scale: int, chunk: int = 25
         other = np.where(black_moves, acc_w, acc_b)
 
         x = np.concatenate([np.clip(own, 0, qa), np.clip(other, 0, qa)], axis=1)
-        w = q["out_w"][bucket[start:stop]].astype(np.int64)
-        b = q["out_b"][bucket[start:stop]].astype(np.int64)
+        buckets_here = bucket[start:stop]
 
-        raw[start:stop] = trunc_div((x * x * w).sum(axis=1), qa) + b
+        if not q["l1_size"]:
+            w = q["out_w"][buckets_here].astype(np.int64)
+            b = q["out_b"][buckets_here].astype(np.int64)
+
+            raw[start:stop] = trunc_div((x * x * w).sum(axis=1), qa) + b
+
+            if unc_raw is not None:
+                uw = q["unc_w"][buckets_here].astype(np.int64)
+                ub = q["unc_b"][buckets_here].astype(np.int64)
+                unc_raw[start:stop] = trunc_div((x * x * uw).sum(axis=1), qa) + ub
+            continue
+
+        trunk = stack_trunk(q, x, buckets_here, qa)
+        w = q["out_w"][buckets_here].astype(np.int64)
+        b = q["out_b"][buckets_here].astype(np.int64)
+        raw[start:stop] = (trunk * w).sum(axis=1) + b
 
         if unc_raw is not None:
-            uw = q["unc_w"][bucket[start:stop]].astype(np.int64)
-            ub = q["unc_b"][bucket[start:stop]].astype(np.int64)
-            unc_raw[start:stop] = trunc_div((x * x * uw).sum(axis=1), qa) + ub
+            uw = q["unc_w"][buckets_here].astype(np.int64)
+            ub = q["unc_b"][buckets_here].astype(np.int64)
+            unc_raw[start:stop] = (trunk * uw).sum(axis=1) + ub
 
     if np.abs(raw).max(initial=0) > INT32_MAX:
         raise SystemExit("a test position overflowed int32; the bound check is wrong")
@@ -467,22 +645,42 @@ def collect_fens(args) -> list:
 
 
 def write_net(path: str, q: dict, args, tag: str) -> bytes:
-    hidden, buckets = q["hidden"], q["buckets"]
+    hidden, buckets, trunk = q["hidden"], q["buckets"], q["trunk"]
 
+    # The order src/nnue.h documents, and nnue_adopt() walks in exactly this
+    # sequence. Note where the stack sits: BEFORE the output layer, because the
+    # output layer reads the trunk and the trunk is what the stack produces.
     blocks = [
         q["ft_w"].astype(np.int16).tobytes(order="C"),
         q["ft_b"].astype(np.int16).tobytes(order="C"),
+    ]
+    expect = NUM_FEATURES * hidden * 2 + hidden * 2
+
+    if q["l1_size"]:
+        blocks += [
+            q["l1_w"].astype(np.int16).tobytes(order="C"),
+            q["l1_b"].astype(np.int32).tobytes(order="C"),
+        ]
+        expect += buckets * q["l1_size"] * 2 * hidden * 2 + buckets * q["l1_size"] * 4
+        if q["l2_size"]:
+            blocks += [
+                q["l2_w"].astype(np.int16).tobytes(order="C"),
+                q["l2_b"].astype(np.int32).tobytes(order="C"),
+            ]
+            expect += buckets * q["l2_size"] * q["l1_size"] * 2 + buckets * q["l2_size"] * 4
+
+    blocks += [
         q["out_w"].astype(np.int16).tobytes(order="C"),
         q["out_b"].astype(np.int32).tobytes(order="C"),
     ]
-    expect = (NUM_FEATURES * hidden * 2 + hidden * 2
-              + buckets * 2 * hidden * 2 + buckets * 4)
+    expect += buckets * trunk * 2 + buckets * 4
+
     if q["uncertainty"]:
         blocks += [
             q["unc_w"].astype(np.int16).tobytes(order="C"),
             q["unc_b"].astype(np.int32).tobytes(order="C"),
         ]
-        expect += buckets * 2 * hidden * 2 + buckets * 4
+        expect += buckets * trunk * 2 + buckets * 4
     payload = b"".join(blocks)
     assert len(payload) == expect, (len(payload), expect)
 
@@ -507,6 +705,10 @@ def write_net(path: str, q: dict, args, tag: str) -> bytes:
         args.qb,
         args.scale,
         len(payload),
+        q["l1_size"],
+        q["l2_size"],
+        q["l1_shift"],
+        q["l2_shift"],
         tag.encode("utf-8")[:32],
         reserved,
     )
@@ -538,8 +740,16 @@ def main() -> None:
     parser.add_argument("--fens", default=None, help="a file of FENs, one per line, instead")
     parser.add_argument("--count", type=int, default=10000, help="test vectors to write")
     parser.add_argument("--vectors", default=None, help="override the vectors path")
-    parser.add_argument("--qa", type=int, default=DEFAULT_QA)
-    parser.add_argument("--qb", type=int, default=DEFAULT_QB)
+    # Defaulted from the CHECKPOINT rather than here, because the right scales
+    # are a property of the architecture: a stacked net needs a power-of-two qa
+    # for its per-element activation shift, and its final layer is free of the
+    # int16 SIMD product that pins the flat one at 128 levels. See resolve_scales().
+    parser.add_argument("--qa", type=int, default=None,
+                        help=f"activation scale (default: {DEFAULT_QA} flat, "
+                             f"{STACK_QA} stacked)")
+    parser.add_argument("--qb", type=int, default=None,
+                        help=f"output weight scale (default: {DEFAULT_QB} flat, "
+                             f"{L3_SCALE} stacked)")
     parser.add_argument("--scale", type=int, default=DEFAULT_SCALE,
                         help="centipawns per unit of float output")
     parser.add_argument("--tag", default=None,
@@ -585,6 +795,7 @@ def main() -> None:
     if sha256_file(checkpoint_path) != checkpoint_hash:
         raise SystemExit("checkpoint changed while being loaded; export a saved epoch checkpoint")
     arch = arch_from_checkpoint(state)
+    resolve_scales(args, arch)
     q = quantise(state["model"], arch, args.qa, args.qb)
     q["qb"] = args.qb
 
@@ -604,15 +815,26 @@ def main() -> None:
     # arrive here as a path, and which one they arrived as is the first thing
     # anyone re-reading this output wants to know.
     print(f"  from      {checkpoint}  ({checkpoint_hash[:12]})")
-    print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2 -> {q['buckets']}, "
+    stack = "".join(f" -> {w}" for w in (q["l1_size"], q["l2_size"]) if w)
+    print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2{stack} -> {q['buckets']}, "
           f"screlu, {FEATURE_SET_NAME}"
           + (", +uncertainty" if q["uncertainty"] else ""))
-    print(f"  quant     qa {args.qa}  qb {args.qb}  scale {args.scale}")
+    print(f"  quant     qa {args.qa}  qb {args.qb}  scale {args.scale}"
+          + (f"  shifts {q['l1_shift']}/{q['l2_shift']}" if q["l1_size"] else ""))
     print(f"  peaks     ft_w {limits['ft_w_peak']}  ft_b {limits['ft_b_peak']}  "
           f"out_w {limits['out_w_peak']}  (int16 holds {INT16_MAX})")
-    print(f"  bounds    accumulator |x| <= {limits['accumulator_bound']} (int16), "
-          f"activation product <= {limits['activation_product_bound']} (int16), "
-          f"output |x| <= {limits['output_bound']} (int32)")
+
+    # The int16 activation product is the FLAT architecture's bound and exists
+    # only there - removing it is what the stack is for - so the stack reports
+    # its own int32 sums in its place rather than a number that does not apply.
+    bounds = [f"accumulator |x| <= {limits['accumulator_bound']} (int16)"]
+    if "activation_product_bound" in limits:
+        bounds.append(f"activation product <= {limits['activation_product_bound']} (int16)")
+    for stage in ("l1", "l2"):
+        if f"{stage}_bound" in limits:
+            bounds.append(f"{stage.upper()} |x| <= {limits[f'{stage}_bound']} (int32)")
+    bounds.append(f"output |x| <= {limits['output_bound']} (int32)")
+    print("  bounds    " + ", ".join(bounds))
     print(f"  sha256    {digest}")
 
     # ------------------------------------------------------------ vectors --

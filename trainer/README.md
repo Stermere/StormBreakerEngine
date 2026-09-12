@@ -289,16 +289,43 @@ output                2H -> B, the row selected by piece count
 The feature set is `(32 mirrored king squares, piece, square)` over both
 colours' pieces, and the activation is SCReLU. Neither is a flag: `src/nnue.c`
 implements one of each and rejects anything else by name. Only the shape is a
-choice, and both halves of it are header fields the engine reads out of the net
-file, so changing either is a retrain and an export with no C change:
+choice, and every part of it is a header field the engine reads out of the net
+file, so changing any of them is a retrain and an export with no C change:
 
 | Flag | Values | Default |
 |---|---|---|
 | `--hidden` | a multiple of 16, up to 2048 | 1024 |
 | `--output-buckets` | any divisor of 32 | 4 |
+| `--l1-size` | 0, or a multiple of 16 | 0 |
+| `--l2-size` | 0, or a multiple of 16; needs `--l1-size` | 0 |
 
 24576 feature rows is a lot to fit. On a few million positions most rows are
 seen a handful of times, and `--hidden 512` is what to trade down first.
+
+**The last two are the layer stack**, which replaces the flat output layer
+with `2H -> l1_size -> l2_size -> buckets`, clipped ReLU between stages. It
+exists because the flat layer is arithmetically pinched rather than merely
+small: `src/nnue.c` forms `v * w` as int16, which caps a quantised output
+weight at 128, and the net before it sat on 127. See **Task 6** in
+[../docs/NNUE.md](../docs/NNUE.md) for the defect, the integer arithmetic the
+stack quantises into, and what was measured.
+
+`--l1-size 0` is the architecture that shipped, so a run that names neither
+flag trains exactly what it trained before — and that is the point, because it
+is the control a stacked net has to be measured against.
+
+A stacked checkpoint exports and runs like any other: net format version 3
+carries the two widths and their requantisation shifts, and `make nnue-test`
+holds it to the same exact-equality gate as a flat one. Two things differ, and
+`tools/export_net.py` picks both from the checkpoint rather than asking:
+
+- **`--qa` is 256 rather than 255**, and must be a power of two. The stack
+  applies the SCReLU rescale per element, to build the vector L1 reads, and per
+  element a shift is a shift and a divide is a divide. A stacked net with any
+  other `qa` is rejected by name, here and at load.
+- **`--qb` is 512 rather than 64.** The int16 SIMD product that caps a flat
+  output weight at 128 levels is not in the stack's path at all, so its final
+  layer is free to carry a much finer scale.
 
 The normalisation is the classical evaluation's, verbatim — rank-flip for the
 perspective's owner, file-mirror when that king sits on the kingside — after

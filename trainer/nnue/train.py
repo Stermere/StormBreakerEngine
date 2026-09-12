@@ -16,10 +16,17 @@ positions/s on the same machine. Raise --workers until it stops helping - four
 to six is usually where that is - and after that the things that move the
 number are --batch-size and the width.
 
-The architecture is SCReLU over 32 mirrored king squares, and the only two
-things left to choose are shape: --hidden and --output-buckets. Both are header
-fields the engine reads out of the net file, so changing either is a retrain
-and an export, with no C change and no flag to keep in sync.
+The architecture is SCReLU over 32 mirrored king squares, and the only things
+left to choose are shape: --hidden, --output-buckets, and --l1-size/--l2-size
+for the layer stack that can replace the flat output layer. All four are header
+fields the engine reads out of the net file, so changing any of them is a
+retrain and an export, with no C change and no flag to keep in sync.
+
+--l1-size 0 is the architecture that shipped and is the default, so a run that
+names none of this computes exactly what it computed before. Task 6 in
+docs/NNUE.md is what the stack is for and how it is quantised; a stacked
+checkpoint exports and runs like any other, at qa 256 and qb 512 rather than
+255 and 64, which tools/export_net.py picks from the checkpoint itself.
 
 24576 feature rows is a lot to fit. A few million positions leave most rows
 seen a handful of times, and the width is what to trade down first - --hidden
@@ -55,8 +62,9 @@ import torch
 from . import sanity
 from .dataset import make_loader, set_epoch, to_device
 from .format import DEFAULT_OUTPUT_BUCKETS, NET_TO_CP, SOURCE_NAMES
-from .model import (DEFAULT_HIDDEN, NNUE, TargetPolicy, arch_from_checkpoint, blended_target,
-                    from_checkpoint, loss_fn, uncertainty_loss_fn)
+from .model import (DEFAULT_HIDDEN, DEFAULT_L1_SIZE, DEFAULT_L2_SIZE, NNUE, TargetPolicy,
+                    arch_from_checkpoint, blended_target, from_checkpoint, loss_fn,
+                    uncertainty_loss_fn)
 from .provenance import code_identity, dataset_identity, sha256_file, write_json
 
 # The evaluation's sigmoid scale, in centipawns. Keeping it equal to the value
@@ -204,7 +212,8 @@ def load_resume(args, model, optimiser, scheduler, device):
     arch = arch_from_checkpoint(checkpoint)
     for field, asked in (("hidden", args.hidden), ("output_buckets", args.output_buckets),
                          ("uncertainty", args.uncertainty),
-                         ("feature_factorization", args.feature_factorization)):
+                         ("feature_factorization", args.feature_factorization),
+                         ("l1_size", args.l1_size), ("l2_size", args.l2_size)):
         if arch[field] != asked:
             raise SystemExit(f"--resume: {net_path} has {field} {arch[field]}, this run "
                              f"asks for {asked}. Pass the flags the original run used, or "
@@ -325,10 +334,12 @@ def train(args) -> None:
         original = from_checkpoint(source)
         args.hidden, args.output_buckets = original.hidden, original.output_buckets
         args.uncertainty = original.uncertainty
+        args.l1_size, args.l2_size = original.l1_size, original.l2_size
         args.feature_factorization = args.feature_factorization or original.feature_factorization
         model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
                      uncertainty=args.uncertainty,
-                     feature_factorization=args.feature_factorization)
+                     feature_factorization=args.feature_factorization,
+                     l1_size=args.l1_size, l2_size=args.l2_size)
         weights = original.state_dict()
         if args.feature_factorization and not original.feature_factorization:
             weights["ft_shared.weight"] = model.ft_shared.weight.detach().clone()
@@ -339,7 +350,8 @@ def train(args) -> None:
     else:
         model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
                      uncertainty=args.uncertainty,
-                     feature_factorization=args.feature_factorization)
+                     feature_factorization=args.feature_factorization,
+                     l1_size=args.l1_size, l2_size=args.l2_size)
     model = model.to(device)
     print(f"net:    {model.describe()}")
 
@@ -634,6 +646,15 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=16384)
     parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN,
                         help="hidden width per perspective; a multiple of 16")
+    parser.add_argument("--l1-size", type=int, default=DEFAULT_L1_SIZE,
+                        help="width of L1, the first layer of the stack that replaces the "
+                             "flat output layer. 0 (the default) is the architecture that "
+                             "shipped, and is the control every stacked net is measured "
+                             "against; otherwise a multiple of 16. See Task 6 in "
+                             "docs/NNUE.md")
+    parser.add_argument("--l2-size", type=int, default=DEFAULT_L2_SIZE,
+                        help="width of L2. 0 runs L1 straight into the output layer. "
+                             "Requires --l1-size, and is a multiple of 16")
     parser.add_argument("--output-buckets", type=int, default=DEFAULT_OUTPUT_BUCKETS,
                         help="output rows, selected by piece count; must divide 32")
     parser.add_argument("--feature-factorization", action="store_true",

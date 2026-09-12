@@ -408,13 +408,21 @@ bool board_set_fen_reason(Position *pos, const char *fen, const char **why) {
      * pawns, five knights - and every one of those plays perfectly well, so the only
      * question asked is whether it fits what the consumers are sized for.
      *
-     * Sixty-four rejects nothing a FEN can spell, and is here because the things
-     * downstream are sized by it: nnue_accumulate()'s feature array, export_net.py's
-     * proof that the int16 accumulator cannot wrap, and MAX_MOVES. Occupancy never grows
-     * during a search, so a diagram that passes here stays inside all three.
+     * THIRTY-TWO IS THE NUMBER BECAUSE THE NETWORK IS SIZED BY IT. tools/export_net.py
+     * proves the int16 accumulator cannot wrap by bounding it with "bias plus the N
+     * largest weights in a column", and N is this. At 64 that proof reserved half the
+     * accumulator's range for boards no legal game can reach, which pushed the shipped
+     * net to 99.5% of int16 and forced the feature transformer's weight clip down to a
+     * bound belonging to the output layer - see Task 6 in docs/NNUE.md.
+     *
+     * What it costs is loading a diagram with more than the 32 men chess has. Nothing in
+     * the engine, the suites or the training pipeline produces one; a position editor
+     * theoretically could, and it now gets a named rejection rather than a net quietly
+     * evaluating it through a wrapped accumulator. ENGINE_MAX_PIECES in export_net.py is
+     * the same number and the two must move together.
      */
-    if (popcount(occupied_bb(&p)) > 64)
-        return fen_reject(why, "the diagram has more men than the board has squares");
+    if (popcount(occupied_bb(&p)) > 32)
+        return fen_reject(why, "the diagram has more men than chess has");
 
     /* Discard rights and an en passant target the diagram does not back, rather than
      * rejecting the whole FEN: a wrong piece layout means the sender and the engine

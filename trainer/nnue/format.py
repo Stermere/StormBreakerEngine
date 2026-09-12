@@ -224,6 +224,86 @@ NET_TO_CP = float(SCALE)
 WEIGHT_CLIP = 127.0 / QB
 
 
+# -------------------------------------------------- the layer stack (Task 6) --
+#
+# The optional L1/L2/L3 stack between the accumulator and the score. See
+# "Task 6" in docs/NNUE.md for why it exists; what lives here is the
+# arithmetic the trainer has to stay inside, and the reason each number is
+# the number it is.
+#
+# The quantised stack reads the SCReLU output as a [0, 255] vector - at
+# QA = 255 the rescale already lands there, so it needs no constant of its own
+# - and every stage then looks the same:
+#
+#     s[u] = sum_j in[j] * w[u][j] + b[u]              int32
+#     r[u] = min(max(s[u], 0) >> SHIFT, 255)           back to [0, 255]
+#
+# CLAMP BEFORE SHIFT, always. `>>` on a negative int32 is implementation
+# defined in C17, and clamping first is what makes floor, truncate and numpy's
+# `>>` agree - which is the whole basis of the exact-equality gate. The float
+# image of that stage is `clamp(x, 0, 1)`, which is what model.py applies.
+#
+# The shifts are powers of two so the mapping is exact rather than a factor
+# folded into the weights: with a weight scale of 2**SHIFT,
+#
+#     s = QA * 2**SHIFT * v_float    and    s >> SHIFT = QA * v_float
+#
+# WHY int16 WEIGHTS AND NOT int8. The obvious port of Stockfish's layout is
+# uint8 activations against int8 weights through `_mm256_maddubs_epi16`, which
+# sums two products into an int16 lane: 255 * 127 * 2 = 64770 saturates it, so
+# an int8 layout without VNNI has to hold weights at |w| <= 64. That is six
+# bits, which is the defect Task 6 exists to remove, in a new place.
+# `_mm256_madd_epi16` accumulates int16 inputs straight into int32 with no
+# intermediate to overflow, so the bound comes from the int32 sum instead and
+# the weights get twelve bits at 2x headroom.
+L1_SHIFT = 9
+L2_SHIFT = 9
+L1_SCALE = 1 << L1_SHIFT
+L2_SCALE = 1 << L2_SHIFT
+
+# L3 quantises exactly as the flat output layer does - `w * scale`, bias at
+# `QA * scale` - so `eval_cp = raw * SCALE / (QA * QB)` is the same line either
+# way, with the header's QB carrying this instead of 64. It can be this much
+# larger because the int16 SIMD product that caps the flat layer at 128 is
+# gone: L3's multiply is int32 from int16 operands.
+L3_SCALE = 512
+
+# QA for a STACKED net, and it must be a power of two.
+#
+# The flat architecture divides by QA exactly once, at the end of a fused dot
+# product, where 255 is as good a number as any. The stack applies the SCReLU
+# rescale PER ELEMENT, to materialise the int16 vector L1 reads - and per
+# element a shift is a shift and a divide is a divide. 256 makes
+# `(x * x) >> 8` land in [0, 256] exactly, which is the whole activation.
+#
+# This is an EXPORT-time choice, not a training one: the float model never sees
+# QA. Changing it re-quantises, it does not retrain.
+STACK_QA = 256
+
+# The training clips, one per layer, each from that layer's own constraint.
+# This is the split WEIGHT_CLIP above does NOT have - it enforces the flat
+# output layer's int16 product on the feature transformer as well, which is a
+# bound that has nothing to do with the accumulator. Fixing that for the FT
+# needs ENGINE_MAX_PIECES in tools/export_net.py to come down to 32 first (see
+# Task 6 step 1), so it is deliberately left alone here: arm A of the
+# pre-flight has to reproduce the current recipe exactly to be a control.
+#
+# L1/L2: the int32 sum `2H * QA * |w_int|` must hold at the widest net the
+# engine will load (NNUE_MAX_HIDDEN 2048, so 2H = 4096):
+#     4096 * 255 * (2.0 * 512) = 1.07e9   against INT32_MAX 2.147e9
+# L3: only `l2_size` terms, so int16 storage binds long before int32 does:
+#     8.0 * 512 = 4096   against 32767
+L1_CLIP = 2.0
+L2_CLIP = 2.0
+L3_CLIP = 8.0
+
+# Both stack widths are inner-loop lengths for the stage after them, and
+# src/nnue.c will walk them sixteen lanes at a time for the same reason the
+# accumulator is walked that way. Refusing here turns an overnight run that
+# cannot be exported into a flag error.
+STACK_WIDTH_MULTIPLE = 16
+
+
 # ------------------------------------------------------------ unpacking -----
 
 

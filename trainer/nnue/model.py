@@ -5,11 +5,19 @@
     activation            SCReLU, clamp(x, 0, 1)^2 in float / [0, QA^2] in int
     output                2H -> B, the row chosen by piece count
 
-Two things are choices, and both are pure SHAPE - a header field the engine
-reads out of the net file, needing no C change to move:
+optionally with a layer stack in place of that flat output, per bucket:
+
+    L1                    2H -> l1_size,      clamp(x, 0, 1)
+    L2                    l1_size -> l2_size, clamp(x, 0, 1)     (if l2_size)
+    L3                    -> B, the row chosen by piece count
+
+Four things are choices, and all four are pure SHAPE - header fields the
+engine reads out of the net file, needing no C change to move:
 
     --hidden           H, a multiple of 16, up to NNUE_MAX_HIDDEN (2048)
     --output-buckets   B, any divisor of 32
+    --l1-size          0 for the flat output layer, else a multiple of 16
+    --l2-size          0 for L1 -> L3 directly, else a multiple of 16
 
 Nothing else is a choice. The feature set is (32 mirrored king squares, piece,
 square) and the activation is SCReLU, because those are the ones worth running
@@ -40,12 +48,16 @@ from .format import (
     ACTIVATION_NAME,
     DEFAULT_OUTPUT_BUCKETS,
     FEATURE_SET_NAME,
+    L1_CLIP,
+    L2_CLIP,
+    L3_CLIP,
     NET_TO_CP,
     NUM_FEATURES,
     PAD_INDEX,
     PIECE_PLANES,
     SQUARES,
     SOURCE_NAMES,
+    STACK_WIDTH_MULTIPLE,
     WEIGHT_CLIP,
     check_output_buckets,
     output_bucket,
@@ -54,6 +66,10 @@ from .format import (
 )
 
 DEFAULT_HIDDEN = 1024
+
+# Off by default
+DEFAULT_L1_SIZE = 0
+DEFAULT_L2_SIZE = 0
 
 # src/nnue.h requires this of the hidden width: the accumulator is walked
 # sixteen int16 lanes at a time, and a remainder loop is code that would run on
@@ -87,16 +103,33 @@ def effective_feature_weights(state: dict, factorized: bool) -> torch.Tensor:
 class NNUE(nn.Module):
     def __init__(self, hidden: int = DEFAULT_HIDDEN,
                  output_buckets: int = DEFAULT_OUTPUT_BUCKETS,
-                 uncertainty: bool = False, feature_factorization: bool = False):
+                 uncertainty: bool = False, feature_factorization: bool = False,
+                 l1_size: int = DEFAULT_L1_SIZE, l2_size: int = DEFAULT_L2_SIZE):
         super().__init__()
         if hidden < 1 or hidden % WIDTH_MULTIPLE:
             raise ValueError(f"hidden width must be a multiple of {WIDTH_MULTIPLE}, "
                              f"got {hidden} - src/nnue.c would refuse the net")
 
+        l1_size, l2_size = int(l1_size), int(l2_size)
+        for name, width in (("l1_size", l1_size), ("l2_size", l2_size)):
+            if width < 0 or (width and width % STACK_WIDTH_MULTIPLE):
+                raise ValueError(
+                    f"{name} must be 0 or a multiple of {STACK_WIDTH_MULTIPLE}, got {width} "
+                    f"- it is an inner-loop length in src/nnue.c, which carries no "
+                    f"remainder loop")
+        # L2 reads L1's output. Without an L1 there is nothing for it to read,
+        # and silently promoting it to "L1 of that width" would train a net
+        # nobody asked for.
+        if l2_size and not l1_size:
+            raise ValueError("l2_size requires l1_size: L2 reads L1's output, and there "
+                             "is no L1 to read. Pass --l1-size too, or drop --l2-size")
+
         self.hidden = hidden
         self.output_buckets = check_output_buckets(output_buckets)
         self.uncertainty = bool(uncertainty)
         self.feature_factorization = bool(feature_factorization)
+        self.l1_size = l1_size
+        self.l2_size = l2_size
 
         # One extra row for the padding slot. padding_idx pins it to zero and
         # keeps it there: it takes no gradient, so a record with 12 pieces
@@ -104,17 +137,40 @@ class NNUE(nn.Module):
         # drift.
         self.ft = nn.EmbeddingBag(NUM_FEATURES + 1, hidden, mode="sum", padding_idx=PAD_INDEX)
         self.ft_bias = nn.Parameter(torch.zeros(hidden))
-        self.out = nn.Linear(2 * hidden, self.output_buckets)
 
-        # The uncertainty head: a second output layer on the same activated
-        # trunk, predicting the SCALE of the value head's own error against the
-        # search label - E[|score - value|] - per bucket, in the same units as
-        # the value. It exists so search.c can widen its pruning margins where
-        # the evaluation is unreliable and tighten them where it is not (the
-        # idea E20 measured with a cruder signal). Optional because the head is
-        # a file-format feature: a net without one is still a complete net.
+        # EVERY per-bucket layer computes all buckets and gathers the one the
+        # piece count asks for, rather than gathering the weights first. The
+        # gather-weights version materialises a (batch, units, inputs) tensor -
+        # a gigabyte at batch 16384 - to save compute that measures at ~3% of a
+        # step. See _pick_rows().
+        if self.l1_size:
+            self.l1 = nn.Linear(2 * hidden, self.output_buckets * self.l1_size)
+            if self.l2_size:
+                self.l2 = nn.Linear(self.l1_size, self.output_buckets * self.l2_size)
+            self.l3 = nn.Linear(self.trunk_width, self.output_buckets)
+        else:
+            self.out = nn.Linear(2 * hidden, self.output_buckets)
+
+        # The uncertainty head: a second output layer on the same trunk,
+        # predicting the SCALE of the value head's own error against the search
+        # label - E[|score - value|] - per bucket, in the same units as the
+        # value. It exists so search.c can widen its pruning margins where the
+        # evaluation is unreliable and tighten them where it is not (the idea
+        # E20 measured with a cruder signal). Optional because the head is a
+        # file-format feature: a net without one is still a complete net.
+        #
+        # WITH A STACK IT READS THE STACK'S LAST HIDDEN LAYER, not the
+        # accumulator. Three reasons, and the first is the one that decides it:
+        # hanging a 2H -> 1 layer off the accumulator keeps the int16 SIMD
+        # product that Task 6 exists to remove, so the head would need a
+        # quantisation scale of its own while the value head no longer does.
+        # It is also ~64x cheaper to evaluate, and the stack's learned features
+        # are a better basis for "how wrong is this likely to be" than a linear
+        # read of the accumulator. The head has to be retrained either way and
+        # `make unc-probe` re-centres unc_scale() on whatever comes out, which
+        # NNUE.md 5c already requires after any retrain.
         if self.uncertainty:
-            self.unc = nn.Linear(2 * hidden, self.output_buckets)
+            self.unc = nn.Linear(self.trunk_width, self.output_buckets)
 
         # Small enough that a 32-piece sum starts inside the activation's
         # active range. Starting outside it means most units are saturated and
@@ -123,8 +179,21 @@ class NNUE(nn.Module):
         # bottom of the range is 2x, so a unit parked near zero learns slowly
         # from both ends.
         nn.init.uniform_(self.ft.weight, -0.02, 0.02)
-        nn.init.uniform_(self.out.weight, -0.05, 0.05)
-        nn.init.zeros_(self.out.bias)
+        if self.l1_size:
+            # The same argument one stage further in. A stack layer's
+            # activation is clamp(x, 0, 1), so a unit that starts outside
+            # [0, 1] is flat on one side and learns from neither - and with
+            # 2H inputs already in [0, 1] the sum is what decides that. Torch's
+            # default 1/sqrt(fan_in) init keeps the sum near zero; the bias
+            # then puts it in the MIDDLE of the active range rather than on
+            # its floor, which is where half the units would otherwise sit.
+            for layer in self.stack_layers:
+                nn.init.constant_(layer.bias, 0.5)
+            nn.init.uniform_(self.l3.weight, -0.05, 0.05)
+            nn.init.zeros_(self.l3.bias)
+        else:
+            nn.init.uniform_(self.out.weight, -0.05, 0.05)
+            nn.init.zeros_(self.out.bias)
         if self.uncertainty:
             nn.init.uniform_(self.unc.weight, -0.05, 0.05)
             nn.init.zeros_(self.unc.bias)
@@ -140,6 +209,29 @@ class NNUE(nn.Module):
             nn.init.zeros_(self.ft_shared.weight)
 
     # ------------------------------------------------------------ shape ----
+
+    @property
+    def trunk_width(self) -> int:
+        """Width of the vector the output heads read.
+
+        The activated accumulator without a stack, the stack's last hidden
+        layer with one. Both heads read it, which is what keeps them one pass
+        over one trunk.
+        """
+        if not self.l1_size:
+            return 2 * self.hidden
+        return self.l2_size or self.l1_size
+
+    @property
+    def stack_layers(self) -> list:
+        """L1 and L2 - the layers with a clamp(x, 0, 1) after them.
+
+        L3 is not one of them: it is the output layer, it has no activation,
+        and its clip and its quantisation scale are the output layer's.
+        """
+        if not self.l1_size:
+            return []
+        return [self.l1] + ([self.l2] if self.l2_size else [])
 
     @property
     def arch(self) -> dict:
@@ -158,10 +250,13 @@ class NNUE(nn.Module):
             "activation": ACTIVATION_NAME,
             "uncertainty": self.uncertainty,
             "feature_factorization": self.feature_factorization,
+            "l1_size": self.l1_size,
+            "l2_size": self.l2_size,
         }
 
     def describe(self) -> str:
-        return (f"{NUM_FEATURES} -> {self.hidden}x2 -> {self.output_buckets}, "
+        stack = "".join(f" -> {w}" for w in (self.l1_size, self.l2_size) if w)
+        return (f"{NUM_FEATURES} -> {self.hidden}x2{stack} -> {self.output_buckets}, "
                 f"{ACTIVATION_NAME}, {FEATURE_SET_NAME}"
                 + (", +uncertainty" if self.uncertainty else "")
                 + (", +training-only PSQT factor" if self.feature_factorization else ""))
@@ -177,6 +272,19 @@ class NNUE(nn.Module):
         """
         clamped = torch.clamp(x, 0.0, 1.0)
         return clamped * clamped
+
+    def stack_activate(self, x: torch.Tensor) -> torch.Tensor:
+        """The activation between stack layers: clipped ReLU, not SCReLU.
+
+        The float image of `min(max(s, 0) >> SHIFT, 255)`, which is the one
+        integer stage src/nnue.c will run for L1 and L2. Both halves matter:
+        the clamp at zero is the ReLU, and the clamp at one is the
+        requantisation ceiling that puts the result back in the [0, 255] range
+        the next stage's weights are scaled against. Training without the
+        upper clamp would fit a net whose activations the quantised engine
+        cannot represent, and it would look completely normal doing it.
+        """
+        return torch.clamp(x, 0.0, 1.0)
 
     def accumulators(self, white: torch.Tensor, black: torch.Tensor):
         """The two perspective accumulators, before the perspective swap.
@@ -217,7 +325,8 @@ class NNUE(nn.Module):
         default would silently evaluate every position out of the opening
         bucket, and the loss curve would look completely normal for that too.
         """
-        return self._pick(self.out(self._activated(white, black, stm)), piece_count)
+        return self._pick(self._value_head(self._trunk(white, black, stm, piece_count)),
+                          piece_count)
 
     def forward_heads(self, white: torch.Tensor, black: torch.Tensor, stm: torch.Tensor,
                       piece_count: torch.Tensor | None = None) -> tuple:
@@ -230,8 +339,9 @@ class NNUE(nn.Module):
         training would zero the gradient exactly where the head most needs to
         learn it overshot.
         """
-        x = self._activated(white, black, stm)
-        return self._pick(self.out(x), piece_count), self._pick(self.unc(x), piece_count)
+        x = self._trunk(white, black, stm, piece_count)
+        return (self._pick(self._value_head(x), piece_count),
+                self._pick(self.unc(x), piece_count))
 
     def _activated(self, white: torch.Tensor, black: torch.Tensor,
                    stm: torch.Tensor) -> torch.Tensor:
@@ -241,6 +351,48 @@ class NNUE(nn.Module):
         other = acc_white * stm + acc_black * (1.0 - stm)
 
         return self.activate(torch.cat([own, other], dim=1))
+
+    def _value_head(self, trunk: torch.Tensor) -> torch.Tensor:
+        return self.l3(trunk) if self.l1_size else self.out(trunk)
+
+    def _trunk(self, white: torch.Tensor, black: torch.Tensor, stm: torch.Tensor,
+               piece_count: torch.Tensor | None) -> torch.Tensor:
+        """The vector both output heads read, after the stack if there is one.
+
+        The stack's layers are per-bucket, so the bucket is selected HERE and
+        not only at the end - which is why `piece_count` reaches this far down.
+        A stacked net with more than one bucket cannot answer without it, and
+        that is the same refusal _pick() makes for the flat architecture.
+        """
+        x = self._activated(white, black, stm)
+        if not self.l1_size:
+            return x
+
+        x = self.stack_activate(self._pick_rows(self.l1(x), self.l1_size, piece_count))
+        if self.l2_size:
+            x = self.stack_activate(self._pick_rows(self.l2(x), self.l2_size, piece_count))
+        return x
+
+    def _pick_rows(self, y: torch.Tensor, width: int,
+                   piece_count: torch.Tensor | None) -> torch.Tensor:
+        """One bucket's `width` outputs out of the (B, buckets * width) a
+        per-bucket layer produces.
+
+        The layer computes every bucket and this throws all but one away. That
+        is deliberate: gathering the WEIGHTS instead - (batch, width, inputs) -
+        is a gigabyte at batch 16384 and 2H inputs, to save compute that
+        measures at roughly 3% of a training step against a feature
+        transformer that is doing 32 embedding rows per perspective anyway.
+        """
+        if self.output_buckets == 1:
+            return y
+        if piece_count is None:
+            raise ValueError(f"this net has {self.output_buckets} output buckets and needs "
+                             f"piece_count to choose one")
+
+        bucket = output_bucket(piece_count.long(), self.output_buckets)
+        rows = y.view(-1, self.output_buckets, width)
+        return rows.gather(1, bucket.view(-1, 1, 1).expand(-1, 1, width)).squeeze(1)
 
     def _pick(self, y: torch.Tensor, piece_count: torch.Tensor | None) -> torch.Tensor:
         if self.output_buckets == 1:
@@ -283,12 +435,30 @@ class NNUE(nn.Module):
         else:
             self.ft.weight.clamp_(-bound, bound)
         self.ft_bias.clamp_(-bound, bound)
-        self.out.weight.clamp_(-bound, bound)
-        # The uncertainty head multiplies the same QA-clamped activation as the
-        # value head in the same int16 SIMD lanes, so it lives under the same
-        # bound for the same reason.
+
+        # One bound per layer, each from that layer's OWN integer constraint -
+        # see the block under WEIGHT_CLIP in format.py. The flat output layer
+        # and the stack do not share one because they do not share an
+        # arithmetic: `out` is capped by an int16 SIMD product, L1 and L2 by an
+        # int32 sum, L3 by int16 storage.
+        if self.l1_size:
+            self.l1.weight.clamp_(-L1_CLIP, L1_CLIP)
+            self.l1.bias.clamp_(-L1_CLIP, L1_CLIP)
+            if self.l2_size:
+                self.l2.weight.clamp_(-L2_CLIP, L2_CLIP)
+                self.l2.bias.clamp_(-L2_CLIP, L2_CLIP)
+            self.l3.weight.clamp_(-L3_CLIP, L3_CLIP)
+            self.l3.bias.clamp_(-L3_CLIP, L3_CLIP)
+        else:
+            self.out.weight.clamp_(-bound, bound)
+
+        # The uncertainty head quantises exactly as the value head it sits
+        # beside: the same input vector, the same scale, the same bound. With
+        # a stack that is L3's; without one it is the flat layer's int16 SIMD
+        # product.
         if self.uncertainty:
-            self.unc.weight.clamp_(-bound, bound)
+            head_bound = L3_CLIP if self.l1_size else bound
+            self.unc.weight.clamp_(-head_bound, head_bound)
         # clamp_ leaves a zero row at zero, but the pad row is load-bearing
         # enough to re-pin rather than reason about.
         self.ft.weight[PAD_INDEX].zero_()
@@ -330,6 +500,13 @@ def arch_from_checkpoint(state: dict) -> dict:
         # checks it against this flag either way.
         "uncertainty": bool(arch.get("uncertainty", False)),
         "feature_factorization": bool(arch.get("feature_factorization", False)),
+        # Absent for the same reason and with the same safety: every
+        # checkpoint written before the stack existed is a flat net, zero is
+        # what flat means, and load_state_dict cross checks it either way
+        # because a stacked model has no `out.*` tensor and a flat one has no
+        # `l1.*`.
+        "l1_size": int(arch.get("l1_size", 0)),
+        "l2_size": int(arch.get("l2_size", 0)),
     }
 
 
@@ -343,7 +520,8 @@ def from_checkpoint(state: dict) -> NNUE:
     arch = arch_from_checkpoint(state)
     model = NNUE(hidden=arch["hidden"], output_buckets=arch["output_buckets"],
                  uncertainty=arch["uncertainty"],
-                 feature_factorization=arch["feature_factorization"])
+                 feature_factorization=arch["feature_factorization"],
+                 l1_size=arch["l1_size"], l2_size=arch["l2_size"])
     model.load_state_dict(state["model"])
     return model
 

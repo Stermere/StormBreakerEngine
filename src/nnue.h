@@ -24,10 +24,14 @@
  * message naming this number. */
 #define NNUE_MAX_HIDDEN 2048
 
+/* The layer stack's widths are stack arrays too, and they are small by design - other
+ * engines run 16 and 32. Generous, and a net past it is rejected by name. */
+#define NNUE_MAX_STACK_WIDTH 128
+
 /* Bumped whenever the on-disk layout or the meaning of a tag changes, so a net from
  * an older exporter fails on the version before anything can read a tag as the
- * wrong thing. */
-#define NNUE_FORMAT_VERSION 2u
+ * wrong thing. Version 3 grew the header by the four stack fields below. */
+#define NNUE_FORMAT_VERSION 3u
 
 #define NNUE_MAGIC     "CKNNUE\0\0"
 #define NNUE_MAGIC_LEN 8u
@@ -53,15 +57,28 @@ typedef enum { NNUE_FEATURES_HALFKA_32SQ = 1 } NnueFeatureSet;
 #define NNUE_MAX_OUTPUT_BUCKETS 32
 
 /*
- * Little-endian, fixed 96 bytes, immediately followed by the payload:
+ * Little-endian, fixed 112 bytes, immediately followed by the payload:
  *
  *     int16  ftWeight[features][hidden]   feature-major, so one feature's row is
  *                                         contiguous - the span the accumulator adds
  *     int16  ftBias[hidden]
- *     int16  outWeight[outputBuckets][2 * hidden]
+ *     int16  l1Weight[outputBuckets][l1Size][2 * hidden]   only when l1Size > 0
+ *     int32  l1Bias[outputBuckets][l1Size]                 only when l1Size > 0
+ *     int16  l2Weight[outputBuckets][l2Size][l1Size]       only when l2Size > 0
+ *     int32  l2Bias[outputBuckets][l2Size]                 only when l2Size > 0
+ *     int16  outWeight[outputBuckets][trunk]
  *     int32  outBias[outputBuckets]
- *     int16  uncWeight[outputBuckets][2 * hidden]   only when reserved[0] == 1
+ *     int16  uncWeight[outputBuckets][trunk]        only when reserved[0] == 1
  *     int32  uncBias[outputBuckets]                 only when reserved[0] == 1
+ *
+ * where `trunk` is the width of whatever the output heads read: `2 * hidden` with no
+ * stack, the stack's last hidden layer with one. BOTH HEADS READ THE SAME TRUNK, which
+ * is what keeps them one pass over one vector.
+ *
+ * l1Size == 0 IS THE FLAT ARCHITECTURE, and its payload is byte-identical to the one
+ * version 2 described - `trunk` is then `2 * hidden` and there is no stack to skip. That
+ * is deliberate: it makes a version-2 net's re-export under version 3 a change that
+ * cannot alter an evaluation, which is a thing a bench node count can prove.
  *
  * reserved[0] flags a second output head, trained to predict the value head's own
  * |error|. It is a flag rather than a version bump because a headless net is still
@@ -80,6 +97,16 @@ typedef struct {
     uint32_t qb;
     int32_t scale;
     uint32_t payloadBytes;
+
+    /* The stack. Zero means absent, and absent for l1Size means the flat output layer
+     * above. The shifts are the requantisation each stage applies to its int32 sum,
+     * carried in the file rather than compiled in for the same reason the widths are:
+     * retraining at a different scale must not need a C change. */
+    uint32_t l1Size;
+    uint32_t l2Size;
+    uint32_t l1Shift;
+    uint32_t l2Shift;
+
     char tag[NNUE_TAG_LEN];
     uint8_t reserved[16];
 } NnueHeader;

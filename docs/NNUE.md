@@ -1290,6 +1290,529 @@ deviation from 100, which is orthogonal to the margin constant beside it. See
 
 ---
 
+## Task 6 — a layer stack after the accumulator
+
+Task 5 is about what the search does with the network's number. This is about
+the number. It is the first architecture change since the net shipped, and it
+exists because two measurements say the current output layer is arithmetically
+pinched rather than capacity-pinched — which is a different complaint from the
+one E27 rejected.
+
+### The defect, stated in numbers
+
+From `external/nets/net.json`, the shipped export:
+
+| | value | ceiling | |
+|---|---|---|---|
+| `out_w_peak` | **127** | 128 | saturated |
+| `ft_w_peak` | **506** | 506 | saturated |
+| `accumulator_bound` | **32593** | 32767 | 99.5% of int16 |
+| quantisation drift | 8.81 cp mean / 52.65 cp max (E34's net) | | |
+
+Two separate things are wrong, and one number is enforcing both.
+
+**The output layer has seven bits.** `nnue_screlu_half()` forms `v * w` as
+int16 via `_mm256_mullo_epi16` before `madd` widens it, so the exporter must
+guarantee `QA * max|out_w|` fits int16. At `QA = 255` that caps a quantised
+output weight at 128, and the trained net sits on 127. A 1024-input dot product
+whose every weight is drawn from 255 levels is not a layer with room in it.
+
+**The feature transformer is clipped by the output layer's bound.**
+`clip_weights()` in `trainer/nnue/model.py` clamps `ft.weight` and `out.weight`
+to the same `WEIGHT_CLIP = 127.0 / QB`. Those enforce different constraints:
+the output layer's is the int16 SIMD product above, the FT's is that the
+accumulator sum stays in int16. The FT peak is 506 = `WEIGHT_CLIP * QA`
+exactly, so it is pinned by a bound that has nothing to do with it.
+
+**Half the accumulator's range is reserved for positions no game reaches.**
+`ENGINE_MAX_PIECES = 64` in `tools/export_net.py`, because `board_set_fen`
+accepts a 64-man FEN (`src/board.c:416`). Legal chess has 32. The bound is
+therefore computed over twice the pieces that can exist, which is what leaves
+it at 99.5% of int16 and forces the FT clip down.
+
+None of that is a capacity argument, and that matters: **E27 measured a wider
+FT (h1024) at -7.0 +/- 11.3 and concluded capacity is not binding.** That
+conclusion stands for width. It was never a claim about the arithmetic between
+the accumulator and the score, which is what this task changes.
+
+### The architecture
+
+```
+feature transformer   24576 -> H, unchanged, int16 accumulator, SCReLU
+a[2H]                 (clamp(acc, 0, QA)^2) / QA         uint8-ranged, [0, 255]
+L1 (per bucket)       2H -> l1Size    int16 weights, int32 accumulation
+                      clamp to >= 0, shift, clamp to 255
+L2 (per bucket)       l1Size -> l2Size                   same shape
+L3 (per bucket)       l2Size -> 1     int16 weights, int32 out
+```
+
+The accumulator, the feature set, the SCReLU and the incremental update are all
+untouched. Everything here happens after the accumulator has been read, which
+is why the debug assert that covers incremental-update drift still covers
+exactly what it covered.
+
+**Why int16 weights and `madd_epi16`, and not Stockfish's int8 layout.** The
+obvious port is uint8 activations against int8 weights through
+`_mm256_maddubs_epi16`, which is what every engine with VNNI does. `maddubs`
+sums two products into an int16 lane, and `255 * 127 * 2 = 64770` saturates it
+— so the int8 layout has to hold weights at `|w| <= 64` to be safe, which is
+six bits, which is the defect again in a new place. `_mm256_madd_epi16` on
+int16 inputs accumulates into int32 with no intermediate to overflow, so the
+weight bound comes from the int32 sum instead:
+
+```
+2H * QA * max|w1|  <=  INT32_MAX
+1024 * 255 * 4096  =   1.07e9        against 2.147e9
+```
+
+**Twelve bits of L1 weight where the current output layer has seven**, with 2x
+headroom, no saturation trap, and the same intrinsic the SCReLU path already
+uses. The cost is 262 KB of weights in a 25 MB net. Packing to int8 on disk and
+widening at load is available later if the traffic ever matters; it is not a
+reason to accept six-bit weights now.
+
+### The arithmetic, exactly
+
+Every stage clamps to non-negative *before* it shifts, so `>>` is never applied
+to a negative int32 — that is implementation-defined in C17 — and floor,
+truncate and numpy's `>>` all agree on the result. This is the rule that makes
+the whole stack reproducible in numpy, and it is not a stylistic preference.
+
+```
+x[j]   = clamp(acc[own][j],   0, QA)            j < H
+x[H+j] = clamp(acc[other][j], 0, QA)
+a[j]   = (x[j] * x[j]) / QA                     trunc; QA = 255 so a is [0, 255]
+
+s1[u]  = sum_j a[j] * l1Weight[b][u][j] + l1Bias[b][u]          int32
+r1[u]  = min(max(s1[u], 0) >> l1Shift, 255)                     [0, 255]
+
+s2[v]  = sum_u r1[u] * l2Weight[b][v][u] + l2Bias[b][v]         int32
+r2[v]  = min(max(s2[v], 0) >> l2Shift, 255)                     [0, 255]
+
+raw    = sum_v r2[v] * l3Weight[b][v] + l3Bias[b]               int32
+cp     = trunc(raw * SCALE / (QA * QB))
+```
+
+`a[j]` needs no new constant: at `QA = 255` the SCReLU rescale already lands in
+`[0, 255]` exactly, so the FT activation *is* the L1 input vector.
+
+The shifts are powers of two chosen so the float image is exact rather than
+approximate. Quantise L1 and L2 weights at scale `2^l1Shift` — at
+`l1Shift = 10` a float weight in `[-4, 4]` maps to `[-4096, 4096]` — and then
+`s1 = QA * 2^l1Shift * v_float`, so `s1 >> l1Shift` is `QA * v_float` with no
+fudge factor folded into the weights. The last line is character-for-character
+the `nnue_centipawns()` that already exists, because `QB` is reused as L3's
+scale.
+
+### The file format
+
+`NNUE_FORMAT_VERSION` 2 -> 3, header 96 -> 112 bytes, four new `uint32`:
+`l1Size`, `l2Size`, `l1Shift`, `l2Shift`. The reserved block is not the place
+for them — it has fifteen bytes and the loader already rejects a nonzero byte
+in it, which is the behaviour that makes a stale net fail loudly.
+
+**`l1Size == 0` means the stack is absent and the output layer reads the
+accumulator directly — today's architecture.** That is the single most
+important thing in this section, and the reason is in the plan below: it makes
+the format migration a change that provably evaluates identically, testable
+against an unchanged bench node count, before any new arithmetic exists.
+
+Payload, after `ftBias`, when `l1Size > 0`:
+
+```
+int16  l1Weight[outputBuckets][l1Size][2 * hidden]
+int32  l1Bias[outputBuckets][l1Size]
+int16  l2Weight[outputBuckets][l2Size][l1Size]
+int32  l2Bias[outputBuckets][l2Size]
+int16  l3Weight[outputBuckets][l2Size]
+int32  l3Bias[outputBuckets]
+```
+
+and `outWeight` / `outBias` are absent. Every section stays 4-byte aligned by
+construction and `nnue_payload_bytes()` asserts it. The uncertainty head keeps
+reading the activated accumulator through its own `2H -> 1` layer, unchanged:
+one change per test, and the head's job is a coarse magnitude.
+
+### The plan, in four steps
+
+**Step 0 — the float pre-flight, and it is a veto rather than a green light.**
+No C work at all. Train three nets on gen-005 at the E34 recipe and compare
+held-out value MSE:
+
+| | architecture |
+|---|---|
+| A | `2H -> 1` — the control, and `net-fact-exp` already is one |
+| B | `2H -> 16 -> 1` |
+| C | `2H -> 16 -> 32 -> 1` |
+
+An epoch is ~21 minutes on the 3070 (measured from the `net-fact-exp` epoch
+checkpoint timestamps, and consistent with E13's 392k pos/s), so a five-epoch
+run is under two hours and all three fit in a day. Use a larger held-out slice
+than `val.cnn`'s 251,882 records — a few million — since this is an
+architecture comparison rather than a training-progress readout.
+
+**Lower loss does not establish Elo, and TESTING.md says so.** What this step
+can do is stop the task: if C does not clearly beat A in float, where there is
+no quantisation at all, then the quantised version will not either and the one
+to two weeks of C work is not funded. Only a negative result here is
+conclusive.
+
+**Step 1 — the format migration, gated on an unchanged bench.** Bump to v3,
+grow the header, teach the loader and the exporter the four new fields, and
+re-export the *current* checkpoint with `l1Size = 0`. Nothing about the
+evaluation changes, so:
+
+- `make nnue-test` passes on the re-exported net — 10,000 positions, exact.
+- **`make bench` reports the same node count as the current build**, with a
+  different net hash in the header. If it does not, the migration changed
+  something and the rest of the task is built on sand.
+
+Fold two independent fixes into this step, since it is the export-side commit
+and both are one-liners that need the same re-export:
+
+- `ENGINE_MAX_PIECES` 64 -> 32 in `tools/export_net.py`, and the matching cap
+  in `board_set_fen`. Costs the ability to load absurdly crowded puzzles; frees
+  roughly 1.9x of accumulator headroom.
+- Split `WEIGHT_CLIP` into an FT clip and an output clip in
+  `trainer/nnue/format.py`, each derived from its own constraint.
+
+The second one changes what a *retrain* can reach, not what this net computes,
+so it does not threaten the bench gate.
+
+**Step 2 — L1 only: `2H -> l1Size -> 1`.** The smallest change that removes the
+seven-bit output layer. Files: `src/nnue.h` (header fields, payload comment),
+`src/nnue.c` (loader sections, `nnue_head()` replaced by the staged path, an
+AVX2 `madd_epi16` inner loop and a scalar twin that must produce identical
+integers), `tools/export_net.py` (quantise, `check_ranges`, `forward`,
+`write_net`), `trainer/nnue/model.py` (the layers, per-layer clipping),
+`trainer/nnue/format.py` (the new scales).
+
+Gates: `make nnue-test` exact on 10,000 positions, both the AVX2 and the scalar
+build; the debug incremental-accumulator assert still passes; then an SPRT.
+
+**Step 3 — add L2.** Same files, one more stage, its own SPRT. Only if step 2
+paid.
+
+### What `check_ranges` has to learn
+
+The exporter's job is to refuse a net whose arithmetic could overflow the
+engine's, using bounds sound over every position rather than over the sample
+the vectors cover. Three new clauses, in the same style as the existing ones:
+
+- **L1 int32.** `QA * sum_j |l1Weight[b][u][j]|` plus `|l1Bias|`, maximised
+  over buckets and units, against `INT32_MAX`. Computed from the actual
+  weights, not from the `2H * QA * 4096` worst case above.
+- **L2 int32.** The same over `l1Size` terms with the input bounded by 255.
+- **L3 int32.** The same over `l2Size` terms.
+
+And one that is not an overflow check: the exporter should report, per stage,
+what fraction of units clamp at 255 on the vector set. A stage where most units
+saturate is a shift chosen wrong, and it will train to a normal-looking loss
+curve.
+
+### What could go wrong that nothing above catches
+
+| Failure | Symptom | Gate |
+|---|---|---|
+| A shift applied to a negative int32 | C and numpy disagree on a fraction of positions | `make nnue-test`, if the vectors include negatives at that stage |
+| A requantisation shift off by one | net is uniformly over- or under-confident, plays plausibly | none — this is why step 0's float control and the saturation report exist |
+| L1 weights quantised at a scale the shift does not match | constant multiplicative error | the exact-match test catches C against Python, **not** Python against the float model; watch the reported drift |
+| AVX2 and scalar paths summing differently | only one build is wrong | `make nnue-test` on both, which the Makefile must actually build |
+
+The second row is the dangerous one and it has the same shape as every other
+entry in "What can go wrong" below: no crash, no symptom in the loss, and it
+costs exactly enough Elo to make the architecture look like it did not work.
+The defence is that the float model from step 0 is kept, and the quantised
+net's drift against it is reported on export exactly as it is today.
+
+### Expected value, honestly
+
+The mechanism is sound and the defect is measured, but there is no local
+evidence for the size of the gain. Other engines report tens of Elo for this
+transition; this engine's output layer is more pinched than most of theirs
+were, which argues up, and E27 says this net is not starved for parameters,
+which argues down. **Somewhere between neutral and +40, and the SPRT decides.**
+Do not pre-commit the follow-ups below to it.
+
+### What came out differently from the plan above
+
+Steps 1, 2 and 3 are **built**: format version 3, the staged integer forward in
+`src/nnue.c` with an AVX2 and a scalar path, the quantised stack in
+`tools/export_net.py`, and the trainer's `--l1-size` / `--l2-size`. Five things
+landed differently from the sketch, each for a reason worth keeping.
+
+**A stacked net's `qa` must be a power of two, and the exporter picks 256.**
+The sketch said `a[j] = (x[j] * x[j]) / QA` needs no constant of its own
+because at `QA = 255` it already lands in `[0, 255]`. True of the arithmetic
+and false of the implementation: the flat head divides by `qa` *once*, at the
+end of a fused dot product, while a stack has to materialise `a` per element -
+and per element a divide is a divide. `(x * x) >> log2(qa)` is a shift, which
+vectorises as `mullo`/`mulhi` and reassembles exactly. The loader rejects a
+stacked net whose `qa` is not a power of two, by name.
+
+**Every stage rounds to nearest, not toward zero.** Clamp-before-shift is still
+the rule and still the reason C and numpy agree - but a bare shift *truncates*,
+and truncating at every stage of every unit is a systematic downward bias
+rather than noise. Measured on a net whose weights span the whole clipped
+range: mean signed error against the float model **-4.31 cp truncating,
+-0.91 cp rounding**, and mean |error| **6.23 cp against 1.80**. One add per
+unit, carried in the exporter's int32 bound.
+
+**The uncertainty head reads the trunk, not the accumulator.** The sketch said
+"unchanged", which would have kept the head on a `2H -> 1` layer - and that is
+exactly the int16 SIMD product the task exists to remove, so the head would
+have needed a quantisation scale of its own at the moment the value head
+stopped needing one. On the stack's last hidden layer it quantises identically
+to L3, costs ~64x less, and reads better features. It has to be retrained
+either way, and 5c already requires `make unc-probe` to re-centre
+`unc_scale()` after any retrain.
+
+**`outWeight` / `outBias` ARE L3.** Both architectures end in one linear layer
+per bucket over whatever the heads read, so they share the payload slot and the
+loader's pointer arithmetic. The payoff is that **a flat net's v3 payload is
+byte-identical to its v2 payload** - only the 16 bytes of new header differ -
+which is what made step 1's bench gate a formality rather than a hope.
+
+**Step 1's two one-liners were not optional.** `ENGINE_MAX_PIECES` 64 -> 32 and
+the matching cap in `board_set_fen` had to land *with* the stack, because
+`qa = 256` raises the accumulator bound by 0.4% and the shipped net was already
+at 99.5% of int16. Measured on `net-fact.pt`: the bound fell from **32593 to
+16381**, half of int16 instead of all of it. `make perft` and `make perft-all`
+pass exactly, standard and Chess960 alike.
+
+### What was measured
+
+| gate | result |
+|---|---|
+| `make nnue-test`, flat v3, AVX2 | 10000/10000 exact |
+| `make nnue-test`, `2H -> 16 -> 8`, AVX2 | 10000/10000 exact |
+| `make nnue-test`, `2H -> 16 -> 32 -> 8`, AVX2 | 10000/10000 exact |
+| `make nnue-test`, `2H -> 16 -> 32 -> 8`, **scalar** (`ARCH=popcnt`) | 10000/10000 exact |
+| `make smp-test`, stacked net | 11 checks, 0 failures |
+| `make perft`, after the piece-cap change | 0 failures, all four suites |
+| debug build, stacked net, `bench` | 5.2M nodes, incremental-accumulator assert clean |
+| **`make bench`, flat v3 vs the v2 build, same weights** | **236283 = 236283** |
+| a v2 net offered to a v3 engine | refused by name, embedded net kept |
+
+The last two are the ones that matter. The bench identity is step 1's gate: the
+format migration provably changed no evaluation. The v2 rejection is the
+loud-failure half of it.
+
+### Speed, and the two things that were costing it
+
+A stacked evaluation is dominated by L1: `l1Size` dot products over the whole
+activation vector, which at 16 units and 2H = 1024 is **16,384 multiplies per
+trunk** against the flat head's 1,024. Two changes, both measured, and one
+non-result worth recording.
+
+**The trunk was being built twice per node, and now is not.** `unc_scale()` in
+`search.c` asks for the uncertainty at very nearly every node the evaluation is
+asked at, and both heads read the same trunk - so the first implementation paid
+L1 twice. The trunk is now cached per accumulator level, keyed on the position
+key, and both heads share it.
+
+Measured on **identical trees** - the same net, the same node counts, one build
+with the cache disabled:
+
+| net | cache off | cache on | |
+|---|---|---|---|
+| `2H -> 16 -> 32 -> 8` | 392,929 nps | **583,617 nps** | **+48.5%** |
+
+That number also says what the trunk COSTS, which no cross-net comparison can.
+If `C` is everything in a node that is not the trunk and `T` is the trunk, then
+cache-off is `C + 2T` and cache-on is `C + T`, so the ratio gives **T = 0.94 C**
+- the trunk is very nearly as expensive as the whole of the rest of a node.
+
+**The cache lives in its own stack, not on `Accumulator`.** Putting 256 bytes
+on every accumulator level pushes consecutive levels apart and cost ~2% of nps
+on a net **with no stack at all** - which would have handed a stacked net that
+much free Elo in the very SPRT meant to judge it. It is allocated on first use,
+so a flat net neither allocates it nor touches it, and validity is the position
+key rather than a flag `eval_state_push()` would have to clear.
+
+**The version-3 header costs nothing.** The first measurements said -2% to
+-3.7% on the flat path and that was an artefact of running each binary's
+repeats back to back, so a busy period landed entirely on one of them.
+Interleaved, one round per binary, best round each, same weights and identical
+node counts:
+
+| build | nodes | nps | |
+|---|---|---|---|
+| v2 | 2,251,354 | 1,152,166 | |
+| v3 | 2,251,354 | 1,149,671 | **-0.2%** |
+
+**Do not measure this with `bench`.** Its nps swings ~40% on tree shape alone -
+the trained flat net benches 1.13M where an untrained one of the same
+architecture benches 1.61M - so it cannot compare two nets, and piping `quit`
+after `go` kills the search and reports a fake 10M nps. The measurements above
+use a driver that waits for `bestmove` on a fixed node count.
+
+**What the stack costs in a real search, now measured.** See the section below:
+inference is 46-48% of search time, and a stacked evaluation is about 3.4x a
+flat one before the work below and about 2.9x after it. Cross-net nps is still
+not comparable - the undertrained stacked net searches 52.9M nodes at `bench 11`
+where the flat one searches 2.1M - so every figure below compares a build
+against another build **on the same net at the same node count**.
+
+### Making inference faster, and what that cost is made of
+
+A net exported to version 3 had to be no slower than the same net under version
+2, and ideally much faster. It is both. Two things have to be separated first,
+because they answer different questions:
+
+- **Inference throughput** - a harness that walks a tree doing make, push,
+  evaluate, pop, unmake, with the tree's own movegen and make/unmake time
+  subtracted. Repeatable to about 1%.
+- **What the engine feels** - `bench` nps at an unchanged node count, which is
+  the only honest engine-level number, plus an `rdtsc` attribution of
+  `eval_evaluate` + `eval_state_push` + `nnue_uncertainty` inside a real search.
+
+| net | inference before | after | |
+|---|---|---|---|
+| flat `2H -> 8` (version 3 payload byte-identical to version 2) | 185.2 ns | **153.6 ns** | **+17.0%** |
+| stacked `2H -> 16 -> 32 -> 8` | 682.5 ns | **515.6 ns** | **+24.5%** |
+
+| net | bench nps before | after | nodes | |
+|---|---|---|---|---|
+| flat, depth 13 | 1,831,018 | **1,957,468** | 5,016,992 both | **+6.9%** |
+| stacked, depth 9 | 1,015,286 | **1,214,627** | 15,663,833 both | **+19.6%** |
+
+Inside a real search at `bench 13`, with identical node counts and identical
+call counts, `rdtsc` over the three entry points gives 5.213G cycles before and
+4.536G after - **-13.0%**, or **-14.7%** once the ~616M cycles of instrumentation
+present in both are taken out. Inference is **46-48% of search time**, which is
+what makes any of this worth doing.
+
+**Identical node counts are the proof of bit-exactness**, together with the
+harness summing every score it computes: that sum is unchanged to the digit over
+715,225 evaluations on both architectures, `make nnue-test` passes on both, and a
+debug build - which asserts the incremental value against a full recomputation at
+every evaluation - ran 15.7M nodes on the stacked net without firing.
+
+#### What moved
+
+**The layer loop was transposed.** It ran one unit at a time, which reads the
+whole activation vector once PER UNIT - sixteen passes over two kilobytes to do
+one pass worth of multiplies - and ended each unit with a horizontal sum through
+memory that the next unit then waited on. Four units now share one pass and
+reduce in registers. Stacked inference 710 -> 558 ns.
+
+**The SCReLU flush counter left the inner loop.** `NNUE_SCRELU_FLUSH` bounds how
+many terms an int32 lane may hold, which is a property of the WIDTH, not of each
+vector - but testing it per iteration spent three of that loop's seven uops on a
+question the trip count had already settled. Hoisted into an outer loop, with
+two accumulators so consecutive vectors travel independent chains: the flat head
+went 43 -> 27.5 ns.
+
+**The output bucket stopped dividing.** `(pieces - 2) / (32 / buckets)` is two
+runtime integer divisions on every evaluation. Every divisor of 32 is a power of
+two - which `nnue_validate()` already requires of the bucket count - so it is a
+shift, derived at load.
+
+**A refresh cache, which was the largest single win.** A king move that changes
+its side's slot or crosses the mirror reindexes every feature that side sees, so
+the accumulator was rebuilt from the bias: 32 rows drawn out of a 25 MB table at
+scattered indices. That path is **20% of the evaluations in a real search**
+(692,806 of 3,448,346 at `bench 13`) and about a fifth of what evaluation costs.
+One accumulator is now kept per (side, king square) along with the pieces it was
+summed from, and a rebuild diffs the board against that snapshot:
+
+| | full accumulations | rows per rebuild |
+|---|---|---|
+| before | 692,806 | 32 |
+| after | **2,273** | **2.9** |
+
+It is correct by construction rather than by invalidation - the entry carries the
+exact bitboards its accumulator sums, so a stale one is a bigger diff and never a
+wrong answer - and `eval_state_clear()` covers the one thing it cannot see for
+itself, which is the net being swapped underneath it.
+
+**A capture-shaped fast path in the delta.** `(one added, two removed)` joins the
+quiet move's `(one, one)`. The general body reaches its rows through a pointer
+array the compiler cannot unroll away, and move ordering tries captures first.
+
+**The refresh writes its two destinations in one pass** - the cache entry and the
+caller's accumulator - rather than summing into one and then copying.
+
+#### What measured worse, and was not kept
+
+These are recorded because each looked obviously right.
+
+**Prefetching both perspectives feature rows before applying either.** Four
+scattered kilobyte rows with nothing to overlap them is exactly the shape
+prefetching is for. It measured neutral in the harness and neutral in the engine,
+and is not in the tree.
+
+What it did do was expose a real trap. The restructure it needed gave
+`nnue_apply_delta` a second caller, GCC stopped inlining it, emitted one shared
+out-of-line copy, and the per-node update lost its specialised body - **a 25%
+regression in `eval_state_push` in a real search**, from a change that touched no
+arithmetic. The refresh now has its own row-summing function precisely so that
+the per-node delta keeps a single caller. **A second call site is a performance
+change.**
+
+**Fusing the two output heads and caching the pair per level.** `unc_scale()`
+asks for the uncertainty at very nearly every node the evaluation is asked at,
+and the two heads read the same accumulators through the same clamp; the asks
+overlap well, turning 7,727,540 separate head computations into 4,160,326 fused
+ones. It still measured worse - **+1.7% nps against +5.8%** for the trunk cache
+it replaced. The flat head is bound by its two integer multiplies per vector,
+135 cycles against a floor of 128, so sharing the loads and the clamp buys
+nothing, and computing both heads where only one was wanted costs. The trunk
+cache stays because it avoids real WORK rather than duplicate loads: L1 is
+sixteen times the output layer.
+
+**Packing the accumulator stack to the net's width.** Levels are
+`NNUE_MAX_HIDDEN` apart whatever the net is, so a 512-wide net spreads 2 KB of
+live data over 8 KB of stride. Measured 0-4%, inconsistently, at every depth
+tried - not worth a runtime-sized stack.
+
+**Eight units per layer pass instead of four**, and **prefetching the bucket's L1
+weight block during the activation**: +0.5% and nothing respectively. Both say
+the same thing, which is that the layer is short of BANDWIDTH and not of issue
+slots - 32 KB of weights per bucket per evaluation is the whole of an L1 data
+cache, and the weights still have to arrive.
+
+#### A staleness bug fixed on the way
+
+`eval_state_clear()` did not clear the trunk stack. Trunk levels are validated by
+position key, and the root of the next search is very often the position the last
+one ended at - so after `setoption EvalFile` a trunk built from the PREVIOUS net
+could be read back under a matching key. That is the same hazard the function
+already existed to close for the accumulator stack, and the comment in
+`search.c` that explains why it is called per search describes this case exactly.
+
+#### Where the remaining time goes
+
+The flat path is close to its floors. Of 153.6 ns: the head is 27.5 ns against a
+multiply-port floor of about 26, and the rest is the per-node delta, which moves
+roughly six kilobytes - two accumulators read, two written, and two to four
+feature rows - at something near L1/L2 bandwidth. The stacked path is 32 KB of
+L1 weights per evaluation and is bandwidth-bound on them.
+
+The one change left with real headroom is **lazy accumulator updates**: the
+search pushes 4,605,882 times and evaluates 3,448,346 times, so a quarter of the
+per-node delta work is done for nodes that never ask for a score. It would not
+show up in an inference microbenchmark at all - it removes wasted inference
+rather than making inference cheaper - which is exactly why it is worth stating
+separately.
+
+### Follow-ups this opens, each its own experiment
+
+- **Pairwise multiplication on the FT output** - multiply the two halves of
+  each perspective together instead of squaring each unit, which halves what L1
+  reads and so halves the dominant cost above. An architecture change rather
+  than a speedup: a pairwise net is a different function and needs its own
+  training run and its own SPRT.
+- **Squared ReLU on L1** rather than clipped ReLU.
+- **Retest a wider FT.** E27's h1024 lost because it doubled the accumulator
+  cost and returned nothing. If the L1 stack is where the capacity now lives,
+  that experiment is asking a different question than it was.
+- **Revisit QA.** With the output weight no longer the binding constraint, the
+  QA/QB trade is free to move for the first time.
+
+---
+
 ## What can go wrong
 
 | Failure | Symptom | Where it is caught |
