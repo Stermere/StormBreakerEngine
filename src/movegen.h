@@ -11,8 +11,17 @@
 #include "move.h"
 
 /* GEN_EVASIONS requires the side to move to actually be in check, and is narrower
- * than filtering GEN_ALL. GEN_CAPTURES and GEN_QUIETS partition GEN_ALL exactly. */
-typedef enum { GEN_CAPTURES, GEN_QUIETS, GEN_EVASIONS, GEN_ALL } GenType;
+ * than filtering GEN_ALL. GEN_CAPTURES and GEN_QUIETS partition GEN_ALL exactly.
+ * The main search's second partition puts ALL promotions in GEN_TACTICALS;
+ * GEN_NON_TACTICALS contains no promotions. Do not use it to widen quiescence. */
+typedef enum {
+    GEN_CAPTURES,
+    GEN_QUIETS,
+    GEN_EVASIONS,
+    GEN_ALL,
+    GEN_TACTICALS,
+    GEN_NON_TACTICALS
+} GenType;
 
 /* Generates PSEUDO-LEGAL moves - filtering with movegen_is_legal() only for the
  * moves the search actually tries beats generating a legal list up front. `list`

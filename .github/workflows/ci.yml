@@ -107,6 +107,9 @@ jobs:
       - name: Pawn-history gate under sanitizers
         run: ./stormbreaker-debug history selftest
 
+      - name: Staged picker gate under sanitizers
+        run: ./stormbreaker-debug movepick selftest
+
       - name: Run perft suites under sanitizers
         run: |
           ./stormbreaker-debug perft suite tests/perft/standard.epd 4
@@ -137,6 +140,16 @@ jobs:
 
       - name: Pawn-history gate
         run: make history-test
+
+      - name: Staged picker gate
+        run: make movepick-test
+
+      - name: Eager-generation control has the same search tree
+        run: |
+          make staged-eager ARCH=popcnt
+          lazy=$(./stormbreaker bench 10 | sed -n 's/^\([0-9][0-9]*\) nodes .*/\1/p')
+          eager=$(./stormbreaker-eager bench 10 | sed -n 's/^\([0-9][0-9]*\) nodes .*/\1/p')
+          [ -n "$lazy" ] && [ "$lazy" = "$eager" ]
 
       # Bench pins one thread by design, so nothing else in this file says
       # whether the thread pool starts, whether its helpers search, or whether a

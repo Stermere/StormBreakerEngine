@@ -22,6 +22,7 @@
 #include "syzygy.h"
 #include "test/chess960test.h"
 #include "test/historytest.h"
+#include "test/movepicktest.h"
 #include "test/smptest.h"
 #include "test/syzygytest.h"
 #ifdef UNC_PROBE
@@ -677,6 +678,13 @@ bool uci_execute(const char *line) {
         cmd_chess960(cursor);
     } else if (strcmp(cmd, "smp") == 0) {
         cmd_smp(cursor);
+    } else if (strcmp(cmd, "movepick") == 0) {
+        if (token_is(next_token(&cursor), "selftest")) {
+            if (movepick_selftest() != 0)
+                ExitCode = 1;
+        } else {
+            printf("usage: movepick selftest\n");
+        }
     } else if (strcmp(cmd, "history") == 0) {
         if (token_is(next_token(&cursor), "selftest")) {
             if (history_selftest() != 0)

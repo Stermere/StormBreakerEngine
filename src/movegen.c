@@ -45,7 +45,8 @@ static ScoredMove *make_promotions(ScoredMove *out, Square from, Square to, GenT
     if (type != GEN_QUIETS)
         (out++)->m = make_promotion(from, to, QUEEN);
 
-    if (type == GEN_EVASIONS || type == GEN_ALL || (type == GEN_CAPTURES) == capture) {
+    if (type == GEN_EVASIONS || type == GEN_ALL || type == GEN_TACTICALS ||
+        (type == GEN_CAPTURES) == capture) {
         (out++)->m = make_promotion(from, to, ROOK);
         (out++)->m = make_promotion(from, to, BISHOP);
         (out++)->m = make_promotion(from, to, KNIGHT);
@@ -71,7 +72,7 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
     /* When answering a check, the only capturable piece is the checker itself. */
     const Bitboard enemies = type == GEN_EVASIONS ? pos->checkers : color_bb(pos, them);
 
-    if (type != GEN_CAPTURES) {
+    if (type != GEN_CAPTURES && type != GEN_TACTICALS) {
         Bitboard single = shift_up(rest, us) & empty;
         Bitboard dbl    = shift_up(single & rank3, us) & empty;
 
@@ -90,7 +91,7 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
         }
     }
 
-    if (onRank7) {
+    if (onRank7 && type != GEN_NON_TACTICALS) {
         Bitboard east = shift_up_east(onRank7, us) & enemies;
         Bitboard west = shift_up_west(onRank7, us) & enemies;
         Bitboard push = shift_up(onRank7, us) & empty;
@@ -112,7 +113,7 @@ static ScoredMove *gen_pawn_moves(const Position *pos, Color us, GenType type, B
         }
     }
 
-    if (type != GEN_QUIETS) {
+    if (type != GEN_QUIETS && type != GEN_NON_TACTICALS) {
         Bitboard east = shift_up_east(rest, us) & enemies;
         Bitboard west = shift_up_west(rest, us) & enemies;
 
@@ -241,9 +242,11 @@ int movegen_generate(const Position *pos, GenType type, ScoredMove *list) {
 
     const Color us        = pos->sideToMove;
     const Square ksq      = king_square(pos, us);
-    const Bitboard target = type == GEN_CAPTURES ? color_bb(pos, (Color)(us ^ 1))
-                            : type == GEN_QUIETS ? ~occupied_bb(pos)
-                                                 : ~color_bb(pos, us);
+    const bool captures   = type == GEN_CAPTURES || type == GEN_TACTICALS;
+    const bool quiets     = type == GEN_QUIETS || type == GEN_NON_TACTICALS;
+    const Bitboard target = captures ? color_bb(pos, (Color)(us ^ 1))
+                            : quiets ? ~occupied_bb(pos)
+                                     : ~color_bb(pos, us);
 
     ScoredMove *out = list;
     out             = gen_pawn_moves(pos, us, type, target, out);
@@ -251,7 +254,7 @@ int movegen_generate(const Position *pos, GenType type, ScoredMove *list) {
     out             = emit(out, ksq, king_attacks(ksq) & target);
 
     /* Castling is quiet, and is never a legal answer to a check. */
-    if (type != GEN_CAPTURES && pos->checkers == BB_EMPTY)
+    if (!captures && pos->checkers == BB_EMPTY)
         out = gen_castling(pos, us, out);
 
     assert(out - list <= MAX_MOVES);
@@ -340,6 +343,12 @@ bool movegen_is_pseudo_legal(const Position *pos, Move m) {
     const Square to   = to_sq(m);
     const MoveType mt = type_of_move(m);
     const Piece pc    = piece_on(pos, from);
+
+    /* Direct TT/refutation moves no longer acquire canonical encoding by matching a
+     * generated list. Bits 12-13 have meaning ONLY on promotions; aliases would evade
+     * duplicate suppression and could even turn a sentinel into an apparent move. */
+    if (mt != MT_PROMOTION && (m & (3 << 12)))
+        return false;
 
     if (pc == NO_PIECE || color_of(pc) != us)
         return false;

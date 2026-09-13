@@ -25,6 +25,7 @@
 #include "movegen.h"
 #include "nnue.h"
 #include "syzygy.h"
+#include "test/movepicktest.h"
 #include "test/uncprobe.h"
 #include "thread.h"
 #include "timeman.h"
@@ -85,6 +86,17 @@ static const int ContPlies[3] = {1, 2, 4};
 #define CORRHIST_GRAIN      256
 #define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32)
 #define CORRHIST_WEIGHT_MAX 256
+
+#ifdef MOVE_PICKER_PROFILE
+typedef struct {
+    uint64_t mainNodes, mainPicked, mainLegal, mainSearched;
+    uint64_t genCalls[5], generated[5], scored[5];
+    uint64_t orderingSee, pruningSee, cutoffs[7];
+} MoveProfile;
+#define MP_ADD(td, field, amount) ((td)->moveProfile.field += (uint64_t)(amount))
+#else
+#define MP_ADD(td, field, amount) ((void)0)
+#endif
 
 /*
  * Everything one searching thread owns.
@@ -175,6 +187,10 @@ typedef struct {
      * measurable cost for a counter nothing reads at that granularity. */
     uint64_t nodeCount;
     uint64_t tbHits;
+
+#ifdef MOVE_PICKER_PROFILE
+    MoveProfile moveProfile;
+#endif
 
     /* What any other thread is allowed to read, so `info nodes`, `info tbhits` and a node
      * limit can see the whole search rather than one thread's share of it. */
@@ -285,6 +301,9 @@ void search_clear(void) {
         memset(td->captureHist, 0, sizeof(td->captureHist));
         memset(td->pawnCorrHist, 0, sizeof(td->pawnCorrHist));
         memset(td->stack, 0, sizeof(td->stack));
+#ifdef MOVE_PICKER_PROFILE
+        memset(&td->moveProfile, 0, sizeof(td->moveProfile));
+#endif
     }
 
     /* The calling thread's, which is the one that has been evaluating outside a search.
@@ -827,11 +846,9 @@ static inline int pawn_history_score(SearchThread *td, Key key, Piece pc, Square
  * already touching every score, and saves the longest scan there is: the first selection
  * in the loop below, over the whole list.
  */
-static int score_moves(SearchThread *td, const Position *pos, ScoredMove *list, int count,
-                       Move ttMove, int ply, Move counter) {
-    const Color us     = pos->sideToMove;
-    const Move killer0 = td->killers[ply][0];
-    const Move killer1 = td->killers[ply][1];
+static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove *list, int count,
+                               Move ttMove, int ply, Move counter, Move killer0, Move killer1) {
+    const Color us = pos->sideToMove;
 
     /* Context for continuation history: the moves that led to this node. */
     int16_t *slices[CONT_SLOTS];
@@ -852,6 +869,7 @@ static int score_moves(SearchThread *td, const Position *pos, ScoredMove *list, 
         int score              = 0;
 
         if (victim != NO_PIECE_TYPE) {
+            MP_ADD(td, orderingSee, 1);
             const int mvvLva = PieceValues[victim] * 16 - PieceValues[type_of(moved)];
 
             /* Divided down so it refines the MVV-LVA order rather than overturning it:
@@ -892,6 +910,12 @@ static int score_moves(SearchThread *td, const Position *pos, ScoredMove *list, 
             best = i;
 
     return best;
+}
+
+static int score_moves(SearchThread *td, const Position *pos, ScoredMove *list, int count,
+                       Move ttMove, int ply, Move counter) {
+    return score_moves_context(td, pos, list, count, ttMove, ply, counter, td->killers[ply][0],
+                               td->killers[ply][1]);
 }
 
 /* The counter-move registered against whatever was played to reach `ply`. */
@@ -1025,6 +1049,353 @@ static void pick_move(ScoredMove *list, int count, int index) {
         list[index]          = list[best];
         list[best]           = tmp;
     }
+}
+
+typedef enum {
+    PICK_TT,
+    PICK_GENERATE_TACTICALS,
+    PICK_GOOD_TACTICALS,
+    PICK_KILLER_0,
+    PICK_KILLER_1,
+    PICK_COUNTER,
+    PICK_GENERATE_QUIETS,
+    PICK_QUIETS,
+    PICK_BAD_TACTICALS,
+    PICK_EVASIONS,
+    PICK_DONE
+} PickStage;
+
+/* Invocation-local, NOT indexed by ply: singular verification re-enters at the
+ * same ply while its parent's list is still alive. No allocation or buffer clear
+ * on the playing path. The two disjoint generators together fit MAX_MOVES. */
+typedef struct {
+    ScoredMove moves[MAX_MOVES];
+    Move tt, excluded;
+    Move refutations[3];
+    Move returned[3];
+    PickStage stage;
+    int cur, end, start;
+    int tacticalCount, quietCount, badBegin;
+} MovePicker;
+
+static void picker_init(MovePicker *mp, SearchThread *td, const Position *pos, Move tt,
+                        Move excluded, int ply, Move counter) {
+    MP_ADD(td, mainNodes, 1);
+    mp->tt             = tt;
+    mp->excluded       = excluded;
+    mp->refutations[0] = td->killers[ply][0];
+    mp->refutations[1] = td->killers[ply][1];
+    mp->refutations[2] = counter;
+    mp->returned[0] = mp->returned[1] = mp->returned[2] = MOVE_NONE;
+    mp->cur = mp->end = mp->start = mp->badBegin = 0;
+    mp->tacticalCount = mp->quietCount = -1;
+    mp->stage                          = PICK_TT;
+
+    /* Keep the old, eager evasion ordering. A pseudo-legal TT move alone does
+     * not prove membership of GEN_EVASIONS. */
+    if (board_checkers(pos)) {
+        mp->stage = PICK_EVASIONS;
+        mp->end   = movegen_generate(pos, GEN_EVASIONS, mp->moves);
+        MP_ADD(td, genCalls[2], 1);
+        MP_ADD(td, generated[2], mp->end);
+        MP_ADD(td, scored[2], mp->end);
+        pick_first(mp->moves, score_moves(td, pos, mp->moves, mp->end, tt, ply, counter));
+    }
+#ifdef MOVE_PICKER_EAGER
+    else {
+        /* Matched-behaviour timing control: generation is eager, but scoring
+         * still happens at exactly the same stages as in the lazy build. */
+        mp->tacticalCount = movegen_generate(pos, GEN_TACTICALS, mp->moves);
+        mp->quietCount    = movegen_generate(pos, GEN_NON_TACTICALS, mp->moves + mp->tacticalCount);
+        MP_ADD(td, genCalls[0], 1);
+        MP_ADD(td, generated[0], mp->tacticalCount);
+        MP_ADD(td, genCalls[1], 1);
+        MP_ADD(td, generated[1], mp->quietCount);
+        assert(mp->tacticalCount + mp->quietCount <= MAX_MOVES);
+    }
+#endif
+}
+
+static bool picker_duplicate(const MovePicker *mp, Move m) {
+    return m == mp->tt || m == mp->excluded || m == mp->returned[0] || m == mp->returned[1] ||
+           m == mp->returned[2];
+}
+
+static Move picker_next(MovePicker *mp, SearchThread *td, const Position *pos, int ply) {
+    for (;;) {
+        switch (mp->stage) {
+        case PICK_TT:
+            mp->stage = PICK_GENERATE_TACTICALS;
+            /* Search validated the TT encoding when probing. Legality stays in
+             * the common loop, before moveCount or board mutation. */
+            if (mp->tt != MOVE_NONE && mp->tt != mp->excluded)
+                return mp->tt;
+            break;
+
+        case PICK_GENERATE_TACTICALS:
+            if (mp->tacticalCount < 0) {
+                mp->tacticalCount = movegen_generate(pos, GEN_TACTICALS, mp->moves);
+                MP_ADD(td, genCalls[0], 1);
+                MP_ADD(td, generated[0], mp->tacticalCount);
+            }
+            MP_ADD(td, scored[0], mp->tacticalCount);
+            mp->cur = mp->start = 0;
+            mp->end             = mp->tacticalCount;
+            pick_first(mp->moves, score_moves(td, pos, mp->moves, mp->end, mp->tt, ply, MOVE_NONE));
+#ifndef NDEBUG
+            /* A future SEE/promotion change must not silently put a tactical
+             * between quiets while this picker assumes two separated bands. */
+            for (int i = 0; i < mp->end; ++i)
+                assert(mp->moves[i].score > SCORE_KILLER_1 ||
+                       mp->moves[i].score < -HISTORY_MAX * (1 + CONT_SLOTS + 2));
+#endif
+            mp->stage = PICK_GOOD_TACTICALS;
+            break;
+
+        case PICK_GOOD_TACTICALS:
+            while (mp->cur < mp->end) {
+                if (mp->cur > mp->start)
+                    pick_move(mp->moves, mp->end, mp->cur);
+                if (mp->moves[mp->cur].score < SCORE_KILLER_1)
+                    break;
+                const Move m = mp->moves[mp->cur++].m;
+                if (!picker_duplicate(mp, m))
+                    return m;
+            }
+            /* The best remaining tactical has already been selected. Preserve
+             * it, and its scores, across quiet subtrees. */
+            mp->badBegin = mp->cur;
+            mp->stage    = PICK_KILLER_0;
+            break;
+
+        case PICK_KILLER_0:
+        case PICK_KILLER_1:
+        case PICK_COUNTER: {
+            const int slot = mp->stage - PICK_KILLER_0;
+            const Move m   = mp->refutations[slot];
+            ++mp->stage;
+            if (m != MOVE_NONE && !picker_duplicate(mp, m) && movegen_is_pseudo_legal(pos, m) &&
+                !is_tactical(pos, m)) {
+                mp->returned[slot] = m;
+                return m;
+            }
+            break;
+        }
+
+        case PICK_GENERATE_QUIETS:
+            if (mp->quietCount < 0) {
+                mp->quietCount =
+                    movegen_generate(pos, GEN_NON_TACTICALS, mp->moves + mp->tacticalCount);
+                MP_ADD(td, genCalls[1], 1);
+                MP_ADD(td, generated[1], mp->quietCount);
+            }
+            MP_ADD(td, scored[1], mp->quietCount);
+            assert(mp->tacticalCount + mp->quietCount <= MAX_MOVES);
+            mp->cur = mp->start = mp->tacticalCount;
+            mp->end             = mp->tacticalCount + mp->quietCount;
+            /* Refutations were snapshotted and tried already. Reading NEW
+             * killers here after singular verification would create a second
+             * refutation stage inside what is meant to be the history band. */
+            pick_first(mp->moves + mp->start,
+                       score_moves_context(td, pos, mp->moves + mp->start, mp->quietCount,
+                                           MOVE_NONE, ply, MOVE_NONE, MOVE_NONE, MOVE_NONE));
+            mp->stage = PICK_QUIETS;
+            break;
+
+        case PICK_QUIETS:
+        case PICK_BAD_TACTICALS:
+        case PICK_EVASIONS:
+            while (mp->cur < mp->end) {
+                if (mp->cur > mp->start)
+                    pick_move(mp->moves, mp->end, mp->cur);
+                const Move m = mp->moves[mp->cur++].m;
+                if (mp->stage == PICK_EVASIONS ? m != mp->excluded : !picker_duplicate(mp, m))
+                    return m;
+            }
+            if (mp->stage == PICK_QUIETS) {
+                mp->cur = mp->start = mp->badBegin;
+                mp->end             = mp->tacticalCount;
+                mp->stage           = PICK_BAD_TACTICALS;
+            } else {
+                mp->stage = PICK_DONE;
+            }
+            break;
+
+        case PICK_DONE: return MOVE_NONE;
+        }
+    }
+}
+
+/* Acceptance bridges use isolated state, so the UCI selftest cannot contaminate
+ * the pool's histories. No playing-path branch or allocation is needed. */
+bool search_test_picker(const Position *pos, PickerTestMoves hints, int limit,
+                        PickerTestResult *out) {
+    memset(out, 0, sizeof(*out));
+    SearchThread *td = calloc(1, sizeof(*td));
+    if (!td)
+        return false;
+    td->killers[1][0] = hints.killer0;
+    td->killers[1][1] = hints.killer1;
+    if (!movegen_is_pseudo_legal(pos, hints.tt))
+        hints.tt = MOVE_NONE;
+    MovePicker mp;
+    picker_init(&mp, td, pos, hints.tt, hints.excluded, 1, hints.counter);
+    bool ok = true;
+    while (out->count < limit) {
+        const Move m = picker_next(&mp, td, pos, 1);
+        if (m == MOVE_NONE)
+            break;
+        if (out->count == MAX_MOVES) {
+            ok = false;
+            break;
+        }
+        ScoredMove *entry = &out->moves[out->count++];
+        entry->m          = m;
+        score_moves(td, pos, entry, 1, hints.tt, 1, hints.counter);
+    }
+    out->tacticalCount = mp.tacticalCount;
+    out->quietCount    = mp.quietCount;
+    free(td);
+    return ok;
+}
+
+static uint64_t picker_perft(SearchThread *td, Position *pos, int depth) {
+    if (depth == 0)
+        return 1;
+    MovePicker mp;
+    picker_init(&mp, td, pos, MOVE_NONE, MOVE_NONE, 1, MOVE_NONE);
+    uint64_t nodes = 0;
+    for (Move m; (m = picker_next(&mp, td, pos, 1)) != MOVE_NONE;) {
+        if (!movegen_is_legal(pos, m))
+            continue;
+        board_do_move(pos, m);
+        nodes += picker_perft(td, pos, depth - 1);
+        board_undo_move(pos, m);
+    }
+    return nodes;
+}
+
+uint64_t search_test_picker_perft(Position *pos, int depth) {
+    SearchThread *td = calloc(1, sizeof(*td));
+    if (!td || depth < 0) {
+        free(td);
+        return 0;
+    }
+    const uint64_t nodes = picker_perft(td, pos, depth);
+    free(td);
+    return nodes;
+}
+
+int search_test_picker_contracts(void) {
+    SearchThread *td = calloc(1, sizeof(*td));
+    Position *pos    = calloc(1, sizeof(*pos));
+    if (!td || !pos) {
+        free(td);
+        free(pos);
+        return 1;
+    }
+    int failures = 0;
+    board_set_startpos(pos);
+    const Move tt       = make_move(SQ_E2, SQ_E4);
+    const Move k0       = make_move(SQ_D2, SQ_D4);
+    const Move k1       = make_move(SQ_G1, SQ_F3);
+    const Move counter  = make_move(SQ_B1, SQ_C3);
+    const Move deferred = make_move(SQ_A2, SQ_A4);
+    td->killers[1][0]   = k0;
+    td->killers[1][1]   = k1;
+    MovePicker parent, child;
+    picker_init(&parent, td, pos, tt, MOVE_NONE, 1, counter);
+    failures += picker_next(&parent, td, pos, 1) != tt;
+
+    /* A nested same-ply picker and changed refutations cannot overwrite the
+     * parent's candidate snapshot. This is singular verification's lifetime. */
+    td->killers[1][0] = deferred;
+    td->killers[1][1] = MOVE_NONE;
+    picker_init(&child, td, pos, tt, tt, 1, deferred);
+    int childCount = 0;
+    for (Move m; (m = picker_next(&child, td, pos, 1)) != MOVE_NONE;) {
+        failures += m == tt;
+        if (++childCount > MAX_MOVES) {
+            ++failures;
+            break;
+        }
+    }
+    failures += childCount != 19;
+    failures += picker_next(&parent, td, pos, 1) != k0;
+    failures += picker_next(&parent, td, pos, 1) != k1;
+    failures += picker_next(&parent, td, pos, 1) != counter;
+#ifndef MOVE_PICKER_EAGER
+    failures += parent.quietCount != -1;
+#endif
+    /* History is read when quiet scoring is reached, then frozen for that
+     * batch, not silently re-read on every next(). */
+    td->history[WHITE][SQ_A2][SQ_A4] = HISTORY_MAX;
+    failures += picker_next(&parent, td, pos, 1) != deferred;
+    MovePicker frozen = parent;
+    for (int from = 0; from < SQUARE_NB; ++from)
+        for (int to = 0; to < SQUARE_NB; ++to)
+            td->history[WHITE][from][to] = (int16_t)(to * 73 - from * 31);
+    for (int i = 0; i < MAX_MOVES; ++i) {
+        const Move a = picker_next(&parent, td, pos, 1);
+        const Move b = picker_next(&frozen, td, pos, 1);
+        failures += a != b;
+        if (a == MOVE_NONE)
+            break;
+        if (i == MAX_MOVES - 1)
+            ++failures;
+    }
+
+    /* All promotion scores are in the early band today: SEE declines to
+     * judge non-normal moves. Exercise the same formulas at history limits,
+     * rather than relying on a historical description of SEE. */
+    if (!board_set_fen(pos, "1r2k3/P7/8/8/8/8/8/4K3 w - - 0 1")) {
+        ++failures;
+    } else {
+        ScoredMove list[MAX_MOVES];
+        const int n = movegen_generate(pos, GEN_TACTICALS, list);
+        failures += n != 8;
+        for (int sign = -1; sign <= 1; sign += 2) {
+            td->captureHist[W_PAWN][SQ_B8][ROOK] = (int16_t)(sign * HISTORY_MAX);
+            score_moves(td, pos, list, n, MOVE_NONE, 1, MOVE_NONE);
+            for (int i = 0; i < n; ++i)
+                failures += list[i].score <= SCORE_KILLER_1;
+        }
+    }
+    const int maxQuiet = HISTORY_MAX * (1 + CONT_SLOTS + 2);
+    failures += maxQuiet >= SCORE_COUNTER;
+
+    /* Read each kind of mutable ordering evidence at its documented stage,
+     * including contexts that share storage with a descendant's updates. */
+    if (!board_set_fen(pos, "4k3/8/8/8/8/1p3p2/8/2N1K1N1 w - - 0 1")) {
+        ++failures;
+    } else {
+        td->killers[1][0] = td->killers[1][1] = MOVE_NONE;
+        const Move king                       = make_move(SQ_E1, SQ_E2);
+        const Move capture                    = make_move(SQ_G1, SQ_F3);
+        picker_init(&parent, td, pos, king, MOVE_NONE, 1, MOVE_NONE);
+        failures += picker_next(&parent, td, pos, 1) != king;
+        td->captureHist[W_KNIGHT][SQ_F3][PAWN] = HISTORY_MAX;
+        failures += picker_next(&parent, td, pos, 1) != capture;
+    }
+    for (int context = 0; context < 2; ++context) {
+        board_set_startpos(pos);
+        memset(td->history, 0, sizeof(td->history));
+        td->stack[0].move       = make_move(SQ_E7, SQ_E5);
+        td->stack[0].movedPiece = B_PAWN;
+        picker_init(&parent, td, pos, tt, MOVE_NONE, 1, MOVE_NONE);
+        failures += picker_next(&parent, td, pos, 1) != tt;
+        int16_t *entry   = context == 0
+                               ? history_pawn_entry(&td->pawnHistory, pos->pawnKey, W_PAWN, SQ_A4)
+                               : &td->contHist[0][B_PAWN][SQ_E5][W_PAWN][SQ_A4];
+        *entry           = HISTORY_MAX;
+        const Move first = picker_next(&parent, td, pos, 1);
+        if (context != 0 || PAWN_HIST_WEIGHT != 0)
+            failures += first != deferred;
+        *entry = 0;
+    }
+    free(pos);
+    free(td);
+    return failures;
 }
 
 static void update_pv(SearchThread *td, int ply, Move m) {
@@ -1270,6 +1641,9 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
 
     ScoredMove moves[MAX_MOVES];
     const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_CAPTURES, moves);
+    MP_ADD(td, genCalls[3], 1);
+    MP_ADD(td, generated[3], count);
+    MP_ADD(td, scored[3], count);
 
     /* No counter-move: quiescence only reaches quiet moves when answering a check, and an
      * evasion is dictated by the check rather than by whatever the opponent played. */
@@ -1589,6 +1963,9 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         !(ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth - 3 && ttValue < probCutBeta)) {
         ScoredMove pcMoves[MAX_MOVES];
         const int pcCount = movegen_generate(pos, GEN_CAPTURES, pcMoves);
+        MP_ADD(td, genCalls[4], 1);
+        MP_ADD(td, generated[4], pcCount);
+        MP_ADD(td, scored[4], pcCount);
 
         /* No counter-move: the list is captures, which the quiet heuristics have no opinion
          * about. The capture has to reach the raised bound on material alone - one needing
@@ -1600,6 +1977,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 pick_move(pcMoves, pcCount, i);
             const Move m = pcMoves[i].m;
 
+            MP_ADD(td, pruningSee, 1);
             if (!see_ge(pos, m, probCutBeta - staticEval))
                 continue;
 
@@ -1633,9 +2011,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         }
     }
 
-    ScoredMove moves[MAX_MOVES];
-    const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_ALL, moves);
-    pick_first(moves, score_moves(td, pos, moves, count, ttMove, ply, counter_move(td, ply)));
+    MovePicker picker;
+    picker_init(&picker, td, pos, ttMove, excluded, ply, counter_move(td, ply));
 
     /* Moves already tried here, so the one that eventually cuts can penalise them. Bounded:
      * a node with more than this many is one where the ordering statistics were not going to
@@ -1663,16 +2040,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * fail-low entry BOUND_EXACT and a later probe would cut on it. */
     bool raisedAlpha = false;
 
-    for (int i = 0; i < count; ++i) {
-        if (i > 0)
-            pick_move(moves, count, i);
-        const Move m = moves[i].m;
-
-        if (m == excluded)
-            continue;
-
+    for (Move m; (m = picker_next(&picker, td, pos, ply)) != MOVE_NONE;) {
+        MP_ADD(td, mainPicked, 1);
         if (!movegen_is_legal(pos, m))
             continue;
+        MP_ADD(td, mainLegal, 1);
         ++moveCount;
 
         const bool tactical = is_tactical(pos, m);
@@ -1736,6 +2108,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                               unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SEE_QUIET) /
                               100;
 
+                MP_ADD(td, pruningSee, 1);
                 if (!see_ge(pos, m, seeMargin))
                     continue;
             }
@@ -1813,7 +2186,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             extension = 1;
 
         const Depth childDepth = depth - 1 + extension;
-        Value v                = VALUE_NONE;
+        MP_ADD(td, mainSearched, 1);
+        Value v = VALUE_NONE;
 
         /* LMR retries reduced fail-highs at normal depth, but a false fail-low can still
          * hide a move. Forcing moves are exempt; failed-move learning below distinguishes
@@ -1911,6 +2285,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                     }
                     update_stats(td, pos, m, quiets, quietPawnMaluses, quietCount, captures,
                                  captureCount, depth, ply, pawnExtraCredit);
+#ifdef MOVE_PICKER_PROFILE
+                    const int stage = inCheck                                ? 6
+                                      : m == ttMove                          ? 0
+                                      : picker.stage == PICK_GOOD_TACTICALS  ? 1
+                                      : picker.stage == PICK_GENERATE_QUIETS ? 3
+                                      : picker.stage == PICK_QUIETS          ? 4
+                                      : picker.stage == PICK_BAD_TACTICALS   ? 5
+                                                                             : 2;
+                    ++td->moveProfile.cutoffs[stage];
+#endif
                     break;
                 }
             }
@@ -2395,6 +2779,9 @@ static void thread_prepare(SearchThread *td) {
     td->nodeCount = 0;
     td->tbHits    = 0;
     td->selDepth  = 0;
+#ifdef MOVE_PICKER_PROFILE
+    memset(&td->moveProfile, 0, sizeof(td->moveProfile));
+#endif
 
     atomic_store(&td->publishedNodes, 0);
     atomic_store(&td->publishedTbHits, 0);
@@ -2435,6 +2822,30 @@ static void finish_search(void) {
     mutex_unlock(&ThreadMutex);
 
     const SearchThread *const best = best_thread();
+
+#ifdef MOVE_PICKER_PROFILE
+    /* Helpers are parked before their counters are read. Per-position lines
+     * keep bench's final OpenBench line untouched and can be summed offline. */
+    static const char *const bands[] = {"tactical", "quiet", "evasion", "qsearch", "probcut"};
+    for (int t = 0; t < ThreadCount; ++t) {
+        const MoveProfile *p = &Threads[t]->moveProfile;
+        printf("info string movepick nodes=%llu picked=%llu legal=%llu searched=%llu "
+               "orderingSEE=%llu pruningSEE=%llu\n",
+               (unsigned long long)p->mainNodes, (unsigned long long)p->mainPicked,
+               (unsigned long long)p->mainLegal, (unsigned long long)p->mainSearched,
+               (unsigned long long)p->orderingSee, (unsigned long long)p->pruningSee);
+        for (int i = 0; i < 5; ++i)
+            printf("info string movepick %s calls=%llu generated=%llu scored=%llu\n", bands[i],
+                   (unsigned long long)p->genCalls[i], (unsigned long long)p->generated[i],
+                   (unsigned long long)p->scored[i]);
+        printf("info string movepick cuts tt=%llu good=%llu killer=%llu counter=%llu "
+               "quiet=%llu bad=%llu evasion=%llu\n",
+               (unsigned long long)p->cutoffs[0], (unsigned long long)p->cutoffs[1],
+               (unsigned long long)p->cutoffs[2], (unsigned long long)p->cutoffs[3],
+               (unsigned long long)p->cutoffs[4], (unsigned long long)p->cutoffs[5],
+               (unsigned long long)p->cutoffs[6]);
+    }
+#endif
 
     /* A GUI's last `info` line is where its evaluation display comes from, and it has
      * been thread 0's all search. When somebody else's iteration wins, saying so is the

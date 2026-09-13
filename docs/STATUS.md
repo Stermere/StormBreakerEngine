@@ -65,7 +65,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | **gen-5 data generated with tablebases and no adjudication** | **TODO** |
 | Lazy SMP: per-thread state, parked pool, `Threads` 1–1024, Windows processor groups | built, **scaling measured, no SPRT** |
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
-| **Staged movegen 2: full staged picker, captures and quiets deferred** | **TODO** |
+| Staged movegen 2: main-search picker, tacticals and quiets deferred | **provisional keep**; STC +5.72 ± 4.96 Elo, LLR +1.920, stopped for budget; **SPRT inconclusive, LTC pending** (E36) |
 | **Staged movegen 3: the ordering changes staging enables, one SPRT each** | **TODO** |
 | Chess960: per-position castling geometry, both FEN spellings, unambiguous notation | shipped; verified against an independent engine (E25) |
 | Time management: the sudden-death horizon was a decay rate, 20 -> 50 | **+271.84 ± 31.03** (E29) |
@@ -77,6 +77,16 @@ adds the structural checks a node count cannot make, and `make openbench-check`
 passes, so the engine can be registered with a distributed testing cluster.
 
 ## Notes on staged move generation
+
+The main search now uses the full picker described in [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md).
+It retains eager evasions and leaves quiescence/ProbCut unchanged. Its changed scoring
+timestamps and tie order make it behavioural. The owner's STC test favoured the
+patch (+5.72 ± 4.96 Elo, LLR +1.920) but was stopped for machine-time budget
+before the +2.944 acceptance boundary. **Provisional keep, not an SPRT pass or
+formal non-inferiority result; LTC pending.** E36 records the reported snapshot,
+including its game-count discrepancy.
+The measurements and failed TT-only experiment below are historical, not estimates
+for the current network or guarantees about the new picker.
 
 Staged move generation is listed after the NNUE integration deliberately: a more
 expensive evaluation shrinks whatever share generation occupies, so it should be
@@ -93,7 +103,7 @@ count**, on the reasoning that the ordering bands in `src/search.c` are strictly
 separated and so a staged picker can reproduce today's order exactly. **That is
 measurably wrong, and each step needs an SPRT.** Band separation governs the
 order in which a *scored* list is walked, but staging also moves *when* the
-scoring happens: `score_moves()` currently runs before any child is searched,
+scoring happens: the old `score_moves()` ran before any child was searched,
 whereas a staged picker runs it after the table move's subtree has already
 updated `History`, `ContHist`, `CaptureHist` and `CounterMoves`. The remaining
 moves are then scored against different tables and can reorder.
@@ -111,13 +121,13 @@ share. **Do not build steps 2 or 3 on the 5-9 Elo figure.** Measure first, on a
 profile, what a full staged picker actually saves in nps - rather than inferring
 it from the share of cycles generation occupies.
 
-Promotions are a second, independent reason step 2 cannot reproduce today's
-order for free. They straddle the bands three ways: a quiet underpromotion is
-generated as a quiet but scores in the winning-capture band, and an SEE-losing
-capturing promotion scores down into the quiet band. A tactical stage therefore
-has to generate promotions and spill whatever scores below `SCORE_KILLER_1` into
-the quiet stage - and unlike the scoring-time effect above, this one is at least
-fixable by construction.
+Promotions are another reason a capture/quiet generator split does not directly
+describe ordering: quiet underpromotions belong to `GEN_QUIETS`, but score in the
+high tactical band. The new `GEN_TACTICALS` includes all four promotions without
+changing the old generators. The earlier warning about SEE-losing promotions
+entering the quiet band does not describe current code: `see_ge()` declines to
+judge non-normal moves and returns true at threshold zero. Tests hold that
+current band contract rather than assuming a future SEE change preserves it.
 
 ## Where to go next
 

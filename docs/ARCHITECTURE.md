@@ -187,10 +187,13 @@ What is left is structural rather than incremental:
   are steered only by a fixed skip pattern; which iterations they should be
   given, and how the pool's results should be combined, are open questions with
   measurable answers.
-- **Move generation is not staged.** Every node generates its whole move list
-  and scores all of it, including at nodes where the transposition move cuts
-  immediately. A staged picker — table move, then captures, then quiets,
-  generated only when reached — avoids that work.
+- **Main-search generation is staged; provisionally kept after STC.** TT, good
+  tacticals (all promotions included), killers/counter, quiets, then retained
+  losing captures. Each batch is generated and scored only when reached. State
+  belongs to an invocation, not a ply, because singular verification re-enters
+  at the same ply. Evasions, quiescence and ProbCut remain eager. STC favoured
+  the patch but stopped for machine-time budget before a verdict; LTC is pending. See
+  [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md) for contracts and measurements.
 - **No correction history.** Nothing feeds the difference between the static
   evaluation and the searched score back into later static evaluations.
 

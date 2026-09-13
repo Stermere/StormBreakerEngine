@@ -2510,3 +2510,70 @@ middlegame set the pool beat them outright, which is the tell.
 - `search_clear()` memsets every thread's 8 MB of history from the calling
   thread, which on a NUMA machine puts all of it on one node. Not measurable
   here - this box has one.
+
+### E36: Full main-search staged generation — provisional keep, STC stopped undecided
+
+**Date** 2026-09-12 · **Baseline** `defc301`, preserved as
+`stormbreaker-staged-base.exe` · **Net** `f2886d3e2c71` · **Status** correctness
+and local throughput checked; **provisional keep after encouraging STC evidence,
+stopped for machine-time budget before an SPRT verdict. LTC pending.**
+
+Unlike E15's TT-only attempt, the picker defers quiet generation/scoring past
+good tacticals, both killers and the counter-move. All promotions belong to the
+main tactical batch without changing quiescence's generator. Evasions, qsearch,
+ProbCut, pruning and reduction policies remain unchanged. Invocation-local
+buffers survive singular verification at the same ply; canonical encoding
+validation replaces the old TT move's implicit generator-membership gate.
+
+Bench depth 13: **5,016,992 original / 5,589,919 staged**. Deferred history reads
+and stage-local ties are behavioural. An eager-GENERATION control keeping the
+same scoring times produces **5,589,919 exactly**, isolating generation timing
+from tree changes. Four alternating native-GCC runs gave median NPS of about
+2.488M original, 2.529M control and 2.565M staged (~3.1% and ~1.4% gains).
+Total time to depth was LONGER than original, since the staged tree grew.
+These short local timings are not evidence of strength or a guaranteed speedup.
+
+The depth-12 profile reached quiet generation at 346,009 of 742,570 non-check
+main-picker nodes, avoiding that work at 53.4%. Qsearch and ProbCut generation
+are counted separately. Production-picker set tests, exhaustive encoding checks,
+picker-driven perft, standard/Chess960 perft, history, SMP, NNUE reference
+verification, OpenBench compliance and datagen tests passed. Linux sanitizer
+execution is left to CI; Windows debug assertions passed locally.
+
+#### Owner-run STC result
+
+The owner ran the match manually and elected to stop for lack of further machine
+time. The reported snapshot was:
+
+| Metric | Reported result |
+|---|---|
+| Match | dev vs stormbreaker-staged-base |
+| Time control / normalized bounds | 8+0.08 / [0, 5] |
+| Panel progress | 6,280 games |
+| W / L / D | 1,676 / 1,573 / 3,011 |
+| Score | 50.82% |
+| Elo | **+5.72 ± 4.96** |
+| Normalized Elo | +9.91 ± 8.61 |
+| LOS | 98.8% |
+| LLR / stopping boundaries | **+1.920** / −2.944, +2.944 |
+| Pentanomial | [56, 751, 1429, 822, 72] |
+| Elapsed | 5:42:22 |
+| Decision | **Provisional keep; SPRT inconclusive** |
+
+Source: the owner's pasted live panel, not an independently reanalysed PGN.
+Its W/L/D totals sum to 6,260 games and its pentanomial counts to 3,130 pairs
+(also 6,260 games), 20 fewer than the panel's progress count. Both are recorded
+as supplied; no final PGN/log path was supplied to reconcile the discrepancy.
+
+The evidence favours an improvement and gives practical reassurance against a
+regression, enough for the owner's provisional keep. It is **not a passed SPRT
+or a formal non-inferiority result**: the LLR did not reach +2.944. The reported
+Elo interval and LOS are interim estimates, not substitutes for the sequential
+stopping boundary or a proven +6 Elo gain. Stopping for budget leaves the test
+undecided. LTC confirmation remains pending; no further matches were launched
+by the coding agent.
+
+See [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md) for exact scope, raw timing values,
+baseline identity, test/control builds and explicit **manual STC/LTC commands**.
+The coding agent checked only their `--dry-run` forms; the STC above was run by
+the owner.
