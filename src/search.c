@@ -428,7 +428,7 @@ static inline void update_seldepth(SearchThread *td, int ply) {
  * the released engine is unchanged, while `make TUNE_SEARCH=on` makes each a spin option
  * so a sweep costs a `setoption` instead of a rebuild.
  */
-TUNABLE(RFP_MARGIN, 67);
+TUNABLE(RFP_MARGIN, 71);
 #define RFP_DEPTH 7
 
 #define LMP_DEPTH 8
@@ -438,7 +438,7 @@ TUNABLE(RFP_MARGIN, 67);
 /* Much smaller than the "value of a quiet move" intuition suggests: at a null-window node
  * alpha tracks the evaluation, so staticEval sits close to alpha far more often than
  * not, and 100/ply measured at 0.008% of the bench tree. The useful range is narrow. */
-TUNABLE(FUTILITY_MARGIN, 58);
+TUNABLE(FUTILITY_MARGIN, 59);
 
 /* The depth below which the previous score is too unreliable to aim a window at. A
  * #define rather than a TUNABLE because SPSA perturbs continuously and then rounds, so
@@ -450,16 +450,16 @@ TUNABLE(FUTILITY_MARGIN, 58);
  * quiescence. Much larger than futility's because the claim is bigger - this discards
  * the whole node - and it is verified rather than assumed: the qsearch actually runs,
  * and only its result can prune. */
-TUNABLE(RAZOR_MARGIN, 309);
+TUNABLE(RAZOR_MARGIN, 311);
 #define RAZOR_DEPTH 3
 
 /* A move that loses material outright is worth searching only if there is depth left to
  * show what it wins back. Captures scale linearly and quiets quadratically, because a
  * quiet move that hangs a piece has no compensation to demonstrate in the first place. */
 #define SEE_CAPTURE_DEPTH 6
-TUNABLE(SEE_CAPTURE_MARGIN, 86);
+TUNABLE(SEE_CAPTURE_MARGIN, 89);
 #define SEE_QUIET_DEPTH 8
-TUNABLE(SEE_QUIET_MARGIN, 12);
+TUNABLE(SEE_QUIET_MARGIN, 7);
 
 /*
  * ProbCut, the mirror of razoring at the other end of the window: a capture that still
@@ -473,26 +473,26 @@ TUNABLE(SEE_QUIET_MARGIN, 12);
  */
 TUNABLE(PROBCUT_DEPTH, 5);
 #define PROBCUT_REDUCTION 4
-TUNABLE(PROBCUT_MARGIN, 109);
+TUNABLE(PROBCUT_MARGIN, 111);
 
 /* Standing pat is always available, so a capture that cannot bring the evaluation within
  * a minor piece of alpha even after winning its victim outright will not raise it. The
  * margin covers what the rest of the sequence might swing, hence a piece rather than a
  * pawn. */
-TUNABLE(DELTA_MARGIN, 389);
+TUNABLE(DELTA_MARGIN, 409);
 
 /* The shallowest depth worth a singular test, and how far below the stored score the
  * verification window sits (in sixteenths of a centipawn per ply). The floor keeps it
  * affordable, and the margin has to be wide enough that a merely best move does not read
  * as singular and narrow enough that a forced line still does. */
 #define SINGULAR_DEPTH 7
-TUNABLE(SINGULAR_MARGIN, 39);
+TUNABLE(SINGULAR_MARGIN, 33);
 
 #define CORR_W_UNIT 128
 /* How much the correction is believed, out of CORR_W_UNIT. A TUNABLE because how far to
  * trust a learned evaluation bias is the kind of question a sweep answers better than a
  * person; this was chosen rather than fitted. See E14. */
-TUNABLE(CORR_W_PAWN, 132);
+TUNABLE(CORR_W_PAWN, 133);
 
 /* Uncertainty scaling of the margins above: floor percentage, percent per centipawn of
  * learned correction, and the cap. The cap is SPSA-fitted (E22, E22a); the floor and
@@ -506,9 +506,11 @@ TUNABLE(UNC_SCALE_MAX, 144);
  * predicted |eval error| rather than learned bias - a larger number with its own
  * distribution, hence its own floor and slope (sixteenths of a percent per cp). Centred
  * on sigma over the d12 bench tree and then fitted by E22; E22a's re-sweep moved both one
- * unit and stopped, so the mapping is converged. */
-TUNABLE(UNC_SIGMA_BASE, 73);
-TUNABLE(UNC_SIGMA_SLOPE, 13);
+ * unit and stopped, which read as converged until a third sweep at LTC pulled the slope
+ * another three units at drift z +3.5. STC reaches depth 12-13 and LTC does not stop
+ * there, so what E22a measured as flat was a mapping flat over the tree it played on. */
+TUNABLE(UNC_SIGMA_BASE, 75);
+TUNABLE(UNC_SIGMA_SLOPE, 16);
 
 /*
  * How much of the mapping each margin actually wants. unc_scale() returns ONE number, and
@@ -522,23 +524,11 @@ TUNABLE(UNC_SIGMA_SLOPE, 13);
  * and a sweep holding both seats would converge on nothing.
  */
 #define UNC_W_UNIT 16
-TUNABLE(UNC_W_RFP, 16);
+TUNABLE(UNC_W_RFP, 17);
 TUNABLE(UNC_W_FUTILITY, 16);
-TUNABLE(UNC_W_RAZOR, 16);
-TUNABLE(UNC_W_PROBCUT, 16);
-TUNABLE(UNC_W_DELTA, 16);
-
-/* Zero because these two never consulted the mapping at all. A SEE threshold is the same
- * kind of claim as a futility margin, so the exclusion was an omission rather than a
- * decision, and a seat that starts at zero costs nothing to leave there. */
-TUNABLE(UNC_W_SEE_CAPTURE, 0);
-TUNABLE(UNC_W_SEE_QUIET, 0);
-
-/* Zero for that reason and one more: this margin sets a verification WINDOW rather than a
- * pruning threshold, so a wider one extends more rather than prunes less. Whether
- * uncertainty should buy extensions is a genuine question, and not the one the other
- * seats ask. */
-TUNABLE(UNC_W_SINGULAR, 0);
+TUNABLE(UNC_W_RAZOR, 17);
+TUNABLE(UNC_W_PROBCUT, 17);
+TUNABLE(UNC_W_DELTA, 18);
 
 /*
  * The second tier: constants that shape a formula rather than sit in a comparison.
@@ -550,20 +540,20 @@ TUNABLE(UNC_W_SINGULAR, 0);
  * Reductions[d][m] is built from LMR_BASE and LMR_DIVISOR once, so search_tunable_set()
  * rebuilds the table.
  */
-TUNABLE(LMR_BASE, 14);
-TUNABLE(LMR_DIVISOR, 22);
+TUNABLE(LMR_BASE, 13);
+TUNABLE(LMR_DIVISOR, 23);
 
 /* How much history is allowed to pull a reduction back. Larger means less influence,
  * which is why these are divisors and not multipliers. */
-TUNABLE(LMR_HIST_DIVISOR, 7714);
-TUNABLE(LMR_CONT_DIVISOR, 6845);
+TUNABLE(LMR_HIST_DIVISOR, 8591);
+TUNABLE(LMR_CONT_DIVISOR, 7528);
 TUNABLE(CAPHIST_DIVISOR, 5);
 
 /* Null-move reduction: base, how fast it grows with depth, and how much of the margin
  * above beta may buy extra reduction before it is capped. */
-TUNABLE(NMP_BASE, 5);
-TUNABLE(NMP_DEPTH_DIVISOR, 5);
-TUNABLE(NMP_EVAL_DIVISOR, 187);
+TUNABLE(NMP_BASE, 6);
+TUNABLE(NMP_DEPTH_DIVISOR, 6);
+TUNABLE(NMP_EVAL_DIVISOR, 183);
 TUNABLE(NMP_EVAL_MAX, 3);
 
 /* How much less a node that was on a principal variation, but is not one in this tree,
@@ -574,7 +564,7 @@ TUNABLE(TTPV_REDUCTION, 2);
  * confidence stops being real. The cap cannot bind unless the search reaches past it, so
  * at STC - where this engine reaches depth 12-13 - a sweep random-walks it inside a flat
  * region; exclude it from the fit there rather than give it room to wander. */
-TUNABLE(HIST_BONUS_MUL, 8);
+TUNABLE(HIST_BONUS_MUL, 10);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
 
 /* The same curve for the moves that FAILED, on its own multiplier. "This move caused a
@@ -582,11 +572,11 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * second is levelled at up to sixty-three moves at once - so nothing says the answer to
  * one should size the other. The depth cap stays shared, because it is a statement about
  * the search and is equally true of evidence pointing either way. */
-TUNABLE(HIST_MALUS_MUL, 9);
+TUNABLE(HIST_MALUS_MUL, 8);
 
 /* Structure-specific evidence supplements the global move history in both ordering
  * and LMR. 128 is one full share; zero disables reads AND learning for an exact A/B. */
-TUNABLE(PAWN_HIST_WEIGHT, 128);
+TUNABLE(PAWN_HIST_WEIGHT, 131);
 
 /* Retained together at 25/25 after an inconclusive positive test (E32/E33).
  * Rescue credit belongs only to the winning pawn context; reduced-only failures
@@ -596,10 +586,10 @@ TUNABLE(PAWN_RESCUE_FLOOR, 32);
 TUNABLE(PAWN_EVIDENCE_WEIGHT, 25);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
-TUNABLE(LMP_BASE, 11);
+TUNABLE(LMP_BASE, 10);
 
 /* Half-width of the first aspiration window. */
-TUNABLE(ASPIRATION_DELTA, 20);
+TUNABLE(ASPIRATION_DELTA, 17);
 
 #ifdef TUNE_SEARCH
 
@@ -634,9 +624,6 @@ static const struct {
     {"UncWRazor", &UNC_W_RAZOR, 0, 64},
     {"UncWProbCut", &UNC_W_PROBCUT, 0, 64},
     {"UncWDelta", &UNC_W_DELTA, 0, 64},
-    {"UncWSeeCapture", &UNC_W_SEE_CAPTURE, 0, 64},
-    {"UncWSeeQuiet", &UNC_W_SEE_QUIET, 0, 64},
-    {"UncWSingular", &UNC_W_SINGULAR, 0, 64},
     {"LmrBase", &LMR_BASE, 4, 24},
     {"LmrDivisor", &LMR_DIVISOR, 12, 48},
     {"LmrHistDivisor", &LMR_HIST_DIVISOR, 2048, 32768},
@@ -2094,19 +2081,14 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         if (!pvNode && !inCheck && best > VALUE_MATED_IN_MAX_PLY) {
             const Depth seeDepth = tactical ? SEE_CAPTURE_DEPTH : SEE_QUIET_DEPTH;
 
-            /* The margin is computed under the depth guard rather than beside it, and that is
-             * a range check: the quiet threshold is quadratic in depth, and at the sweep
-             * bounds 120 * 246 * 246 * 500 does not fit in the int a Value is. Identical
-             * pruning either way - see_ge() was never reached when the guard was false. */
+            /* Still computed under the depth guard rather than beside it, though the reason
+             * has shrunk: it used to be a range check, because the quiet threshold is
+             * quadratic in depth and the uncertainty factor multiplied it by another 500 at
+             * the sweep bounds, which did not fit in the int a Value is. Without that factor
+             * it fits anywhere, and nothing reads the margin when the guard is false. */
             if (depth <= seeDepth) {
                 const Value seeMargin =
-                    tactical
-                        ? -SEE_CAPTURE_MARGIN * depth *
-                              unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SEE_CAPTURE) /
-                              100
-                        : -SEE_QUIET_MARGIN * depth * depth *
-                              unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SEE_QUIET) /
-                              100;
+                    tactical ? -SEE_CAPTURE_MARGIN * depth : -SEE_QUIET_MARGIN * depth * depth;
 
                 MP_ADD(td, pruningSee, 1);
                 if (!see_ge(pos, m, seeMargin))
@@ -2139,10 +2121,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         if (!isExcluded && depth >= SINGULAR_DEPTH && m == ttMove && ttValue != VALUE_NONE &&
             !is_mate_score(ttValue) && (tt_entry_bound(&tte) & BOUND_LOWER) &&
             tt_entry_depth(&tte) >= depth - 3) {
-            const Value singularBeta =
-                ttValue - SINGULAR_MARGIN * depth *
-                              unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_SINGULAR) /
-                              100 / 16;
+            const Value singularBeta  = ttValue - SINGULAR_MARGIN * depth / 16;
             const Depth singularDepth = (depth - 1) / 2;
 
             /* The verification searches this ply again and writes the PV table as it goes.

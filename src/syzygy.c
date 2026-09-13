@@ -1674,10 +1674,10 @@ SyzygyRoot syzygy_probe_root(Position *pos) {
     ScoredMove list[MAX_MOVES];
     const int count = movegen_generate(board, board_checkers(board) ? GEN_EVASIONS : GEN_ALL, list);
 
-    /* The move: among the legal ones, the child that keeps the result and is nearest to
-     * zeroing, taken from the generator's own list so nothing it did not produce can reach
-     * the board. */
-    int bestOutcome = -2, bestTiebreak = 0;
+    /* The move: among the legal ones, the child that keeps the result, zeroes the fifty-move
+     * clock if a winning move can, and is otherwise nearest to zeroing - taken from the
+     * generator's own list so nothing it did not produce can reach the board. */
+    int bestOutcome = -2, bestZeroing = 0, bestTiebreak = 0;
     for (int i = 0; i < count; ++i) {
         const Move m = list[i].m;
         if (!movegen_is_legal(board, m))
@@ -1713,11 +1713,45 @@ SyzygyRoot syzygy_probe_root(Position *pos) {
                                  : (childDtz < 0 && -childDtz + childClock <= 100) ? -1
                                                                                    : 0;
 
-        const int tiebreak = childOutcome > 0 ? -childDtz : childOutcome < 0 ? -childDtz : 0;
+        /*
+         * Distance is ranked WITH the clock, because the clock is what the fifty-move rule
+         * counts and a zeroing move sets it back to nothing. Ranking the raw table distance
+         * instead prefers a quiet move that merely keeps a zeroing capture available - that
+         * move's distance is measured from the capture, one ply away, while the capture's own
+         * is measured from whatever has to happen after it - so the winner circles the
+         * position at a fixed distance and never plays the move that resets the clock.
+         * KQPvKP with the clock on 17: Qxh5 is distance 4 from a zeroed counter, total 4;
+         * Qe2 is distance 2 inheriting clock 18, total 20. Winning wants that total small.
+         *
+         * Losing wants it large, and for the same reason: a clock run all the way to 100 is
+         * the draw a lost position is playing for, so resistance means the far loss AND the
+         * quiet move that keeps counting.
+         */
+        const int tiebreak = childOutcome > 0   ? -(childDtz + childClock)
+                             : childOutcome < 0 ? -childDtz + childClock
+                                                : 0;
+
+        /*
+         * A zeroing move that keeps the win outranks distance, because distance alone still
+         * lets the winner hover next to one forever. The hovering move is measured from the
+         * zeroing move it declines to play - one ply - while the zeroing move is measured
+         * from the whole fresh count that follows it, so the near move wins every comparison
+         * and the position never advances. KPvK with the pawn on h2: h1=Q is distance 14 from
+         * a zeroed counter and mates in 14, Kb1 is distance 2 inheriting clock 1 and mates in
+         * 18 - and Kb1 keeps being chosen, which is a repetition, not a win.
+         *
+         * Only for a win. A zeroing move throws away the one thing a lost position is playing
+         * for, so the losing side wants the clock to keep counting - which the clock already
+         * in `tiebreak` says, and nothing here should override.
+         */
+        const int zeroingRank = (childOutcome > 0 && zeroing) ? 1 : 0;
 
         if (out.move == MOVE_NONE || childOutcome > bestOutcome ||
-            (childOutcome == bestOutcome && tiebreak > bestTiebreak)) {
+            (childOutcome == bestOutcome &&
+             (zeroingRank > bestZeroing ||
+              (zeroingRank == bestZeroing && tiebreak > bestTiebreak)))) {
             bestOutcome  = childOutcome;
+            bestZeroing  = zeroingRank;
             bestTiebreak = tiebreak;
             out.move     = m;
         }

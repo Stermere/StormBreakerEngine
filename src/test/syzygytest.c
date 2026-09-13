@@ -165,6 +165,123 @@ static int check(const char *fen, Expect expect, const char *what, const char *h
     return 1;
 }
 
+/* Defined with the position generator below; the conversion gate needs it first. */
+static bool has_any_legal(Position *pos);
+
+/*
+ * Does a won root actually CONVERT? The suite above asks what a position is worth, which is
+ * the question a wrong table answers wrongly. It is not the question that loses games: the
+ * root probe also has to name a move, and a move that keeps the win without approaching it
+ * holds the value at +win forever while the fifty-move rule runs out underneath it. Nothing
+ * above can see that, because a shuffle scores exactly as well as a conversion.
+ *
+ * So these play the position out - BOTH sides from the root probe, which makes the defence
+ * maximal resistance rather than a stand-in - and require checkmate, with the engine's own
+ * draw test never firing on the way. A shuffle fails on the threefold or on the clock, and
+ * it fails at the ply it happens rather than as a score nobody questions.
+ *
+ * Every FEN is a win for the side to move, at a nonzero clock where that is the point, and
+ * lichess.org confirmed each one.
+ */
+typedef struct {
+    const char *fen;
+    const char *what;
+} ConvertCase;
+
+static const ConvertCase ConvertCases[] = {
+    /* The case this gate was written for: a queen one diagonal from the pawn that zeroes the
+     * clock, where ranking the raw table distance prefers standing next to the capture over
+     * making it, and the queen shuffles for forty moves. */
+    {"8/8/7p/4K2P/8/8/8/k2q4 b - - 17 80", "KQPvKP, the capture is one move away"},
+    /* The same position with the clock nearly out: the win is still there (distance 1 plus
+     * clock 90) and there is no room left to spend on anything but taking. */
+    {"8/8/7p/4K2P/8/8/8/k2q4 b - - 90 80", "KQPvKP, same, clock 90 of 100"},
+    /* Promotion is zeroing and the king step is not, and the king step is nearer to the
+     * promotion than the promotion is to the mate that follows it. */
+    {"8/8/8/8/8/1K6/7p/k7 b - - 0 87", "KPvK, promote or shuffle the king"},
+
+    /* Wins with NO zeroing move anywhere, so the distance is the whole ranking and a high
+     * clock leaves little of it: these fail if preferring a zeroing move ever costs one. */
+    {"8/8/8/4k3/8/8/4K3/4Q3 w - - 30 1", "KQvK, clock 30, mate is the only zeroing"},
+    {"8/8/8/3k4/8/8/3K4/3R4 w - - 60 1", "KRvK, clock 60, 23 plies to mate"},
+
+    /* Technique rather than counting: a blocked pawn the knight has to win first, and a
+     * bishop that has to let the pawn through. */
+    {"8/8/8/4k3/4p3/4P3/4KN2/8 w - - 5 1", "KNPvKP, centre pawns, 37 plies to mate"},
+    {"7k/8/5K2/7P/8/8/8/6B1 w - - 40 1", "KBPvK, right-colour bishop, clock 40"},
+    {"8/8/8/4k3/8/8/3r4/3QK3 w - - 20 1", "KQvKR, clock 20"},
+};
+
+/*
+ * Generous: the clock alone bounds one phase at 100 plies and a five-man win passes through
+ * a handful of them. A bound is here so a prober that returns a legal move forever fails as
+ * a failure rather than as a hung gate.
+ */
+enum { CONVERT_MAX_PLIES = 600 };
+
+static int check_converts(const ConvertCase *c) {
+    Position pos;
+    if (!board_set_fen(&pos, c->fen)) {
+        printf("  FAIL  %-44s unparseable FEN %s\n", c->what, c->fen);
+        return 1;
+    }
+
+    const Color winner = pos.sideToMove;
+
+    for (int ply = 0; ply < CONVERT_MAX_PLIES; ++ply) {
+        if (!has_any_legal(&pos)) {
+            /* Mate for the winner is the pass. Stalemate, or the winner mated, is not. */
+            if (board_checkers(&pos) && pos.sideToMove != winner)
+                return 0;
+            printf("  FAIL  %-44s ply %d: %s instead of mate\n", c->what, ply,
+                   board_checkers(&pos) ? "the winner is mated" : "stalemate");
+            printf("        %s\n", c->fen);
+            return 1;
+        }
+
+        /* The arbiter's three: threefold, the fifty-move rule, insufficient material. Reached
+         * from a won position, any of them means the win was played away. */
+        if (board_is_draw(&pos, 0)) {
+            printf("  FAIL  %-44s ply %d: drawn with the win still on the board (clock %d)\n",
+                   c->what, ply, pos.halfmoveClock);
+            printf("        %s\n", c->fen);
+            return 1;
+        }
+
+        const SyzygyRoot r = syzygy_probe_root(&pos);
+        if (r.value == VALUE_NONE || r.move == MOVE_NONE) {
+            printf("  FAIL  %-44s ply %d: root probe declined (%s)\n", c->what, ply,
+                   r.value == VALUE_NONE ? "no value" : "no move");
+            printf("        %s\n", c->fen);
+            return 1;
+        }
+
+        /* The winner's own turns are the ones that have to keep saying win: the defence is
+         * expected to report a loss, and does not get to end the gate by agreeing. */
+        if (pos.sideToMove == winner && r.value != VALUE_TB_WIN) {
+            printf("  FAIL  %-44s ply %d: the win became %s\n", c->what, ply, value_name(r.value));
+            printf("        %s\n", c->fen);
+            return 1;
+        }
+
+        /* Invariant 6 applies to a test as much as to a search: the probe's move is matched
+         * against the generator inside syzygy_probe_root, and this is the second opinion. */
+        if (!movegen_is_pseudo_legal(&pos, r.move) || !movegen_is_legal(&pos, r.move)) {
+            char buf[6];
+            printf("  FAIL  %-44s ply %d: illegal move %s\n", c->what, ply,
+                   move_to_str(r.move, pos.chess960, buf));
+            printf("        %s\n", c->fen);
+            return 1;
+        }
+
+        board_do_move(&pos, r.move);
+    }
+
+    printf("  FAIL  %-44s no mate in %d plies\n", c->what, CONVERT_MAX_PLIES);
+    printf("        %s\n", c->fen);
+    return 1;
+}
+
 int syzygy_verify_suite(const char *path) {
     if (!syzygy_init(path)) {
         printf("syzygy: no usable tablebases at %s\n", path);
@@ -197,8 +314,15 @@ int syzygy_verify_suite(const char *path) {
     printf("syzygy: %d cases (%d probes, each position and its mirror), %d failures\n", count,
            count * 2, failures);
 
+    const int converts = (int)(sizeof(ConvertCases) / sizeof(ConvertCases[0]));
+    int convFailures   = 0;
+    for (int i = 0; i < converts; ++i)
+        convFailures += check_converts(&ConvertCases[i]);
+
+    printf("syzygy: %d won roots played out to mate, %d failures\n", converts, convFailures);
+
     syzygy_free();
-    return failures;
+    return failures + convFailures;
 }
 
 /*
