@@ -9,12 +9,12 @@ loss plus the sanity table printed after every epoch: a net whose loss curve
 looks perfect and whose start position scores +300 has a perspective bug, and
 only the second of those two will tell you.
 
-Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5-15 epochs.
-At 1024 wide with 6 workers that is about 390k positions/s, and at that point
-the GPU is the constraint and not the loader: the loader alone measures 1.2M
-positions/s on the same machine. Raise --workers until it stops helping - four
-to six is usually where that is - and after that the things that move the
-number are --batch-size and the width.
+Expect a few minutes per 100M-position epoch on an RTX 3070, and 5-15 epochs.
+At 512 wide with an uncertainty head and a factor, batch 16384 and four
+workers, that is about 1.39M positions/s sustained. The GPU is the constraint
+and not the loader: the loader alone measures 2.8M positions/s on the same
+machine, and does not get faster with more than four workers. After --workers
+the thing that moves the number is the width.
 
 The architecture is SCReLU over 32 mirrored king squares, and the only things
 left to choose are shape: --hidden, --output-buckets, and --l1-size/--l2-size
@@ -247,7 +247,13 @@ class Metrics:
     """
 
     def __init__(self, device, unc_weight):
-        self.sums = torch.zeros(7, device=device, dtype=torch.float64)
+        self.sums = torch.zeros(6, device=device, dtype=torch.float64)
+        # Record counts are known without asking the GPU anything, and asking
+        # costs a queue drain per batch: ``new_tensor(n)`` is a host-to-device
+        # copy, which synchronises. They are summed here and folded in at
+        # report() instead.
+        self.seen = 0
+        self.flat_mass = 0
         self.unc_weight = unc_weight
 
     @torch.no_grad()
@@ -256,21 +262,31 @@ class Metrics:
         squared = (probability - target) ** 2
         weights = policy.weights(batch)
         n = prediction.numel()
-        mass = squared.new_tensor(n) if weights is None else weights.sum()
+        self.seen += n
+        if weights is None:
+            self.flat_mass += n
+        mass = squared.new_zeros(()) if weights is None else weights.sum()
         value_sum = squared.sum() if weights is None else (squared * weights).sum()
         unc_sum = (squared.new_zeros(()) if unc is None else
                    (unc.detach() - (policy.score(batch) / NET_TO_CP
                                     - prediction.detach()).abs()).abs().sum())
-        fixed = torch.sigmoid(prediction.detach() * NET_TO_CP / DEFAULT_SIGMOID_K)
+        # The fixed-K probability is the same tensor as the policy's whenever
+        # the run did not move K, which is the usual case - and recomputing a
+        # sigmoid over the batch to get the same numbers back is three kernel
+        # launches in a loop that is bound by how many of those it issues.
+        fixed = (probability if policy.sigmoid_k == DEFAULT_SIGMOID_K else
+                 torch.sigmoid(prediction.detach() * NET_TO_CP / DEFAULT_SIGMOID_K))
         score_sum = ((fixed - torch.sigmoid(batch["score"] / DEFAULT_SIGMOID_K)) ** 2).sum()
         known = batch["wdl"] <= 2
         result = batch["wdl"].float().clamp_max(2) / 2
         wdl_sum = (((fixed - result) ** 2) * known).sum()
-        self.sums += torch.stack((value_sum, mass, unc_sum, squared.new_tensor(n),
+        self.sums += torch.stack((value_sum, mass, unc_sum,
                                   score_sum, wdl_sum, known.sum()))
 
     def report(self):
-        value, mass, unc, n, score, wdl, known = self.sums.tolist()
+        value, mass, unc, score, wdl, known = self.sums.tolist()
+        n = float(self.seen)
+        mass += self.flat_mass
         if n == 0:
             raise ValueError("no records remain after source filtering")
         if not all(math.isfinite(x) for x in (value, mass, unc, n, score, wdl, known)):
@@ -282,6 +298,24 @@ class Metrics:
                 "total": value + self.unc_weight * unc,
                 "score_mse": score / n, "wdl_mse": wdl / known if known else None,
                 "positions": int(n), "known_results": int(known)}
+
+
+def run_model(model, batch: dict) -> tuple:
+    """Value and predicted-|error| for a batch, in whichever presentation it came.
+
+    Training always builds sparse loaders. The padded branch is what the tests
+    reach, since they drive evaluate() straight off a default make_loader, and
+    that is the point of it being here rather than inlined: the reference path
+    stays exercised by the suite instead of rotting behind a flag nobody sets.
+    """
+    if "own" in batch:
+        if model.uncertainty:
+            return model.forward_heads_sparse(batch)
+        return model.forward_sparse(batch), None
+    if model.uncertainty:
+        return model.forward_heads(batch["white"], batch["black"],
+                                   batch["stm"], batch["piece_count"])
+    return model(batch["white"], batch["black"], batch["stm"], batch["piece_count"]), None
 
 
 def evaluate(model, loader, device, policy, lam, limit=None, unc_weight=0.05) -> dict:
@@ -300,13 +334,7 @@ def evaluate(model, loader, device, policy, lam, limit=None, unc_weight=0.05) ->
             if limit and i >= limit:
                 break
             batch = to_device(batch, device)
-            if model.uncertainty:
-                prediction, unc = model.forward_heads(batch["white"], batch["black"],
-                                                      batch["stm"], batch["piece_count"])
-            else:
-                prediction = model(batch["white"], batch["black"], batch["stm"],
-                                   batch["piece_count"])
-                unc = None
+            prediction, unc = run_model(model, batch)
             target = policy.target(batch, lam)
             metrics.update(prediction, unc, batch, target, policy)
     model.train(was_training)
@@ -357,10 +385,11 @@ def train(args) -> None:
 
     train_loader = make_loader(args.train, args.batch_size, args.workers, shuffle=True,
                                sources=args.sources, chunk_records=args.chunk_records,
-                               seed=args.seed)
+                               seed=args.seed, sparse=True)
     val_loader = (make_loader(args.val, args.batch_size, max(args.workers // 2, 0),
                               shuffle=False, sources=args.sources,
-                              chunk_records=args.chunk_records, seed=args.seed)
+                              chunk_records=args.chunk_records, seed=args.seed,
+                              sparse=True)
                   if args.val else None)
 
     print(f"train: {train_loader.dataset.records:,} records "
@@ -452,7 +481,8 @@ def train(args) -> None:
                 del arriving
                 train_loader = make_loader(args.train, args.batch_size, args.workers,
                                            shuffle=True, sources=args.sources,
-                                           chunk_records=args.chunk_records, seed=args.seed)
+                                           chunk_records=args.chunk_records, seed=args.seed,
+                                           sparse=True)
                 set_epoch(train_loader, epoch - 1)
         position_limit = 0 if finishing else args.positions_per_epoch
         planned = (math.ceil(position_limit / args.batch_size)
@@ -498,20 +528,14 @@ def train(args) -> None:
             score = policy.score(batch)
             target = blended_target(score, batch["wdl"], lambdas, args.sigmoid_k)
             weight = policy.weights(batch)
-            if args.uncertainty:
-                prediction, unc = model.forward_heads(batch["white"], batch["black"],
-                                                      batch["stm"], batch["piece_count"])
+            prediction, unc = run_model(model, batch)
+            loss = loss_fn(prediction, target, args.sigmoid_k, weight)
+            if unc is not None:
                 # The clipped score, not the raw one: the value head is trained
                 # toward the clipped label, so its residual has to be measured
                 # against that same label or the head learns to predict an error
                 # the value head was never asked to avoid.
-                loss = loss_fn(prediction, target, args.sigmoid_k, weight) \
-                    + args.unc_weight * uncertainty_loss_fn(unc, prediction, score)
-            else:
-                unc = None
-                prediction = model(batch["white"], batch["black"], batch["stm"],
-                                   batch["piece_count"])
-                loss = loss_fn(prediction, target, args.sigmoid_k, weight)
+                loss = loss + args.unc_weight * uncertainty_loss_fn(unc, prediction, score)
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()

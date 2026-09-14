@@ -307,6 +307,96 @@ STACK_WIDTH_MULTIPLE = 16
 # ------------------------------------------------------------ unpacking -----
 
 
+def _decode(records: np.ndarray):
+    """Every packed record exploded into ONE entry per piece on the board.
+
+    The tight (nnz,) arrays this returns are what both presentations are built
+    from: :func:`unpack` scatters them into padded (B, 32) matrices, and
+    :func:`unpack_sparse` hands them over as they are. One decode, two shapes -
+    the alternative is two copies of the feature arithmetic, and a feature set
+    that disagrees with itself is the failure this module exists to prevent.
+
+    Everything is int32. The values top out at NUM_FEATURES = 24576 and these
+    are the widest arrays in the loader, so int64 here would double the memory
+    traffic of the whole input pipeline to carry no extra information.
+    """
+    batch = len(records)
+
+    occ = np.ascontiguousarray(records["occupied"])
+    bits = np.unpackbits(occ.view(np.uint8).reshape(batch, 8), axis=1, bitorder="little")
+    counts = bits.sum(axis=1, dtype=np.int32)
+
+    # One flatnonzero rather than np.nonzero: the same scan, but it writes a
+    # single index array instead of a pair of int64 ones that then have to be
+    # narrowed. Row-major, so pieces come out in ascending square per record.
+    flat = np.flatnonzero(bits.ravel()).astype(np.int32)
+    rows = flat >> 6
+    squares = flat & 63
+
+    packed = np.ascontiguousarray(records["pieces"]).reshape(batch, 16)
+    nibbles = np.empty((batch, 32), dtype=np.uint8)
+    nibbles[:, 0::2] = packed & 0x0F
+    nibbles[:, 1::2] = packed >> 4
+
+    # Position of each piece within its own record: both the nibble index and
+    # the column it would occupy in a padded feature matrix.
+    starts = np.zeros(batch, dtype=np.int32)
+    np.cumsum(counts[:-1], out=starts[1:])
+    slot = np.arange(rows.size, dtype=np.int32) - starts[rows]
+
+    codes = nibbles.reshape(-1)[rows * MAX_PIECES + slot].astype(np.int32)
+    colour = codes >> 3
+    raw = codes & 7
+    ptype = np.where(raw == NIB_ROOK_CASTLE, 3, raw)  # a castling rook is a rook
+
+    # Both kings in one scatter. There is exactly one per colour per record, so
+    # the destination is (batch, colour) and nothing collides.
+    is_king = ptype == 5
+    kings = np.zeros((batch, 2), dtype=np.int32)
+    kings[rows[is_king], colour[is_king]] = squares[is_king]
+
+    return batch, counts, rows, squares, slot, colour, ptype, kings
+
+
+def _features(perspective: int, rows, squares, colour, ptype, kings):
+    """Tight (nnz,) int32 feature indices from one perspective.
+
+    Rank-flip so the perspective's owner always reads the board from rank 1,
+    then mirror when that king sits on the kingside. The mirror is driven by
+    the KING and applied to both squares, or the table would be indexed
+    inconsistently - the same rule TERM_PSQK follows.
+    """
+    ksq = kings[:, perspective]
+    king_n = ksq ^ 56 if perspective == 1 else ksq
+    mirror = (king_n & 7) >= 4
+    king_n = np.where(mirror, king_n ^ 7, king_n)
+    # Folded per record, not per piece: this is the base of that king's 768-row
+    # block, and every piece of the record reads the same one.
+    base = king_index(king_n) * (PIECE_PLANES * SQUARES)
+
+    sq_n = squares ^ 56 if perspective == 1 else squares
+    sq_n = np.where(mirror[rows], sq_n ^ 7, sq_n)
+    plane = ptype + np.where(colour == perspective, 0, 6)
+    return base[rows] + plane * SQUARES + sq_n
+
+
+def _scalars(records: np.ndarray, counts, out: dict) -> dict:
+    """The per-record columns, identical for both presentations."""
+    stm_ep = records["stm_ep"]
+    flags = records["flags"]
+    out["stm"] = (stm_ep >> 7).astype(np.int64)
+    out["score"] = records["score"].astype(np.int32)
+    out["wdl"] = records["wdl"].astype(np.int64)
+    out["source"] = (flags & SRC_MASK).astype(np.int64)
+    out["in_check"] = (flags & IN_CHECK) != 0
+    out["piece_count"] = counts.astype(np.int64)
+    # The bucket, not a distance: what a bucket MEANS is progress_plies() and
+    # progress_closeness(), and a loader that baked one of those in would have
+    # to be rebuilt to change a lambda schedule.
+    out["progress"] = ((flags & PROGRESS_MASK) >> PROGRESS_SHIFT).astype(np.int64)
+    return out
+
+
 def unpack(records: np.ndarray, index_dtype=np.int64) -> dict:
     """Explode a batch of packed records into arrays.
 
@@ -316,11 +406,16 @@ def unpack(records: np.ndarray, index_dtype=np.int64) -> dict:
 
     ``index_dtype`` is the width of the two feature-index matrices. They are
     the largest thing this function produces - (B, 32) apiece - and every byte
-    of them is memset here, copied into pinned memory and pushed over PCIe, so
-    the loader asks for int32. It defaults to int64 because the callers that
-    are not the loader (the exporter, the sanity table, the tests) compare
-    against hand-written int64 arrays and there is nothing to gain there.
-    Indices run to NUM_FEATURES = 24576, so int32 loses nothing.
+    of them is memset here. It defaults to int64 because the callers that are
+    not the loader (the exporter, the sanity table, the tests) compare against
+    hand-written int64 arrays and there is nothing to gain there. Indices run
+    to NUM_FEATURES = 24576, so a narrower one loses nothing.
+
+    THE TRAINING LOADER DOES NOT CALL THIS - see :func:`unpack_sparse`. At the
+    piece counts real data has, a padded matrix is half padding, and that
+    padding is memset here only to be dropped again on the GPU. This stays
+    because it is the shape the exporter, the sanity table and the tests read,
+    and because it is the readable statement of what a record decodes to.
 
     Returns a dict with, for a batch of B records:
 
@@ -334,74 +429,61 @@ def unpack(records: np.ndarray, index_dtype=np.int64) -> dict:
         piece_count (B,)    int64
         progress    (B,)    int64 game-progress bucket, 0 when not recorded
     """
-    batch = len(records)
-
-    occ = np.ascontiguousarray(records["occupied"])
-    bits = np.unpackbits(occ.view(np.uint8).reshape(batch, 8), axis=1, bitorder="little")
-
-    counts = bits.sum(axis=1).astype(np.int64)
-    rows, squares = np.nonzero(bits)  # row-major, so ascending square per record
-    squares = squares.astype(np.int64)
-
-    packed = np.ascontiguousarray(records["pieces"]).reshape(batch, 16)
-    nibbles = np.empty((batch, 32), dtype=np.uint8)
-    nibbles[:, 0::2] = packed & 0x0F
-    nibbles[:, 1::2] = packed >> 4
-
-    # Position of each piece within its own record, which is both the nibble
-    # index and the column it occupies in the padded feature matrix.
-    starts = np.zeros(batch, dtype=np.int64)
-    np.cumsum(counts[:-1], out=starts[1:])
-    slot = np.arange(rows.size, dtype=np.int64) - starts[rows]
-
-    codes = nibbles[rows, slot].astype(np.int64)
-    colour = codes >> 3
-    raw = codes & 7
-    ptype = np.where(raw == NIB_ROOK_CASTLE, 3, raw)  # a castling rook is a rook
-
-    kings = {}
-    for c in (0, 1):
-        sel = (ptype == 5) & (colour == c)
-        ksq = np.zeros(batch, dtype=np.int64)
-        ksq[rows[sel]] = squares[sel]
-        kings[c] = ksq
+    batch, counts, rows, squares, slot, colour, ptype, kings = _decode(records)
 
     out = {}
     for perspective in (0, 1):
-        ksq = kings[perspective]
-        # Rank-flip so the perspective's owner always reads the board from
-        # rank 1, then mirror when that king sits on the kingside. The mirror
-        # is driven by the KING and applied to both squares, or the table would
-        # be indexed inconsistently - the same rule TERM_PSQK follows.
-        king_n = ksq ^ 56 if perspective == 1 else ksq
-        mirror = (king_n & 7) >= 4
-        king_n = np.where(mirror, king_n ^ 7, king_n)
-        king_slot = king_index(king_n)
-
-        sq_n = squares ^ 56 if perspective == 1 else squares
-        sq_n = np.where(mirror[rows], sq_n ^ 7, sq_n)
-
-        plane = np.where(colour == perspective, 0, 6) + ptype
-        feature = king_slot[rows] * (PIECE_PLANES * SQUARES) + plane * SQUARES + sq_n
-
+        feature = _features(perspective, rows, squares, colour, ptype, kings)
         idx = np.full((batch, MAX_PIECES), PAD_INDEX, dtype=index_dtype)
         idx[rows, slot] = feature
         out["white" if perspective == 0 else "black"] = idx
 
-    stm_ep = records["stm_ep"]
-    flags = records["flags"]
+    return _scalars(records, counts, out)
 
-    out["stm"] = (stm_ep >> 7).astype(np.int64)
-    out["score"] = records["score"].astype(np.int32)
-    out["wdl"] = records["wdl"].astype(np.int64)
-    out["source"] = (flags & SRC_MASK).astype(np.int64)
-    out["in_check"] = (flags & IN_CHECK) != 0
-    out["piece_count"] = counts
-    # The bucket, not a distance: what a bucket MEANS is progress_plies() and
-    # progress_closeness(), and a loader that baked one of those in would have
-    # to be rebuilt to change a lambda schedule.
-    out["progress"] = ((flags & PROGRESS_MASK) >> PROGRESS_SHIFT).astype(np.int64)
-    return out
+
+def unpack_sparse(records: np.ndarray, index_dtype=np.uint16) -> dict:
+    """The same decode, presented as the sparsity pattern the network wants.
+
+    A position contributes one feature per piece on the board, and real data
+    averages sixteen pieces against the thirty-two a padded matrix reserves.
+    So this hands the features back TIGHTLY PACKED, in record order, with the
+    per-record counts that say where each position's run ends - which is a CSR
+    row length in all but name, and is what :mod:`nnue.sparse` builds one from.
+
+    That is two wins, and the second is the one that matters: the padding is
+    never materialised on either side of the PCIe bus, and the feature
+    transformer never multiplies by it.
+
+    ``own`` and ``other`` rather than ``white`` and ``black``: the network
+    reads the side to move's accumulator first, and choosing here costs a
+    select on an index array. Doing it after the feature transformer instead
+    means blending two (B, H) float matrices - the same answer for sixty-four
+    times the memory traffic.
+
+    ``index_dtype`` is uint16 because NUM_FEATURES is 24576 and the pad index
+    is gone from this presentation, so every index fits with room to spare.
+    That halves the bytes again on the way to the GPU, where :mod:`nnue.sparse`
+    widens them back out to the int32 a CSR index array has to be.
+
+    Returns, for a batch of B records whose pieces total NNZ:
+
+        own      (NNZ,) index_dtype, the side to move's features
+        other    (NNZ,) index_dtype, the waiting side's features
+        counts   (B,)   int32, pieces per record - the CSR row lengths
+        ...      plus the same scalar columns :func:`unpack` returns
+    """
+    batch, counts, rows, squares, slot, colour, ptype, kings = _decode(records)
+
+    white = _features(0, rows, squares, colour, ptype, kings)
+    black = _features(1, rows, squares, colour, ptype, kings)
+
+    black_to_move = (records["stm_ep"] >> 7).astype(bool)[rows]
+    out = {
+        "own": np.where(black_to_move, black, white).astype(index_dtype),
+        "other": np.where(black_to_move, white, black).astype(index_dtype),
+        "counts": counts,
+    }
+    return _scalars(records, counts, out)
 
 
 # ------------------------------------------------------ FEN <-> record ------

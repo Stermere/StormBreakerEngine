@@ -2577,3 +2577,113 @@ See [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md) for exact scope, raw timing values,
 baseline identity, test/control builds and explicit **manual STC/LTC commands**.
 The coding agent checked only their `--dry-run` forms; the STC above was run by
 the owner.
+
+### E37: The feature transformer as a sparse matrix product
+
+**Date** 2026-09-13 · **Not an Elo test.** No engine change, no SPRT, and the
+net file format is untouched. The network this produces is the same network;
+what moved is how long it takes to fit one, so the measurement is positions/s
+and the gate is that the loss curve is unchanged.
+
+Reference configuration throughout: `--hidden 512 --output-buckets 8
+--uncertainty --feature-factorization --batch-size 16384 --workers 4` on
+`gen-005.cnn` (17.6 GB, 549M records), RTX 3070. Rates are the steady-state
+window between batch 200 and batch 1000, so worker spawn and CUDA init are
+excluded.
+
+| | before | after |
+|---|---|---|
+| **steady state** | 447k pos/s | **1,387k pos/s (3.10x)** |
+| GPU step, same batch resident | 34.6 ms | **11.6 ms** |
+| loader alone | 1.59M pos/s | **2.81M pos/s** |
+| `unpack()`, one core | 26.3 ms/batch | **19.2 ms/batch** |
+
+**What changed.** Four things, in descending order of what they were worth:
+
+  * the accumulator is `S @ W` against a CSR matrix of ones rather than an
+    `nn.EmbeddingBag`, with the backward run off an explicitly built `S^T`.
+    EmbeddingBag's dense backward sorts the index array and runs a segment
+    reduction over a gradient the full width of the table, every step; two
+    cuSPARSE SpMM calls do the same arithmetic for a third of the time.
+  * the padding is gone from both sides of the bus. A padded (B, 32) index
+    matrix is half padding at the piece counts real data has - gen-005
+    averages 15.4 - and every pad slot was memset in a worker, pushed over
+    PCIe and then multiplied by. `unpack_sparse` emits one int16 index per
+    piece, so a batch is 1.05 MB where it was 4.19 MB and the feature
+    transformer does half the work.
+  * the perspective swap moved from the accumulators to the indices. Choosing
+    between two (B, 32) index matrices in the loader is the same answer as
+    blending two (B, 512) float matrices on the GPU, for a sixty-fourth of the
+    traffic.
+  * factorisation folds into the feature table once per step instead of
+    running a second embedding over every piece. It cost 34% of a step; it
+    now costs 16%.
+
+Two supporting changes mattered more than their size suggests. Seven implicit
+host synchronisations per step - `int(tensor)`, `repeat_interleave` without
+`output_size`, `bincount`, and `new_tensor` on a Python int in the metrics -
+each drained the queue and left the GPU idle while Python caught up; removing
+them took the step from 14.8 ms to 14.2 ms and turned a CPU-bound loop back
+into a GPU-bound one. Computing both output heads in one matmul rather than
+two took it from 14.5 ms to 12.1 ms.
+
+**The gate.** 300 batches from the same seed, `--hidden 256`, sparse path
+against the EmbeddingBag one (driven by a local patch forcing `sparse=False` on
+the loader; there is no flag for it, see below):
+
+| batch | sparse | EmbeddingBag |
+|---|---|---|
+| 50 | 0.383060 | 0.383060 |
+| 150 | 0.301605 | 0.301606 |
+| 300 | 0.245324 | 0.245322 |
+| epoch train value | 0.019960 | 0.019960 |
+| epoch val value | 0.006875 | 0.006877 |
+
+`trainer/tests/test_sparse.py` is the standing version of that check: outputs
+and gradients, across seven architectures, on real records, to 1e-5 relative
+against a measured worst case near 4e-7.
+
+**On determinism.** cuSPARSE reduces in whatever order its work partitioning
+lands on, so two runs from one seed are no longer bit-identical. This was
+briefly exposed as a `--deterministic-ft` flag and then removed: the
+justification did not survive contact. The disagreement is ~1e-6 relative,
+which is fp32 summation order; training diverges further than that from its own
+chaos inside one epoch; nothing reads a checkpoint bit-wise; and nets are
+judged by SPRT, whose error bars are in Elo. The padded presentation remains
+the loader's default, so `make_loader(..., sparse=False)` still reaches the
+EmbeddingBag path for a differential check - which is also how the test suite
+keeps that path alive.
+
+**Other configurations.** The win is largest where the old FT dominated least
+in absolute terms; a wider net moves less because the elementwise chain scales
+with it and the fixed per-step costs do not:
+
+| | before | after |
+|---|---|---|
+| hidden 512, 8 buckets, uncertainty + factor | 447k | **1,387k (3.10x)** |
+| hidden 1024, 4 buckets | 422k | **919k (2.18x)** |
+
+**Where the remaining time goes**, per 16,384-position step at the reference
+configuration. This is the reason the number is 3.1x and not higher:
+
+| | ms |
+|---|---|
+| feature transformer, forward and backward (cuSPARSE) | 1.4 |
+| the activation chain and its backward | 2.3 |
+| weight clipping | 1.3 |
+| fused AdamW over 13M parameters | 0.9 |
+| per-epoch metrics | 0.7 |
+| building the batch's sparsity pattern | 0.6 |
+| everything else, mostly unfused elementwise kernels | 4.4 |
+| **total** | **11.6** |
+
+The loader runs concurrently at 5.8 ms and is no longer the constraint. What
+is left is not one hot spot but roughly fifteen separate kernels, each
+streaming a 33-67 MB tensor in and back out, which eager PyTorch will not
+merge: the step moves about 4 GB through a card that does ~450 GB/s. Closing
+that needs a fusing compiler - `torch.compile` needs Triton, which is not
+installed and is not a dependency this repository has agreed to take. On the
+arithmetic above, fusion plus CUDA graphs would be worth something like
+another 1.3x at this batch size, and a larger batch would be worth more again
+by amortising the optimiser and the clip - but a larger batch is a different
+training recipe, not a faster implementation of this one.

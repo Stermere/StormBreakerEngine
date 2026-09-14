@@ -1,17 +1,26 @@
 """Feeding the GPU.
 
 Plain PyTorch is 5-20x slower than a purpose-built NNUE trainer and almost all
-of the difference is the input pipeline rather than the model. Three things get
-most of it back, and all three are here:
+of the difference is the input pipeline rather than the model. Four things get
+most of it back, and all four are here:
 
   * the records are fixed-size, so a batch is a contiguous SLICE and the
     tensors come out of whole-array arithmetic - there is no per-record Python;
   * a Dataset item is a whole BATCH rather than one record, so the DataLoader's
     collate step and its per-item overhead are paid once per batch instead of
     sixteen thousand times;
-  * feature indices are int32. They run to 24576, so this is the same numbers
-    in half the bytes - and those bytes are memset in a worker, copied into
-    pinned memory and pushed over PCIe, twice per batch.
+  * a batch carries one feature index per PIECE, not one per slot of a padded
+    (B, 32) matrix. Real data averages fifteen pieces, so the padded shape is
+    half padding - memset in a worker, pushed over PCIe, and then multiplied by
+    on the GPU. See ``unpack_sparse``;
+  * those indices are int16. They run to 24575 and the pad index does not exist
+    in this presentation, so it is the same numbers in a quarter of the bytes.
+
+WHAT LIMITS IT, measured on the reference machine: not the drive, and not the
+worker-to-parent hand-off. A loader that reads the same batches and skips
+``unpack`` runs at 42M positions/s, so the 2.8M it actually delivers is
+``unpack`` itself. Four workers reach that and six or eight do not beat it -
+the numpy it runs is memory-bandwidth bound, and four already saturate it.
 
 WHICH LOADER RUNS IS A PROPERTY OF THE DATASET'S SIZE:
 
@@ -55,12 +64,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
-from .format import RECORD_DTYPE, SOURCE_NAMES, SRC_MASK, unpack
+from .format import RECORD_DTYPE, SOURCE_NAMES, SRC_MASK, unpack, unpack_sparse
 
-# Feature indices top out at NUM_FEATURES = 24576. int32 is not a trade here,
-# it is the same numbers in half the bytes: 2.1 MB per perspective per batch
-# at the default batch size rather than 4.2 MB.
+# Feature indices top out at NUM_FEATURES = 24576, so int16 holds every one of
+# them with a bit to spare and the pad index - the only value that would not
+# fit - does not exist in the sparse presentation. int32 is what the padded
+# presentation uses, where PAD_INDEX is a real entry.
 INDEX_DTYPE = np.int32
+SPARSE_INDEX_DTYPE = np.int16
 
 # Above this many bytes of shard, make_loader picks ShuffledChunks. There is no
 # cliff to find here - the chunked path was not slower at any size measured -
@@ -102,7 +113,9 @@ def _source_filter(sources):
     return np.array(sorted(set(sources)), dtype=np.uint8)
 
 
-def _tensors(records: np.ndarray, index_dtype) -> dict:
+def _tensors(records: np.ndarray, index_dtype, sparse: bool = False) -> dict:
+    if sparse:
+        return _sparse_tensors(records)
     fields = unpack(records, index_dtype=index_dtype)
     return {
         "white": torch.from_numpy(fields["white"]),
@@ -122,6 +135,31 @@ def _tensors(records: np.ndarray, index_dtype) -> dict:
     }
 
 
+def _sparse_tensors(records: np.ndarray) -> dict:
+    """A batch as the sparsity pattern the feature transformer wants.
+
+    Two thirds smaller over the PCIe bus than the padded pair of (B, 32)
+    matrices, because it carries one index per piece rather than per slot and
+    carries each in two bytes rather than four - and the GPU then never has to
+    drop the padding, because it was never sent.
+
+    ``stm`` is gone: the perspective swap is already applied, which is what
+    ``own`` and ``other`` mean. It costs a select on an index array here
+    instead of blending two (B, hidden) float matrices on the GPU.
+    """
+    fields = unpack_sparse(records, index_dtype=SPARSE_INDEX_DTYPE)
+    return {
+        "own": torch.from_numpy(fields["own"]),
+        "other": torch.from_numpy(fields["other"]),
+        "counts": torch.from_numpy(fields["counts"]),
+        "score": torch.from_numpy(fields["score"]).float(),
+        "wdl": torch.from_numpy(fields["wdl"]),
+        "piece_count": torch.from_numpy(fields["piece_count"]),
+        "source": torch.from_numpy(fields["source"]),
+        "progress": torch.from_numpy(fields["progress"]),
+    }
+
+
 class ShardBatches(Dataset):
     """Fixed-size batches over one or more shards, as memmap slices.
 
@@ -135,11 +173,12 @@ class ShardBatches(Dataset):
     """
 
     def __init__(self, paths, batch_size: int = 16384, sources=None,
-                 index_dtype=INDEX_DTYPE):
+                 index_dtype=INDEX_DTYPE, sparse: bool = False):
         self.paths, counts = _shard_lengths(paths)
         self.batch_size = int(batch_size)
         self.sources = _source_filter(sources)
         self.index_dtype = index_dtype
+        self.sparse = bool(sparse)
         self._maps = None
 
         self.index = []  # (file, start, length)
@@ -188,7 +227,7 @@ class ShardBatches(Dataset):
             if len(records) == 0:
                 raise RuntimeError("shard changed after its filtered batch index was built")
 
-        return _tensors(records, self.index_dtype)
+        return _tensors(records, self.index_dtype, self.sparse)
 
 
 class ShuffledChunks(IterableDataset):
@@ -205,7 +244,8 @@ class ShuffledChunks(IterableDataset):
 
     def __init__(self, paths, batch_size: int = 16384,
                  chunk_records: int = DEFAULT_CHUNK_RECORDS, sources=None,
-                 shuffle: bool = True, seed: int = 0, index_dtype=INDEX_DTYPE):
+                 shuffle: bool = True, seed: int = 0, index_dtype=INDEX_DTYPE,
+                 sparse: bool = False):
         self.paths, counts = _shard_lengths(paths)
         self.batch_size = int(batch_size)
         # A chunk smaller than a batch would make every batch short, which is
@@ -215,6 +255,7 @@ class ShuffledChunks(IterableDataset):
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.index_dtype = index_dtype
+        self.sparse = bool(sparse)
         self._epoch = 0
 
         self.chunks = []  # (file, start, length)
@@ -298,7 +339,7 @@ class ShuffledChunks(IterableDataset):
             for lo in range(0, n, self.batch_size):
                 hi = min(lo + self.batch_size, n)
                 take = records[perm[lo:hi]] if perm is not None else records[lo:hi]
-                yield _tensors(take, self.index_dtype)
+                yield _tensors(take, self.index_dtype, self.sparse)
 
 
 def identity_collate(batch):
@@ -313,12 +354,17 @@ def identity_item(item):
 
 def make_loader(paths, batch_size: int = 16384, workers: int = 4,
                 shuffle: bool = True, sources=None, chunk_records=None,
-                seed: int = 0, index_dtype=INDEX_DTYPE) -> DataLoader:
+                seed: int = 0, index_dtype=INDEX_DTYPE,
+                sparse: bool = False) -> DataLoader:
     """A loader over ``paths``, chunked if the dataset is big enough to need it.
 
     ``chunk_records`` picks the strategy: ``None`` decides from the total size
     against AUTO_CHUNK_BYTES, ``0`` forces the memmap path, and a positive
     value forces the chunked one at that size.
+
+    ``sparse`` picks the PRESENTATION, which is a separate axis from the
+    strategy: batches come out as a sparsity pattern for
+    ``NNUE.forward_sparse`` rather than as padded index matrices.
     """
     paths, counts = _shard_lengths(paths)
     if chunk_records is None:
@@ -335,13 +381,13 @@ def make_loader(paths, batch_size: int = 16384, workers: int = 4,
     if chunk_records:
         dataset = ShuffledChunks(paths, batch_size=batch_size, chunk_records=chunk_records,
                                  sources=sources, shuffle=shuffle, seed=seed,
-                                 index_dtype=index_dtype)
+                                 index_dtype=index_dtype, sparse=sparse)
         # No sampler and no collation: an IterableDataset shuffles itself, and
         # batch_size=None is what stops the DataLoader batching the batches.
         return DataLoader(dataset, batch_size=None, collate_fn=identity_item, **shared)
 
     dataset = ShardBatches(paths, batch_size=batch_size, sources=sources,
-                           index_dtype=index_dtype)
+                           index_dtype=index_dtype, sparse=sparse)
     if not len(dataset):
         raise ValueError("no records remain after source filtering")
     return DataLoader(dataset, batch_size=1, shuffle=shuffle,

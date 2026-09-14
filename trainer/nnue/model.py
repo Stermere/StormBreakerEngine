@@ -32,11 +32,23 @@ What it costs is arithmetic range - the quantised activation is QA^2 rather
 than QA, so the output sum is rescaled by QA and the weights are clipped to
 keep the SIMD int16 multiply in range. See WEIGHT_CLIP in format.py.
 
-WHY EmbeddingBag. A position has at most 32 active features per perspective out
-of 24576. A dense 24576-wide input matmul is ~800x wasted work;
-``nn.EmbeddingBag(mode='sum')`` is exactly the sparse-sum primitive an NNUE
-accumulator is, and it is where most of the gap to a purpose-built trainer
-closes.
+HOW THE FEATURE TRANSFORMER IS COMPUTED. A position has at most 32 active
+features per perspective out of 24576, so a dense 24576-wide input matmul is
+~800x wasted work. There are two spellings of the sparse sum instead, and this
+module keeps both:
+
+  * ``nn.EmbeddingBag(mode='sum')`` over a padded (B, 32) index matrix. This is
+    what ``forward()`` runs, and it is what the exporter, the sanity table and
+    the equivalence tests read, because it is the plain statement of the
+    arithmetic.
+  * a CSR matrix product against the same weights - :mod:`nnue.sparse` - which
+    is what ``forward_sparse()`` runs and what training uses. Same answer, to
+    fp32 summation order; roughly three times the speed, mostly because the
+    padding never exists and the backward is one SpMM rather than a sort and a
+    segment reduction.
+
+The weights are the same Parameter either way, so a checkpoint, an export and
+``make nnue-test`` cannot tell which path trained it.
 """
 
 from __future__ import annotations
@@ -64,6 +76,7 @@ from .format import (
     phase_endgameness,
     progress_closeness,
 )
+from .sparse import build_pattern
 
 DEFAULT_HIDDEN = 1024
 
@@ -339,9 +352,8 @@ class NNUE(nn.Module):
         training would zero the gradient exactly where the head most needs to
         learn it overshot.
         """
-        x = self._trunk(white, black, stm, piece_count)
-        return (self._pick(self._value_head(x), piece_count),
-                self._pick(self.unc(x), piece_count))
+        value, unc = self._heads(self._trunk(white, black, stm, piece_count))
+        return self._pick(value, piece_count), self._pick(unc, piece_count)
 
     def _activated(self, white: torch.Tensor, black: torch.Tensor,
                    stm: torch.Tensor) -> torch.Tensor:
@@ -352,26 +364,117 @@ class NNUE(nn.Module):
 
         return self.activate(torch.cat([own, other], dim=1))
 
-    def _value_head(self, trunk: torch.Tensor) -> torch.Tensor:
-        return self.l3(trunk) if self.l1_size else self.out(trunk)
+    def _linear_2h_weights(self, weight: torch.Tensor, bias: torch.Tensor,
+                           x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return torch.addmm(bias, x, weight.t())
+        half = self.hidden
+        y = torch.addmm(bias, x[0], weight[:, :half].t())
+        return torch.addmm(y, x[1], weight[:, half:].t())
 
-    def _trunk(self, white: torch.Tensor, black: torch.Tensor, stm: torch.Tensor,
-               piece_count: torch.Tensor | None) -> torch.Tensor:
-        """The vector both output heads read, after the stack if there is one.
+    def _heads(self, trunk: torch.Tensor) -> tuple:
+        """Value and uncertainty, in one matmul where they share an input.
+
+        Without a stack both heads are row blocks of the same linear map over
+        the same 2H vector, so running them separately reads the widest tensor
+        in the model twice and runs two gemms where one does - and twice as
+        many again in the backward. With a stack they read a narrow vector
+        instead, and concatenating to save that is not worth it.
+        """
+        if self.l1_size:
+            return self.l3(trunk), self.unc(trunk)
+        y = self._linear_2h_weights(torch.cat([self.out.weight, self.unc.weight], 0),
+                                    torch.cat([self.out.bias, self.unc.bias], 0), trunk)
+        return y[:, :self.output_buckets], y[:, self.output_buckets:]
+
+    def _linear_2h(self, layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        """A layer that reads the 2H-wide activation, in either of its layouts.
+
+        The dense path hands over (B, 2H) - own and other concatenated - and
+        this is just the layer. The sparse path hands over (2, B, H), which is
+        the same numbers WITHOUT the copy that interleaves them, and the layer
+        is applied by splitting its weight down the middle instead. Two gemms
+        over half the columns each, and a 2H-wide copy of the whole batch never
+        happens.
+
+        Only the first layer after the activation ever sees the split layout;
+        everything past it is (B, width) either way, and falls through.
+        """
+        return self._linear_2h_weights(layer.weight, layer.bias, x)
+
+    def _value_head(self, trunk: torch.Tensor) -> torch.Tensor:
+        return self.l3(trunk) if self.l1_size else self._linear_2h(self.out, trunk)
+
+    def _stack(self, x: torch.Tensor, piece_count: torch.Tensor | None) -> torch.Tensor:
+        """The layer stack, from whichever layout the activation produced.
 
         The stack's layers are per-bucket, so the bucket is selected HERE and
         not only at the end - which is why `piece_count` reaches this far down.
         A stacked net with more than one bucket cannot answer without it, and
         that is the same refusal _pick() makes for the flat architecture.
         """
-        x = self._activated(white, black, stm)
         if not self.l1_size:
             return x
 
-        x = self.stack_activate(self._pick_rows(self.l1(x), self.l1_size, piece_count))
+        x = self.stack_activate(self._pick_rows(self._linear_2h(self.l1, x),
+                                                self.l1_size, piece_count))
         if self.l2_size:
             x = self.stack_activate(self._pick_rows(self.l2(x), self.l2_size, piece_count))
         return x
+
+    def _trunk(self, white: torch.Tensor, black: torch.Tensor, stm: torch.Tensor,
+               piece_count: torch.Tensor | None) -> torch.Tensor:
+        """The vector both output heads read, after the stack if there is one."""
+        return self._stack(self._activated(white, black, stm), piece_count)
+
+    # ------------------------------------------------- the sparse input path --
+
+    def feature_table(self) -> torch.Tensor:
+        """The effective feature weights the sparse path multiplies by.
+
+        Folding the training-only factor HERE rather than running a second
+        embedding for it is what stops factorisation from costing a second pass
+        over the widest tensor in the model - and it is the same fold
+        effective_feature_weights() does for export, so the two cannot disagree
+        about what a factored net means.
+
+        Unfactored this is the parameter itself, pad row and all. The pad row
+        simply never appears in a sparsity pattern, so it takes no gradient,
+        which is exactly what padding_idx bought on the dense path.
+        """
+        if not self.feature_factorization:
+            return self.ft.weight
+        residual = self.ft.weight[:NUM_FEATURES].view(-1, SHARED_FEATURES, self.hidden)
+        return (residual + self.ft_shared.weight[:SHARED_FEATURES]).reshape(-1, self.hidden)
+
+    def _activated_sparse(self, batch: dict) -> torch.Tensor:
+        """The activated accumulators as (2, B, H), own first.
+
+        One sparse matmul covers both perspectives: they are the same position
+        read from two sides, so they stack into one matrix and the feature
+        transformer runs once.
+        """
+        table = self.feature_table()
+        pattern = build_pattern(batch["own"], batch["other"], batch["counts"],
+                                columns=table.shape[0])
+        acc = pattern.apply(table).view(2, -1, self.hidden)
+        return self.activate(acc + self.ft_bias)
+
+    def forward_sparse(self, batch: dict) -> torch.Tensor:
+        """:meth:`forward`, reading the loader's sparse batch.
+
+        Same arithmetic, same answer to fp32 summation order - and the test
+        that says so is what keeps the two paths from drifting apart.
+        """
+        piece_count = batch["piece_count"]
+        trunk = self._stack(self._activated_sparse(batch), piece_count)
+        return self._pick(self._value_head(trunk), piece_count)
+
+    def forward_heads_sparse(self, batch: dict) -> tuple:
+        """:meth:`forward_heads`, reading the loader's sparse batch."""
+        piece_count = batch["piece_count"]
+        value, unc = self._heads(self._stack(self._activated_sparse(batch), piece_count))
+        return self._pick(value, piece_count), self._pick(unc, piece_count)
 
     def _pick_rows(self, y: torch.Tensor, width: int,
                    piece_count: torch.Tensor | None) -> torch.Tensor:

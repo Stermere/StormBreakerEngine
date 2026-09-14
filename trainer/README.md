@@ -7,6 +7,7 @@ covers setup and operation.
 ```
 nnue/format.py    the 32-byte record, and the features the network sees
 nnue/dataset.py   batches: memmap slices, or shuffled chunks at size
+nnue/sparse.py    the feature transformer as a sparse matrix product
 nnue/model.py     the network and the loss
 nnue/train.py     the training loop
 nnue/sanity.py    score positions whose evaluation is known
@@ -88,8 +89,6 @@ cd trainer
 # Gen 5 + factorization + finish pass ~3450 -> ~3500 (net-6e5d89a32b73)
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --checkpoint-every 1 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.2 --lambda-pieces -0.0 --score-clip 2000 --unc-weight 0.01 --feature-factorization --finish-epochs 1 --finish-lr 0.00001
 
-
-.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --checkpoint-every 1 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.2 --lambda-pieces -0.0 --score-clip 2000 --unc-weight 0.01 --feature-factorization --finish-epochs 1 --finish-lr 0.00001 --l1-size 32
 
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..
@@ -450,15 +449,35 @@ typo, and nothing else in the run would report it.
 | `--score-clip 3000` | stop mate and tablebase labels asking for infinite confidence |
 | `--source-weight human=0.5` | set the mixture without regenerating |
 
-Expect tens of minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
-At `--hidden 1024 --workers 6` that is about **390k positions/s**.
+Expect a few minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
+The reference configuration — `--hidden 512 --output-buckets 8 --uncertainty
+--feature-factorization`, batch 16,384, four workers, on `gen-005.cnn` — runs
+at **1.39M positions/s** sustained, measured as the steady-state window rate
+over 1,000 batches. It was **447k** before the sparse feature transformer
+landed, so a pass that took an hour takes twenty minutes.
 
-On the reference machine, the loader is not the bottleneck. It delivers
-**1.2M positions/s** — three times what training consumes — because 1.2M
-positions/s is only 38 MB/s of records, and the work is `unpack()` on the CPU
-rather than anything the drive does. So raise `--workers` until it stops
-helping, which is four to six, and then stop: past that the numbers that move
-are `--batch-size` (32768 is worth about 7% over 16384) and `--hidden`.
+Raise `--workers` until it stops helping, which is **four**: the loader
+delivers 2.8M positions/s there and does not improve at six or eight, because
+`unpack()` is the cost and four workers already saturate the memory bandwidth
+it runs on. Past that the number that moves is `--hidden`.
+
+Where a 16,384-position step goes at the reference configuration:
+
+| | ms |
+|---|---|
+| feature transformer, forward and backward (cuSPARSE) | 1.4 |
+| the activation chain and its backward | 2.3 |
+| weight clipping | 1.3 |
+| fused AdamW over 13M parameters | 0.9 |
+| per-epoch metrics | 0.7 |
+| building the batch's sparsity pattern | 0.6 |
+| everything else, mostly unfused elementwise kernels | 4.4 |
+| **total** | **11.6** |
+
+The loader runs concurrently at 5.8 ms and is not the constraint. That last row
+is what a fusing compiler would take: the step is a chain of separate kernels
+each streaming a 33-67 MB tensor in and back out, and nothing in eager PyTorch
+merges them.
 
 ---
 
@@ -482,10 +501,14 @@ feature count, hidden width and inference cost. Training does extra embedding
 work; the size of the strength gain must be measured, not assumed.
 
 A short same-batch GPU diagnostic on the RTX 3070 (512 wide, batch 16,384,
-fused AdamW, 5 warm-up + 20 timed steps) measured about 639k positions/s without
-factorization and 422k with it. This excludes loading/validation/checkpointing
-and is not a sustained throughput benchmark, but budget for additional training
-time. The exported engine still pays **no extra inference cost**.
+uncertainty head, fused AdamW, 10 warm-up + 30 timed steps) measures about
+1.60M positions/s without factorization and 1.35M with it — a 16% cost, where
+before the sparse feature transformer it was 34%. The factor is folded into the
+feature table once per step now, rather than run as a second embedding over
+every piece of every position, so it costs one pass over the table instead of a
+second pass over the batch. This excludes loading/validation/checkpointing and
+is not a sustained throughput benchmark. The exported engine still pays **no
+extra inference cost**.
 
 Old checkpoints still load/export. `--init-from` can add a zero shared factor
 to an old checkpoint; a factorized checkpoint automatically retains its factor.

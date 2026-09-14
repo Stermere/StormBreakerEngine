@@ -32,6 +32,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Evaluation tuning on real game data (`make tuner`) | complete |
 | NNUE data generation, record format, shuffler (`make datagen`) | complete |
 | NNUE trainer: features, dataset, model, training loop (`trainer/`) | complete |
+| NNUE trainer: sparse feature transformer, 3.10x positions/s (E37) | complete |
 | NNUE export + C inference, bit-exact against the reference (`make nnue-test`) | complete |
 | NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
 | NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
