@@ -164,10 +164,12 @@ run_selfplay() {
         _sp_opts="$_sp_opts -book $_book"
     fi
     _sp_opts="$_sp_opts $TB_OPT"
-    [ -z "${SELFPLAY_TREE:-}" ] || _sp_opts="$_sp_opts -tree $SELFPLAY_TREE"
     [ -z "${SELFPLAY_OPENING:-}" ] || _sp_opts="$_sp_opts -opening $SELFPLAY_OPENING"
     [ -z "${SELFPLAY_OPENING_SCORE:-}" ] \
         || _sp_opts="$_sp_opts -openingscore $SELFPLAY_OPENING_SCORE"
+    [ -z "${SELFPLAY_RANDOM:-}" ] || _sp_opts="$_sp_opts -random $SELFPLAY_RANDOM"
+    [ -z "${SELFPLAY_RANDOM_PLY:-}" ] \
+        || _sp_opts="$_sp_opts -randomply $SELFPLAY_RANDOM_PLY"
     log "selfplay options:${_sp_opts:- (datagen defaults)}"
 
     _i=0

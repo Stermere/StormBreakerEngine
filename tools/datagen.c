@@ -809,6 +809,9 @@ typedef struct {
     int openingPlies;
     int openingPliesMax;
     int openingMaxScore;
+    int randomChance;
+    int randomPlyMin;
+    int randomPlyMax;
     int maxPlies;
 
     bool gameProgress;
@@ -892,6 +895,12 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
         fprintf(f, "    \"opening_plies\": %d,\n", m->openingPlies);
         fprintf(f, "    \"opening_plies_max\": %d,\n", m->openingPliesMax);
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
+        /* The perturbation is invisible in the records themselves - a position reached after a
+         * random move is spelled exactly like one reached by play - so the manifest is the only
+         * place a dataset says whether it has any. */
+        fprintf(f, "    \"random_chance\": %d,\n", m->randomChance);
+        fprintf(f, "    \"random_ply_min\": %d,\n", m->randomPlyMin);
+        fprintf(f, "    \"random_ply_max\": %d,\n", m->randomPlyMax);
         fprintf(f, "    \"max_plies\": %d,\n", m->maxPlies);
         fprintf(f, "    \"game_progress\": %s\n", m->gameProgress ? "true" : "false");
         fprintf(f, "  },\n");
@@ -1426,6 +1435,10 @@ typedef struct {
     int openingPliesMax;
     int openingMaxScore;
 
+    int randomChance;
+    int randomPlyMin;
+    int randomPlyMax;
+
     int maxPlies;
     const char *syzygyPath;
 
@@ -1557,8 +1570,13 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     PendingList pending = {NULL, 0, 0};
     Position pos;
 
-    const double start    = now_seconds();
-    uint64_t labelled     = 0;
+    const double start = now_seconds();
+    uint64_t labelled  = 0;
+    /* Both are reported rather than merely counted. A perturbation rate is a 1-in-N chance
+     * against an eligible-ply count nobody computes by hand, and an opening rejection rate is
+     * the throughput -openingscore costs; a run that is throwing away nine openings in ten
+     * looks exactly like a slow one from the outside. */
+    uint64_t perturbed    = 0;
     int rejected          = 0;
     double lastReport     = start;
     double lastCheckpoint = start;
@@ -1632,10 +1650,14 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 ScoredMove list[MAX_MOVES];
                 const int n =
                     movegen_generate(&pos, board_checkers(&pos) ? GEN_EVASIONS : GEN_ALL, list);
+
+                /* Kept rather than counted, because `-random` picks out of this list. Filling
+                 * it is a couple of hundred stores against a search of thousands of nodes. */
+                Move legal[MAX_MOVES];
                 int legalCount = 0;
                 for (int j = 0; j < n; ++j)
                     if (movegen_is_legal(&pos, list[j].m))
-                        ++legalCount;
+                        legal[legalCount++] = list[j].m;
 
                 if (legalCount == 0) {
                     result = board_checkers(&pos)
@@ -1694,7 +1716,34 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                     ++labelled;
                 }
 
-                board_do_move(&pos, res.best);
+                /*
+                 * The perturbation, and the only randomness a game gets after its opening.
+                 * Self-play walks the lines the engine already likes, so a corpus of it
+                 * teaches the net its own blind spots (E18: coverage, not label quality, is
+                 * the binding constraint) - and the gap is in the MIDDLEGAME, where nothing
+                 * deterministic ever produces a damaged structure or an odd material split.
+                 *
+                 * It replaces the move PLAYED and nothing else. The record above is already
+                 * written, and its score is this search's evaluation of the position in hand,
+                 * not an endorsement of what follows; its policy `best` is likewise the move
+                 * the search chose, which is what a policy label wants. So the perturbation
+                 * costs no label here - what it does cost is the game RESULT for every record
+                 * before it, and that is why the chance wants to be small. See NNUE.md.
+                 *
+                 * Never on the ply `-openingscore` just screened: that check is the one
+                 * guarantee the game did not start already decided, and a random move on the
+                 * same ply would spend it. Nothing is drawn at all when -random is 0, so a
+                 * shard generated before this existed still reproduces byte for byte.
+                 */
+                Move chosen = res.best;
+                if (o->randomChance > 0 && legalCount > 1 && pos.gamePly > plies &&
+                    pos.gamePly >= o->randomPlyMin && pos.gamePly <= o->randomPlyMax &&
+                    rng_below(&rng, (uint64_t)o->randomChance) == 0) {
+                    chosen = legal[rng_below(&rng, (uint64_t)legalCount)];
+                    ++perturbed;
+                }
+
+                board_do_move(&pos, chosen);
             }
 
             /* Where the game stopped, in the same gamePly units the candidates recorded -
@@ -1727,10 +1776,12 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         const double now = now_seconds();
         if (!Quiet && (now - lastReport > 5.0 || played == games)) {
             const double elapsed = now - start > 0.001 ? now - start : 0.001;
-            fprintf(stdout, "[w%02d] games %d/%d  records %llu  labels %llu  %.0f labels/s%s\n",
+            fprintf(stdout,
+                    "[w%02d] games %d/%d  records %llu  labels %llu  %.0f labels/s"
+                    "  rejected %d  random %llu\n",
                     index, played, games, (unsigned long long)writer.count,
-                    (unsigned long long)labelled, (double)labelled / elapsed,
-                    rejected ? "  (openings rejected)" : "");
+                    (unsigned long long)labelled, (double)labelled / elapsed, rejected,
+                    (unsigned long long)perturbed);
             fflush(stdout);
             lastReport = now;
         }
@@ -1750,6 +1801,9 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.openingPlies    = o->openingPlies;
     man.openingPliesMax = o->openingPliesMax;
     man.openingMaxScore = o->openingMaxScore;
+    man.randomChance    = o->randomChance;
+    man.randomPlyMin    = o->randomPlyMin;
+    man.randomPlyMax    = o->randomPlyMax;
     man.maxPlies        = o->maxPlies;
     man.gameProgress    = true;
 
@@ -1828,7 +1882,25 @@ static void usage_selfplay(void) {
            "                     generation start on the same side; 2-3 splits it.\n"
            "                                               (2 with -book, otherwise 8)\n"
            "  -openingscore N    discard the game if the opening is already decided by\n"
-           "                     more than this many centipawns.          (800)\n"
+           "                     more than this many centipawns. Matches the -maxscore\n"
+           "                     the CCRL book is extracted at.           (300)\n"
+           "\n"
+           "middlegame perturbation\n"
+           "  -random N          1-in-N chance, per ply in the window below, that a\n"
+           "                     uniformly random legal move is played instead of the\n"
+           "                     search's. 0 is off; 1 is refused. Self-play walks the\n"
+           "                     lines the engine already likes, and this is what puts\n"
+           "                     damaged structures and odd material splits in the\n"
+           "                     corpus at all. It replaces the move PLAYED only - the\n"
+           "                     record's score is still a real search of a real\n"
+           "                     position. What it does cost is the game RESULT for the\n"
+           "                     records BEFORE it, so keep it low: 128 fires on about a\n"
+           "                     third of games, which is the recommended setting.  (0)\n"
+           "  -randomply MIN-MAX plies, counted from the game's start position, that\n"
+           "                     -random may fire in. Out of a ply-20 book the default\n"
+           "                     is roughly real moves 15-40. The ply -openingscore\n"
+           "                     screened is never perturbed, whatever this says.\n"
+           "                                                              (8-60)\n"
            "\n"
            "endings  (there is NO adjudication: games end by mate, stalemate, the\n"
            "          fifty-move rule, repetition or insufficient material. Endgame\n"
@@ -1880,8 +1952,19 @@ static int cmd_selfplay(int argc, char **argv) {
      * of a book line chosen for its depth. */
     o.openingPlies    = -1;
     o.openingPliesMax = -1;
-    o.openingMaxScore = 800;
-    o.maxPlies        = 400;
+    /* 300 rather than the 800 this used to be. A randomised opening that is already a
+     * bishop up is not an opening: the game that follows is a conversion exercise, every
+     * record in it carries a result the perturbation decided rather than the position, and
+     * the game-result term the trainer spends on it is attributing that result to a
+     * middlegame nobody played. 300cp is also what the CCRL book was extracted at
+     * (`tuner extract -maxscore 300`), so the two bounds now agree. */
+    o.openingMaxScore = 300;
+    /* Off: the mid-game perturbation is a per-generation decision recorded in the manifest,
+     * and defaulting it on would silently change what every existing command produces. */
+    o.randomChance = 0;
+    o.randomPlyMin = 8;
+    o.randomPlyMax = 60;
+    o.maxPlies     = 400;
     /* 0: games are played to their natural end, and the conversion of a decisive advantage
      * is precisely what gen-5 onward trains - capping the label magnitude would drop every
      * position of the grind. */
@@ -1913,7 +1996,12 @@ static int cmd_selfplay(int argc, char **argv) {
                 dief("-opening wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
         } else if (!strcmp(argv[i], "-openingscore") && i + 1 < argc)
             o.openingMaxScore = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-maxplies") && i + 1 < argc)
+        else if (!strcmp(argv[i], "-random") && i + 1 < argc)
+            o.randomChance = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-randomply") && i + 1 < argc) {
+            if (!parse_ply_range(argv[++i], &o.randomPlyMin, &o.randomPlyMax))
+                dief("-randomply wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
+        } else if (!strcmp(argv[i], "-maxplies") && i + 1 < argc)
             o.maxPlies = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-syzygy") && i + 1 < argc)
             o.syzygyPath = argv[++i];
@@ -1953,6 +2041,11 @@ static int cmd_selfplay(int argc, char **argv) {
         dief("-maxplies must be between 2 and %d - a game's plies and the deepest search's "
              "share one %d-entry history",
              MAX_GAME_PLY - MAX_PLY - 1, MAX_GAME_PLY);
+    /* 1 would make every move of the window random, which is not a perturbation of a game
+     * but the absence of one - and the scores recorded along it would label a walk. */
+    if (o.randomChance == 1 || o.randomChance < 0)
+        die("-random wants 0 (off) or 2 and above: it is a 1-in-N chance per ply");
+
     if (o.openingPlies < 0)
         o.openingPlies = o.book ? 2 : 8;
     if (o.openingPliesMax < o.openingPlies)

@@ -62,8 +62,9 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Datagen: the game's own search is the label; the re-search and tree sampling removed | built, **5.2x** faster (E26) |
 | Trainer: per-record lambda (game progress, phase, source), score clip, source weights | built, every dial defaults to no effect |
 | Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
-| **Self-play data generation with deliberate variation** | **TODO** |
-| **gen-5 data generated with tablebases and no adjudication** | **TODO** |
+| Datagen: middlegame perturbation (`-random`), `-openingscore` 800 → 300 | built, gated by `make datagen-test`; **no net trained on it yet** |
+| **A generation run using `-random`, and a net trained on it** | **TODO** |
+| gen-5 data generated with tablebases and no adjudication | done — `gen-005.cnn`, 549M records, what E34 and E37 train and profile on |
 | Lazy SMP: per-thread state, parked pool, `Threads` 1–1024, Windows processor groups | built, **scaling measured, no SPRT** |
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
 | Staged movegen 2: main-search picker, tacticals and quiets deferred | **provisional keep**; STC +5.72 ± 4.96 Elo, LLR +1.920, stopped for budget; **SPRT inconclusive, LTC pending** (E36) |
@@ -144,8 +145,18 @@ The open work, roughly in order of Elo per unit of effort:
    what it covers however good the labeller gets. Self-play has the opposite
    problem: it concentrates on the lines the engine already likes, so a corpus
    without variation teaches the net its own blind spots. The levers are
-   opening-book spread and randomised early plies (see [NNUE.md](NNUE.md));
-   tree sampling was the third lever and has been removed (E26).
+   opening-book spread, randomised early plies, and — new — a **middlegame
+   perturbation**, `-random N`, a 1-in-N chance per ply of playing a random
+   legal move (see [NNUE.md](NNUE.md)). The first two vary where a game
+   *starts*; only the third varies where it *goes*, which is where the
+   uncovered positions are. Tree sampling was a fourth lever and has been
+   removed (E26).
+
+   `-random` is built, off by default, and **no net has been trained on a
+   corpus that used it** — the next generation run is what tests it. Its cost
+   is that the game result becomes wrong for records *before* a perturbation,
+   so if a net trained on one looks hurt rather than helped, try
+   `--lambda-end 1.0` before reaching for a smaller `-random`.
 
    `gen-004` is the first pass at the first two. `datagen selfplay` gained
    `-book`, and the generation is configured to start every game from one of

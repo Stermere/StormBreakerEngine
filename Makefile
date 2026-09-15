@@ -561,6 +561,54 @@ datagen-test: datagen
 	    fi; \
 	    echo "PASS: -opening 2-3 splits the game start ($$n records over 40 games)"
 
+# And that the middlegame perturbation is OFF when it is off, ON when it is on,
+# and bounded by its window. The first is the load-bearing one: `-random 0` has
+# to consume no draws at all, or every shard generated before it existed stops
+# reproducing and the regeneration gate above becomes a gate on nothing. The
+# third catches the perturbation firing outside -randomply, which no amount of
+# eyeballing a shard would reveal - a position reached after a random move is
+# spelled exactly like one reached by play.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/noise-off.cnn \
+	    -games 6 -nodes 2000 -seed 7 -quiet
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/noise-zero.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 0 -quiet
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-off.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-zero.cnn -n 100000); \
+	 [ "$$a" = "$$b" ] \
+	    || { echo 'FAIL: -random 0 drew from the RNG and changed the games'; exit 1; }
+	@echo "PASS: -random 0 costs no draws"
+
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/noise-far.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 2 -randomply 100-150 -maxplies 30 -quiet
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/noise-cap.cnn \
+	    -games 6 -nodes 2000 -seed 7 -maxplies 30 -quiet
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-cap.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-far.cnn -n 100000); \
+	 [ "$$a" = "$$b" ] \
+	    || { echo 'FAIL: -random fired outside its -randomply window'; exit 1; }
+	@echo "PASS: -random stays inside -randomply"
+
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/noise-on.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 4 -quiet
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-off.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-on.cnn -n 100000); \
+	 [ "$$a" != "$$b" ] \
+	    || { echo 'FAIL: -random 4 changed nothing - the perturbation never fired'; exit 1; }
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/noise-on.cnn
+	@echo "PASS: -random perturbs the game line, and its shard still verifies"
+
+# And that a perturbed run is still a function of its seed. The regeneration
+# gate above is what replaced `verify -relabel` for self-play shards (E26), and
+# a perturbation drawn from anywhere but the per-game stream would pass every
+# other check here while making the dataset unreproducible.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/noise-again.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 4 -quiet
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-on.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-again.cnn -n 100000); \
+	 [ "$$a" = "$$b" ] \
+	    || { echo 'FAIL: a perturbed shard did not reproduce from its seed'; exit 1; }
+	@echo "PASS: a perturbed shard reproduces from its seed"
+
 # And that a game stopped by the ply cap records NO result rather than a
 # fabricated draw. Every game in range.cnn was cut off by -maxplies 4, so
 # every record must carry WDL 3 (unknown) - the value the trainer treats as

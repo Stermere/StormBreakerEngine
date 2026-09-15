@@ -406,16 +406,18 @@ the parts that are surprising.
 
 ### Openings: a book, and a deliberately tiny perturbation
 
-Everything after the opening is deterministic. The search is fixed-node on one
-thread and nothing randomises the move choice, so **a game is a function of its
-start position and its random plies, and of nothing else.** That makes the
-opening the entire coverage story.
+Everything after the opening is deterministic unless `-random` is set. The
+search is fixed-node on one thread and nothing else randomises the move choice,
+so **a game is a function of its start position, its random plies and its
+perturbations, and of nothing else.**
 
 | Flag | Default | What it does |
 |---|---|---|
 | `-book <file.epd>` | none | draw each game's start uniformly from this EPD — a FEN per line, anything after it ignored, which is exactly what `tuner extract` writes |
 | `-opening N` or `MIN-MAX` | 2 with a book, 8 without | random legal plies played out of the start position; a range is drawn per game |
-| `-openingscore N` | 800 | throw the game away if the opening is already decided by more than this |
+| `-openingscore N` | 300 | throw the game away if the opening is already decided by more than this |
+| `-random N` | 0 (off) | 1-in-N chance per ply that a random legal move is played instead of the search's — see below |
+| `-randomply MIN-MAX` | 8-60 | the plies `-random` may fire in |
 
 Only the line offsets of a book are held in memory, so a 50 MB book costs ~6 MB
 per worker rather than being loaded once per core.
@@ -449,6 +451,19 @@ whichever side starts. The manifest records both bounds (`opening_plies`,
 The book decides which positions a generation ever sees, so it is pinned by
 hash in `job.env` (`BOOK_SHA`) exactly as the net is, and the shard manifest
 records its path and how many entries it indexed.
+
+**`-openingscore` is 300, not the 800 it used to be.** A randomised opening
+that is already a bishop up is not an opening: the game after it is a
+conversion exercise, and every record in it carries a result the perturbation
+decided rather than the position. 300 is also the `-maxscore` the CCRL book is
+extracted at, so the two bounds now agree instead of one being nearly three
+times the other. Measured over 600 games out of the ply-20 book, `-opening
+2-3`, `-nodes 10000`:
+
+| `-openingscore` | openings rejected | records per game |
+|---|---|---|
+| 800 | 11.9% of attempts | 106.3 |
+| **300** | **34.4% of attempts** | **112.2** |
 
 **Building one.** `tuner extract` writes the format directly, and `-minply N
 -maxply N` bounds the sampling window to a single ply, which is one position
