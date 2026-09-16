@@ -24,4 +24,10 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
  * `maximum` is enforced separately, so an unstable position cannot flag. */
 int64_t timeman_optimum(const TimeManager *tm, int stability);
 
+/* False for `go depth`, `go nodes`, `go infinite` and bench, where the budget is a
+ * sentinel rather than a deadline. Anything that shortens a search to save time must
+ * ask this first: a fixed-depth search was asked for a depth and owes exactly that,
+ * and bench node counts are reproducible only because nothing abbreviates them. */
+bool timeman_has_clock(const TimeManager *tm);
+
 #endif

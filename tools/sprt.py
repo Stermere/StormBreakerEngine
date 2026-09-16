@@ -188,6 +188,10 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--rounds", type=int, default=40000, help="game-pair cap; default runs to a verdict")
     ap.add_argument("--book")
+    ap.add_argument("--syzygy",
+                    help="tablebase directory, given to BOTH engines. Without it a change "
+                         "to tablebase code is not exercised at all: the engine loads none "
+                         "unless SyzygyPath is set.")
     ap.add_argument("--dev-options", default="",
                     help='UCI options for dev only: "RfpMargin=72 DeltaMargin=222". '
                          'An "option." prefix is tolerated so tune.py output pastes straight in.')
@@ -269,6 +273,7 @@ def main() -> int:
         threads=args.threads,
         book=book,
         extra=extra,
+        syzygy=args.syzygy,
     )
 
     c.section("SPRT configuration")
@@ -281,6 +286,8 @@ def main() -> int:
     print(f"  hash/threads {args.hash_mb} MB / {args.threads}")
     if book:
         print(f"  book         {book}")
+    if args.syzygy:
+        print(f"  syzygy       {args.syzygy}  (both engines)")
     print(f"  pgn          {pgn}")
     if dev_options:
         print(f"  dev options  {len(dev_options)}: " +

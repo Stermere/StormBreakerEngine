@@ -103,10 +103,12 @@ static const int StabilityPercent[] = {170, 130, 110, 100, 92, 86, 82, 80};
 
 #define STABILITY_BUCKETS ((int)(sizeof(StabilityPercent) / sizeof(StabilityPercent[0])))
 
+bool timeman_has_clock(const TimeManager *tm) { return tm->optimum < INT64_MAX / 256; }
+
 int64_t timeman_optimum(const TimeManager *tm, int stability) {
     /* No clock at all - `go depth`, `go nodes`, `go infinite`, bench. Scaling a
      * sentinel would overflow, and there is nothing here to scale. */
-    if (tm->optimum >= INT64_MAX / 256)
+    if (!timeman_has_clock(tm))
         return tm->optimum;
 
     if (stability < 0)

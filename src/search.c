@@ -238,6 +238,7 @@ static CondVar ThreadCv;
 static bool PoolReady;
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
+static inline int imax(int a, int b) { return a > b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /* Nodes between clock checks: fine enough that a search cannot overrun by more than a
@@ -445,6 +446,12 @@ TUNABLE(FUTILITY_MARGIN, 59);
  * both sides of a gradient estimate land on the same integer and the measurement is
  * noise; thresholds want a sweep of their own, not a sweep seat. */
 #define ASPIRATION_MIN_DEPTH 5
+
+/*
+ * When a proven mate is allowed to end the search early.
+ */
+#define MATE_CONFIRM_ITERS  5
+#define MATE_CONFIRM_MARGIN 8
 
 /* How far below alpha the static evaluation must sit before the node drops straight into
  * quiescence. Much larger than futility's because the claim is bigger - this discards
@@ -1805,15 +1812,29 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         return ttValue;
 
     /*
+     * What a tablebase hit at a PV node leaves behind: a floor under the score, or a ceiling
+     * over it. Both stay neutral at every node that does not probe.
+     */
+    Value tbFloor   = -VALUE_INFINITE;
+    Value tbCeiling = VALUE_INFINITE;
+
+    /*
      * Syzygy WDL probe. The halfmove-clock gate keeps this off the hot path and is also a
      * correctness condition: WDL tables assume a fresh fifty-move counter, so only the
      * capture or pawn move that entered the tablebase region probes and everything behind
      * it transposes through the entry stored here.
      *
-     * The value is game-theoretic truth rather than a heuristic, so it is returned
-     * outright; a win is only a lower bound (a search might still prefer the faster mate)
-     * and a loss only an upper one. Stored a few plies deeper than asked so neighbouring
-     * nodes transpose into it rather than re-probing the disk.
+     * The value is game-theoretic truth rather than a heuristic, so it is returned outright
+     * WHERE IT SETTLES THE NODE - a draw, a win that already beats beta, a loss that is
+     * already under alpha. Stored a few plies deeper than asked so neighbouring nodes
+     * transpose into it rather than re-probing the disk.
+     *
+     * A win is only a lower bound, though, and a loss only an upper one: the tables prove
+     * the result and say nothing about its length, while a mate score says both and outranks
+     * the whole tablebase band. Returning the bound outright at a PV node is what stopped the
+     * engine ever looking for that mate - the one line where the search knows something the
+     * tables do not. So the PV node keeps the proof as a floor and searches on. Every other
+     * node still returns immediately, which is where the probe's cost savings were.
      */
     if (TbLimit != 0 && !isExcluded && pos->halfmoveClock == 0 && pos->castling == NO_CASTLING &&
         popcount(occupied_bb(pos)) <= TbLimit) {
@@ -1823,9 +1844,23 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             const Bound tbBound = tbValue > VALUE_DRAW   ? BOUND_LOWER
                                   : tbValue < VALUE_DRAW ? BOUND_UPPER
                                                          : BOUND_EXACT;
-            tt_store(key, MOVE_NONE, tbValue, VALUE_NONE, (Depth)imin(depth + 6, MAX_PLY - 1),
-                     tbBound, ttPv, ply);
-            return tbValue;
+
+            if (!pvNode || tbBound == BOUND_EXACT ||
+                (tbBound == BOUND_LOWER ? tbValue >= beta : tbValue <= alpha)) {
+                tt_store(key, MOVE_NONE, tbValue, VALUE_NONE, (Depth)imin(depth + 6, MAX_PLY - 1),
+                         tbBound, ttPv, ply);
+                return tbValue;
+            }
+
+            /* Not stored: this node is about to be searched properly, and the entry it writes
+             * on the way out describes that search. Writing the bound here at depth + 6 first
+             * would shadow it. */
+            if (tbBound == BOUND_LOWER) {
+                tbFloor = tbValue;
+                alpha   = (Value)imax(alpha, tbValue);
+            } else {
+                tbCeiling = tbValue;
+            }
         }
     }
 
@@ -2017,7 +2052,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     for (int i = 0; i < CONT_SLOTS; ++i)
         slices[i] = cont_slice(td, i, ply, ContPlies[i]);
 
-    Value best    = -VALUE_INFINITE;
+    /* Seeded from the tablebase floor, which is -VALUE_INFINITE at every node that did not
+     * probe one. A proven win the search cannot improve on is still this node's value, so it
+     * has to survive a move loop in which nothing beats it. */
+    Value best    = tbFloor;
     Move bestMove = MOVE_NONE;
     int moveCount = 0;
 
@@ -2292,6 +2330,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         tt_store(key, MOVE_NONE, best, rawEval, depth, BOUND_EXACT, ttPv, ply);
         return best;
     }
+
+    /*
+     * A proven loss caps this node however well the tree below it scored: the tables are
+     * right and the search is guessing. Applied before the entry is written, so nothing
+     * above can read back a score the tables have already ruled out. Every pruning shortcut
+     * between the probe and here is !pvNode-gated and the ceiling is only ever set at a PV
+     * node, so there is no path out of this function that skips it.
+     */
+    if (tbCeiling != VALUE_INFINITE)
+        best = (Value)imin(best, tbCeiling);
 
     /*
      * A move that raised alpha without failing high proves an exact score, because every
@@ -2621,6 +2669,12 @@ static void thread_search(SearchThread *td) {
     int stability = 0;
     Move prevBest = MOVE_NONE;
 
+    /* Consecutive completed iterations returning the SAME mate score, which is a different
+     * question from agreeing on the move: two iterations can agree on the move while the
+     * distance behind it is still moving. */
+    int mateStreak      = 0;
+    Value prevMateScore = VALUE_NONE;
+
     /* The helper's seat in the skip tables. Offset by the root's ply so two searches from
      * different positions in the same game do not hand every thread the same schedule. */
     const int pattern = isMain ? -1 : (td->id - 1) % SKIP_PATTERNS;
@@ -2673,6 +2727,9 @@ static void thread_search(SearchThread *td) {
         stability = (prevBest != MOVE_NONE && iterationBest == prevBest) ? stability + 1 : 0;
         prevBest  = iterationBest;
 
+        mateStreak = (prevMateScore != VALUE_NONE && value == prevMateScore) ? mateStreak + 1 : 0;
+        prevMateScore = value >= VALUE_MATE_IN_MAX_PLY ? value : VALUE_NONE;
+
         /* A proven result outranks the tree's opinion of it. `prevScore` keeps the tree's own
          * number so the next aspiration window is centred on something the tree can return,
          * while everything outward-facing reports the proof.
@@ -2706,6 +2763,27 @@ static void thread_search(SearchThread *td) {
             continue;
 
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)
+            break;
+
+        /*
+         * A proven mate the search can no longer improve on. Spending the rest of the clock
+         * re-proving it buys nothing - the move is already chosen, and the only better answer
+         * is a SHORTER mate, which is precisely what the two conditions above rule out.
+         *
+         * This is deliberately not "stop as soon as a mate appears": the first sighting is
+         * the least trustworthy number in the whole search, and the distance usually keeps
+         * falling for several iterations after it. Left unguarded the engine announces a mate
+         * in one and then drives the iteration counter to 245 re-proving it, which is where
+         * this came from.
+         *
+         * Only with a clock to save. `go depth`, `go nodes`, `go infinite` and bench were
+         * asked for an amount of work and get exactly it - bench's node counts are
+         * reproducible only because nothing abbreviates them.
+         */
+        if (timeman_has_clock(&Timer) && !atomic_load(&Pondering) &&
+            value >= VALUE_MATE_IN_MAX_PLY &&
+            depth >= (Depth)(VALUE_MATE - value) + MATE_CONFIRM_MARGIN &&
+            mateStreak >= MATE_CONFIRM_ITERS)
             break;
 
         /* Do not begin an iteration there is no realistic chance of finishing: each costs

@@ -318,6 +318,7 @@ def match_args(
     book: str | None = None,
     extra: list[str] | None = None,
     depth: int | None = None,
+    syzygy: str | None = None,
 ) -> list[str]:
     """The argument vector shared by every match this repository runs.
 
@@ -329,6 +330,11 @@ def match_args(
     nodes is free, so every pruning parameter is rewarded for pruning less and
     a tuner pointed at it will happily walk them all in the wrong direction.
     Useful precisely because that direction is known in advance.
+
+    `syzygy` goes on `-each`, never on one engine: tablebases change how a game
+    is played, so pointing one side at them and not the other measures the
+    tables rather than the patch. The engine loads none unless told to, which
+    is why a change to tablebase code is invisible to a match without this.
     """
     args: list[str] = []
     for e in engines:
@@ -338,6 +344,10 @@ def match_args(
         f"depth={depth}" if depth else f"tc={tc}",
         f"option.Hash={hash_mb}",
         f"option.Threads={threads}",
+    ]
+    if syzygy:
+        args.append(f"option.SyzygyPath={Path(syzygy).resolve()}")
+    args += [
         "-rounds",
         str(rounds),
         "-games",
