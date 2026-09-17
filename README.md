@@ -4,9 +4,8 @@ A UCI chess engine written in C, built for competitive strength built entirely
 from scratch with a mission to see how far a near fully AI generated engine can go,
 with some human help along the way of course.
 
-The current build scores ~3410 on a gauntlet against five CCRL-rated engines at short time control, dead even
-head-to-head with Ethereal 12.75 (CCRL 3426). Ratings do not transfer perfectly across time controls, so we
-claim **~3300 CCRL Blitz**.
+The current build scores ~3480 on a gauntlet against five CCRL-rated engines at STC.
+A small LTC test has shown similar results, but the exact number is not yet known.
 
 ---
 
@@ -20,17 +19,6 @@ the value loss is untouched. The label was already in every training record, so
 the head cost a retrain rather than a regeneration, and it costs the search one
 extra output-row pass over the accumulator the evaluation already keeps.
 
-Every margin-based prune makes the same claim in different clothes: that *k*
-centipawns cover the gap between the static evaluation and a deeper search,
-with *k* a global constant fitted to the average position. That residual is
-heteroscedastic, so one constant is wrong in both directions at once.
-`unc_scale()` in [src/search.c](src/search.c) maps the predicted error onto a
-percentage, `min(73 + σ·13/16, 144)`, and eight pruning sites scale by it —
-reverse futility, futility, razoring, ProbCut and qsearch delta at full weight,
-the two SEE thresholds and the singular margin wired in at zero. Each site
-weights the mapping's *deviation* from 100 rather than the scale itself, which
-keeps the conditioning orthogonal to the margin constant beside it.
-
 A net without the head is still a valid net: `unc_scale()` then runs the same
 mapping off correction-history magnitude, a running measurement in place of a
 position-only prior. Both were tested, in that order, each against the build
@@ -39,13 +27,7 @@ before it:
 | | Measured, STC 8+0.08 |
 |---|---|
 | Corrhist-magnitude probe, no network change (E20) | **+25.61 ± 9.85** |
-| The trained σ head replacing it (E21) | **+21.29 ± 9.22** |
-
-Corrhist-conditioned margins are prior art — Stockfish merged "corrplexity" in
-early 2025, worth 1-2 Elo there against margins SPSA'd for a decade. The
-*learned head* has no known precedent in an alpha-beta engine, and E21 is, as
-far as is known, the first measured instance of one paying its way. Both
-verdicts are STC-only.
+| The trained σ head vs Corrhist-magnitude probe (E21) | **+21.29 ± 9.22** |
 
 ---
 
@@ -70,8 +52,6 @@ head above — run with an incremental int16 accumulator and AVX2. The net file
 describes its own architecture in its header, so a retrain at a different
 width or bucket count is a drop-in, and the uncertainty head sits behind a
 header flag so a headless net stays loadable by every build.
-The classical evaluation still builds (`make classical`) and is much stronger now than the engine used to generate the first
-set of training data however it is still not compatible with the NNUE evaluation and is not used in the default build.
 
 **Training pipeline.** `tools/datagen.c` generates and labels positions with
 fixed-node searches into a packed 32-byte format; `trainer/` (PyTorch) fits
@@ -85,44 +65,10 @@ behavioural change and needs a passing SPRT before it ships — roughly half of
 "obviously good" engine patches measure neutral or worse, and
 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) records every result either way.
 
+I've been quite lazy and not let all the sprt's run to completion, that worked out when the engine was weak but
+it is now too strong to do that and end up gaining in the gauntlet.
 ---
 
-## Quick start
-
-```sh
-make                     # build for this machine (the network evaluation)
-make classical           # the hand-written eval, as stormbreaker-classical
-make bench               # deterministic node-count benchmark
-make perft               # move generation correctness suite
-```
-
-The default build embeds a net, and a clean clone has none — `external/` is
-gitignored. The first `make` therefore downloads the net the Makefile pins
-(~25 MB, SHA-256 verified before it is used) and then builds. `make classical`
-needs no net and no network access.
-
-First-time environment setup (Windows):
-
-```powershell
-powershell -File tools\setup.ps1             # fastchess, GUIs, Stockfish; the book
-powershell -File tools\register-engines.ps1  # register with Cute Chess
-make sprt ARGS=--smoke                       # verify the match pipeline
-make trainer-setup                           # trainer\.venv, PyTorch
-```
-
-To watch it play:
-
-```powershell
-powershell -File tools\gui.ps1                  # En Croissant (default)
-powershell -File tools\gui.ps1 -App cutechess   # Cute Chess
-```
-
-`gui.ps1` re-registers the engine against your current build before
-launching, so the GUI never runs a stale binary. `bestmove 0000` means the
-engine found no legal move — checkmate, stalemate, or an empty `go
-searchmoves` list; anywhere else it is a bug.
-
----
 
 ## Make commands
 
@@ -176,22 +122,7 @@ correctly — a `.buildflags` stamp is a prerequisite of every binary.
 | `make unc-probe` | build `stormbreaker-uncprobe` and measure the σ distribution `unc_scale()` is centred on, scaling held neutral. `PROBE_ARGS="-o <csv>"` records it, `-ref <csv>` solves for the constants that reproduce an older net's, `-live` measures the tree the mapping shapes instead |
 | `make net-publish` | upload `EVALFILE` as a content-addressed release |
 
-Training itself runs from `trainer/` — see [trainer/README.md](trainer/README.md);
-`--uncertainty` adds the error-predicting head, `--unc-weight` sets its share of
-the loss ([docs/NNUE.md](docs/NNUE.md), Task 5b).
-
-An ad-hoc match, if you want one without the scripts (fastchess is on PATH as
-`fast-chess`):
-
-```powershell
-fast-chess -engine cmd=.\stormbreaker.exe name=dev `
-           -engine cmd=stockfish name=sf `
-           -each tc=10+0.1 -rounds 2 -pgnout file=external\games\quick.pgn
-```
-
-For measured results, use `make sprt` or `make gauntlet`; these commands set
-the book, concurrency and PGN output consistently.
-
+Training itself runs from `trainer/` — see [trainer/README.md](trainer/README.md).
 ---
 
 ## Repository layout
