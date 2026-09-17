@@ -8,6 +8,7 @@
  */
 #include "uci.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,6 @@
 #include "search.h"
 #include "syzygy.h"
 #include "test/chess960test.h"
-#include "test/historytest.h"
 #include "test/movepicktest.h"
 #include "test/smptest.h"
 #include "test/syzygytest.h"
@@ -217,6 +217,7 @@ static void end_search_for_option(const char *name) {
  * would arrive as a plausible-looking setting the GUI never asked for. */
 static int spin_value(const char *name, const char *value, int min, int max, int fallback) {
     char *end         = NULL;
+    errno             = 0;
     const long long v = strtoll(value, &end, 10);
 
     if (end == value) {
@@ -224,9 +225,13 @@ static int spin_value(const char *name, const char *value, int min, int max, int
                fallback);
         return fallback;
     }
-    if (v < min || v > max) {
+    if (errno == ERANGE || v < min || v > max) {
         const int clamped = v < min ? min : max;
-        printf("info string option '%s': %lld is outside %d..%d; using %d\n", name, v, min, max,
+
+        /* The value as TYPED. strtoll saturates at LLONG_MAX, so echoing what it returned
+         * reports a number the sender never sent - and a GUI author reading the log is
+         * then looking for a bug in the wrong place. */
+        printf("info string option '%s': %s is outside %d..%d; using %d\n", name, value, min, max,
                clamped);
         return clamped;
     }
@@ -317,11 +322,50 @@ static void cmd_setoption(char *args) {
         Pos.chess960 = strcmp(value, "true") == 0;
     } else {
 #ifdef TUNE_SEARCH
-        if (value && search_tunable_set(name, atoi(value))) {
-            fflush(stdout);
-            return;
+        /*
+         * Matched before it is set, so the search can be ended first. Setting a tunable
+         * rewrites Reductions[][], which every searching thread indexes at every node, and
+         * the value itself is read just as widely - this is the same hazard Hash and
+         * EvalFile end the search for, and it was the one option path that did not.
+         * search_tunable_set() has no "does this name exist" query, so the enumeration
+         * that cmd_uci() already advertises from answers it.
+         */
+        if (value) {
+            for (int i = 0; i < search_tunable_count(); ++i) {
+                const char *tname;
+                int tvalue, tmin, tmax;
+
+                search_tunable_info(i, &tname, &tvalue, &tmin, &tmax);
+                if (strcmp(name, tname) != 0)
+                    continue;
+
+                end_search_for_option(name);
+                search_tunable_set(name, atoi(value));
+                fflush(stdout);
+                return;
+            }
         }
 #endif
+        /*
+         * Every branch above requires a value, so a known name sent without one falls all
+         * the way down here and used to be reported as unknown - which sends whoever is
+         * reading the log looking for a spelling mistake that is not there. Name the real
+         * fault instead.
+         */
+        static const char *const Known[] = {
+            "Hash",     "Threads", "Ponder", "Move Overhead", "SyzygyPath", "UCI_Chess960",
+#ifdef EVAL_NNUE
+            "EvalFile",
+#endif
+        };
+
+        for (size_t i = 0; i < sizeof(Known) / sizeof(Known[0]); ++i)
+            if (strcmp(name, Known[i]) == 0) {
+                printf("info string option '%s': no value given\n", name);
+                fflush(stdout);
+                return;
+            }
+
         printf("info string unknown option '%s'\n", name);
     }
     fflush(stdout);
@@ -423,23 +467,37 @@ static void cmd_go(char *args) {
     char *tok;
 
     while ((tok = next_token(&cursor)) != NULL) {
-        if (token_is(tok, "wtime"))
+        /*
+         * The clock fields record that they ARRIVED as well as what they said. A zero is a
+         * flagged clock and has to be answered instantly; an absent field is no clock at
+         * all and has no deadline, and the zeroed struct cannot tell the two apart by
+         * value. See the note beside `timeGiven` in search.h.
+         */
+        if (token_is(tok, "wtime")) {
             limits.time[WHITE] = atoll(next_or(&cursor, "0"));
-        else if (token_is(tok, "btime"))
+            limits.timeGiven   = true;
+        } else if (token_is(tok, "btime")) {
             limits.time[BLACK] = atoll(next_or(&cursor, "0"));
-        else if (token_is(tok, "winc"))
+            limits.timeGiven   = true;
+        } else if (token_is(tok, "winc"))
             limits.inc[WHITE] = atoll(next_or(&cursor, "0"));
         else if (token_is(tok, "binc"))
             limits.inc[BLACK] = atoll(next_or(&cursor, "0"));
         else if (token_is(tok, "movestogo"))
             limits.movestogo = atoi(next_or(&cursor, "0"));
-        else if (token_is(tok, "depth"))
-            limits.depth = atoi(next_or(&cursor, "0"));
-        else if (token_is(tok, "nodes"))
-            limits.nodes = strtoull(next_or(&cursor, "0"), NULL, 10);
-        else if (token_is(tok, "movetime"))
-            limits.movetime = atoll(next_or(&cursor, "0"));
-        else if (token_is(tok, "mate"))
+        /* Floored at one rather than taken as written: `go depth 0` and `go nodes 0` are
+         * a limit that cannot be met, and the loops that enforce them read "no limit" from
+         * the same zero. One iteration, or one check interval, is what was asked for. */
+        else if (token_is(tok, "depth")) {
+            const int d  = atoi(next_or(&cursor, "1"));
+            limits.depth = d > 0 ? (Depth)d : 1;
+        } else if (token_is(tok, "nodes")) {
+            const unsigned long long n = strtoull(next_or(&cursor, "1"), NULL, 10);
+            limits.nodes               = n > 0 ? (uint64_t)n : 1;
+        } else if (token_is(tok, "movetime")) {
+            limits.movetime      = atoll(next_or(&cursor, "0"));
+            limits.movetimeGiven = true;
+        } else if (token_is(tok, "mate"))
             limits.mate = atoi(next_or(&cursor, "0"));
         else if (token_is(tok, "infinite"))
             limits.infinite = true;
@@ -684,13 +742,6 @@ bool uci_execute(const char *line) {
                 ExitCode = 1;
         } else {
             printf("usage: movepick selftest\n");
-        }
-    } else if (strcmp(cmd, "history") == 0) {
-        if (token_is(next_token(&cursor), "selftest")) {
-            if (history_selftest() != 0)
-                ExitCode = 1;
-        } else {
-            printf("usage: history selftest\n");
         }
 #ifdef UNC_PROBE
     } else if (strcmp(cmd, "probe") == 0) {

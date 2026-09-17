@@ -51,7 +51,8 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | The mapping re-centred onto the gen-5 net (`UncSigmaBase` 57, `UncSigmaSlope` 12) | tried, **-7.4 ± 20.0** (E27), rejected |
 | Search: sigma-scaled LMR (`LmrSigmaLo` / `LmrSigmaHi`) | tried, **-29.9 ± 29.6** (E27), reverted |
 | Search: surprise-weighted quiet rewards | stopped inconclusive, **-1.40 ± 11.94** at 1238 games; code removed ([E30](EXPERIMENTS.md#e30-surprise-weighted-quiet-history)) |
-| Search: pawn-structure move history | experimental; **SPRT running** ([E31](EXPERIMENTS.md#e31-pawn-structure-move-history)) |
+| Search: pawn-structure move history, rescue credit, evidence penalties | tried, **removing them is not a loss** — +1.53 ± 3.35 over 13,830 games, LLR +2.95 on [-5, 0]; code removed ([E39](EXPERIMENTS.md#e39-the-pawn-history-stack-is-removed)) |
+| Correction history (pawn-structure keyed) — **kept**, not the same feature | +25.8 Elo (E14), untouched by E39 |
 | NNUE: a wider net (h1024) on the gen-5 corpus | tried, **-7.0 ± 11.3** (E27), rejected |
 | **Uncertainty scaling split per margin (8 weights, no-op at defaults)** | **built, sweep running** |
 | NNUE: the default evaluation is the network (`make`; `make classical` for the other one) | complete (E11) |
@@ -72,6 +73,8 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Chess960: per-position castling geometry, both FEN spellings, unambiguous notation | shipped; verified against an independent engine (E25) |
 | Time management: the sudden-death horizon was a decay rate, 20 -> 50 | **+271.84 ± 31.03** (E29) |
 | **Time management: LTC confirmation (E29 is STC-only)** | **TODO** |
+| Datagen: the accumulator stack was never claimed on the synchronous path | fixed, **1.81x labels/s**, shards byte-identical ([E38](EXPERIMENTS.md#e38-a-correctness-sweep-and-datagens-missing-accumulator-stack)) |
+| A zero or negative clock is a flagged clock, not an absent one | fixed; eight `go` spellings no longer search unbounded (E38) |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`

@@ -1955,11 +1955,24 @@ int nnue_verify_vectors(const char *path) {
         long uncRaw = 0, uncCp = 0;
         if (wantUnc) {
             /* Through the same accumulators the value just used, exactly as the reference
-             * computes both heads from one activation. */
+             * computes both heads from one activation. NULL means the stack could not be
+             * allocated, which every other consumer in this file answers by accumulating
+             * from the board - the gate must still run on a machine short of memory, and
+             * it is the same arithmetic either way. */
+            _Alignas(64) int16_t local[COLOR_NB][NNUE_MAX_HIDDEN];
             const Accumulator *const a = nnue_current(eval_state(), &pos);
             const Color stm            = pos.sideToMove;
 
-            uncRaw = nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(&pos));
+            if (!a)
+                for (Color c = WHITE; c <= BLACK; ++c) {
+                    const Perspective p = nnue_perspective(&pos, c);
+                    nnue_accumulate(&pos, &p, local[c]);
+                }
+
+            const int16_t *const own   = a ? a->acc[stm] : local[stm];
+            const int16_t *const other = a ? a->acc[stm ^ 1] : local[stm ^ 1];
+
+            uncRaw = nnue_unc_output(own, other, nnue_output_bucket(&pos));
             uncCp  = nnue_unc_centipawns((int32_t)uncRaw);
             ok     = ok && uncRaw == expectedUncRaw && uncCp == expectedUncCp;
         }

@@ -53,7 +53,7 @@ From the repository root:
 
 ```sh
 make EXE=stormbreaker-staged
-make EXE=stormbreaker-staged movepick-test perft chess960-test history-test
+make EXE=stormbreaker-staged movepick-test perft chess960-test
 make EXE=stormbreaker-staged smp-test THREADS=4
 make EXE=stormbreaker-staged staged-eager
 make EXE=stormbreaker-staged staged-profile

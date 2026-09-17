@@ -41,6 +41,17 @@ typedef struct {
     bool infinite;
     bool ponder;
 
+    /*
+     * Whether `go` SUPPLIED a clock, as against what it supplied. The two are not the
+     * same question and conflating them is how an engine sits thinking with its flag
+     * down: the struct is zeroed, so an absent `wtime` and a `wtime 0` are the same
+     * value, and a zero read as "no clock was given" produces a search with no deadline
+     * at all. A zero or negative clock means FLAGGED - move now - and only the absence
+     * of the field means there is no clock to answer to.
+     */
+    bool timeGiven;
+    bool movetimeGiven;
+
     /* `go searchmoves e2e4 d2d4` restricts the root to these. */
     Move searchmoves[MAX_MOVES];
     int searchmovesCount;

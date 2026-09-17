@@ -69,17 +69,25 @@ void bench_run(int depth) {
     if (depth <= 0)
         depth = BENCH_DEFAULT_DEPTH;
 
-    /* Fixed hash size, so the node count cannot depend on whatever Hash was set to. */
+    /*
+     * Both of these are pinned for the run and put back afterwards. Pinned because the
+     * node count must not depend on what a session happened to set; put back because
+     * `bench` is also a UCI command, and an engine that answered it by quietly moving a
+     * GUI's 512 MB table down to 16 would play the rest of the game on a table nobody
+     * asked for and nothing reports. Thread count was already restored; the hash was not.
+     */
+    const size_t hashMb = tt_size_mb();
+    const int threads   = search_threads();
+
     tt_resize(16);
 
     /*
-     * And fixed at one thread, for the same reason and a stronger one. A parallel search
-     * reaches the shared table in whatever order the scheduler produces, so its node count
-     * is not reproducible even on one machine - and invariant 1 is what makes every
-     * measurement in this repository comparable. `bench` is a measurement, not a benchmark
-     * of the machine.
+     * One thread, for the same reason and a stronger one. A parallel search reaches the
+     * shared table in whatever order the scheduler produces, so its node count is not
+     * reproducible even on one machine - and invariant 1 is what makes every measurement
+     * in this repository comparable. `bench` is a measurement, not a benchmark of the
+     * machine.
      */
-    const int threads = search_threads();
     search_set_threads(1);
 
     uint64_t totalNodes = 0;
@@ -116,7 +124,11 @@ void bench_run(int depth) {
 
     const uint64_t nps = (uint64_t)((double)totalNodes * 1000.0 / (double)elapsed);
 
+    /* Restored before the report, so a failure to give the table back is said out loud
+     * above the contract line rather than after it. */
     search_set_threads(threads);
+    if (hashMb != 0 && hashMb != 16 && !tt_resize(hashMb))
+        printf("info string could not restore the %zu MB hash after bench; it is 16 MB\n", hashMb);
 
     printf("\n===========================\n");
     printf("Positions  : %d\n", BENCH_POSITION_COUNT);

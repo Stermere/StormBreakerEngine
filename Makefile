@@ -84,6 +84,12 @@ ifeq ($(OS),Windows_NT)
     # on PATH and silently fails to launch from Cute Chess / fastchess, which
     # spawn it with a bare environment.
     LDFLAGS += -static
+    # The MAIN thread's stack, to match the 8 MB thread.c gives every pooled
+    # one. It is not decoration: search_run_sync() and the no-pool fallback in
+    # search_start() run the whole search on whichever thread called them, and
+    # the PE default of 2 MB is under what a line to MAX_PLY needs. Reserved
+    # address space is committed as it is touched, so this costs nothing.
+    LDFLAGS += -Wl,--stack,8388608
 else
     SUFFIX  :=
     UNAME   := $(shell uname -s)
@@ -259,7 +265,7 @@ endif
         ratings snapshot \
         classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
         syzygy-fetch syzygy-test chess960-test chess960-campaign unc-probe \
-        smp-test history-test movepick-test staged-eager staged-profile
+        smp-test movepick-test staged-eager staged-profile
 
 all: $(TARGET)
 
@@ -383,9 +389,6 @@ unc-probe: $(EVALDEP)
 # default is what the machine reports.
 smp-test: $(TARGET)
 	./$(TARGET) smp selftest $(THREADS)
-
-history-test: $(TARGET)
-	./$(TARGET) history selftest
 
 movepick-test: $(TARGET)
 	./$(TARGET) movepick selftest

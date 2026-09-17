@@ -21,7 +21,6 @@
 
 #include "bitboard.h"
 #include "eval.h"
-#include "history.h"
 #include "movegen.h"
 #include "nnue.h"
 #include "syzygy.h"
@@ -131,7 +130,6 @@ typedef struct {
      */
     Move killers[MAX_PLY][2];
     int16_t history[COLOR_NB][SQUARE_NB][SQUARE_NB];
-    PawnHistory pawnHistory;
     Move counterMoves[PIECE_NB][SQUARE_NB];
 
     /*
@@ -296,7 +294,6 @@ void search_clear(void) {
 
         memset(td->killers, 0, sizeof(td->killers));
         memset(td->history, 0, sizeof(td->history));
-        memset(&td->pawnHistory, 0, sizeof(td->pawnHistory));
         memset(td->counterMoves, 0, sizeof(td->counterMoves));
         memset(td->contHist, 0, sizeof(td->contHist));
         memset(td->captureHist, 0, sizeof(td->captureHist));
@@ -581,17 +578,6 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * the search and is equally true of evidence pointing either way. */
 TUNABLE(HIST_MALUS_MUL, 8);
 
-/* Structure-specific evidence supplements the global move history in both ordering
- * and LMR. 128 is one full share; zero disables reads AND learning for an exact A/B. */
-TUNABLE(PAWN_HIST_WEIGHT, 131);
-
-/* Retained together at 25/25 after an inconclusive positive test (E32/E33).
- * Rescue credit belongs only to the winning pawn context; reduced-only failures
- * receive a smaller pawn malus. Zero weights disable the respective adjustments. */
-TUNABLE(PAWN_RESCUE_WEIGHT, 25);
-TUNABLE(PAWN_RESCUE_FLOOR, 32);
-TUNABLE(PAWN_EVIDENCE_WEIGHT, 25);
-
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 10);
 
@@ -643,10 +629,6 @@ static const struct {
     {"HistBonusMul", &HIST_BONUS_MUL, 1, 24},
     {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 32},
     {"HistMalusMul", &HIST_MALUS_MUL, 1, 32},
-    {"PawnHistWeight", &PAWN_HIST_WEIGHT, 0, 256},
-    {"PawnRescueWeight", &PAWN_RESCUE_WEIGHT, 0, 100},
-    {"PawnRescueFloor", &PAWN_RESCUE_FLOOR, 1, 256},
-    {"PawnEvidenceWeight", &PAWN_EVIDENCE_WEIGHT, 0, 100},
     {"LmpBase", &LMP_BASE, 1, 24},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
@@ -824,12 +806,6 @@ static inline PieceType victim_of(const Position *pos, Move m) {
     }
 }
 
-static inline int pawn_history_score(SearchThread *td, Key key, Piece pc, Square to) {
-    if (PAWN_HIST_WEIGHT == 0)
-        return 0;
-    return history_pawn_score(history_pawn_entry(&td->pawnHistory, key, pc, to), PAWN_HIST_WEIGHT);
-}
-
 /* MVV-LVA for the tactical moves - most valuable victim, least valuable attacker - with
  * SEE deciding which band a capture lands in and capture history separating the ones SEE
  * calls equal. Quiet moves fall through to the heuristic tables. */
@@ -890,9 +866,7 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
             else if (m == counter)
                 score = SCORE_COUNTER;
             else
-                score = td->history[us][from_sq(m)][to_sq(m)] +
-                        cont_score(slices, moved, to_sq(m)) +
-                        pawn_history_score(td, pos->pawnKey, moved, to_sq(m));
+                score = td->history[us][from_sq(m)][to_sq(m)] + cont_score(slices, moved, to_sq(m));
         }
 
         list[i].score = score;
@@ -972,8 +946,8 @@ static void capture_hist_update(SearchThread *td, const Position *pos, Move m, i
  * heuristics nothing.
  */
 static void update_stats(SearchThread *td, const Position *pos, Move best, const Move *quiets,
-                         const int *quietPawnMaluses, int quietCount, const Move *captures,
-                         int captureCount, Depth depth, int ply, int pawnExtraCredit) {
+                         int quietCount, const Move *captures, int captureCount, Depth depth,
+                         int ply) {
     const Color us   = pos->sideToMove;
     const int bonus  = history_bonus(depth);
     const int malus  = history_malus(depth);
@@ -987,10 +961,6 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
 
         history_update(&td->history[us][from_sq(best)][to_sq(best)], bonus);
         cont_hist_update(td, ply, piece_on(pos, from_sq(best)), to_sq(best), bonus);
-        if (PAWN_HIST_WEIGHT != 0)
-            history_update(history_pawn_entry(&td->pawnHistory, pos->pawnKey,
-                                              piece_on(pos, from_sq(best)), to_sq(best)),
-                           bonus + pawnExtraCredit);
 
         const Move prev = td->stack[ply - 1].move;
         if (is_ok_move(prev))
@@ -1004,10 +974,6 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
             continue;
         history_update(&td->history[us][from_sq(quiets[i])][to_sq(quiets[i])], -malus);
         cont_hist_update(td, ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -malus);
-        if (PAWN_HIST_WEIGHT != 0)
-            history_update(history_pawn_entry(&td->pawnHistory, pos->pawnKey,
-                                              piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i])),
-                           -(PAWN_EVIDENCE_WEIGHT != 0 ? quietPawnMaluses[i] : malus));
     }
 
     for (int i = 0; i < captureCount; ++i)
@@ -1371,20 +1337,19 @@ int search_test_picker_contracts(void) {
         td->captureHist[W_KNIGHT][SQ_F3][PAWN] = HISTORY_MAX;
         failures += picker_next(&parent, td, pos, 1) != capture;
     }
-    for (int context = 0; context < 2; ++context) {
+    {
+        /* Continuation history is read at the stage that reads it, against the move that
+         * led here rather than against a ply-indexed slot. */
         board_set_startpos(pos);
         memset(td->history, 0, sizeof(td->history));
         td->stack[0].move       = make_move(SQ_E7, SQ_E5);
         td->stack[0].movedPiece = B_PAWN;
         picker_init(&parent, td, pos, tt, MOVE_NONE, 1, MOVE_NONE);
         failures += picker_next(&parent, td, pos, 1) != tt;
-        int16_t *entry   = context == 0
-                               ? history_pawn_entry(&td->pawnHistory, pos->pawnKey, W_PAWN, SQ_A4)
-                               : &td->contHist[0][B_PAWN][SQ_E5][W_PAWN][SQ_A4];
-        *entry           = HISTORY_MAX;
-        const Move first = picker_next(&parent, td, pos, 1);
-        if (context != 0 || PAWN_HIST_WEIGHT != 0)
-            failures += first != deferred;
+
+        int16_t *const entry = &td->contHist[0][B_PAWN][SQ_E5][W_PAWN][SQ_A4];
+        *entry               = HISTORY_MAX;
+        failures += picker_next(&parent, td, pos, 1) != deferred;
         *entry = 0;
     }
     free(pos);
@@ -1453,17 +1418,11 @@ static inline int unc_apply(int scale, int weight) {
  * corrhist defaults are centred rather than chosen, and a cold entry lands on the floor -
  * which is why the floor sits just under 100.
  */
-/* Optional uncapped head output for rescue learning. Keeping it local to the node
- * avoids another inference and survives child searches without shared state. */
-static inline int unc_scale(SearchThread *td, const Position *pos, int *errorEstimate) {
-    if (errorEstimate)
-        *errorEstimate = -1;
+static inline int unc_scale(SearchThread *td, const Position *pos) {
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
         const int sigma = nnue_uncertainty(td->es, pos);
         const int scale = imin(UNC_SIGMA_BASE + sigma * UNC_SIGMA_SLOPE / 16, UNC_SCALE_MAX);
-        if (errorEstimate)
-            *errorEstimate = sigma;
         return unc_probe(sigma, scale);
     }
 #endif
@@ -1488,23 +1447,21 @@ static inline int unc_scale(SearchThread *td, const Position *pos, int *errorEst
 /* Eager under UNC_PROBE on purpose: the probe's population is the set of nodes that READ
  * the signal, and deferring would silently resample it against the very mapping it exists
  * to re-centre. */
-static inline int unc_start(bool neutral, int *errorEstimate, SearchThread *td,
-                            const Position *pos) {
+static inline int unc_start(bool neutral, SearchThread *td, const Position *pos) {
     if (neutral)
         return 100;
 #ifdef UNC_PROBE
-    return unc_scale(td, pos, errorEstimate);
+    return unc_scale(td, pos);
 #else
-    (void)errorEstimate;
     (void)td;
     (void)pos;
     return UNC_PENDING;
 #endif
 }
 
-static inline int unc_get(int *cache, int *errorEstimate, SearchThread *td, const Position *pos) {
+static inline int unc_get(int *cache, SearchThread *td, const Position *pos) {
     if (*cache == UNC_PENDING)
-        *cache = unc_scale(td, pos, errorEstimate);
+        *cache = unc_scale(td, pos);
     return *cache;
 }
 
@@ -1622,7 +1579,7 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         rawEval    = ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
                                                                 : eval_evaluate(td->es, pos);
         staticEval = corrected_eval(td, pos, rawEval);
-        uncScale   = unc_start(false, NULL, td, pos);
+        uncScale   = unc_start(false, td, pos);
         best       = staticEval;
 
         if (best >= beta) {
@@ -1670,8 +1627,7 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
             const Value bare = staticEval + PieceValues[victim_of(pos, m)];
 
             if (bare <= alpha &&
-                bare + DELTA_MARGIN * unc_apply(unc_get(&uncScale, NULL, td, pos), UNC_W_DELTA) /
-                            100 <=
+                bare + DELTA_MARGIN * unc_apply(unc_get(&uncScale, td, pos), UNC_W_DELTA) / 100 <=
                     alpha)
                 continue;
         }
@@ -1885,12 +1841,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                                                               : eval_evaluate(td->es, pos));
 
     const Value staticEval = corrected_eval(td, pos, rawEval);
-    int evalError          = -1;
-
-    /* Where the error estimate is wanted, unchanged: unc_scale() leaves it at -1 when it is
-     * not asked for, and the rescue credit reads -1 as "no head". */
-    int *const errSink = PAWN_HIST_WEIGHT != 0 && PAWN_RESCUE_WEIGHT != 0 ? &evalError : NULL;
-    int uncScale       = unc_start(inCheck, errSink, td, pos);
+    int uncScale           = unc_start(inCheck, td, pos);
 
     td->stack[ply].staticEval = staticEval;
 
@@ -1911,7 +1862,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
          * head could report - and asking it is a whole inference. */
         staticEval >= beta &&
         staticEval - RFP_MARGIN * (depth - improving) *
-                         unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_RFP) / 100 >=
+                         unc_apply(unc_get(&uncScale, td, pos), UNC_W_RFP) / 100 >=
             beta)
         return staticEval;
 
@@ -1923,8 +1874,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
         /* Added, so no scale can bring this under alpha if the bare evaluation is not. */
         staticEval < alpha &&
-        staticEval + RAZOR_MARGIN * depth *
-                         unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_RAZOR) / 100 <
+        staticEval +
+                RAZOR_MARGIN * depth * unc_apply(unc_get(&uncScale, td, pos), UNC_W_RAZOR) / 100 <
             alpha) {
         const Value v = qsearch(td, pos, alpha - 1, alpha, ply);
         if (v < alpha)
@@ -1977,8 +1928,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         !pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta);
     const Value probCutBeta =
         probCutGate
-            ? beta + PROBCUT_MARGIN *
-                         unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_PROBCUT) / 100
+            ? beta + PROBCUT_MARGIN * unc_apply(unc_get(&uncScale, td, pos), UNC_W_PROBCUT) / 100
             : VALUE_NONE;
 
     if (probCutGate && !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
@@ -2040,7 +1990,6 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * a node with more than this many is one where the ordering statistics were not going to
      * be decisive anyway. */
     Move quiets[64];
-    int quietPawnMaluses[64];
     int quietCount = 0;
     Move captures[32];
     int captureCount = 0;
@@ -2078,7 +2027,6 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         /* How the plan-aware tables rate this move. Only meaningful for quiet moves - the
          * tactical ones are scored by what they win. */
         const int contScore = tactical ? 0 : cont_score(slices, moved, to_sq(m));
-        const int pawnScore = tactical ? 0 : pawn_history_score(td, pos->pawnKey, moved, to_sq(m));
 
         /* Shallow-depth pruning of quiet moves, guarded on `best` beating a forced mate:
          * until the node has found something that is not losing outright, every remaining
@@ -2098,8 +2046,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
              * depend on which move it is; captures keep being searched, which is the point. */
             if (depth <= FUTILITY_DEPTH && staticEval <= alpha &&
                 staticEval + FUTILITY_MARGIN * depth *
-                                 unc_apply(unc_get(&uncScale, errSink, td, pos), UNC_W_FUTILITY) /
-                                 100 <=
+                                 unc_apply(unc_get(&uncScale, td, pos), UNC_W_FUTILITY) / 100 <=
                     alpha)
                 continue;
         }
@@ -2226,9 +2173,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             if (!improving)
                 ++r;
 
-            /* Add structure-specific history BEFORE dividing: a context entry need not
-             * earn a whole ply by itself to influence the existing history adjustment. */
-            r -= (td->history[us][from_sq(m)][to_sq(m)] + pawnScore) / LMR_HIST_DIVISOR;
+            /* A move the history tables like gets some of its reduction back, on separate
+             * divisors because the two tables answer different questions and nothing says
+             * one ply of evidence in either is worth the same. */
+            r -= td->history[us][from_sq(m)][to_sq(m)] / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
             if (r < 0)
@@ -2241,23 +2189,18 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
          * the rest the only question worth asking is whether anything BEATS it, which a null
          * window answers far more cheaply. A reduced null-window search is a bet that the
          * move fails low, so the child is by definition expected to fail high. */
-        bool fullDepthSearch = r == 0;
         if (r > 0) {
             v = -negamax(td, pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
-            if (v > alpha) {
-                fullDepthSearch = true;
+            if (v > alpha)
                 v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
-            }
         } else if (!pvNode || moveCount > 1) {
             v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
 
         /* A full-window search is never a cut node: the whole point is that its value is
          * wanted exactly, not as a bound. */
-        if (pvNode && (moveCount == 1 || (v > alpha && v < beta))) {
-            fullDepthSearch = true;
-            v               = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
-        }
+        if (pvNode && (moveCount == 1 || (v > alpha && v < beta)))
+            v = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
 
         eval_state_pop(td->es);
         board_undo_move(pos, m);
@@ -2265,19 +2208,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         if (search_stopped())
             return VALUE_ZERO;
 
-        /* Only completed attempts enter the list. Global histories retain the original
-         * malus; the optional pawn malus remembers how much evidence was requested. */
-        if (!tactical && quietCount < (int)(sizeof(quiets) / sizeof(quiets[0]))) {
-            quiets[quietCount] = m;
-            if (PAWN_HIST_WEIGHT != 0 && PAWN_EVIDENCE_WEIGHT != 0) {
-                const Depth evidence =
-                    history_pawn_evidence_depth(depth, childDepth, r, fullDepthSearch);
-                quietPawnMaluses[quietCount] =
-                    history_pawn_evidence_malus(history_malus(depth), history_malus(evidence),
-                                                isExcluded ? 0 : PAWN_EVIDENCE_WEIGHT);
-            }
-            ++quietCount;
-        }
+        /* Only completed attempts enter the list: a move the loop pruned was never
+         * tried, and charging it for a failure it was not given the chance to have is
+         * evidence about the pruning rule rather than about the move. */
+        if (!tactical && quietCount < (int)(sizeof(quiets) / sizeof(quiets[0])))
+            quiets[quietCount++] = m;
 
         if (v > best) {
             best     = v;
@@ -2290,18 +2225,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                     /* Fail high: the opponent would avoid this line. The move that cut is
                      * credited in whichever table describes it, and everything tried before it
                      * is blamed in both. */
-                    /* The only consumer that wants the signal rather than the scale, and
-                     * the one place the deferred read has to be forced. Same number
-                     * whenever it is taken. */
-                    int pawnExtraCredit = 0;
-                    if (PAWN_HIST_WEIGHT != 0 && !tactical) {
-                        unc_get(&uncScale, errSink, td, pos);
-                        pawnExtraCredit = history_pawn_rescue_credit(
-                            history_bonus(depth), staticEval, beta, v, evalError, isExcluded,
-                            PAWN_RESCUE_WEIGHT, PAWN_RESCUE_FLOOR);
-                    }
-                    update_stats(td, pos, m, quiets, quietPawnMaluses, quietCount, captures,
-                                 captureCount, depth, ply, pawnExtraCredit);
+                    update_stats(td, pos, m, quiets, quietCount, captures, captureCount, depth,
+                                 ply);
 #ifdef MOVE_PICKER_PROFILE
                     const int stage = inCheck                                ? 6
                                       : m == ttMove                          ? 0
@@ -2584,6 +2509,23 @@ static const int SkipPhase[] = {0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 
 static void thread_search(SearchThread *td) {
     Position *const pos = &td->rootPos;
     const bool isMain   = td->id == 0;
+
+    /*
+     * A block whose accumulator stack was never claimed, which is not the pooled case:
+     * thread_entry() claims one as each thread starts. It is the SYNCHRONOUS one - a
+     * process that only ever calls search_run_sync() never starts the pool, so
+     * thread_entry() never runs and this block reaches the search with es == NULL.
+     * tools/datagen.c is that process, and the evaluation then accumulates all 32 rows
+     * per perspective at every node instead of applying a two-row delta, which measured
+     * 200 labels/s against 368 (E38).
+     *
+     * Claimed here rather than in search_run_sync() so the inline fallback in
+     * search_start() - the path taken when no pooled thread could be created - is
+     * covered by the same line. A no-op for a pooled thread, whose es is already set,
+     * and still NULL-safe if the allocation fails.
+     */
+    if (!td->es)
+        td->es = eval_state();
 
     /*
      * This thread's accumulator stack starts empty. It has to: a level keeps the key of

@@ -16,6 +16,11 @@ typedef struct {
 } TTCluster;
 
 static TTCluster *Table;
+
+/* What free() is owed. The table is slid forward inside it so a cluster cannot straddle
+ * two cache lines - see tt_resize(). */
+static void *TableBlock;
+
 static size_t ClusterCount;
 static size_t SizeMb;
 /*
@@ -87,6 +92,18 @@ Value tt_value_from_tt(Value v, int ply) {
     return v;
 }
 
+/*
+ * A cluster is a cache line's worth of entries and the whole point of the layout is that
+ * reading one costs ONE miss - which holds only if the cluster is on a line boundary.
+ * malloc guarantees alignment for the fundamental types, which is 16 bytes here, so
+ * three clusters in four would straddle two lines if the block landed on one.
+ *
+ * Over-allocate by a line and slide the table forward, the same trick nnue_load_file()
+ * uses on the net blob. calloc rather than an aligned allocator with a memset, because
+ * calloc's pages arrive zeroed from the OS and are faulted in as the search touches
+ * them: writing a 16 GB table at startup just to zero it is not a cost a `setoption
+ * name Hash` should pay.
+ */
 bool tt_resize(size_t mb) {
     if (mb == 0)
         mb = 1;
@@ -94,12 +111,14 @@ bool tt_resize(size_t mb) {
     const size_t bytes    = mb * 1024ULL * 1024ULL;
     const size_t clusters = bytes / sizeof(TTCluster);
 
-    TTCluster *fresh = (TTCluster *)calloc(clusters, sizeof(TTCluster));
-    if (!fresh)
+    void *const block = calloc(clusters * sizeof(TTCluster) + 64u, 1);
+    if (!block)
         return false;
 
-    free(Table);
-    Table        = fresh;
+    free(TableBlock);
+    TableBlock = block;
+    Table =
+        (TTCluster *)(void *)((unsigned char *)block + ((64u - ((uintptr_t)block & 63u)) & 63u));
     ClusterCount = clusters;
     SizeMb       = mb;
     atomic_store_explicit(&Generation, 0, memory_order_relaxed);
@@ -107,7 +126,8 @@ bool tt_resize(size_t mb) {
 }
 
 void tt_free(void) {
-    free(Table);
+    free(TableBlock);
+    TableBlock   = NULL;
     Table        = NULL;
     ClusterCount = 0;
     SizeMb       = 0;

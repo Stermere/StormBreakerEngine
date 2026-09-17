@@ -124,8 +124,10 @@ int64_t timeman_optimum(const TimeManager *tm, int stability) {
 
 void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly) {
     /* A fixed movetime is an instruction, not a budget: honour it exactly, less the
-     * overhead reserved for GUI and network latency. */
-    if (limits->movetime > 0) {
+     * overhead reserved for GUI and network latency. Keyed on the field being PRESENT,
+     * so `go movetime 0` asks for a move now and gets the one-millisecond floor below
+     * rather than a search with no deadline. */
+    if (limits->movetimeGiven) {
         tm->optimum = tm->maximum = clamp64(limits->movetime - uci_move_overhead(), 1, INT64_MAX);
         return;
     }
@@ -133,7 +135,7 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
     /* No clock was given - `go depth`, `go nodes`, `go infinite` and bench all land
      * here. The search enforces those limits, and a time limit on top of them would
      * make bench non-deterministic. */
-    if (limits->time[us] <= 0) {
+    if (!limits->timeGiven) {
         tm->optimum = tm->maximum = INT64_MAX;
         return;
     }
@@ -145,7 +147,12 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
                               ? limits->movestogo
                               : MOVESTOGO_CAP;
 
-    const int64_t clock    = limits->time[us];
+    /* A clock at or below zero is one that has already run out. Everything below still
+     * runs on it, and every clamp is a floor of one millisecond, so the budget comes out
+     * at 1ms and the search returns the move the root list already holds. Answering at
+     * once is the only useful thing left to do; thinking about it is the behaviour this
+     * floor exists to prevent. */
+    const int64_t clock    = limits->time[us] > 0 ? limits->time[us] : 0;
     const int64_t overhead = uci_move_overhead();
     const int64_t inc      = limits->inc[us] > 0 ? limits->inc[us] : 0;
 

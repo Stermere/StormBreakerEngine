@@ -4,9 +4,21 @@ A UCI chess engine written in C, built for competitive strength built entirely
 from scratch with a mission to see how far a near fully AI generated engine can go,
 with some human help along the way of course.
 
-The current build scores ~3480 on a gauntlet against five CCRL-rated engines at STC.
-A small LTC test has shown similar results, but the exact number is not yet known.
+The current build measures **~3500 Elo on the CCRL Blitz scale**, from a
+4,200-game gauntlet at 40+0.4 (LTC) against seven CCRL-rated engines.
 
+| Opponent | CCRL | W-L-D | Score |
+|---|---:|---:|---:|
+| koivisto-8.0 | 3593 | 17-73-60 | 31.3% |
+| carp-3.0.1 | 3528 | 27-53-70 | 41.3% |
+| ethereal-12.75 | 3426 | 66-34-50 | 60.7% |
+| clover-3.0 | 3340 | 94-10-46 | 78.0% |
+| weiss-1.4 | 3256 | 109-4-37 | 85.0% |
+| berserk-4.1.0 | 3133 | 117-7-26 | 86.7% |
+| halogen-8.1 | 3008 | 139-0-11 | 96.3% |
+
+1,050 games per seat. Fitting all seven anchors at once puts the engine at
+**3500 ± 17** This is not a direct CCRL rating but it should give a good idea of where the engine sits
 ---
 
 ## The uncertainty head

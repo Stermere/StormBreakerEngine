@@ -2687,3 +2687,188 @@ arithmetic above, fusion plus CUDA graphs would be worth something like
 another 1.3x at this batch size, and a larger batch would be worth more again
 by amortising the optimiser and the clip - but a larger batch is a different
 training recipe, not a faster implementation of this one.
+
+---
+
+### E38: A correctness sweep, and datagen's missing accumulator stack
+
+**Date** 2026-09-16 · **Not an Elo test.** No search, evaluation or time-allocation
+rule changed, and bench is **214915** at depth 7 on both sides of every change
+below. What moved is datagen throughput, and a set of defects that were costing
+nothing in Elo and something in every other currency.
+
+#### datagen ran the network with the accumulator stack turned off
+
+`Threads[0]->es` was assigned in exactly one place, `thread_entry()`. Datagen
+calls neither `search_start()` nor `search_set_threads()`, so `pool_start()`
+never ran, `thread_entry()` never ran, and the block reached `thread_search()`
+with `es == NULL` for the life of the process. `eval_evaluate()` then took the
+from-scratch path at every node: 32 feature rows per perspective instead of a
+two-row delta. Instrumented, on the shipped path:
+
+    [instr] run_sync es=0000000000000000 started=0 count=1
+
+`thread_search()` now claims the calling thread's state when the block has none,
+which also covers `search_start()`'s inline fallback - the path taken when no
+pooled thread could be created, which had the same hole.
+
+Interleaved, 8 games x 5000 nodes, one worker, one seed, `-march=native`:
+
+| | labels/s |
+|---|---|
+| before | 201, 202, 202 |
+| after | 366, 369, 363 |
+
+**1.81x**, and the shards are byte-identical (`42d2a434bc7acd218884901c38c167ba`
+on both sides), so this is a speedup and not a relabelling. Isolated on bench the
+same way - `td->es` forced to NULL against the ordinary build - it is 0.80M nps
+against 1.39M at an identical 214915 nodes.
+
+**The effect is AVX2-specific.** At `-march=x86-64-v2` the same pair measures 66
+against 66 labels/s: with the vector paths compiled out, the layer stack dominates
+and the accumulation disappears into it. `make datagen` inherits the default
+`-march=native`, so the shipped configuration is the one that was losing the 1.81x.
+`gen-005` was generated this way.
+
+#### Eight `go` spellings produced a search with no deadline
+
+`search_limits_clear()` zeroes the struct, so an absent `wtime` and a `wtime 0`
+were the same value, and `timeman_init()` read zero as "no clock was given" -
+the sentinel that means bench and `go depth`. A flagged clock therefore bought an
+unbounded search, recoverable only by `stop`. Measured with an 8-second cutoff:
+
+    go wtime 0 btime 0 / +winc +binc      go movetime 0 / movetime -1
+    go btime 30000 binc 100               go depth 0 / go nodes 0
+    go wtime -50 btime 30000
+
+`SearchLimits` now records that a clock field ARRIVED separately from what it
+said; a clock at or below zero falls through the existing one-millisecond floors
+and answers at once, and `depth` and `nodes` are floored at one so a limit that
+cannot be met is not read as no limit at all. All eight now return a legal move
+in under 10ms; `movetime 300`, `depth 6`, `nodes 100000` and `wtime 3000` are
+unchanged to the millisecond.
+
+#### The rest
+
+* **`bench` never gave the hash back.** It pinned 16 MB for the run - correctly,
+  invariant 1 - and left it there, while restoring the thread count it pinned
+  beside it. A session that benched and then played did so on a table nobody
+  asked for and nothing reports: `hashfull` on one fixed search went 6 permille
+  to 116 with `Hash 512` still set. Now 2.
+* **`nnue verify` dereferenced a NULL accumulator** when the stack could not be
+  allocated - the one site in nnue.c that did not handle what the rest of the
+  file documents as legal.
+* **`setoption` on a tunable did not end the search first.** It is the only
+  option path that skipped `end_search_for_option()`, and it rewrites
+  `Reductions[][]`, which every thread indexes per node. TUNE_SEARCH builds only.
+* **`quietPawnMaluses[]` is filled unconditionally.** Under TUNE_SEARCH a
+  `setoption` could move `PawnEvidenceWeight` off zero between the move loop and
+  `update_stats()`, which then read an entry never written. Identical machine
+  code in a normal build, where both weights are non-zero enum constants.
+* **The main thread's stack was 2 MB against the pool's 8.** `-fstack-usage` puts
+  `negamax` at 5,040 bytes and `qsearch` at 4,336, and singular verification puts
+  two `negamax` frames on one ply, so a line to MAX_PLY wants two to five
+  megabytes - not the "half a megabyte" the comment claimed. Both consumers of
+  the main thread's stack run the whole search on it. `-Wl,--stack,8388608` now
+  matches the two.
+* **A transposition cluster could straddle two cache lines.** `calloc` aligns to
+  16 bytes, not 64, so "one cluster, one cache miss" was an aspiration. The block
+  is over-allocated by a line and the table slid forward, the same way
+  `nnue_load_file()` places the net; calloc is kept so the pages still arrive
+  zeroed from the OS rather than being written at `setoption` time.
+* **`spin_value` echoed `strtoll`'s saturated value**, so an over-large Hash was
+  reported as 9223372036854775807 - a number nobody sent. And a known option sent
+  without a value was reported as unknown.
+
+**Gates:** `perft` standard and Chess960 exact, `chess960`/`smp`/`movepick`/
+`history` selftests, `nnue verify` 10000 positions exact against the pinned net,
+`datagen-test`, `openbench-check`, `format-check`. Bench 214915 throughout.
+
+---
+
+### E39: The pawn-history stack is removed
+
+**Date** 2026-09-17 · **Baseline** `stormbreaker-pawnhist` (a `TUNE_SEARCH=on` build
+of E38's tree, driving BOTH seats) · **Net** `f2886d3e2c71` · **Status** **H1
+accepted; E31, E32 and E33 are deleted from source.**
+
+E31, E32 and E33 all shipped on SPRTs that never reached a boundary - `+6.44 ±
+8.46` at LLR 0.79, then `+6.22 ± 6.27` at LLR 1.36 - and E31 measured a
+throughput cost beside them. Three features retained by judgement, on one table,
+none of them individually certified. This is the test that settles the set.
+
+#### The test
+
+`dev` is the side with the feature OFF, so the sign reads directly. One binary
+drives both seats, which makes the option the only difference between them, and
+`PawnHistWeight=0` disables reads and learning for all three at once - E32 and
+E33 are both gated on it.
+
+Bounds are **[-5, 0]** rather than the usual [0, 5], because "can this be
+deleted" is a NON-INFERIORITY question. The standard bounds would have asked
+whether removing it is worth +5 Elo, which nothing claimed, and could not have
+separated neutral from harmful.
+
+| STC 8+0.08, 1 thread, 16 MB, UHO_Lichess_4852_v1.epd, normalized bounds [-5, 0] | dev = stack OFF |
+|---|---|
+| Games / W-L-D | **13,830** / 3578-3517-6735 |
+| Elo / nElo | **+1.53 ± 3.35** / +2.65 ± 5.79 |
+| Score / LOS | 50.22% / 81.5% |
+| LLR / boundaries | **+2.950** / [-2.944, +2.944] |
+| Ptnml | [148, 1665, 3259, 1664, 179] |
+| Elapsed | 7:13:02 |
+
+**H1 accepted at the upper boundary.** Removing the whole stack is not a loss.
+
+**Read that precisely.** It does NOT say the removal gains 1.53 Elo - the
+interval spans zero and LOS is 81.5%, well short of anything. What the boundary
+establishes, at alpha = beta = 0.05, is that the alternative - that removing it
+costs five normalised Elo or more - is rejected. The feature is not paying for
+itself, which is a different and much weaker claim than it being harmful, and it
+is the only claim needed to justify deleting it.
+
+#### What it was costing
+
+| | with | without |
+|---|---|---|
+| per-thread state | 9 MB | **8 MB** |
+| time to bench depth 12 | 1778-1795 ms | **1623-1652 ms** |
+| bench nodes d7 / d12 | 214915 / 4369806 | 242977 / 4060026 |
+
+The ~8.7% is E31's own figure, reproduced: that entry recorded 1570 -> 1706 ms
+and called it "an overhead warning, not strength evidence". It was the warning.
+The bench tree is also smaller without it, which is suggestive and is not
+evidence - a node count is not a strength measurement, which is what the 13,830
+games above are for.
+
+#### What was removed
+
+`src/history.h` and `src/test/historytest.{c,h}` in full; the `PawnHistory`
+table from `SearchThread`; `PawnHistWeight`, `PawnRescueWeight`,
+`PawnRescueFloor` and `PawnEvidenceWeight` and their sweep seats; the ordering
+and LMR reads; the rescue credit and the evidence-depth malus; the `history
+selftest` command and `make history-test`. The `errorEstimate` plumbing through
+`unc_scale()`/`unc_start()`/`unc_get()` went with it - the rescue credit was its
+only consumer - as did `fullDepthSearch`, which only the evidence depth read.
+
+**Correction history is untouched.** `pawnCorrHist` is keyed on the pawn
+structure too and the names are one word apart, but it is E14, it is worth
++25.8 Elo, and it answers a different question: how far the static evaluation
+and the search have been running apart, not how a quiet move has been ordering.
+Nothing in this entry's diff mentions `corr`.
+
+**The removal is verified by node count**, the way E19a verified the cut-node
+retry's. The build with the code deleted benches **242977** at depth 7 and
+**4060026** at depth 12 - identical to the ablation binary driven with
+`PawnHistWeight=0`, which is the configuration the SPRT above actually played.
+What ships is exactly what was measured, and not a neighbouring configuration
+that happens to compile.
+
+**Gates:** `perft` standard and Chess960 exact, `chess960`/`smp`/`movepick`
+selftests, `nnue verify` 10000 positions exact, `openbench-check`,
+`format-check`, and clean builds at `TUNE_SEARCH=on` and `EVAL=classical`.
+
+**Still open.** LTC confirmation was not run. The three were never separated
+from each other, and now cannot be - if any one of them was carrying real value
+it went out with the other two. That is the cost of having shipped them as a
+batch; E19b made the same point about the reverse case.

@@ -16,10 +16,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Each search frame carries a MAX_MOVES move list, so a line running to MAX_PLY needs
- * on the order of half a megabyte, more under a sanitizer - and the Win32 default of
- * 1 MB is uncomfortably close. Reserved address space is committed only as it is
- * touched, so asking for more costs nothing. */
+/*
+ * Each search frame carries a MAX_MOVES move list, and `-fstack-usage` puts negamax at
+ * about 5 KB and qsearch at 4.3 KB. Singular verification re-enters negamax at the same
+ * ply, so a line running to MAX_PLY reserves on the order of two to five megabytes -
+ * more under a sanitizer. Reserved address space is committed only as it is touched, so
+ * asking for eight costs nothing and the default (1 MB on Win32, 2 MB from MinGW's PE
+ * header) does not cover it. The Makefile passes the same number to the linker for the
+ * main thread, which runs the search in tools/datagen.c and in search_start()'s fallback.
+ */
 #define THREAD_STACK_BYTES (8u * 1024u * 1024u)
 
 #if defined(_WIN32)
