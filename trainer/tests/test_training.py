@@ -128,7 +128,7 @@ def test_init_from_adds_zero_factor_and_finishes_without_main_epochs(shard, tmp_
 
 @pytest.mark.parametrize("extra", [["--finish-lr", "0"], ["--epochs", "-1"],
                                    ["--epochs", "0"], ["--finish-epochs", "-1"],
-                                   ["--sources", "6"], ["--lr", "nan"],
+                                   ["--sources", "7"], ["--lr", "nan"],
                                    ["--init-from", "x.pt", "--resume"]])
 def test_invalid_training_flags_are_rejected(extra):
     with pytest.raises(SystemExit):

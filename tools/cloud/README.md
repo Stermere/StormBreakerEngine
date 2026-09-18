@@ -236,6 +236,12 @@ not 8, and why it wants to be the RANGE `2-3` and not the number 2: a book cut
 at one ply is one side to move on every line of it, so a fixed count starts
 every game in the generation on the same side.
 
+`SELFPLAY_DFRC` is the third setting: the percent of games that start from a
+Double Fischer Random array instead, with `SELFPLAY_DFRC_OPENING` random plies
+after it. Those records carry the `dfrc` source tag, so the trainer can lower
+the share later without a regeneration. `gen-006` runs with no book,
+`SELFPLAY_OPENING=8-9` and `SELFPLAY_DFRC=10`.
+
 Unlike the net, the book is **not** part of the provisioning stamp — it is a
 runtime input, not a build input, so changing it does not cost the fleet a
 rebuild. `provision.sh` fetches it before its own early exit, so a box already

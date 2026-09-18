@@ -220,11 +220,14 @@ typedef enum {
     SRC_ENGINE   = 3,
     SRC_BOOK     = 4,
     SRC_OTHER    = 5,
-    SRC_NB       = 6
+    /* Self-play from a Double Fischer Random start. Tagged apart from SRC_SELFPLAY so the
+     * trainer can weigh or drop the 960 share without regenerating it. */
+    SRC_DFRC = 6,
+    SRC_NB   = 7
 } SourceTag;
 
-static const char *const SourceNames[SRC_NB] = {"selfplay", "tree", "human",
-                                                "engine",   "book", "other"};
+static const char *const SourceNames[SRC_NB] = {"selfplay", "tree",  "human", "engine",
+                                                "book",     "other", "dfrc"};
 
 static bool source_from_name(const char *name, SourceTag *out) {
     for (int i = 0; i < SRC_NB; ++i)
@@ -327,24 +330,6 @@ static unsigned record_progress(const Record *r) {
     return (unsigned)(r->flags & REC_PROGRESS_MASK) >> REC_PROGRESS_SHIFT;
 }
 
-/* The rook a castling right refers to: the outermost one on the king's side of the king.
- * That is what KQkq means, what board_set_fen assumes, and the X-FEN disambiguation rule,
- * so it stays correct if Chess960 lands. */
-static Square castling_rook(const Position *pos, Color c, bool kingside) {
-    const Square ksq = king_square(pos, c);
-    Bitboard rooks   = pieces_bb(pos, c, ROOK) & rank_bb(rank_of(ksq));
-    Square best      = SQ_NONE;
-
-    while (rooks) {
-        const Square s = pop_lsb(&rooks);
-        if (kingside ? file_of(s) > file_of(ksq) : file_of(s) < file_of(ksq)) {
-            if (best == SQ_NONE || kingside)
-                best = s;
-        }
-    }
-    return best;
-}
-
 /* Packs `pos` plus its label. Every writer in this file goes through here, so if the
  * encoding is wrong it is wrong in exactly one place. `progress` is PROGRESS_UNKNOWN where
  * no game end is known - every `label` record, and every game the ply cap stopped. */
@@ -352,16 +337,14 @@ static void record_from_position(Record *r, const Position *pos, int score, int 
                                  unsigned progress) {
     memset(r, 0, sizeof(*r));
 
-    Square castleRooks[4] = {SQ_NONE, SQ_NONE, SQ_NONE, SQ_NONE};
-    int rookCount         = 0;
-    if (pos->castling & WHITE_OO)
-        castleRooks[rookCount++] = castling_rook(pos, WHITE, true);
-    if (pos->castling & WHITE_OOO)
-        castleRooks[rookCount++] = castling_rook(pos, WHITE, false);
-    if (pos->castling & BLACK_OO)
-        castleRooks[rookCount++] = castling_rook(pos, BLACK, true);
-    if (pos->castling & BLACK_OOO)
-        castleRooks[rookCount++] = castling_rook(pos, BLACK, false);
+    /* The rook the position's own geometry says the right belongs to, never a guess from
+     * the diagram. "The outermost rook" is right in standard chess and wrong in Chess960
+     * once the other rook walks round to the far side of the castling one. The geometry
+     * outlives a lost right, so the right itself is what is checked. */
+    Square castleRooks[CASTLING_NB];
+    for (int i = 0; i < CASTLING_NB; ++i)
+        castleRooks[i] = (pos->castling & (1 << i)) ? pos->castlingRook[i] : SQ_NONE;
+    const int rookCount = CASTLING_NB;
 
     r->occupied = occupied_bb(pos);
 
@@ -448,9 +431,19 @@ static bool record_to_fen(const Record *r, char *fen) {
 
     for (int i = 0; i < rookCount; ++i) {
         const Color c       = color_of(piece_on(&p, rookSquares[i]));
-        const bool kingside = file_of(rookSquares[i]) > file_of(king_square(&p, c));
-        p.castling |= (CastlingRights)(c == WHITE ? (kingside ? WHITE_OO : WHITE_OOO)
-                                                  : (kingside ? BLACK_OO : BLACK_OOO));
+        const Square ksq    = king_square(&p, c);
+        const bool kingside = file_of(rookSquares[i]) > file_of(ksq);
+        p.castling |= castling_right(c, kingside);
+        p.castlingRook[castling_index(c, kingside)] = rookSquares[i];
+
+        /* KQkq only names the outermost rook, so it is kept for the boards where that is
+         * the whole story - king on e, rook in the corner - and every shard written before
+         * Chess960 starts dumps exactly as it did. Anything else is spelled Shredder, which
+         * is board.c's rule for the same question. */
+        const Rank home = c == WHITE ? RANK_1 : RANK_8;
+        if (ksq != make_square(FILE_E, home) ||
+            rookSquares[i] != make_square(kingside ? FILE_H : FILE_A, home))
+            p.chess960 = true;
     }
 
     p.halfmoveClock  = r->halfmove;
@@ -809,6 +802,10 @@ typedef struct {
     int openingPlies;
     int openingPliesMax;
     int openingMaxScore;
+    int dfrcPercent;
+    int dfrcPlies;
+    int dfrcPliesMax;
+    int dfrcGames;
     int randomChance;
     int randomPlyMin;
     int randomPlyMax;
@@ -895,6 +892,10 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
         fprintf(f, "    \"opening_plies\": %d,\n", m->openingPlies);
         fprintf(f, "    \"opening_plies_max\": %d,\n", m->openingPliesMax);
         fprintf(f, "    \"opening_max_score\": %d,\n", m->openingMaxScore);
+        fprintf(f, "    \"dfrc_percent\": %d,\n", m->dfrcPercent);
+        fprintf(f, "    \"dfrc_opening_plies\": %d,\n", m->dfrcPlies);
+        fprintf(f, "    \"dfrc_opening_plies_max\": %d,\n", m->dfrcPliesMax);
+        fprintf(f, "    \"dfrc_games\": %d,\n", m->dfrcGames);
         /* The perturbation is invisible in the records themselves - a position reached after a
          * random move is spelled exactly like one reached by play - so the manifest is the only
          * place a dataset says whether it has any. */
@@ -1435,6 +1436,10 @@ typedef struct {
     int openingPliesMax;
     int openingMaxScore;
 
+    int dfrcPercent;
+    int dfrcPlies;
+    int dfrcPliesMax;
+
     int randomChance;
     int randomPlyMin;
     int randomPlyMax;
@@ -1578,6 +1583,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
      * looks exactly like a slow one from the outside. */
     uint64_t perturbed    = 0;
     int rejected          = 0;
+    int dfrcGames         = 0;
     double lastReport     = start;
     double lastCheckpoint = start;
     int played            = 0;
@@ -1610,6 +1616,15 @@ static int selfplay_worker(int index, int workers, void *ctx) {
         GameResult result;
         pending.count = 0;
 
+        /* Drawn once per GAME, not per attempt: DFRC openings and standard ones are not
+         * rejected at the same rate, and a per-attempt draw would let the rejection rate
+         * decide the mixture rather than -dfrc. No draw at all when it is 0, so every shard
+         * generated before this existed still reproduces. */
+        const bool dfrc = o->dfrcPercent > 0 && (int)rng_below(&rng, 100) < o->dfrcPercent;
+        const int plyLo = dfrc ? o->dfrcPlies : o->openingPlies;
+        const int plyHi = dfrc ? o->dfrcPliesMax : o->openingPliesMax;
+        dfrcGames += dfrc;
+
         for (;;) {
             /* Reached by a book line this build cannot set up, and by an opening the search
              * says is already decided. Both are normal a few times; a hundred in a row means
@@ -1618,7 +1633,17 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 dief("no playable opening in 100 attempts (%s, -openingscore %d)",
                      o->book ? o->book : "start position", o->openingMaxScore);
 
-            if (o->book) {
+            /* board_set_fen latches chess960 on from the Position it is handed and never
+             * clears it, so a DFRC game would otherwise leak its notation into every
+             * standard game the worker plays after it. */
+            pos.chess960 = false;
+
+            if (dfrc) {
+                const int w = (int)rng_below(&rng, 960);
+                const int b = (int)rng_below(&rng, 960);
+                if (!board_set_dfrc_start(&pos, w, b))
+                    continue;
+            } else if (o->book) {
                 char bookFen[FEN_MAX_LEN];
                 const uint64_t entry = rng_below(&rng, (uint64_t)book.count);
                 if (!book_fen(&book, (size_t)entry, bookFen, sizeof(bookFen)) ||
@@ -1632,9 +1657,7 @@ static int selfplay_worker(int index, int workers, void *ctx) {
              * count as well as a fresh line. rng_below returns without consuming a draw when
              * the range is one wide, so a fixed -opening N reproduces every shard generated
              * before the range existed. */
-            const int plies =
-                o->openingPlies +
-                (int)rng_below(&rng, (uint64_t)(o->openingPliesMax - o->openingPlies + 1));
+            const int plies = plyLo + (int)rng_below(&rng, (uint64_t)(plyHi - plyLo + 1));
             if (!random_opening(&pos, plies, &rng))
                 continue;
 
@@ -1707,8 +1730,8 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                     !(o->quietFilter && move_is_tactical(&pos, res.best)) &&
                     (!o->dedup || keyset_insert(&seen, pos.key))) {
                     Pending *pd = pending_push(&pending);
-                    record_from_position(&pd->rec, &pos, res.score, WDL_UNKNOWN, SRC_SELFPLAY,
-                                         PROGRESS_UNKNOWN);
+                    record_from_position(&pd->rec, &pos, res.score, WDL_UNKNOWN,
+                                         dfrc ? SRC_DFRC : SRC_SELFPLAY, PROGRESS_UNKNOWN);
                     pd->pol.best   = (uint16_t)res.best;
                     pd->pol.cutoff = MOVE_NONE;
                     pd->stm        = pos.sideToMove;
@@ -1778,10 +1801,10 @@ static int selfplay_worker(int index, int workers, void *ctx) {
             const double elapsed = now - start > 0.001 ? now - start : 0.001;
             fprintf(stdout,
                     "[w%02d] games %d/%d  records %llu  labels %llu  %.0f labels/s"
-                    "  rejected %d  random %llu\n",
+                    "  rejected %d  random %llu  dfrc %d\n",
                     index, played, games, (unsigned long long)writer.count,
                     (unsigned long long)labelled, (double)labelled / elapsed, rejected,
-                    (unsigned long long)perturbed);
+                    (unsigned long long)perturbed, dfrcGames);
             fflush(stdout);
             lastReport = now;
         }
@@ -1801,6 +1824,10 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.openingPlies    = o->openingPlies;
     man.openingPliesMax = o->openingPliesMax;
     man.openingMaxScore = o->openingMaxScore;
+    man.dfrcPercent     = o->dfrcPercent;
+    man.dfrcPlies       = o->dfrcPlies;
+    man.dfrcPliesMax    = o->dfrcPliesMax;
+    man.dfrcGames       = dfrcGames;
     man.randomChance    = o->randomChance;
     man.randomPlyMin    = o->randomPlyMin;
     man.randomPlyMax    = o->randomPlyMax;
@@ -1884,6 +1911,15 @@ static void usage_selfplay(void) {
            "  -openingscore N    discard the game if the opening is already decided by\n"
            "                     more than this many centipawns. Matches the -maxscore\n"
            "                     the CCRL book is extracted at.           (300)\n"
+           "  -dfrc P            percent of games that start from a Double Fischer Random\n"
+           "                     position (each side's back rank drawn independently from\n"
+           "                     the 960) instead of the book or the start position.\n"
+           "                     Their records are tagged `dfrc`, not `selfplay`, so the\n"
+           "                     trainer can reweight or drop them.              (0)\n"
+           "  -dfrcopening N|MIN-MAX\n"
+           "                     random plies after a DFRC start, in place of -opening.\n"
+           "                     The start is already varied, so this only wants to\n"
+           "                     split the side to move.                       (2-3)\n"
            "\n"
            "middlegame perturbation\n"
            "  -random N          1-in-N chance, per ply in the window below, that a\n"
@@ -1959,6 +1995,11 @@ static int cmd_selfplay(int argc, char **argv) {
      * middlegame nobody played. 300cp is also what the CCRL book was extracted at
      * (`tuner extract -maxscore 300`), so the two bounds now agree. */
     o.openingMaxScore = 300;
+    /* Off, for the same reason -random is: it changes what a generation IS, and an old
+     * command line must keep producing the dataset it always did. */
+    o.dfrcPercent  = 0;
+    o.dfrcPlies    = 2;
+    o.dfrcPliesMax = 3;
     /* Off: the mid-game perturbation is a per-generation decision recorded in the manifest,
      * and defaulting it on would silently change what every existing command produces. */
     o.randomChance = 0;
@@ -1996,7 +2037,12 @@ static int cmd_selfplay(int argc, char **argv) {
                 dief("-opening wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
         } else if (!strcmp(argv[i], "-openingscore") && i + 1 < argc)
             o.openingMaxScore = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-random") && i + 1 < argc)
+        else if (!strcmp(argv[i], "-dfrc") && i + 1 < argc)
+            o.dfrcPercent = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-dfrcopening") && i + 1 < argc) {
+            if (!parse_ply_range(argv[++i], &o.dfrcPlies, &o.dfrcPliesMax))
+                dief("-dfrcopening wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
+        } else if (!strcmp(argv[i], "-random") && i + 1 < argc)
             o.randomChance = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-randomply") && i + 1 < argc) {
             if (!parse_ply_range(argv[++i], &o.randomPlyMin, &o.randomPlyMax))
@@ -2045,6 +2091,8 @@ static int cmd_selfplay(int argc, char **argv) {
      * but the absence of one - and the scores recorded along it would label a walk. */
     if (o.randomChance == 1 || o.randomChance < 0)
         die("-random wants 0 (off) or 2 and above: it is a 1-in-N chance per ply");
+    if (o.dfrcPercent < 0 || o.dfrcPercent > 100)
+        die("-dfrc wants a percentage, 0 to 100");
 
     if (o.openingPlies < 0)
         o.openingPlies = o.book ? 2 : 8;

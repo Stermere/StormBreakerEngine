@@ -60,7 +60,7 @@ IN_CHECK = 0x08
 
 WDL_LOSS, WDL_DRAW, WDL_WIN, WDL_UNKNOWN = 0, 1, 2, 3
 
-SOURCE_NAMES = ("selfplay", "tree", "human", "engine", "book", "other")
+SOURCE_NAMES = ("selfplay", "tree", "human", "engine", "book", "other", "dfrc")
 
 # ------------------------------------------------------------ game progress --
 #
@@ -549,14 +549,30 @@ def record_to_fen(record: np.void) -> str:
         elif piece == "k":
             kings[True] = sq
 
-    rights = ""
+    # KQkq while that says everything - king on e, castling rooks in the
+    # corners - and Shredder (the rook's file) otherwise, as datagen.c does:
+    # on a Chess960 board KQkq can only name the OUTERMOST rook.
+    by_right = {}
+    chess960 = False
     for sq in castle_rooks:
         black = board[sq].islower()
-        kingside = (sq & 7) > (kings[black] & 7)
-        rights += ("k" if kingside else "q") if black else ("K" if kingside else "Q")
-    # FEN spells rights in KQkq order regardless of the order the rooks were
-    # walked in, which is ascending square.
-    rights = "".join(c for c in "KQkq" if c in rights) or "-"
+        ksq = kings[black]
+        kingside = (sq & 7) > (ksq & 7)
+        flag = ("k" if kingside else "q") if black else ("K" if kingside else "Q")
+        by_right[flag] = sq
+        home = 7 if black else 0
+        if ksq != _square(4, home) or sq != _square(7 if kingside else 0, home):
+            chess960 = True
+    rights = ""
+    for flag in "KQkq":
+        if flag not in by_right:
+            continue
+        if chess960:
+            letter = "ABCDEFGH"[by_right[flag] & 7]
+            rights += letter.lower() if flag.islower() else letter
+        else:
+            rights += flag
+    rights = rights or "-"
 
     ep = stm_ep & 0x7F
     ep_str = "-" if ep == EP_NONE else "abcdefgh"[ep & 7] + str((ep >> 3) + 1)
@@ -617,9 +633,16 @@ def pack_fen(fen: str, score: int = 0, wdl: int = WDL_UNKNOWN, source: int = 5,
     if False not in kings or True not in kings:
         raise ValueError(f"FEN is missing a king: {fen!r}")
 
-    # The rook a right refers to: the outermost one on the king's side of the
-    # king, matching castling_rook() in datagen.c.
+    # The rook a right refers to. KQkq names the outermost one on the king's side
+    # of the king (X-FEN); a file letter (Shredder) names it outright, and is how
+    # a Chess960 right with a second rook on the same side reads back.
     castle_rooks = set()
+    for ch in rights if rights != "-" else "":
+        if ch.upper() not in "KQ":
+            black = ch.islower()
+            sq = _square("abcdefgh".index(ch.lower()), kings[black] >> 3)
+            if board[sq] == ("r" if black else "R"):
+                castle_rooks.add(sq)
     for flag, black, kingside in (("K", False, True), ("Q", False, False),
                                   ("k", True, True), ("q", True, False)):
         if flag not in rights:

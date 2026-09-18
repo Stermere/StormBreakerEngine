@@ -167,6 +167,9 @@ run_selfplay() {
     [ -z "${SELFPLAY_OPENING:-}" ] || _sp_opts="$_sp_opts -opening $SELFPLAY_OPENING"
     [ -z "${SELFPLAY_OPENING_SCORE:-}" ] \
         || _sp_opts="$_sp_opts -openingscore $SELFPLAY_OPENING_SCORE"
+    [ -z "${SELFPLAY_DFRC:-}" ] || _sp_opts="$_sp_opts -dfrc $SELFPLAY_DFRC"
+    [ -z "${SELFPLAY_DFRC_OPENING:-}" ] \
+        || _sp_opts="$_sp_opts -dfrcopening $SELFPLAY_DFRC_OPENING"
     [ -z "${SELFPLAY_RANDOM:-}" ] || _sp_opts="$_sp_opts -random $SELFPLAY_RANDOM"
     [ -z "${SELFPLAY_RANDOM_PLY:-}" ] \
         || _sp_opts="$_sp_opts -randomply $SELFPLAY_RANDOM_PLY"

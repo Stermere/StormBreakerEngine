@@ -141,6 +141,10 @@ void board_set_startpos(Position *pos);
  * on - a numbering off by one is otherwise very hard to notice. */
 bool board_set_chess960_start(Position *pos, int idx);
 
+/* Double Fischer Random: each side's back rank is its own SP number, so the arrays need
+ * not mirror. (idx, idx) is exactly board_set_chess960_start(idx). */
+bool board_set_dfrc_start(Position *pos, int whiteIdx, int blackIdx);
+
 /* `buf` must hold at least FEN_MAX_LEN bytes. */
 void board_to_fen(const Position *pos, char *buf);
 

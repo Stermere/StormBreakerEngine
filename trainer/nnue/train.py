@@ -778,7 +778,7 @@ def parse_args(argv=None):
     parser.add_argument("--device", default=None)
     parser.add_argument("--sources", type=int, nargs="*", default=None,
                         help="keep only these source tags (0 selfplay, 1 tree, "
-                             "2 human, 3 engine, 4 book, 5 other)")
+                             "2 human, 3 engine, 4 book, 5 other, 6 dfrc)")
     parser.add_argument("--limit-batches", type=int, default=0,
                         help="stop each epoch after N batches (smoke tests)")
     parser.add_argument("--log-every", type=int, default=50)

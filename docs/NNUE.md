@@ -416,6 +416,8 @@ perturbations, and of nothing else.**
 | `-book <file.epd>` | none | draw each game's start uniformly from this EPD — a FEN per line, anything after it ignored, which is exactly what `tuner extract` writes |
 | `-opening N` or `MIN-MAX` | 2 with a book, 8 without | random legal plies played out of the start position; a range is drawn per game |
 | `-openingscore N` | 300 | throw the game away if the opening is already decided by more than this |
+| `-dfrc P` | 0 (off) | P percent of games start from a Double Fischer Random array instead — see below |
+| `-dfrcopening N` or `MIN-MAX` | 2-3 | random plies after a DFRC start, in place of `-opening` |
 | `-random N` | 0 (off) | 1-in-N chance per ply that a random legal move is played instead of the search's — see below |
 | `-randomply MIN-MAX` | 8-60 | the plies `-random` may fire in |
 
@@ -451,6 +453,26 @@ whichever side starts. The manifest records both bounds (`opening_plies`,
 The book decides which positions a generation ever sees, so it is pinned by
 hash in `job.env` (`BOOK_SHA`) exactly as the net is, and the shard manifest
 records its path and how many entries it indexed.
+
+**`-dfrc` is the structural lever the book never was.** A book of mainstream
+theory varies the start of a game but not much its *structure*, and the net
+evaluates every node of a search tree, not only positions people play into.
+`-dfrc P` starts P percent of games from a Double Fischer Random array — each
+side's back rank drawn independently from the 960, so 921,600 starts that
+mirror nothing — followed by `-dfrcopening` random plies (a range again, to
+split the side to move). The draw is made once per game, not per opening
+attempt, so a different rejection rate for DFRC openings cannot shift the
+mixture away from P; and nothing is drawn at all when P is 0, so older shards
+still reproduce. The records carry their own source tag, `dfrc`, which is what
+makes the share an experiment rather than a commitment: `--sources` and the
+per-source weights can lower it at training time, never raise it. gen-006 is
+the first generation to use it, at 10%, with no book and `-opening 8-9`.
+
+Castling in those records is encoded from the position's own geometry rather
+than inferred as "the outermost rook", which is wrong on a 960 board once the
+other rook has walked round to the far side of the castling one. `dump` and
+`nnue/format.py` spell such rights the Shredder way (the rook's file) and keep
+`KQkq` for every standard board, so older shards dump exactly as they did.
 
 **`-openingscore` is 300, not the 800 it used to be.** A randomised opening
 that is already a bishop up is not an opening: the game after it is a

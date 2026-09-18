@@ -504,7 +504,7 @@ datagen-test: datagen
 	@rm -rf $(DATAGEN_TEST_DIR)
 	@mkdir -p $(DATAGEN_TEST_DIR)
 	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/shard%02d.cnn \
-	    -games 6 -nodes 2000 -threads 2 -seed 7 -quiet
+	    -games 6 -nodes 2000 -threads 2 -seed 7 -dfrc 50 -quiet
 	./datagen$(SUFFIX) shuffle $(DATAGEN_TEST_DIR)/shard00.cnn \
 	    $(DATAGEN_TEST_DIR)/shard01.cnn -o $(DATAGEN_TEST_DIR)/all.cnn -seed 7 -quiet
 	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/all.cnn
@@ -518,7 +518,7 @@ datagen-test: datagen
 # checks the whole pipeline the old relabel check did - the search, the filters
 # and the writer - against a stronger requirement than a sampled score.
 	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/again%02d.cnn \
-	    -games 6 -nodes 2000 -threads 2 -seed 7 -quiet
+	    -games 6 -nodes 2000 -threads 2 -seed 7 -dfrc 50 -quiet
 	@for w in 00 01; do \
 	    a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/shard$$w.cnn -n 100000); \
 	    b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/again$$w.cnn -n 100000); \
@@ -606,6 +606,28 @@ datagen-test: datagen
 	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/noise-on.cnn
 	@echo "PASS: -random perturbs the game line, and its shard still verifies"
 
+# And that -dfrc really starts games from a Double Fischer Random array, tags
+# their records `dfrc`, and costs no draws when it is 0. -dfrcopening 0 makes
+# the first record the start position itself, with both back ranks and the
+# Shredder castling field in plain sight; a DFRC game that silently fell back
+# to the standard start would be 10% of a generation labelled as something it
+# is not.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/dfrc.cnn \
+	    -dfrc 100 -dfrcopening 0 -noquiet -games 3 -nodes 2000 -seed 5 -quiet
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/dfrc.cnn
+	@./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/dfrc.cnn -n 1 | tail -n +2 \
+	    | LC_ALL=C awk -F';' '$$4 != "dfrc" { bad = 1 } \
+	        $$1 !~ /^[rnbqk]+\/pppppppp\/8\/8\/8\/8\/PPPPPPPP\/[RNBQK]+ w [A-H][A-H][a-h][a-h] - 0 1$$/ \
+	        { bad = 1 } END { exit bad || NR != 1 }' \
+	    || { echo 'FAIL: -dfrc did not start from a tagged DFRC array'; exit 1; }
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/dfrc-zero.cnn \
+	    -games 6 -nodes 2000 -seed 7 -dfrc 0 -quiet
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-off.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/dfrc-zero.cnn -n 100000); \
+	 [ "$$a" = "$$b" ] \
+	    || { echo 'FAIL: -dfrc 0 drew from the RNG and changed the games'; exit 1; }
+	@echo "PASS: -dfrc starts tagged DFRC games, and costs no draws when off"
+
 # And that a perturbed run is still a function of its seed. The regeneration
 # gate above is what replaced `verify -relabel` for self-play shards (E26), and
 # a perturbation drawn from anywhere but the per-game stream would pass every
@@ -647,9 +669,9 @@ datagen-test: datagen
 # interleave and nothing else; -nodedup because the dedup table is per worker,
 # so one worker sees collisions four of them cannot.
 	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/seed1.cnn \
-	    -games 8 -nodes 1500 -seed 11 -threads 1 -nodedup -nopolicy -quiet
+	    -games 8 -nodes 1500 -seed 11 -threads 1 -dfrc 50 -nodedup -nopolicy -quiet
 	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/seed4%02d.cnn \
-	    -games 8 -nodes 1500 -seed 11 -threads 4 -nodedup -nopolicy -quiet
+	    -games 8 -nodes 1500 -seed 11 -threads 4 -dfrc 50 -nodedup -nopolicy -quiet
 	@cat $(DATAGEN_TEST_DIR)/seed400.cnn $(DATAGEN_TEST_DIR)/seed401.cnn \
 	     $(DATAGEN_TEST_DIR)/seed402.cnn $(DATAGEN_TEST_DIR)/seed403.cnn \
 	     > $(DATAGEN_TEST_DIR)/seed4.cnn

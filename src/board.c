@@ -460,11 +460,7 @@ bool board_set_fen(Position *pos, const char *fen) { return board_set_fen_reason
 static const char *const KrnPatterns[10] = {"NNRKR", "NRNKR", "NRKNR", "NRKRN", "RNNKR",
                                             "RNKNR", "RNKRN", "RKNNR", "RKNRN", "RKRNN"};
 
-bool board_set_chess960_start(Position *pos, int idx) {
-    if (idx < 0 || idx >= 960)
-        return false;
-
-    char back[9];
+static void chess960_back_rank(int idx, char back[9]) {
     memset(back, ' ', 8);
     back[8] = '\0';
 
@@ -488,25 +484,35 @@ bool board_set_chess960_start(Position *pos, int idx) {
     for (int f = 0, k = 0; f < 8; ++f)
         if (back[f] == ' ')
             back[f] = KrnPatterns[n][k++];
+}
 
-    char front[9];
+bool board_set_dfrc_start(Position *pos, int whiteIdx, int blackIdx) {
+    if (whiteIdx < 0 || whiteIdx >= 960 || blackIdx < 0 || blackIdx >= 960)
+        return false;
+
+    char back[9], front[9];
+    chess960_back_rank(whiteIdx, back);
+    chess960_back_rank(blackIdx, front);
     for (int f = 0; f < 8; ++f)
-        front[f] = (char)tolower((unsigned char)back[f]);
-    front[8] = '\0';
+        front[f] = (char)tolower((unsigned char)front[f]);
 
-    const char *const first = strchr(back, 'R');
-    const char *const last  = strrchr(back, 'R');
-    const char aSide        = (char)('A' + (first - back));
-    const char hSide        = (char)('A' + (last - back));
+    /* Each side's rooks are found on its own rank: with two arrays the files differ. */
+    const char wA = (char)('A' + (strchr(back, 'R') - back));
+    const char wH = (char)('A' + (strrchr(back, 'R') - back));
+    const char bA = (char)('a' + (strchr(front, 'r') - front));
+    const char bH = (char)('a' + (strrchr(front, 'r') - front));
 
     /* Spelled the Shredder way even for SP 518, whose geometry is standard: a Chess960
      * game is being set up, and its castling should read back as one. */
     char fen[FEN_MAX_LEN];
-    snprintf(fen, sizeof(fen), "%s/pppppppp/8/8/8/8/PPPPPPPP/%s w %c%c%c%c - 0 1", front, back,
-             hSide, aSide, (char)tolower((unsigned char)hSide),
-             (char)tolower((unsigned char)aSide));
+    snprintf(fen, sizeof(fen), "%s/pppppppp/8/8/8/8/PPPPPPPP/%s w %c%c%c%c - 0 1", front, back, wH,
+             wA, bH, bA);
 
     return board_set_fen(pos, fen);
+}
+
+bool board_set_chess960_start(Position *pos, int idx) {
+    return board_set_dfrc_start(pos, idx, idx);
 }
 
 void board_set_startpos(Position *pos) { board_set_fen(pos, FEN_STARTPOS); }
