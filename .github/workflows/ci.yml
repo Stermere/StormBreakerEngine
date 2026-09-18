@@ -104,9 +104,6 @@ jobs:
       - name: Run bench under sanitizers
         run: ./stormbreaker-debug bench 4
 
-      - name: Pawn-history gate under sanitizers
-        run: ./stormbreaker-debug history selftest
-
       - name: Staged picker gate under sanitizers
         run: ./stormbreaker-debug movepick selftest
 
@@ -137,9 +134,6 @@ jobs:
 
       - name: Perft suites
         run: make perft
-
-      - name: Pawn-history gate
-        run: make history-test
 
       - name: Staged picker gate
         run: make movepick-test

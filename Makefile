@@ -89,7 +89,13 @@ ifeq ($(OS),Windows_NT)
     # search_start() run the whole search on whichever thread called them, and
     # the PE default of 2 MB is under what a line to MAX_PLY needs. Reserved
     # address space is committed as it is touched, so this costs nothing.
-    LDFLAGS += -Wl,--stack,8388608
+    # A clang that targets MSVC links with link.exe/lld-link, which spells it
+    # differently and reads GNU's `--stack,N` as an input file named N.obj.
+    ifneq ($(findstring msvc,$(shell $(CC) -dumpmachine)),)
+        LDFLAGS += -Wl,/STACK:8388608
+    else
+        LDFLAGS += -Wl,--stack,8388608
+    endif
 else
     SUFFIX  :=
     UNAME   := $(shell uname -s)
