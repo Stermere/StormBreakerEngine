@@ -83,10 +83,10 @@ cd trainer
 # Gen 3 + 4 ~3100 -> ~3350 Elo (Additional search improvments contributed to this gain net-0ba56166ba9c)
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-003.cnn ..\external\data\gen-004.cnn --val ..\external\data\val.cnn --epochs 4 --out ..\external\nets\net --output-buckets 4 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty
 
-# Gen 5 ~3350 -> ~3450 (net-34aaa009f3db)
+# Gen 5 ~3350 -> ~3450
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.4 --lambda-pieces -0.2 --score-clip 2000
 
-# Gen 5 + factorization + finish pass ~3450 -> ~3500 (net-6e5d89a32b73)
+# Gen 5 + factorization + finish pass ~3450 -> ~3500 (net-f2886d3e2c71)
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --checkpoint-every 1 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.2 --lambda-pieces -0.0 --score-clip 2000 --unc-weight 0.01 --feature-factorization --finish-epochs 1 --finish-lr 0.00001
 
 

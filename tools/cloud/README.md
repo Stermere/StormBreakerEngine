@@ -130,6 +130,9 @@ generation ever needs to upload anything again.
 ```
 
 `aggregate.ps1` leaves a shuffled `external/data/$GEN.cnn` ready to train on.
+`-DataDir F:\data` puts the shards and the shuffled file under another
+directory instead (as `F:\data\$GEN\` and `F:\data\$GEN.cnn`); pass the same
+`-DataDir` to a later `-SkipDownload` run.
 
 Cost is roughly flat in box count: Hetzner bills by the hour, so eight boxes
 finish in half the time for the same money. Box count buys wall time, not

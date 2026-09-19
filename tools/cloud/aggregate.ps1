@@ -5,6 +5,7 @@
 #   .\tools\cloud\aggregate.ps1 -Parallel 4      fewer concurrent scp streams
 #   .\tools\cloud\aggregate.ps1 -SkipDownload    re-merge what is already local
 #   .\tools\cloud\aggregate.ps1 -StrictVerify    stop if sampled labels disagree
+#   .\tools\cloud\aggregate.ps1 -DataDir F:\data  shards and result somewhere other than external\data
 #
 # The download is the slow part (~6.5 GB for a full human pass) and it is not
 # bandwidth-bound: a Storage Box throttles per CONNECTION, so one scp saturates
@@ -18,7 +19,8 @@ param(
     [switch]$SkipDownload,
     [switch]$StrictVerify,
     [int]$ShuffleSeed = 7,
-    [int]$Parallel = 8
+    [int]$Parallel = 8,
+    [string]$DataDir
 )
 
 Set-StrictMode -Version Latest
@@ -65,7 +67,11 @@ if ($cfg.ContainsKey('SSH_KEY_FILE') -and $cfg['SSH_KEY_FILE']) {
 }
 
 $Datagen      = Join-Path $RepoRoot 'datagen.exe'
-$DataDir      = Ensure-Dir (Join-Path $ExternalDir 'data')
+# Resolved to a full path up front: the merge writes through [System.IO.File],
+# which resolves a relative path against the PROCESS directory, not PowerShell's
+# current location.
+if (-not $DataDir) { $DataDir = Join-Path $ExternalDir 'data' }
+$DataDir      = Ensure-Dir $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDir)
 $GenDir       = Ensure-Dir (Join-Path $DataDir $Gen)
 $MergeDir     = Ensure-Dir (Join-Path $GenDir 'merged')
 $ShardsRemote = "$HubDir/$Gen/shards"
@@ -575,5 +581,5 @@ Write-Section "Result"
 
 Write-Host ""
 Write-Host "  train with:"
-Write-Host "    python -m nnue.train --train external\data\$Gen.cnn"
+Write-Host "    python -m nnue.train --train $outFile"
 Write-Host "  record this generation in docs\EXPERIMENTS.md: size, nodes, eval, commit."
