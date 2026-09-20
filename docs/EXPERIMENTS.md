@@ -1455,6 +1455,39 @@ weaker engine, so those numbers do not difference against the CCRL tables. The
 engine is now strong enough to play Stockfish unlimited instead — `make gauntlet
 ARGS="--field stockfish"` — which is an honest opponent rather than a rung.
 
+**2026-09-20 — the ladder was replaced below 3426.** Not a measurement: a
+change to what the measurements are made against. The field of 2026-09-04 ran
+from 3008, and the gauntlet of this date (150 games per pairing, 1,050 for the
+engine, LTC 40+0.4) scored 96.3%, 86.7%, 85.0% and 78.0% against its four
+lowest rungs. Two things follow from that. A 96.3% score pins the rung's
+implied rating to ± 53 and costs exactly the machine time a 40% score would;
+and the four weak rungs implied 3537 ± 16 for the engine against the three
+strong ones' 3474 ± 13 — 63 ± 21 Elo apart, three sigma, with nothing to
+arbitrate it, because a rung being swept is not measuring the engine so much as
+recording that it is stronger.
+
+So halogen-8.1 (3008), berserk-4.1.0 (3133), weiss-1.4 (3256) and clover-3.0
+(3340) left `CCRL_LADDER`, and **berserk-8.5 (3575 ± 12)**, **viridithas-12.0.0
+(3600 ± 13)**, **clover-6.0 (3628 ± 10)** and **seer-2.8.0 (3640 ± 7)** took
+their seats. ethereal-12.75, carp-3.0.1 and koivisto-8.0 stay. Still seven
+rungs and seven authors, still single-file binaries with the net embedded, now
+spanning 3426-3640 — every seat within about 170 Elo of the engine, six of the
+seven above it.
+
+One check the change makes cheap: re-running `make ratings` on that same PGN
+now fits it on the three surviving anchors alone, since the other four are no
+longer rated in `CCRL_LADDER`, and returns **3481 ± 18** where the seven-anchor
+fit returned 3500 ± 17 — the strong band's answer, reproduced from games
+already on disk, and within a few Elo of the 3474 that
+[ROAD_TO_3600.md](ROAD_TO_3600.md) sizes its plan against.
+
+**What it costs.** Four of the seven seats changed, so gauntlet tables from
+before this date and after it do not difference: the fit is relative to the
+field, and the field moved. Any conversion factor between self-play SPRT Elo
+and gauntlet Elo has to be re-established here rather than carried across, and
+the first run on this ladder is a new baseline rather than a continuation of
+the 3500 ± 17 one.
+
 **2026-09-04**, at STC 8+0.08, 16MB hash, on the network build, against the
 five-rung CCRL ladder. Round-robin, 1217 games, ~81 per pairing. Fitted with
 `make ratings`, which reads the PGN back and puts every seat on one scale:

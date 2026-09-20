@@ -1,17 +1,28 @@
 # aggregate.ps1 - pull a generation off the hub and turn it into one shuffled
 # training file.
 #
-#   .\tools\cloud\aggregate.ps1                  download, check, merge, shuffle
+#   .\tools\cloud\aggregate.ps1                  download, check, shuffle
 #   .\tools\cloud\aggregate.ps1 -Parallel 4      fewer concurrent scp streams
-#   .\tools\cloud\aggregate.ps1 -SkipDownload    re-merge what is already local
+#   .\tools\cloud\aggregate.ps1 -SkipDownload    re-shuffle what is already local
 #   .\tools\cloud\aggregate.ps1 -StrictVerify    stop if sampled labels disagree
 #   .\tools\cloud\aggregate.ps1 -DataDir F:\data  shards and result somewhere other than external\data
 #
-# The download is the slow part (~6.5 GB for a full human pass) and it is not
-# bandwidth-bound: a Storage Box throttles per CONNECTION, so one scp saturates
-# one stream and leaves the rest of the link idle. It is pulled a unit at a time
-# over -Parallel connections, and every integrity check that can run before the
-# shuffle runs before the shuffle.
+# The download is not bandwidth-bound: a Storage Box throttles per CONNECTION,
+# so one scp saturates one stream and leaves the rest of the link idle. It is
+# pulled a unit at a time over -Parallel connections, and every integrity check
+# that can run before the shuffle runs before the shuffle.
+#
+# The shards go into `datagen shuffle` as they are. There used to be a merge
+# step here that concatenated each unit into one file first, because a thousand
+# paths do not fit on a Windows command line - it cost a full second copy of the
+# generation, written and read back for nothing, and it dropped every shard's
+# manifest on the floor, which is why gen-005.json says `"nodes": 0`. `-inputs`
+# takes the list in a file instead, and the shuffled output's record order is
+# unchanged: the merge only ever concatenated in the order the shards are passed
+# in now.
+#
+# Interrupting this is safe and leaves nothing that lies about itself - see
+# "what a Ctrl-C leaves behind" at the bottom.
 
 [CmdletBinding()]
 param(
@@ -73,7 +84,11 @@ $Datagen      = Join-Path $RepoRoot 'datagen.exe'
 if (-not $DataDir) { $DataDir = Join-Path $ExternalDir 'data' }
 $DataDir      = Ensure-Dir $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDir)
 $GenDir       = Ensure-Dir (Join-Path $DataDir $Gen)
-$MergeDir     = Ensure-Dir (Join-Path $GenDir 'merged')
+# The shuffle's bucket files, in one directory this script owns, so an interrupted
+# run leaves its temporaries somewhere known and the next run can sweep them. Left
+# to itself datagen puts them beside -o as <out>.bucketNNN.tmp, where a run killed
+# in pass 2 strands up to a whole generation of them among the datasets.
+$TmpDir       = Join-Path $GenDir 'shuffle-tmp'
 $ShardsRemote = "$HubDir/$Gen/shards"
 $DoneRemote   = "$HubDir/$Gen/done"
 
@@ -119,25 +134,10 @@ if ($Parallel -gt 10) {
     $Parallel = 10
 }
 
-# 64 KiB is enough to keep the copy sequential; the point is to avoid pulling a
-# multi-GB shard through PowerShell's pipeline as objects.
-function Join-BinaryFiles([string[]]$Inputs, [string]$Output) {
-    $out = [System.IO.File]::Create($Output)
-    try {
-        $buf = New-Object byte[] 65536
-        foreach ($f in $Inputs) {
-            $in = [System.IO.File]::OpenRead($f)
-            try {
-                while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) { $out.Write($buf, 0, $n) }
-            } finally { $in.Dispose() }
-        }
-    } finally { $out.Dispose() }
-}
-
 # Summed by hand rather than with Measure-Object: given -Property and no input
 # objects at all, Measure-Object emits NOTHING, and `(nothing).Sum` is a
 # strict-mode error - which is precisely the state a fresh generation directory
-# is in on the first run, when it holds only the empty merged\ subdirectory.
+# is in on the first run, before the first unit has landed in it.
 function Get-DirectoryBytes([string]$Path) {
     $total = [long]0
     foreach ($f in @(Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue)) {
@@ -169,20 +169,47 @@ function ConvertFrom-LsListing([string[]]$Lines) {
     return $files
 }
 
+# ssh writes its diagnostics to stderr, and under `2>&1 | Tee-Object` - which is
+# how anyone babysitting a long aggregation runs this - PowerShell turns each of
+# those lines into an ErrorRecord that $ErrorActionPreference = 'Stop' raises as
+# a NativeCommandError. Every one of these calls has a considered answer for a
+# hub that will not talk, and none of them get to give it if the shell kills the
+# script first. The exit code is the thing to read.
+function Invoke-Hub([string]$Command) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser $Command 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    # The ErrorRecords are ssh's stderr; they are not listing lines and must not be
+    # parsed as any. They are kept for the failure message and dropped otherwise.
+    return [pscustomobject]@{
+        Code  = $code
+        Lines = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+        Error = (@($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) |
+                 ForEach-Object { "$_" }) -join '; '
+    }
+}
+
 # One ssh round trip for the whole listing. `-l` because the sizes are what make
 # the download restartable: a unit already on disk at the right length is skipped,
 # and everything that is pulled is checked against the length the hub reported. A
 # hub whose shell will not do `-l` still works, it just loses both (Size = -1).
 function Get-RemoteShards {
-    $listing = & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser "ls -l $ShardsRemote"
-    if ($LASTEXITCODE -ne 0) { throw "cannot list ${HubUser}:$ShardsRemote" }
+    $r = Invoke-Hub "ls -l $ShardsRemote"
+    if ($r.Code -ne 0) { throw "cannot list ${HubUser}:${ShardsRemote}: $($r.Error)" }
+    $listing = $r.Lines
 
     $files = @(ConvertFrom-LsListing $listing)
     if ($files.Count -gt 0) { return $files }
 
     Write-Warn2 "hub gave no parseable 'ls -l'; falling back to names only"
-    $listing = & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser "ls $ShardsRemote"
-    if ($LASTEXITCODE -ne 0) { throw "cannot list ${HubUser}:$ShardsRemote" }
+    $r = Invoke-Hub "ls $ShardsRemote"
+    if ($r.Code -ne 0) { throw "cannot list ${HubUser}:${ShardsRemote}: $($r.Error)" }
+    $listing = $r.Lines
     foreach ($line in $listing) {
         $t = "$line".Trim()
         if ($t -match '\.(cnn|pol)$') { $files += [pscustomobject]@{ Name = $t; Size = [long]-1 } }
@@ -199,15 +226,16 @@ function Get-RemoteShards {
 # the one thing separating "finished" from "in flight". Without consulting it,
 # a run against a live fleet quietly merges a fraction of the generation.
 function Get-DoneUnits {
-    $listing = & ssh @IdentityArgs -p $HubPort -o BatchMode=yes $HubUser "ls $DoneRemote"
-    if ($LASTEXITCODE -ne 0) {
+    $r = Invoke-Hub "ls $DoneRemote"
+    if ($r.Code -ne 0) {
         # A generation older than the markers. Refusing would be worse than
         # merging: that data is genuinely finished, it just never said so.
         Write-Warn2 "no $DoneRemote on the hub; merging every shard present"
+        if ($r.Error) { Write-Host "         ssh said: $($r.Error)" }
         return $null
     }
     $done = @{}
-    foreach ($line in $listing) {
+    foreach ($line in $r.Lines) {
         $t = "$line".Trim()
         if ($t -match '\.done$') { $done[($t -replace '\.done$', '')] = $true }
     }
@@ -441,21 +469,28 @@ foreach ($s in $shards) {
 }
 Write-Ok "$totalRecords records, sidecars aligned"
 
-# Merge per chunk/batch before shuffling. 8 inputs instead of ~400 keeps the
-# shuffle command line well inside the Windows limit, and .cnn/.pol concatenate
-# byte-for-byte as long as both are joined in the SAME order - hence the single
-# sorted list driving both.
-Write-Host "  merging by unit..."
-Get-ChildItem $MergeDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
-$groups = $shards | Group-Object { $_.BaseName -replace '_\d+$', '' }
-foreach ($g in $groups) {
-    $ordered = @($g.Group | Sort-Object Name)
-    $cnnOut = Join-Path $MergeDir "$($g.Name).cnn"
-    $polOut = Join-Path $MergeDir "$($g.Name).pol"
-    Join-BinaryFiles ($ordered | ForEach-Object { $_.FullName }) $cnnOut
-    Join-BinaryFiles ($ordered | ForEach-Object {
-        [System.IO.Path]::ChangeExtension($_.FullName, '.pol') }) $polOut
-    Write-Ok "$($g.Name): $($ordered.Count) shards"
+# The shuffle's input list. Sorted by name, which is the order the old merge step
+# concatenated in, so the record stream the shuffle sees - and therefore its
+# output, byte for byte - is the one this pipeline has always produced.
+$ListFile = Join-Path $GenDir 'shuffle-inputs.txt'
+Write-TextNoBom $ListFile (($shards | ForEach-Object { $_.FullName }) -join "`r`n")
+$units = @($shards | Group-Object { $_.BaseName -replace '_\d+$', '' }).Count
+Write-Ok "$($shards.Count) shards in $units unit(s) listed for the shuffle"
+
+# Anything left by a run that was killed: bucket files, from before -tmp pointed
+# them at a directory of their own, and the merged copies the merge step used to
+# make. Both are a whole generation in size and neither is read any more.
+$legacy = @()
+$legacy += @(Get-ChildItem $DataDir -Filter "$Gen.cnn.bucket*.tmp" -File -ErrorAction SilentlyContinue)
+$legacyMerge = Join-Path $GenDir 'merged'
+if (Test-Path $legacyMerge) { $legacy += @(Get-ChildItem $legacyMerge -File -ErrorAction SilentlyContinue) }
+if ($legacy.Count -gt 0) {
+    $freed = [long]0
+    foreach ($f in $legacy) { $freed += $f.Length }
+    Write-Host ("  reclaiming {0:N0} MB from {1} stale file(s) (merged copies, old bucket temporaries)" -f
+                ($freed / 1MB), $legacy.Count)
+    $legacy | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (Test-Path $legacyMerge) { Remove-Item $legacyMerge -Force -Recurse -ErrorAction SilentlyContinue }
 }
 
 # Relabelling a sample from a cleared engine is what catches a box whose build
@@ -479,71 +514,121 @@ foreach ($g in $groups) {
 # search_clear() empties the table but keeps its geometry, so the table size
 # decides which entries collide, and a collision that changes a score is rare
 # rather than impossible.
-$sampleFile = Get-ChildItem $MergeDir -Filter '*.cnn' | Select-Object -First 1
-$sample     = $sampleFile.FullName
+# One shard from each of up to four DIFFERENT units, rather than 256 records out
+# of one. The check exists to catch one box whose build drifted from the rest of
+# the fleet, and a sample that never leaves one box's output cannot see that. The
+# budget is the same 256 re-searches, and verify's other two checks - which read
+# every record of what they are given - now cover four 18 MB shards instead of
+# one 2 GB merge, which is also the faster way round.
+$byUnit  = @($shards | Group-Object { $_.BaseName -replace '_\d+$', '' })
+$samples = @($byUnit | ForEach-Object { $_.Group[0] } | Select-Object -First 4)
+$perFile = [Math]::Max(1, [int](256 / $samples.Count))
 
-$vNodes = [int]$Nodes
-$vHash  = 8
-$manifest = Get-ChildItem $GenDir -Filter "$($sampleFile.BaseName)_*.json" | Select-Object -First 1
-if ($manifest) {
-    $m  = ConvertFrom-Json (Get-Content -LiteralPath $manifest.FullName -Raw)
-    $mf = $m.PSObject.Properties.Name
-    if ($mf -contains 'nodes')   { $vNodes = [int]$m.nodes }
-    if ($mf -contains 'hash_mb') { $vHash  = [int]$m.hash_mb }
-    if ($vNodes -ne [int]$Nodes) {
-        Write-Warn2 ("job.env says NODES=$Nodes but $($manifest.Name) was labelled at " +
-                     "$vNodes; relabelling at $vNodes")
+$labelChecked = 0
+$labelBad     = 0
+$vNodes       = [int]$Nodes
+$vHash        = 8
+
+foreach ($sampleFile in $samples) {
+    $sample = $sampleFile.FullName
+    $vNodes = [int]$Nodes
+    $vHash  = 8
+    # A self-play score is what the game's own search returned, with a warm table
+    # and a deeper tree behind it, so a cleared engine cannot reproduce it and
+    # datagen refuses -relabel on such a shard outright - "a gate that always
+    # fails is worse than no gate". The manifest says which kind this is. While
+    # the sample was a merged file with no manifest, nothing here could tell, and
+    # a selfplay generation got 256 re-searches whose mismatches meant nothing.
+    $canRelabel = $true
+
+    # Now that the sample is a shard rather than a merge, its manifest is the file
+    # beside it rather than a glob - and verify would read it on its own. It is
+    # still read here, because job.env having moved on since the pass is worth a
+    # warning and verify has no way to know that.
+    $manifest = [System.IO.Path]::ChangeExtension($sample, '.json')
+    if (Test-Path -LiteralPath $manifest) {
+        $m  = ConvertFrom-Json (Get-Content -LiteralPath $manifest -Raw)
+        $mf = $m.PSObject.Properties.Name
+        if ($mf -contains 'nodes')   { $vNodes = [int]$m.nodes }
+        if ($mf -contains 'hash_mb') { $vHash  = [int]$m.hash_mb }
+        if ($mf -contains 'labels' -and $m.labels -eq 'game') { $canRelabel = $false }
+        if ($canRelabel -and $vNodes -ne [int]$Nodes) {
+            Write-Warn2 ("job.env says NODES=$Nodes but $($sampleFile.BaseName).json was " +
+                         "labelled at $vNodes; relabelling at $vNodes")
+        }
+    } else {
+        Write-Warn2 ("no manifest beside $($sampleFile.BaseName); relabelling at NODES=$Nodes " +
+                     "and a $vHash MB hash, either of which may not be what the pass used")
     }
-} else {
-    Write-Warn2 ("no manifest beside $($sampleFile.BaseName); relabelling at NODES=$Nodes and " +
-                 "a $vHash MB hash, either of which may not be what the pass used")
-}
 
-Write-Host "  verifying labels reproduce (relabel 256 @ $vNodes nodes, $vHash MB hash)..."
+    if ($canRelabel) {
+        Write-Host ("  verifying $($sampleFile.Name) (relabel $perFile @ $vNodes nodes, " +
+                    "$vHash MB hash)...")
+    } else {
+        Write-Host "  verifying $($sampleFile.Name) (bytes only - game labels)..."
+    }
 
-# datagen names every mismatching record on stderr, and that is the useful half
-# of the output. Run the whole script under `2>&1 | Tee-Object` - which is what
-# anyone babysitting a multi-hour aggregation does - and PowerShell turns each of
-# those lines into an ErrorRecord, which $ErrorActionPreference = 'Stop' then
-# raises as a NativeCommandError. The script would die at exactly the point it is
-# supposed to keep going and explain itself, so the preference is lifted for this
-# one call and $LASTEXITCODE is trusted instead.
-$prevEap = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-try {
-    $verifyOut  = @(& $Datagen verify $sample -relabel 256 -nodes $vNodes -hash $vHash)
-    $verifyExit = $LASTEXITCODE
-} finally {
-    $ErrorActionPreference = $prevEap
-}
-$verifyOut | ForEach-Object { Write-Host "    $_" }
+    # datagen names every mismatching record on stderr, and that is the useful half
+    # of the output. Run the whole script under `2>&1 | Tee-Object` - which is what
+    # anyone babysitting a multi-hour aggregation does - and PowerShell turns each of
+    # those lines into an ErrorRecord, which $ErrorActionPreference = 'Stop' then
+    # raises as a NativeCommandError. The script would die at exactly the point it is
+    # supposed to keep going and explain itself, so the preference is lifted for this
+    # one call and $LASTEXITCODE is trusted instead.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $verifyOut = if ($canRelabel) {
+            @(& $Datagen verify $sample -relabel $perFile -nodes $vNodes -hash $vHash)
+        } else {
+            @(& $Datagen verify $sample)
+        }
+        $verifyExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $verifyOut | ForEach-Object { Write-Host "    $_" }
 
-$rtBad = $null; $polBad = 0; $labelBad = $null; $labelChecked = 0
-foreach ($line in $verifyOut) {
-    if     ($line -match '^round-trip:.*checked, (\d+) failures') { $rtBad  = [int]$Matches[1] }
-    elseif ($line -match '^policy:.*checked, (\d+) not legal')    { $polBad = [int]$Matches[1] }
-    elseif ($line -match '^relabel:\s+(\d+) checked, (\d+) mismatch') {
-        $labelChecked = [int]$Matches[1]
-        $labelBad     = [int]$Matches[2]
+    $rtBad = $null; $polBad = 0; $fileBad = $null; $fileChecked = 0
+    foreach ($line in $verifyOut) {
+        if     ($line -match '^round-trip:.*checked, (\d+) failures') { $rtBad  = [int]$Matches[1] }
+        elseif ($line -match '^policy:.*checked, (\d+) not legal')    { $polBad = [int]$Matches[1] }
+        elseif ($line -match '^relabel:\s+(\d+) checked, (\d+) mismatch') {
+            $fileChecked = [int]$Matches[1]
+            $fileBad     = [int]$Matches[2]
+        }
+    }
+
+    # A verify that printed no summary did not run - a missing file, a rejected
+    # option, a crash - and its silence must not be read as a pass.
+    if ($null -eq $rtBad -or ($canRelabel -and $null -eq $fileBad)) {
+        throw "datagen verify produced no result for $sample (exit $verifyExit)"
+    }
+
+    # A record that does not round-trip, or a policy move that is not legal in its
+    # own record, is corruption rather than disagreement: the shuffle would carry it
+    # straight into the training file. Those stay fatal.
+    if ($rtBad -gt 0 -or $polBad -gt 0) {
+        throw "$sample is corrupt: $rtBad records do not round-trip, " +
+              "$polBad policy moves are not legal in their record"
+    }
+
+    if ($canRelabel) {
+        $labelChecked += $fileChecked
+        $labelBad     += $fileBad
     }
 }
 
-# A verify that printed no summary did not run - a missing file, a rejected
-# option, a crash - and its silence must not be read as a pass.
-if ($null -eq $rtBad -or $null -eq $labelBad) {
-    throw "datagen verify produced no result for $sample (exit $verifyExit)"
-}
-
-# A record that does not round-trip, or a policy move that is not legal in its
-# own record, is corruption rather than disagreement: the shuffle would carry it
-# straight into the training file. Those stay fatal.
-if ($rtBad -gt 0 -or $polBad -gt 0) {
-    throw "$sample is corrupt: $rtBad records do not round-trip, " +
-          "$polBad policy moves are not legal in their record"
-}
-
-if ($labelBad -eq 0) {
-    Write-Ok "$labelChecked sampled labels reproduce exactly"
+if ($labelChecked -eq 0) {
+    # Not a pass and not a failure: there is no label check to run on this kind of
+    # shard. Said plainly, because "0 checked" printed as a tick is how a gate
+    # gets believed after it has stopped gating anything.
+    Write-Warn2 ("$Gen carries game labels, which no fresh search reproduces - the bytes of " +
+                 "$($samples.Count) unit(s) were checked and the labels were not")
+    Write-Host  '         what gates a selfplay unit is regeneration from its seed, and the box'
+    Write-Host  '         runs that against its own shard before it uploads one'
+} elseif ($labelBad -eq 0) {
+    Write-Ok "$labelChecked sampled labels from $($samples.Count) unit(s) reproduce exactly"
 } else {
     Write-Host ''
     Write-Fail "$labelBad of $labelChecked sampled labels did not reproduce"
@@ -566,15 +651,23 @@ if ($labelBad -eq 0) {
     Write-Host '  mixes labels from two different engines, which is precisely what this check'
     Write-Host '  exists to catch - do not train on it until you know which one you have.'
     Write-Host ''
-    if ($StrictVerify) { throw "label verification failed on $sample (-StrictVerify)" }
+    if ($StrictVerify) { throw "label verification failed (-StrictVerify)" }
     Write-Warn2 'aggregating anyway; -StrictVerify -SkipDownload reruns this as a hard gate'
 }
 
+# The bucket files are a whole generation in size and they live for the length of
+# the shuffle, so the directory is emptied on the way in as well as on the way
+# out: a previous run that was killed left its own set here, and they are dead
+# weight rather than anything to resume from.
+if (Test-Path $TmpDir) { Get-ChildItem $TmpDir -File | Remove-Item -Force }
+$TmpDir = Ensure-Dir $TmpDir
+
 $outFile = Join-Path $DataDir "$Gen.cnn"
-$inputs  = @(Get-ChildItem $MergeDir -Filter '*.cnn' | ForEach-Object { $_.FullName })
-Write-Host "  shuffling $($inputs.Count) merged files -> $outFile"
-& $Datagen shuffle @inputs -o $outFile -seed $ShuffleSeed
+Write-Host "  shuffling $($shards.Count) shards -> $outFile"
+& $Datagen shuffle -inputs $ListFile -o $outFile -seed $ShuffleSeed -tmp $TmpDir
 if ($LASTEXITCODE -ne 0) { throw "shuffle failed" }
+Get-ChildItem $TmpDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
+Remove-Item $TmpDir -Force -ErrorAction SilentlyContinue
 
 Write-Section "Result"
 & $Datagen stats $outFile
@@ -583,3 +676,18 @@ Write-Host ""
 Write-Host "  train with:"
 Write-Host "    python -m nnue.train --train $outFile"
 Write-Host "  record this generation in docs\EXPERIMENTS.md: size, nodes, eval, commit."
+Write-Host ""
+# What a Ctrl-C leaves behind, and what picks it up:
+#   during the download - shards at their final names, some of them short. The
+#     next run compares every local file against the hub's listing and refetches
+#     the whole unit of anything that does not match, so this costs time and
+#     nothing else. scp holds no lock across runs.
+#   during the verify - nothing.
+#   during the shuffle - the bucket files in <gen>\shuffle-tmp, up to the size of
+#     the generation again, and a truncated <gen>.cnn/.pol. The next run empties
+#     that directory before it starts; deleting it by hand is safe at any time
+#     the shuffle is not running.
+#   A truncated <gen>.cnn cannot be mistaken for a finished one: datagen removes
+#     <gen>.json before it writes the first record and writes it again only after
+#     the last, so an interrupted output has no manifest beside it. Nothing
+#     downstream reads a shard whose manifest is missing without saying so.

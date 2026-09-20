@@ -89,7 +89,15 @@ enum {
 
     /* `shuffle` keeps one open file and one counter per bucket in fixed stack arrays, so
      * this bounds a user-supplied -buckets as well as the auto-computed one. */
-    SHUFFLE_MAX_BUCKETS = 256
+    SHUFFLE_MAX_BUCKETS = 256,
+
+    /* How many records `shuffle` reads and writes per call, and how much each bucket stages
+     * before it writes. Both exist to keep stdio out of the inner loop: a 36-byte fwrite per
+     * record is a locked library call and a 4 KiB write every hundred records, which at half
+     * a billion records costs more than the disk. 256 KiB x 256 buckets is the worst-case
+     * staging cost, and that is small beside the dedup table. */
+    SHUFFLE_IO_RECS    = 8192,
+    SHUFFLE_BUCKET_BUF = 256u << 10
 };
 
 /* For the messages that have to name the file and the numbers: a failure that says which
@@ -118,6 +126,13 @@ static void *xmalloc(size_t n) {
     if (!p)
         die("out of memory");
     return p;
+}
+
+static void *xrealloc(void *p, size_t n) {
+    void *q = realloc(p, n ? n : 1);
+    if (!q)
+        die("out of memory");
+    return q;
 }
 
 static FILE *xfopen(const char *path, const char *mode) {
@@ -304,6 +319,13 @@ static void policy_decode(const uint8_t *in, PolicyRecord *p) {
 }
 
 static SourceTag record_source(const Record *r) { return (SourceTag)(r->flags & REC_SRC_MASK); }
+
+/* The same tag straight out of the encoded bytes. `shuffle` wants nothing else from the
+ * record - every other field it touches is copied through verbatim - and at half a billion
+ * records a decode per record to read one byte is minutes of nothing. */
+static SourceTag record_source_raw(const uint8_t *raw) {
+    return (SourceTag)(raw[REC_BYTES - 1] & REC_SRC_MASK);
+}
 
 /*
  * Game progress: plies from this position to the end of its game, in four bits. Bucket 0
@@ -2416,6 +2438,69 @@ static int cmd_label(int argc, char **argv) {
     return rc;
 }
 
+/*
+ * The input list `shuffle` takes, which is the one command handed a whole generation at
+ * once. A generation is a thousand shards and a Windows command line dies at 32 KiB, which
+ * is why aggregate.ps1 used to concatenate
+ * units into a handful of merged files first - a second full copy of the dataset on disk,
+ * written and read back for nothing, and one that left every shard's manifest behind so the
+ * output could not say what nodes or net had labelled it.
+ *
+ * The file's bytes stay allocated and the entries point into them, so the caller frees one
+ * buffer rather than a thousand strings.
+ */
+static void inputs_add(char ***list, int *count, int *cap, char *path) {
+    if (*count == *cap) {
+        *cap  = *cap ? *cap * 2 : 64;
+        *list = xrealloc(*list, (size_t)*cap * sizeof(**list));
+    }
+    (*list)[(*count)++] = path;
+}
+
+static char *inputs_add_file(const char *listPath, char ***list, int *count, int *cap) {
+    FILE *f = xfopen(listPath, "rb");
+    fseek64(f, 0, SEEK_END);
+    const long long size = (long long)ftell64(f);
+    if (size < 0)
+        dief("cannot measure '%s'", listPath);
+    fseek64(f, 0, SEEK_SET);
+
+    char *buf = xmalloc((size_t)size + 1);
+    if (size && fread(buf, 1, (size_t)size, f) != (size_t)size)
+        dief("short read from '%s'", listPath);
+    buf[size] = '\0';
+    fclose(f);
+
+    /* A UTF-8 BOM, because PowerShell's Set-Content writes one by default and the failure it
+     * would otherwise cause names the first shard and not the list. */
+    char *start = buf;
+    if (size >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB &&
+        (unsigned char)buf[2] == 0xBF)
+        start += 3;
+
+    int added = 0;
+    for (char *p = start; *p;) {
+        char *line = p;
+        while (*p && *p != '\n')
+            ++p;
+        if (*p)
+            *p++ = '\0';
+        /* CRLF, because this list is written by PowerShell as often as by a shell. */
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t'))
+            line[--n] = '\0';
+        while (*line == ' ' || *line == '\t')
+            ++line;
+        if (!*line || *line == '#')
+            continue;
+        inputs_add(list, count, cap, line);
+        ++added;
+    }
+    if (!added)
+        dief("no paths in '%s'", listPath);
+    return buf;
+}
+
 static void usage_shuffle(void) {
     printf("datagen shuffle <in.cnn>... -o <out.cnn> [options]\n"
            "\n"
@@ -2434,6 +2519,9 @@ static void usage_shuffle(void) {
            "unit. Either every input has a .pol or none may.\n"
            "\n"
            "  -o <path>          output shard.                            (required)\n"
+           "  -inputs <file>     read input paths from a file, one per line, in addition\n"
+           "                     to any named on the command line. A generation is a\n"
+           "                     thousand shards and a command line is not.\n"
            "  -buckets K         bucket count; by default chosen so one bucket fits in\n"
            "                     -memory.                                 (auto, max 256)\n"
            "  -memory MB         how much RAM one bucket may take.        (512)\n"
@@ -2441,9 +2529,10 @@ static void usage_shuffle(void) {
            "  -seed N            RNG seed.                                (1)\n"
            "  -nodedup           keep every record, duplicates included. The output is\n"
            "                     then a pure permutation of the input.\n"
-           "  -dedupbits N       initial log2 size of the dedup table; it grows. Start it\n"
-           "                     near log2(distinct records) to avoid rehashing; 2^28\n"
-           "                     holds 150M and costs 2 GB.                       (24)\n"
+           "  -dedupbits N       initial log2 size of the dedup table. Raised on its own\n"
+           "                     to hold the inputs without rehashing, so this is a floor\n"
+           "                     rather than a budget; 2^28 holds 150M and costs 2 GB.\n"
+           "                                                              (auto, min 24)\n"
            "  -quiet             progress lines off.\n");
 }
 
@@ -2462,10 +2551,12 @@ static int cmd_shuffle(int argc, char **argv) {
         return 0;
     }
 
-    const char *out = NULL;
-    const char *tmp = NULL;
-    char *inputs[256];
+    const char *out  = NULL;
+    const char *tmp  = NULL;
+    char **inputs    = NULL;
+    char *inputsFile = NULL;
     int inputCount   = 0;
+    int inputCap     = 0;
     int buckets      = 0;
     uint64_t seed    = 1;
     size_t bucketCap = 512u << 20;
@@ -2475,7 +2566,11 @@ static int cmd_shuffle(int argc, char **argv) {
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc)
             out = argv[++i];
-        else if (!strcmp(argv[i], "-buckets") && i + 1 < argc)
+        else if (!strcmp(argv[i], "-inputs") && i + 1 < argc) {
+            if (inputsFile)
+                die("-inputs given twice");
+            inputsFile = inputs_add_file(argv[++i], &inputs, &inputCount, &inputCap);
+        } else if (!strcmp(argv[i], "-buckets") && i + 1 < argc)
             buckets = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-seed") && i + 1 < argc)
             seed = strtoull(argv[++i], NULL, 10);
@@ -2492,10 +2587,8 @@ static int cmd_shuffle(int argc, char **argv) {
         else if (argv[i][0] == '-') {
             fprintf(stderr, "datagen: unknown shuffle option '%s'\n", argv[i]);
             return 1;
-        } else if (inputCount < (int)(sizeof(inputs) / sizeof(inputs[0])))
-            inputs[inputCount++] = argv[i];
-        else
-            die("too many input shards");
+        } else
+            inputs_add(&inputs, &inputCount, &inputCap, argv[i]);
     }
 
     if (!out || inputCount == 0)
@@ -2570,14 +2663,45 @@ static int cmd_shuffle(int argc, char **argv) {
 
     Rng rng = seed;
 
+    /* Presized from the inputs instead of grown into. keyset_insert doubles at a 0.7 load
+     * factor and every doubling memsets a new table and rehashes the old one; half a billion
+     * records reach an 8 GB table through six of those, with 12 GB live at the moment of the
+     * last one. Sizing it once costs the same 8 GB and none of the rest. Which records are
+     * dropped does not change - a slot matches on the whole 64-bit key, so the table's size
+     * moves probe positions and nothing else - so the output stays byte-identical. */
+    if (dedup)
+        while (dedupBits < 31 && ((uint64_t)1 << dedupBits) * 7 <= total * 10)
+            ++dedupBits;
+
     KeySet seen;
     if (dedup)
         keyset_init(&seen, dedupBits);
 
-    if (!Quiet)
+    if (!Quiet) {
+        /* The table is the largest thing this command allocates, by an order of magnitude.
+         * Naming it turns "why is the machine swapping" into a number on the screen. */
+        char dedupNote[80];
+        dedupNote[0] = '\0';
+        if (dedup)
+            snprintf(dedupNote, sizeof(dedupNote), ", deduplicating (2^%d table, %.1f GB)",
+                     dedupBits,
+                     (double)((uint64_t)1 << dedupBits) * sizeof(uint64_t) / (double)(1u << 30));
         fprintf(stdout, "pass 1: scattering %llu records into %d buckets%s%s\n",
                 (unsigned long long)total, buckets, policy ? " (with policy sidecar)" : "",
-                dedup ? ", deduplicating" : "");
+                dedupNote);
+    }
+
+    /* Blocked I/O on both sides. A record is 32 bytes and a unit 36, and stdio turns each
+     * one into a locked call and, every hundred records or so, a 4 KiB write - so half a
+     * billion records spent more time in the C library than on the disk. Reads come in
+     * SHUFFLE_IO_RECS at a time and each bucket stages SHUFFLE_BUCKET_BUF bytes before it
+     * touches the disk. The record ORDER is untouched, which is what keeps the RNG draws -
+     * and so the output bytes - identical to the unbuffered version. */
+    uint8_t *recBuf    = xmalloc(SHUFFLE_IO_RECS * REC_BYTES);
+    uint8_t *polBuf    = policy ? xmalloc(SHUFFLE_IO_RECS * POL_BYTES) : NULL;
+    uint8_t *bucketBuf = xmalloc((size_t)buckets * SHUFFLE_BUCKET_BUF);
+    size_t *bucketFill = xmalloc((size_t)buckets * sizeof(size_t));
+    memset(bucketFill, 0, (size_t)buckets * sizeof(size_t));
 
     uint64_t scattered = 0;
     uint64_t dropped   = 0;
@@ -2590,25 +2714,37 @@ static int cmd_shuffle(int argc, char **argv) {
             pf = xfopen(pol, "rb");
         }
 
-        uint8_t unitBuf[REC_BYTES + POL_BYTES];
-        while (fread(unitBuf, 1, REC_BYTES, rf) == REC_BYTES) {
-            if (pf && fread(unitBuf + REC_BYTES, 1, POL_BYTES, pf) != POL_BYTES)
+        size_t got;
+        while ((got = fread(recBuf, REC_BYTES, SHUFFLE_IO_RECS, rf)) > 0) {
+            if (pf && fread(polBuf, POL_BYTES, got, pf) != got)
                 die("policy sidecar is shorter than its shard");
 
-            /* THE ONLY PLACE CROSS-SHARD DUPLICATES CAN BE SEEN: `selfplay` and `label` dedup
-             * within a shard, so a position two workers both reach survives twice - gen-004
-             * was ten copies of everything, and its loss curve looked normal. The sidecar is
-             * read before the skip, always, because it is positional. */
-            if (dedup && !keyset_insert(&seen, (Key)record_position_key(unitBuf))) {
-                ++dropped;
-                continue;
-            }
+            for (size_t r = 0; r < got; ++r) {
+                const uint8_t *rec = recBuf + r * REC_BYTES;
 
-            const int b = (int)rng_below(&rng, (uint64_t)buckets);
-            if (fwrite(unitBuf, 1, unit, bucketFile[b]) != unit)
-                die("short write to a bucket file");
-            ++bucketCount[b];
-            ++scattered;
+                /* THE ONLY PLACE CROSS-SHARD DUPLICATES CAN BE SEEN: `selfplay` and `label`
+                 * dedup within a shard, so a position two workers both reach survives twice -
+                 * gen-004 was ten copies of everything, and its loss curve looked normal. The
+                 * sidecar is read before the skip, always, because it is positional. */
+                if (dedup && !keyset_insert(&seen, (Key)record_position_key(rec))) {
+                    ++dropped;
+                    continue;
+                }
+
+                const int b    = (int)rng_below(&rng, (uint64_t)buckets);
+                uint8_t *stage = bucketBuf + (size_t)b * SHUFFLE_BUCKET_BUF;
+                if (bucketFill[b] + unit > SHUFFLE_BUCKET_BUF) {
+                    if (fwrite(stage, 1, bucketFill[b], bucketFile[b]) != bucketFill[b])
+                        die("short write to a bucket file");
+                    bucketFill[b] = 0;
+                }
+                memcpy(stage + bucketFill[b], rec, REC_BYTES);
+                if (policy)
+                    memcpy(stage + bucketFill[b] + REC_BYTES, polBuf + r * POL_BYTES, POL_BYTES);
+                bucketFill[b] += unit;
+                ++bucketCount[b];
+                ++scattered;
+            }
         }
 
         fclose(rf);
@@ -2616,8 +2752,16 @@ static int cmd_shuffle(int argc, char **argv) {
             fclose(pf);
     }
 
-    for (int b = 0; b < buckets; ++b)
+    for (int b = 0; b < buckets; ++b) {
+        const uint8_t *stage = bucketBuf + (size_t)b * SHUFFLE_BUCKET_BUF;
+        if (bucketFill[b] && fwrite(stage, 1, bucketFill[b], bucketFile[b]) != bucketFill[b])
+            die("short write to a bucket file");
         fclose(bucketFile[b]);
+    }
+    free(bucketBuf);
+    free(bucketFill);
+    free(recBuf);
+    free(polBuf);
 
     if (dedup)
         keyset_free(&seen);
@@ -2632,6 +2776,17 @@ static int cmd_shuffle(int argc, char **argv) {
 
     char outPol[PATH_CAP];
     replace_ext(outPol, sizeof(outPol), out, ".pol");
+
+    /* A manifest describes a FINISHED shard, so it is written at the end - and a stale one
+     * from an earlier run has to be removed now, before the file it describes is truncated.
+     * Pass 2 runs for minutes on a real generation and gets interrupted; what that leaves
+     * behind is a partial shard, and with the old manifest still beside it, a partial shard
+     * wearing the record count of the one it replaced. Nothing downstream can catch that.
+     * Removed, the interrupted output is unmistakably unfinished. */
+    char outManifest[PATH_CAP];
+    replace_ext(outManifest, sizeof(outManifest), out, ".json");
+    remove(outManifest);
+
     FILE *of  = xfopen(out, "wb");
     FILE *opf = policy ? xfopen(outPol, "wb") : NULL;
 
@@ -2641,6 +2796,13 @@ static int cmd_shuffle(int argc, char **argv) {
 
     if (!Quiet)
         fprintf(stdout, "pass 2: shuffling each bucket in memory\n");
+
+    /* The record and its policy bytes go to two different files, so the shuffled bucket is
+     * repacked into one block per file and written a block at a time rather than a record at
+     * a time. Same bytes, same order; four hundred million fewer library calls. */
+    uint8_t *outRecBuf = xmalloc(SHUFFLE_IO_RECS * REC_BYTES);
+    uint8_t *outPolBuf = policy ? xmalloc(SHUFFLE_IO_RECS * POL_BYTES) : NULL;
+    size_t held        = 0;
 
     for (int b = 0; b < buckets; ++b) {
         const size_t n = (size_t)bucketCount[b];
@@ -2663,35 +2825,55 @@ static int cmd_shuffle(int argc, char **argv) {
             }
 
             for (size_t i = 0; i < n; ++i) {
-                if (fwrite(data + i * unit, 1, REC_BYTES, of) != REC_BYTES)
-                    die("short write to the output shard");
-                if (opf && fwrite(data + i * unit + REC_BYTES, 1, POL_BYTES, opf) != POL_BYTES)
-                    die("short write to the output policy sidecar");
+                memcpy(outRecBuf + held * REC_BYTES, data + i * unit, REC_BYTES);
+                if (outPolBuf)
+                    memcpy(outPolBuf + held * POL_BYTES, data + i * unit + REC_BYTES, POL_BYTES);
+                ++held;
+                if (held == SHUFFLE_IO_RECS) {
+                    if (fwrite(outRecBuf, REC_BYTES, held, of) != held)
+                        die("short write to the output shard");
+                    if (opf && fwrite(outPolBuf, POL_BYTES, held, opf) != held)
+                        die("short write to the output policy sidecar");
+                    held = 0;
+                }
 
-                Record rec;
-                record_decode(data + i * unit, &rec);
-                ++bySource[record_source(&rec)];
+                ++bySource[record_source_raw(data + i * unit)];
                 ++written;
             }
             free(data);
         }
         remove(bucketPath[b]);
     }
+
+    if (held) {
+        if (fwrite(outRecBuf, REC_BYTES, held, of) != held)
+            die("short write to the output shard");
+        if (opf && fwrite(outPolBuf, POL_BYTES, held, opf) != held)
+            die("short write to the output policy sidecar");
+    }
+    free(outRecBuf);
+    free(outPolBuf);
     free(bucketPath);
 
     fclose(of);
     if (opf)
         fclose(opf);
 
+    /* A thousand shards do not fit in a manifest field and would not be read if they did.
+     * Past a handful the list becomes a count and the first name, which is what identifies
+     * the generation; the truncation is stated rather than silent. */
     char joined[PATH_CAP];
     joined[0] = '\0';
-    for (int i = 0; i < inputCount; ++i) {
-        if (strlen(joined) + strlen(inputs[i]) + 2 >= sizeof(joined))
-            break;
-        if (joined[0])
-            strcat(joined, " ");
-        strcat(joined, inputs[i]);
-    }
+    if (inputCount > 8)
+        snprintf(joined, sizeof(joined), "%d shards, first %s", inputCount, inputs[0]);
+    else
+        for (int i = 0; i < inputCount; ++i) {
+            if (strlen(joined) + strlen(inputs[i]) + 2 >= sizeof(joined))
+                break;
+            if (joined[0])
+                strcat(joined, " ");
+            strcat(joined, inputs[i]);
+        }
 
     Manifest man;
     memset(&man, 0, sizeof(man));
@@ -2771,6 +2953,9 @@ static int cmd_shuffle(int argc, char **argv) {
     man.syzygyPath = syzygyAgree ? firstSyzygy : NULL;
 
     manifest_write(out, &man, written, bySource, policy);
+
+    free(inputs);
+    free(inputsFile);
 
     fprintf(stdout, "shuffled %llu records into %s\n", (unsigned long long)written, out);
     return 0;

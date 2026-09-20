@@ -254,7 +254,14 @@ def main() -> int:
             opponents += [str(p) for p in sorted(c.BASELINE_DIR.glob("*.exe"))]
         if args.field in ("all", "engines"):
             c.ensure_dir(c.ENGINES_DIR)
-            opponents += [str(p) for p in sorted(c.ENGINES_DIR.glob("*.exe"))]
+            fetched = sorted(c.ENGINES_DIR.glob("*.exe"))
+            for p in fetched:
+                if c.ccrl_rating(p.stem) is None:
+                    # Left behind by an older ladder: it plays, it costs games,
+                    # and ratings.py has no published rating to anchor it with.
+                    c.warn(f"{p.stem} is not on the ladder - it will play as an "
+                           "unrated seat. Drop it with: make engines-fetch ARGS=--prune")
+            opponents += [str(p) for p in fetched]
 
     engines = [c.engine_args(engine, "engine")]
     for opp in opponents:

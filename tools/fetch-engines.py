@@ -4,6 +4,7 @@ fetch-engines.py - download a ladder of rated opponents for the gauntlet.
     python tools/fetch-engines.py            # fetch any that are missing
     python tools/fetch-engines.py --list     # just show the ladder
     python tools/fetch-engines.py --force    # re-download everything
+    python tools/fetch-engines.py --prune    # also delete engines off the ladder
 
 gauntlet.py's problem is that every engine in external/baselines is a snapshot
 of THIS engine, so the table it prints is relative to a scale nobody outside
@@ -50,6 +51,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="fetch-engines.py", description="Fetch gauntlet opponents.")
     ap.add_argument("--list", action="store_true", help="show the ladder and exit")
     ap.add_argument("--force", action="store_true", help="re-download even if present")
+    ap.add_argument("--prune", action="store_true",
+                    help="delete binaries in the directory that are not on the ladder")
     args = ap.parse_args()
 
     dest_dir = c.ensure_dir(c.ENGINES_DIR)
@@ -57,9 +60,28 @@ def main() -> int:
     c.section("Opponent ladder (CCRL Blitz, 1 CPU)")
     for e in c.CCRL_LADDER:
         p = dest_dir / f"{e['name']}.exe"
-        print(f"  {e['ccrl']:>5} +-{e['err']:<3} {e['name']:<16}"
+        print(f"  {e['ccrl']:>5} +-{e['err']:<3} {e['name']:<18}"
               f" {'present' if p.exists() else 'missing'}")
     print()
+
+    # Binaries left over from an older ladder still match gauntlet.py's glob,
+    # so a field can quietly be the one it used to be. ENGINES_DIR is this
+    # script's directory and nothing else writes to it, but deleting on a fetch
+    # is still not this command's job unless asked.
+    strays = sorted(p for p in dest_dir.glob("*.exe")
+                    if not any(e["name"] == p.stem for e in c.CCRL_LADDER))
+    if strays:
+        c.warn(f"{len(strays)} binary(s) here are NOT on the ladder and will still "
+               "play in the gauntlet, unrated:")
+        for p in strays:
+            print(f"    {p.name}" + ("  -> deleting" if args.prune else ""))
+        if args.prune:
+            for p in strays:
+                p.unlink()
+        else:
+            print("    keep them deliberately, or drop them: --prune")
+        print()
+
     if args.list:
         return 0
 

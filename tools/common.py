@@ -157,9 +157,17 @@ def default_concurrency() -> int:
 # and `ratings.py` reads the ratings back off it, so the two cannot disagree
 # about which engine carries which number.
 #
-# WHY THESE SEVEN. They span 3008-3593 in roughly 100-Elo steps, which brackets
-# the engine on both sides - a field entirely above or entirely below it scores
-# near 0% or near 100%, which carries almost no information per game. They come
+# WHY THESE SEVEN. They span 3426-3640, which places six of the seven ABOVE the
+# engine rather than around it. That is deliberate, and it is a correction. The
+# ladder this replaces ran from 3008, and in the 2026-09-20 gauntlet the engine
+# scored 78-96% against its bottom four rungs: a 96.3% score pins a rating to
+# about +- 53 while costing exactly the machine time a 40% score would. Worse,
+# those four rungs implied a rating 63 +- 21 Elo above what the three rungs
+# nearest the engine implied - three sigma, and not something a sweep can
+# arbitrate, because a rung that never wins a game is not measuring anything.
+# So every rung below ethereal-12.75 was replaced with an engine in the
+# 3550-3650 band. Each of the seven now takes real points off the engine, and
+# the fit is constrained on the side it actually extrapolates towards. They come
 # from seven different authors, so a quirk this engine happens to exploit in one
 # of them cannot flatter the whole table. All are self-contained: no companion
 # net file to place, no config to write.
@@ -175,34 +183,6 @@ GH = "https://github.com"
 
 CCRL_LADDER = [
     {
-        "name": "halogen-8.1",
-        "ccrl": 3008,
-        "err": 18,
-        "url": f"{GH}/KierenP/Halogen/releases/download/v8.1/Halogen8.1-x64-pext-avx2.exe",
-        "member": None,
-    },
-    {
-        "name": "berserk-4.1.0",
-        "ccrl": 3133,
-        "err": 17,
-        "url": f"{GH}/jhonnold/berserk/releases/download/4.1.0/berserk-4.1.0-x64-avx2-pext.exe",
-        "member": None,
-    },
-    {
-        "name": "weiss-1.4",
-        "ccrl": 3256,
-        "err": 16,
-        "url": f"{GH}/TerjeKir/weiss/releases/download/v1.4/Weiss-1.4-windows-collection.zip",
-        "member": "weiss-pext.exe",
-    },
-    {
-        "name": "clover-3.0",
-        "ccrl": 3340,
-        "err": 16,
-        "url": f"{GH}/lucametehau/CloverEngine/releases/download/v3.0/Clover.3.0-avx2.exe",
-        "member": None,
-    },
-    {
         "name": "ethereal-12.75",
         "ccrl": 3426,
         "err": 11,
@@ -217,10 +197,42 @@ CCRL_LADDER = [
         "member": None,
     },
     {
+        "name": "berserk-8.5",
+        "ccrl": 3575,
+        "err": 12,
+        "url": f"{GH}/jhonnold/berserk/releases/download/8.5/berserk-8.5-x64-avx2-pext.exe",
+        "member": None,
+    },
+    {
         "name": "koivisto-8.0",
         "ccrl": 3593,
         "err": 10,
         "url": f"{GH}/Luecx/Koivisto/releases/download/v8.0/Koivisto_8.0-x64-windows-avx2.exe",
+        "member": None,
+    },
+    {
+        "name": "viridithas-12.0.0",
+        "ccrl": 3600,
+        "err": 13,
+        # -v3 is the x86-64-v3 build: AVX2 without requiring fast PEXT.
+        "url": f"{GH}/cosmobobak/viridithas/releases/download/v12.0.0/"
+               f"viridithas-12.0.0-x86_64-win-v3.exe",
+        "member": None,
+    },
+    {
+        "name": "clover-6.0",
+        "ccrl": 3628,
+        "err": 10,
+        "url": f"{GH}/lucametehau/CloverEngine/releases/download/v6.0/Clover.6.0-avx2.exe",
+        "member": None,
+    },
+    {
+        "name": "seer-2.8.0",
+        "ccrl": 3640,
+        "err": 7,
+        # 78 MB: Seer embeds a large net. It is one file all the same.
+        "url": f"{GH}/connormcmonigle/seer-nnue/releases/download/v2.8.0/"
+               f"seer_v2.8_x64_avx2_popcnt.exe",
         "member": None,
     },
 ]

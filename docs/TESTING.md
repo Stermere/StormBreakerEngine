@@ -247,9 +247,14 @@ PGN.
 Read the residual column before the estimate. A rung the engine sweeps locates
 almost nothing — 93% of the points against a 3008 engine pins its rating to
 about ± 126 — so an estimate above the top rung is an extrapolation off the
-least-constrained end of the ladder, however tight its bar looks. When the
-engine outgrows the top rung, add a rung, do not trust the extrapolation:
-the ladder lives in `CCRL_LADDER` in [tools/common.py](../tools/common.py).
+least-constrained end of the ladder, however tight its bar looks. That is why
+the ladder is kept ahead of the engine: on 2026-09-20 every rung below
+ethereal-12.75 was replaced with one in the 3550-3650 band, and the weakest
+seat now scores about 60% rather than 96%. When the engine outgrows the top
+rung, add a rung, do not trust the extrapolation: the ladder lives in
+`CCRL_LADDER` in [tools/common.py](../tools/common.py). Replacing a rung is not
+free — tables either side of the change do not difference, because the field
+moved and the fit is relative to it.
 
 ---
 
