@@ -1993,13 +1993,44 @@ its perspective, which is added cost on the 80% that are used. The honest
 estimate is **1-1.5%**, not the quarter the raw push-versus-evaluate ratio
 suggests.
 
+### A third pass: a stacked net at 1.43x of a flat one
+
+[E40](EXPERIMENTS.md#e40-making-the-layer-stack-cheap---exact-speedups-then-a-pairwise-l1) has the numbers. The metric is new: a real
+`bench 13` search's calls into the evaluation, recorded and replayed against each
+net. That is the only way to charge two nets for identical work in the engine's real
+mix of pushes, evaluations and uncertainty requests.
+
+**The SCReLU stack went from 2.85x to 2.00x a flat evaluation**, exactly, with bench
+unchanged:
+- Sparse L1 over the nonzero activation pairs (46% of them), with the weights
+  re-laid out pair-major at load.
+- SCReLU in one `mulhi`.
+- The stack's two outputs recorded per level and in a 4 MB table per thread, with
+  `eval_state_push()` prefetching the line the evaluation will probe.
+
+**What bounds it is not the multiplies.** `vpmaddwd` issues two a cycle here. The
+trunk is bound by instructions and loads per pair, and by a 32 KB-per-bucket L1 that
+cannot stay in a 32 KB L1 data cache beside the accumulators: a trunk costs 199 ns
+hot and about 290 ns under realistic cache traffic. That is what "Where the remaining
+time goes" above was reaching for.
+
+**So the stack got a second activation: pairwise multiplication, tag 2.**
+- Each perspective's accumulator halves are multiplied, `(x * y) >> log2(qa)`, into
+  the same [0, qa] range.
+- L1 reads 512 inputs, not 1024, and a bucket's L1 is 16 KB.
+- Products are nonzero too often, 63-71% of pairs, for sparsity to pay, so a pairwise
+  net runs L1 dense. That loop is load-bound and splits four pairs' inputs out of one
+  load.
+- A pairwise net costs **1.43x** of a flat evaluation on the replay.
+
+The trainer (`--pairwise`), the exporter and the engine all carry it, and
+`nnue verify` is exact on both builds. Its strength against gen-6-3 is an SPRT that
+has not been run.
+
 ### Follow-ups this opens, each its own experiment
 
-- **Pairwise multiplication on the FT output** - multiply the two halves of
-  each perspective together instead of squaring each unit, which halves what L1
-  reads and so halves the dominant cost above. An architecture change rather
-  than a speedup: a pairwise net is a different function and needs its own
-  training run and its own SPRT.
+- **Pairwise multiplication on the FT output** - built, see the section above; what
+  remains is the SPRT that says whether gen-6-pw plays as well as gen-6-3.
 - **Squared ReLU on L1** rather than clipped ReLU.
 - **Retest a wider FT.** E27's h1024 lost because it doubled the accumulator
   cost and returned nothing. If the L1 stack is where the capacity now lives,

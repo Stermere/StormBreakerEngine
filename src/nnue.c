@@ -229,6 +229,10 @@ extern const unsigned char nnueEmbeddedEnd[];
  *
  * outWeight/outBias are the FINAL layer in both architectures: the flat output layer
  * without a stack, L3 with one.
+ *
+ * l1Weight/l2Weight are the file's own [unit][input] order in a scalar build and a
+ * pair-major copy of it in an AVX2 one - see nnue_interleave(), and the layers that read
+ * it, for why.
  */
 typedef struct {
     const int16_t *ftWeight;
@@ -243,7 +247,7 @@ typedef struct {
     const int32_t *uncBias;
 
     uint32_t hidden;
-    uint32_t inputs; /* what L1 reads: 2 * hidden, one activation per accumulator unit */
+    uint32_t inputs; /* what L1 reads: 2 * hidden for SCReLU, hidden for pairwise */
     uint32_t buckets;
     uint32_t trunkWidth; /* what both output heads read */
     uint32_t l1Size;
@@ -256,6 +260,7 @@ typedef struct {
     uint8_t l2Shift;
     uint8_t actShift;    /* log2(qa) - why a stacked net's qa must be a power of two */
     uint8_t bucketShift; /* log2(32 / buckets), which nnue_validate() makes a power of two */
+    uint8_t pairwise;    /* NNUE_ACT_PAIRWISE: see nnue_activate() */
 
     int32_t qa;
     int32_t qb;
@@ -269,6 +274,7 @@ typedef struct {
 
     NnueHeader hdr;
     unsigned char *owned;
+    unsigned char *stackOwned; /* the interleaved stack weights, when there are any */
     char hash[65];
     char source[512];
     bool loaded;
@@ -300,6 +306,12 @@ static uint32_t nnue_trunk_width(const NnueHeader *h) {
  *
  * Every section is a whole number of int32s wide by construction - the widths are
  * multiples of 16 - so nothing here needs padding and the int32 biases land aligned. */
+/* How many numbers the activation hands L1: SCReLU gives one per unit of both
+ * accumulators, pairwise one per PAIR of units. */
+static uint32_t nnue_l1_inputs(const NnueHeader *h) {
+    return h->activation == NNUE_ACT_PAIRWISE ? h->hidden : 2u * h->hidden;
+}
+
 static uint64_t nnue_payload_bytes(const NnueHeader *h) {
     const uint64_t buckets = h->outputBuckets;
     const uint64_t headBytes =
@@ -307,7 +319,7 @@ static uint64_t nnue_payload_bytes(const NnueHeader *h) {
 
     uint64_t stackBytes = 0;
     if (h->l1Size) {
-        stackBytes = buckets * h->l1Size * 2u * h->hidden * sizeof(int16_t) +
+        stackBytes = buckets * h->l1Size * nnue_l1_inputs(h) * sizeof(int16_t) +
                      buckets * h->l1Size * sizeof(int32_t);
         if (h->l2Size)
             stackBytes += buckets * h->l2Size * h->l1Size * sizeof(int16_t) +
@@ -353,10 +365,10 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
                "in src/nnue.c",
                h->featureSet, (unsigned)NNUE_FEATURES_HALFKA_32SQ);
 
-    if (h->activation != NNUE_ACT_SCRELU)
-        REJECT("activation %u is not implemented (this build runs %u, screlu) - add its "
-               "case to nnue_activate() in src/nnue.c",
-               h->activation, (unsigned)NNUE_ACT_SCRELU);
+    if (h->activation != NNUE_ACT_SCRELU && h->activation != NNUE_ACT_PAIRWISE)
+        REJECT("activation %u is not implemented (this build runs %u, screlu, and %u, "
+               "pairwise) - add its case to nnue_activate() in src/nnue.c",
+               h->activation, (unsigned)NNUE_ACT_SCRELU, (unsigned)NNUE_ACT_PAIRWISE);
 
     /* The feature set's tag defines its own shape, so a file that disagrees was written by
      * an exporter with a different idea of what the tag means. */
@@ -398,6 +410,17 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
         REJECT("stack widths %u/%u must be multiples of %u, which the vectorised dot "
                "product requires - retrain at widths that are",
                h->l1Size, h->l2Size, (unsigned)NNUE_WIDTH_MULTIPLE);
+
+    /* Pairwise halves what L1 reads, and a flat net has no L1: the flat head fuses SCReLU
+     * into its own dot product, which is the only activation it has. Each half of an
+     * accumulator is walked sixteen lanes at a time, so the width needs two of those. */
+    if (h->activation == NNUE_ACT_PAIRWISE && h->l1Size == 0)
+        REJECT("activation pairwise with no layer stack - it feeds L1, and there is none");
+
+    if (h->activation == NNUE_ACT_PAIRWISE && h->hidden % (2u * NNUE_WIDTH_MULTIPLE) != 0)
+        REJECT("pairwise hidden width %u is not a multiple of %u - each half is walked %u "
+               "lanes at a time",
+               h->hidden, 2u * NNUE_WIDTH_MULTIPLE, (unsigned)NNUE_WIDTH_MULTIPLE);
 
     /* L2 reads L1's output, so a file claiming one without the other describes a shape
      * that has no arithmetic. It is a malformed header rather than an unsupported one. */
@@ -471,15 +494,90 @@ static bool nnue_validate(const unsigned char *blob, size_t bytes, const char *w
     return true;
 }
 
+#ifdef NNUE_AVX2
+
+/*
+ * For each 8-bit mask, the positions of its set bits in ascending order.
+ *
+ * This is what turns one movemask into a compacted run of pair indices with no branch per
+ * pair: the activation stores all eight entries every time and advances its count only by
+ * the bits that were set, so whatever lies past a mask's population is overwritten by the
+ * next one. Filled at load, before anything can evaluate.
+ */
+static uint8_t NnzLut[256][8];
+
+static void nnue_nnz_lut_init(void) {
+    for (unsigned mask = 0; mask < 256; ++mask) {
+        unsigned k = 0;
+        for (unsigned bit = 0; bit < 8; ++bit)
+            if (mask & (1u << bit))
+                NnzLut[mask][k++] = (uint8_t)bit;
+    }
+}
+
+/*
+ * One stack layer's weights re-laid out pair-major: [bucket][pair][unit][2] where the file
+ * has [bucket][unit][input], so that `dst[(p * units + u) * 2 + k]` is the weight unit `u`
+ * gives input `2p + k`.
+ *
+ * That is the order the AVX2 layers read in: they broadcast one PAIR of inputs against
+ * every unit's weights for it, which is what lets L1 skip the pairs that are zero. A
+ * bucket's block is the same size in both orders, so the bucket offsets do not change,
+ * and at 16 units one pair's weights are exactly one cache line.
+ */
+static void nnue_interleave(const int16_t *w, uint32_t buckets, uint32_t units, uint32_t inputs,
+                            int16_t *dst) {
+    for (uint32_t b = 0; b < buckets; ++b) {
+        const int16_t *const src = w + (size_t)b * units * inputs;
+        int16_t *const out       = dst + (size_t)b * units * inputs;
+
+        for (uint32_t p = 0; p < inputs / 2u; ++p)
+            for (uint32_t u = 0; u < units; ++u) {
+                out[((size_t)p * units + u) * 2u]      = src[(size_t)u * inputs + 2u * p];
+                out[((size_t)p * units + u) * 2u + 1u] = src[(size_t)u * inputs + 2u * p + 1u];
+            }
+    }
+}
+#endif
+
 /* Points the net at a validated blob and hashes it. `owned` is NULL for the embedded
- * blob, which lives in rodata and must not be freed. */
-static void nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *owned,
+ * blob, which lives in rodata and must not be freed.
+ *
+ * False when the stack's interleaved weights cannot be allocated, and then the previous
+ * net is left exactly as it was: the allocation comes first so that a failed
+ * `setoption EvalFile` keeps the engine playing on what it had. */
+static bool nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *owned,
                        const char *source) {
+    unsigned char *stackOwned = NULL;
+
+#ifdef NNUE_AVX2
+    {
+        const NnueHeader *const nh = (const NnueHeader *)(const void *)blob;
+        const size_t weights       = (size_t)nh->outputBuckets * nh->l1Size * nnue_l1_inputs(nh) +
+                               (size_t)nh->outputBuckets * nh->l2Size * nh->l1Size;
+
+        /* 64 bytes of slack to slide the copy onto a cache line, as the net itself is. */
+        if (nh->l1Size) {
+            stackOwned = (unsigned char *)malloc(weights * sizeof(int16_t) + 64u);
+            if (!stackOwned) {
+                printf("info string %s: out of memory for the layer stack's interleaved weights "
+                       "(%zu bytes)\n",
+                       source, weights * sizeof(int16_t));
+                fflush(stdout);
+                return false;
+            }
+        }
+        nnue_nnz_lut_init();
+    }
+#endif
+
     if (Loaded.owned)
         free(Loaded.owned);
+    free(Loaded.stackOwned);
 
     memcpy(&Loaded.hdr, blob, sizeof(NnueHeader));
-    Loaded.owned = owned;
+    Loaded.owned      = owned;
+    Loaded.stackOwned = stackOwned;
 
     const NnueHeader *const h = &Loaded.hdr;
     const size_t buckets      = h->outputBuckets;
@@ -497,7 +595,8 @@ static void nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *o
     hot->qb         = (int32_t)h->qb;
     hot->scale      = h->scale;
 
-    hot->inputs = 2u * h->hidden;
+    hot->inputs   = nnue_l1_inputs(h);
+    hot->pairwise = h->activation == NNUE_ACT_PAIRWISE;
 
     /* log2(qa), which validate() has already established exists. Counted rather than
      * reached for by a builtin so ARCH=popcnt and a compiler without one both build. */
@@ -540,9 +639,29 @@ static void nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *o
         hot->uncBias = (const int32_t *)(const void *)p;
     }
 
+#ifdef NNUE_AVX2
+    /* Every layer block is a multiple of 64 bytes - both widths are multiples of 16 - so
+     * aligning the first puts every pair's line of both layers on a boundary. */
+    if (stackOwned) {
+        int16_t *const l1 =
+            (int16_t *)(void *)(stackOwned + ((64u - ((uintptr_t)stackOwned & 63u)) & 63u));
+
+        nnue_interleave(hot->l1Weight, hot->buckets, h->l1Size, hot->inputs, l1);
+        hot->l1Weight = l1;
+
+        if (h->l2Size) {
+            int16_t *const l2 = l1 + (size_t)hot->buckets * h->l1Size * hot->inputs;
+
+            nnue_interleave(hot->l2Weight, hot->buckets, h->l2Size, h->l1Size, l2);
+            hot->l2Weight = l2;
+        }
+    }
+#endif
+
     sha256_hex(blob, bytes, Loaded.hash);
     snprintf(Loaded.source, sizeof(Loaded.source), "%s", source);
     Loaded.loaded = true;
+    return true;
 }
 
 bool nnue_load_file(const char *path) {
@@ -580,12 +699,11 @@ bool nnue_load_file(const char *path) {
     const size_t got = fread(blob, 1, (size_t)size, f);
     fclose(f);
 
-    if (got != (size_t)size || !nnue_validate(blob, got, path)) {
+    if (got != (size_t)size || !nnue_validate(blob, got, path) ||
+        !nnue_adopt(blob, got, owned, path)) {
         free(owned);
         return false;
     }
-
-    nnue_adopt(blob, got, owned, path);
     return true;
 }
 
@@ -600,7 +718,8 @@ void nnue_init(void) {
         fflush(stdout);
         exit(1);
     }
-    nnue_adopt(nnueEmbeddedStart, bytes, NULL, NNUE_EVALFILE " (embedded)");
+    if (!nnue_adopt(nnueEmbeddedStart, bytes, NULL, NNUE_EVALFILE " (embedded)"))
+        exit(1);
 #else
     printf("info string this build embeds no net: rebuild with "
            "'make EVALFILE=<path>'\n");
@@ -752,17 +871,6 @@ static inline int32_t nnue_hsum32(__m256i v) {
     return _mm_cvtsi128_si32(s);
 }
 
-/* Four accumulators reduced together, into the four sums they hold. Two hadd rounds
- * leave each accumulator's halves in the two 128-bit lanes, and the fold across adds
- * them. */
-static inline __m128i nnue_hsum32x4(__m256i a, __m256i b, __m256i c, __m256i d) {
-    const __m256i ab   = _mm256_hadd_epi32(a, b);
-    const __m256i cd   = _mm256_hadd_epi32(c, d);
-    const __m256i abcd = _mm256_hadd_epi32(ab, cd);
-
-    return _mm_add_epi32(_mm256_castsi256_si128(abcd), _mm256_extracti128_si256(abcd, 1));
-}
-
 /* SCReLU against one half of the output row. v * w stays in int16 - the exporter refuses
  * a net where it would not - and madd then widens (v * w) * v into int32 pairs, flushed
  * as the bound at the top of this file describes. */
@@ -894,58 +1002,148 @@ static inline int32_t nnue_dot(const int16_t *in, const int16_t *w, uint32_t n) 
 #endif
 }
 
-/* One perspective's SCReLU output as a vector L1 can read: clamp to [0, qa], square, and
- * shift back down by log2(qa) so the result lands in [0, qa] again.
+/* One perspective's activation as a vector L1 can read: clamp to [0, qa], multiply, and
+ * shift back down by log2(qa) so the result lands in [0, qa] again. SCReLU multiplies
+ * each unit by itself, pairwise the unit `j` by the unit `j + hidden / 2`, and both are
+ * this one function - handed the same pointer twice, or the two halves.
  *
  * The flat head never materialises this - it fuses the square into its own dot product
  * and divides by qa once at the end. A stack has to hand L1 a real vector, and doing the
  * rescale per element is what keeps that vector int16 and its dot products plain
  * `madd_epi16`. It is also why a stacked net's qa must be a power of two: per element,
  * a shift is a shift and a divide is a divide.
+ *
+ * The AVX2 path also writes down which PAIRS of the output are nonzero, as it goes, which
+ * is the list sparse L1 walks - see NnzList. `firstPair` is where this half's pairs start
+ * in the whole vector; the return is the list's new length.
  */
-static inline void nnue_activate_half(const int16_t *acc, int16_t *out, uint32_t n, int32_t qa,
-                                      uint32_t shift) {
 #ifdef NNUE_AVX2
-    const __m256i zero = _mm256_setzero_si256();
-    const __m256i top  = _mm256_set1_epi16((short)qa);
-    const __m128i down = _mm_cvtsi32_si128((int)shift);
-    const __m128i up   = _mm_cvtsi32_si128((int)(16u - shift));
+
+/*
+ * The activation vector, and the indices of its pairs that are not both zero.
+ *
+ * Indices, and not the pairs' values compacted beside them. Compacting the values makes
+ * sparse L1 cheaper by a load and a shift per pair, and it measured 30 ns faster per
+ * evaluation with everything hot - but it costs the activation a permute and a wider
+ * store per sixteen units, and in a real search L1 is not short of instructions: it is
+ * waiting on its weights, which a 32 KB-per-bucket layer cannot keep in a 32 KB L1 data
+ * cache beside the accumulators. Replayed on a real search's calls it was a loss.
+ *
+ * One index per pair, `hidden` in all and no slack: each vector's row of eight is stored
+ * at the running count, which never exceeds the index of that vector's own first pair, so
+ * no store reaches past the last one.
+ */
+typedef struct {
+    _Alignas(64) int16_t act[2 * NNUE_MAX_HIDDEN];
+    uint16_t idx[NNUE_MAX_HIDDEN];
+} NnzList;
+
+/* Always inlined so the SCReLU call, which passes the same pointer as both factors, loads
+ * and clamps each vector once rather than twice - and so a NULL `idxOut`, which asks for
+ * the activation alone, compiles the whole list out rather than testing for it. */
+static inline __attribute__((always_inline)) uint32_t
+nnue_activate_half(const int16_t *lhs, const int16_t *rhs, int16_t *out, uint32_t n, int32_t qa,
+                   uint32_t shift, uint16_t *idxOut, uint32_t count, uint32_t firstPair) {
+    const __m256i zero  = _mm256_setzero_si256();
+    const __m256i top   = _mm256_set1_epi16((short)qa);
+    const __m128i k1    = _mm_cvtsi32_si128((int)((17u - shift) / 2u));
+    const __m128i k2    = _mm_cvtsi32_si128((int)((16u - shift) / 2u));
+    const __m128i eight = _mm_set1_epi16(8);
+    __m128i base        = _mm_set1_epi16((short)firstPair);
 
     for (uint32_t j = 0; j < n; j += 16) {
-        const __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(acc + j));
-        const __m256i v = _mm256_min_epi16(_mm256_max_epi16(a, zero), top);
+        const __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(lhs + j));
+        const __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(rhs + j));
+        const __m256i u = _mm256_min_epi16(_mm256_max_epi16(a, zero), top);
+        const __m256i v = _mm256_min_epi16(_mm256_max_epi16(b, zero), top);
 
-        /* x * x reaches qa^2, which does not fit int16 for any qa past 181, so the
-         * product is taken as its two halves and the shift reassembles them. Exact, and
-         * the scalar path below is the same arithmetic in one expression. */
-        const __m256i lo = _mm256_mullo_epi16(v, v);
-        const __m256i hi = _mm256_mulhi_epu16(v, v);
+        /* u * v >> shift as the HIGH half of one 16x16 product: the missing 16 - shift
+         * bits are split between the two operands, (u << k1) * (v << k2) >> 16 with
+         * k1 + k2 = 16 - shift, which is u * v >> shift exactly. Neither operand leaves
+         * 16 bits, because u, v <= qa <= 2^14 - validate() holds a stacked net's qa to a
+         * power of two no larger than int16 - so u << k1 is at most 2^15.
+         *
+         * One multiply where squaring and reassembling the halves took two. The scalar
+         * path below is the same arithmetic in one expression. */
+        const __m256i x = _mm256_mulhi_epu16(_mm256_sll_epi16(u, k1), _mm256_sll_epi16(v, k2));
 
-        _mm256_storeu_si256((__m256i *)(void *)(out + j),
-                            _mm256_or_si256(_mm256_sll_epi16(hi, up), _mm256_srl_epi16(lo, down)));
+        _mm256_storeu_si256((__m256i *)(void *)(out + j), x);
+
+        if (!idxOut)
+            continue;
+
+        /* Two int16 lanes read as one int32 are a pair, and both lie in [0, qa] - so that
+         * int32 is positive exactly when either of them is nonzero. The row of eight is
+         * stored whole; see NnzLut for why that is safe. */
+        const unsigned mask =
+            (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(x, zero)));
+        const __m128i idx =
+            _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(const void *)NnzLut[mask]));
+
+        _mm_storeu_si128((__m128i *)(void *)(idxOut + count), _mm_add_epi16(base, idx));
+        count += (uint32_t)__builtin_popcount(mask);
+        base = _mm_add_epi16(base, eight);
     }
-#else
-    for (uint32_t j = 0; j < n; ++j) {
-        const int32_t x = acc[j] < 0 ? 0 : (acc[j] > qa ? qa : acc[j]);
-        out[j]          = (int16_t)((x * x) >> shift);
-    }
-#endif
+    return count;
 }
 
 /*
- * The whole activation vector L1 reads, from both accumulators: SCReLU of every unit,
- * so `2 * hidden` numbers.
+ * The whole activation vector L1 reads, from both accumulators - `hot->inputs` numbers,
+ * own perspective first - and, for SCReLU, the nonzero pairs of it, whose count this
+ * returns.
+ *
+ * A pairwise net gets no list. A product of two clamped units is nonzero far more often
+ * than one squared unit - 71% of pairs against 46% - and at that density skipping the
+ * zeros costs more than multiplying them: L1 runs dense instead, see nnue_stack_trunk().
  *
  * UPGRADE POINT: a new NnueActivation gets its case here and in the exporter's
  * stack_trunk().
  */
+static inline uint32_t nnue_activate(const NnueHot *hot, const int16_t *own, const int16_t *other,
+                                     NnzList *list) {
+    const uint32_t h = hot->hidden;
+
+    if (hot->pairwise) {
+        const uint32_t q = h / 2u;
+
+        nnue_activate_half(own, own + q, list->act, q, hot->qa, hot->actShift, NULL, 0, 0);
+        nnue_activate_half(other, other + q, list->act + q, q, hot->qa, hot->actShift, NULL, 0, 0);
+        return h / 2u;
+    }
+
+    const uint32_t count =
+        nnue_activate_half(own, own, list->act, h, hot->qa, hot->actShift, list->idx, 0, 0);
+
+    return nnue_activate_half(other, other, list->act + h, h, hot->qa, hot->actShift, list->idx,
+                              count, h / 2u);
+}
+#else
+static inline void nnue_activate_half(const int16_t *lhs, const int16_t *rhs, int16_t *out,
+                                      uint32_t n, int32_t qa, uint32_t shift) {
+    for (uint32_t j = 0; j < n; ++j) {
+        const int32_t x = lhs[j] < 0 ? 0 : (lhs[j] > qa ? qa : lhs[j]);
+        const int32_t y = rhs[j] < 0 ? 0 : (rhs[j] > qa ? qa : rhs[j]);
+        out[j] = (int16_t)((x * y) >> shift);
+    }
+}
+
+/* UPGRADE POINT: as above. */
 static inline void nnue_activate(const NnueHot *hot, const int16_t *own, const int16_t *other,
                                  int16_t *out) {
     const uint32_t h = hot->hidden;
 
-    nnue_activate_half(own, out, h, hot->qa, hot->actShift);
-    nnue_activate_half(other, out + h, h, hot->qa, hot->actShift);
+    if (hot->pairwise) {
+        const uint32_t q = h / 2u;
+
+        nnue_activate_half(own, own + q, out, q, hot->qa, hot->actShift);
+        nnue_activate_half(other, other + q, out + q, q, hot->qa, hot->actShift);
+        return;
+    }
+
+    nnue_activate_half(own, own, out, h, hot->qa, hot->actShift);
+    nnue_activate_half(other, other, out + h, h, hot->qa, hot->actShift);
 }
+#endif
 
 /* One stage's int32 sum, back into the [0, qa] range the next stage's weights are scaled
  * against.
@@ -967,68 +1165,236 @@ static inline int16_t nnue_requantise(int32_t sum, uint32_t shift, int32_t ceili
     return (int16_t)(r > ceiling ? ceiling : r);
 }
 
+#ifdef NNUE_AVX2
+
 /*
- * One whole layer: every unit's dot product against the same input, biased and
- * requantised.
+ * The AVX2 layers do not take a dot product per unit. They walk the INPUTS, two at a
+ * time because madd consumes pairs, and broadcast each pair against every unit's weights
+ * for it - one int32 lane per unit, sixteen units to two registers. That is why their
+ * weights are the pair-major copy nnue_interleave() made at load: one pair's weights for
+ * every unit are contiguous, and at 16 units they are one cache line.
  *
- * The transposition is the point, and it is worth more than the arithmetic. A
- * unit-at-a-time loop reads the entire input vector once PER UNIT - sixteen passes over
- * two kilobytes to do one pass' worth of multiplies - and finishes each unit with a
- * horizontal sum through memory, whose store-to-load round trip the next unit then waits
- * on. Taking four units together reads the input once for the four of them and reduces
- * their partial sums in registers.
+ * What that order buys is the ability to SKIP an input. SCReLU clamps every unit at or
+ * below zero, and at qa = 256 every unit below 16 squares to zero as well: at `bench 13`
+ * 27% of the activation vector is nonzero and 46% of its pairs are. An all-zero pair
+ * adds exactly nothing to any unit, so L1 visits only the pairs the activation listed and
+ * reads only their lines - about half the multiplies, and half the weight traffic, of the
+ * dense product this replaced, which read the bucket's whole 32 KB every evaluation.
  *
- * Four rather than more because more buys almost nothing. The layer is not short of issue
- * slots once the input is being read once per group - it is short of BANDWIDTH: L1 is
- * l1Size * 2 * hidden weights, which at the shape this was written for is 32 KB per
- * bucket per evaluation, and that is the whole of an L1 data cache. Taking eight units at
- * a time measures half a percent, because the weights still have to arrive.
+ * Exact rather than close, for the reason the dense product was: every term is still
+ * added exactly once, and tools/export_net.py refuses a net whose |bias| + half +
+ * qa * sum|w| could leave int32, which bounds every subset of those terms in any order.
+ * The bias STARTS each accumulator for the same reason, which saves adding it at the end.
  *
- * Every width here is a multiple of NNUE_WIDTH_MULTIPLE, which nnue_validate() enforces
- * on both the accumulator and the stack, so neither loop needs a tail.
+ * Every width is a multiple of NNUE_WIDTH_MULTIPLE, which nnue_validate() enforces on
+ * both the accumulator and the stack, so the sixteen-unit groups need no tail.
+ */
+
+/* One pair of inputs, as the int32 madd wants broadcast. memcpy because the pair is two
+ * int16 and reading it through an int32 pointer would break aliasing; it compiles to a
+ * single broadcast from memory. The index is widened BEFORE it is doubled: doubled as a
+ * uint32 it has to be masked back to 17 bits on every pair. */
+static inline __m256i nnue_pair(const int16_t *in, size_t pair) {
+    int32_t v;
+    memcpy(&v, in + 2u * pair, sizeof(v));
+    return _mm256_set1_epi32(v);
+}
+
+/* Sixteen units' int32 sums, requantised and packed back to int16 - nnue_requantise() in
+ * vector form, step for step, and that function says why each step is there. Every value
+ * lands in [0, ceiling] before the pack, so the pack's saturation never engages. */
+static inline void nnue_requantise16(__m256i lo, __m256i hi, uint32_t shift, int32_t ceiling,
+                                     int16_t *out) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i half = _mm256_set1_epi32((int32_t)1 << (shift - 1));
+    const __m256i cap  = _mm256_set1_epi32(ceiling);
+    const __m128i down = _mm_cvtsi32_si128((int)shift);
+
+    lo = _mm256_min_epi32(
+        _mm256_srl_epi32(_mm256_add_epi32(_mm256_max_epi32(lo, zero), half), down), cap);
+    hi = _mm256_min_epi32(
+        _mm256_srl_epi32(_mm256_add_epi32(_mm256_max_epi32(hi, zero), half), down), cap);
+
+    /* packs works within each 128-bit lane, leaving units 0-3, 8-11, 4-7, 12-15; the
+     * permute puts the middle two quarters back in order. */
+    _mm256_storeu_si256((__m256i *)(void *)out,
+                        _mm256_permute4x64_epi64(_mm256_packs_epi32(lo, hi), 0xD8));
+}
+
+/* 32 bytes of weights at `p`. */
+static inline __m256i nnue_load_at(const char *p) {
+    return _mm256_loadu_si256((const __m256i *)(const void *)p);
+}
+
+/*
+ * L1 over the pairs the activation listed, and no others.
+ *
+ * Two pairs a step, summed before either meets the accumulator, so the loop-carried chain
+ * is one add per two pairs rather than one per pair.
+ */
+static inline __attribute__((always_inline)) void
+nnue_l1_sparse_units(const NnzList *list, uint32_t count, const int16_t *w, const int32_t *bias,
+                     uint32_t units, uint32_t shift, int32_t ceiling, int16_t *out) {
+    /* A pair's block: two int16 for each unit. */
+    const size_t stride = (size_t)units * 4u;
+
+    for (uint32_t g = 0; g < units; g += 16) {
+        /* Each unit takes two int16 in a pair's block, so group g starts 4g bytes in. */
+        const char *const wg = (const char *)(const void *)w + 4u * g;
+
+        __m256i s0 = _mm256_loadu_si256((const __m256i *)(const void *)(bias + g));
+        __m256i s1 = _mm256_loadu_si256((const __m256i *)(const void *)(bias + g + 8));
+        uint32_t i = 0;
+
+        for (; i + 2u <= count; i += 2u) {
+            const char *const p0 = wg + list->idx[i] * stride;
+            const char *const p1 = wg + list->idx[i + 1] * stride;
+            const __m256i x0     = nnue_pair(list->act, list->idx[i]);
+            const __m256i x1     = nnue_pair(list->act, list->idx[i + 1]);
+
+            s0 = _mm256_add_epi32(s0, _mm256_add_epi32(_mm256_madd_epi16(x0, nnue_load_at(p0)),
+                                                       _mm256_madd_epi16(x1, nnue_load_at(p1))));
+            s1 = _mm256_add_epi32(s1,
+                                  _mm256_add_epi32(_mm256_madd_epi16(x0, nnue_load_at(p0 + 32)),
+                                                   _mm256_madd_epi16(x1, nnue_load_at(p1 + 32))));
+        }
+        if (i < count) {
+            const char *const p0 = wg + list->idx[i] * stride;
+            const __m256i x0     = nnue_pair(list->act, list->idx[i]);
+
+            s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(x0, nnue_load_at(p0)));
+            s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(x0, nnue_load_at(p0 + 32)));
+        }
+
+        nnue_requantise16(s0, s1, shift, ceiling, out + g);
+    }
+}
+
+/* 16 units - one cache line of weights per pair - is every net trained so far, and with
+ * the width constant the per-pair address is a shift rather than a multiply. */
+static void nnue_l1_sparse(const NnzList *list, uint32_t count, const int16_t *w,
+                           const int32_t *bias, uint32_t units, uint32_t shift, int32_t ceiling,
+                           int16_t *out) {
+    if (units == 16)
+        nnue_l1_sparse_units(list, count, w, bias, 16, shift, ceiling, out);
+    else
+        nnue_l1_sparse_units(list, count, w, bias, units, shift, ceiling, out);
+}
+
+/*
+ * A layer over EVERY pair of its input, in the same pair-major order: L2.
+ *
+ * Not sparse, because its input is L1's output - nonzero in 77% of pairs at `bench 13`,
+ * and eight pairs in all at l1Size = 16 - so listing them would cost more than skipping
+ * the rest saves. What it keeps from the sparse layer is the order: sums land one unit per
+ * lane and are requantised in registers, where a dot product per unit needed a horizontal
+ * reduction for every four units and a scalar requantise for every one.
+ *
+ * Deliberately the plain loop. Two things that help pairwise L1 below - four pairs'
+ * inputs from one load, and a tree of sums - measured slower here, at L2's eight pairs
+ * and runtime width; so did an always-inlined constant 16 -> 32 body, by 3-7 ns a trunk.
  */
 static void nnue_layer(const int16_t *in, uint32_t n, const int16_t *w, const int32_t *bias,
                        uint32_t units, uint32_t shift, int32_t ceiling, int16_t *out) {
-#ifdef NNUE_AVX2
-    for (uint32_t u = 0; u < units; u += 4) {
-        const int16_t *const w0 = w + (size_t)u * n;
-        const int16_t *const w1 = w0 + n;
-        const int16_t *const w2 = w1 + n;
-        const int16_t *const w3 = w2 + n;
+    const size_t stride = (size_t)units * 2u;
 
-        __m256i s0 = _mm256_setzero_si256();
-        __m256i s1 = _mm256_setzero_si256();
-        __m256i s2 = _mm256_setzero_si256();
-        __m256i s3 = _mm256_setzero_si256();
+    for (uint32_t g = 0; g < units; g += 16) {
+        const int16_t *const wg = w + 2u * g;
 
-        for (uint32_t j = 0; j < n; j += 16) {
-            const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(in + j));
+        __m256i s0 = _mm256_loadu_si256((const __m256i *)(const void *)(bias + g));
+        __m256i s1 = _mm256_loadu_si256((const __m256i *)(const void *)(bias + g + 8));
+
+        for (uint32_t p = 0; p < n / 2u; ++p) {
+            const int16_t *const wp = wg + p * stride;
+            const __m256i x         = nnue_pair(in, p);
 
             s0 = _mm256_add_epi32(
-                s0,
-                _mm256_madd_epi16(v, _mm256_loadu_si256((const __m256i *)(const void *)(w0 + j))));
+                s0, _mm256_madd_epi16(x, _mm256_loadu_si256((const __m256i *)(const void *)wp)));
             s1 = _mm256_add_epi32(
                 s1,
-                _mm256_madd_epi16(v, _mm256_loadu_si256((const __m256i *)(const void *)(w1 + j))));
-            s2 = _mm256_add_epi32(
-                s2,
-                _mm256_madd_epi16(v, _mm256_loadu_si256((const __m256i *)(const void *)(w2 + j))));
-            s3 = _mm256_add_epi32(
-                s3,
-                _mm256_madd_epi16(v, _mm256_loadu_si256((const __m256i *)(const void *)(w3 + j))));
+                _mm256_madd_epi16(x, _mm256_loadu_si256((const __m256i *)(const void *)(wp + 16))));
         }
 
-        int32_t sums[4];
-        _mm_storeu_si128((__m128i *)(void *)sums, nnue_hsum32x4(s0, s1, s2, s3));
-
-        for (uint32_t k = 0; k < 4; ++k)
-            out[u + k] = nnue_requantise(sums[k] + bias[u + k], shift, ceiling);
+        nnue_requantise16(s0, s1, shift, ceiling, out + g);
     }
+}
+
+/* Sixteen int16 weights - eight units' two each - at `w`, times the pair `x` broadcast. */
+static inline __m256i nnue_madd_at(__m256i x, const int16_t *w) {
+    return _mm256_madd_epi16(x, _mm256_loadu_si256((const __m256i *)(const void *)w));
+}
+
+/*
+ * L1 over every pair of a pairwise net's activation - see nnue_activate() for why it
+ * lists none of them.
+ *
+ * Bound by LOADS, not by its multiplies: each pair needs two 32-byte weight loads, and
+ * broadcasting its two inputs from memory made a third. So four pairs' inputs arrive in
+ * one 16-byte load, copied to both lanes, and in-lane shuffles split out each pair - which
+ * moves the broadcasts onto the shuffle units and measured 90 -> 83 ns for the layer.
+ *
+ * The four products are summed as a tree before they meet the accumulator, leaving one
+ * loop-carried add per four pairs rather than one per pair. (Four accumulators would say
+ * the same thing and do not survive the compiler, which re-associates them back into one
+ * chain.)
+ *
+ * Always inlined with the width constant, so each pair's weights are a fixed offset from
+ * one moving pointer. The pair count is a multiple of four: a pairwise net's hidden width
+ * is a multiple of 32.
+ */
+static inline __attribute__((always_inline)) void
+nnue_l1_dense_units(const int16_t *in, uint32_t n, const int16_t *w, const int32_t *bias,
+                    uint32_t units, uint32_t shift, int32_t ceiling, int16_t *out) {
+    const size_t stride = (size_t)units * 2u;
+
+    for (uint32_t g = 0; g < units; g += 16) {
+        const int16_t *wp = w + 2u * g;
+
+        __m256i s0 = _mm256_loadu_si256((const __m256i *)(const void *)(bias + g));
+        __m256i s1 = _mm256_loadu_si256((const __m256i *)(const void *)(bias + g + 8));
+
+        for (uint32_t p = 0; p < n / 2u; p += 4u, wp += 4u * stride) {
+            const __m256i v = _mm256_broadcastsi128_si256(
+                _mm_loadu_si128((const __m128i *)(const void *)(in + 2u * p)));
+            const __m256i x0 = _mm256_shuffle_epi32(v, 0x00);
+            const __m256i x1 = _mm256_shuffle_epi32(v, 0x55);
+            const __m256i x2 = _mm256_shuffle_epi32(v, 0xAA);
+            const __m256i x3 = _mm256_shuffle_epi32(v, 0xFF);
+
+            const __m256i lo = _mm256_add_epi32(
+                _mm256_add_epi32(nnue_madd_at(x0, wp), nnue_madd_at(x1, wp + stride)),
+                _mm256_add_epi32(nnue_madd_at(x2, wp + 2u * stride),
+                                 nnue_madd_at(x3, wp + 3u * stride)));
+            const __m256i hi = _mm256_add_epi32(
+                _mm256_add_epi32(nnue_madd_at(x0, wp + 16), nnue_madd_at(x1, wp + stride + 16)),
+                _mm256_add_epi32(nnue_madd_at(x2, wp + 2u * stride + 16),
+                                 nnue_madd_at(x3, wp + 3u * stride + 16)));
+
+            s0 = _mm256_add_epi32(s0, lo);
+            s1 = _mm256_add_epi32(s1, hi);
+        }
+
+        nnue_requantise16(s0, s1, shift, ceiling, out + g);
+    }
+}
+
+static void nnue_l1_dense(const int16_t *in, uint32_t n, const int16_t *w, const int32_t *bias,
+                          uint32_t units, uint32_t shift, int32_t ceiling, int16_t *out) {
+    if (units == 16)
+        nnue_l1_dense_units(in, n, w, bias, 16, shift, ceiling, out);
+    else
+        nnue_l1_dense_units(in, n, w, bias, units, shift, ceiling, out);
+}
 #else
+
+/* One whole layer in the file's own order: every unit's dot product against the same
+ * input, biased and requantised. The reference the AVX2 layers must match. */
+static void nnue_layer(const int16_t *in, uint32_t n, const int16_t *w, const int32_t *bias,
+                       uint32_t units, uint32_t shift, int32_t ceiling, int16_t *out) {
     for (uint32_t u = 0; u < units; ++u)
         out[u] = nnue_requantise(nnue_dot(in, w + (size_t)u * n, n) + bias[u], shift, ceiling);
-#endif
 }
+#endif
 
 /* The vector both output heads read, for one bucket. */
 static void nnue_stack_trunk(const int16_t *own, const int16_t *other, int bucket, int16_t *trunk) {
@@ -1037,16 +1403,28 @@ static void nnue_stack_trunk(const int16_t *own, const int16_t *other, int bucke
     const int32_t qa         = hot->qa;
     const size_t b           = (size_t)bucket;
 
-    _Alignas(64) int16_t a[2 * NNUE_MAX_HIDDEN];
     _Alignas(64) int16_t first[NNUE_MAX_STACK_WIDTH];
 
-    nnue_activate(hot, own, other, a);
-
     /* With no L2, L1 IS the trunk and writes straight into the caller's buffer. */
-    int16_t *const l1Out = hot->l2Size ? first : trunk;
+    int16_t *const l1Out     = hot->l2Size ? first : trunk;
+    const int32_t *const l1b = hot->l1Bias + b * hot->l1Size;
 
-    nnue_layer(a, inputs, hot->l1Weight + b * hot->l1Size * inputs, hot->l1Bias + b * hot->l1Size,
-               hot->l1Size, hot->l1Shift, qa, l1Out);
+#ifdef NNUE_AVX2
+    NnzList list;
+    const uint32_t count     = nnue_activate(hot, own, other, &list);
+    const int16_t *const l1w = hot->l1Weight + b * hot->l1Size * inputs;
+
+    if (hot->pairwise)
+        nnue_l1_dense(list.act, inputs, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
+    else
+        nnue_l1_sparse(&list, count, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
+#else
+    const int16_t *const l1w = hot->l1Weight + b * hot->l1Size * inputs;
+    _Alignas(64) int16_t a[2 * NNUE_MAX_HIDDEN];
+
+    nnue_activate(hot, own, other, a);
+    nnue_layer(a, inputs, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
+#endif
 
     if (!hot->l2Size)
         return;
@@ -1150,30 +1528,44 @@ typedef struct {
 } Accumulator;
 
 /*
- * The layer stack's trunk, one per accumulator level.
+ * A layer stack's two outputs for one position, in centipawns as eval_evaluate() and
+ * nnue_uncertainty() return them - `unc` is 0 for a net without the head.
  *
- * Both output heads read the same trunk, and unc_scale() in search.c asks for the
- * uncertainty at very nearly every node the value is asked at - so without this the
- * stack's dominant cost, L1, is paid twice per node.
+ * Both heads read the same trunk, and the trunk is nearly all of what a stacked
+ * evaluation costs, so the first head asked for computes both and records them here.
+ * unc_scale() in search.c asks for the uncertainty at most nodes the value is asked at,
+ * which without this pays for the trunk twice.
  *
- * A PARALLEL STACK, not a field on Accumulator, and that is a measurement rather than a
- * preference: 256 bytes a level pushes consecutive accumulators apart and costs the
- * incremental update ~2% of nps on a net WITH NO STACK, which would hand a stacked net
- * that much free Elo in the SPRT meant to judge it. Allocated on first use, so a flat net
- * never allocates it and never touches it.
+ * Kept in two places. One per accumulator level, which answers the second head at the
+ * same node from a line that is already hot. And a direct-mapped table per thread, which
+ * answers a position the search has already evaluated - a quarter of all trunk builds at
+ * `bench 13` were such repeats, mostly nodes whose value came from the transposition table
+ * and whose uncertainty did not.
  *
- * Validity is the position key rather than a flag the push has to clear, which is what
- * keeps eval_state_push() free of this entirely: a level whose key matches was built from
- * accumulators describing that same position, since nnue_current() has already
- * established they describe it. `valid` covers the untouched level, whose key is zero.
+ * Both are validated by the FULL 64-bit key, which is exactly what the accumulator stack
+ * already trusts to say two positions are the same, so a hit is the value the trunk
+ * would have produced and never an approximation of it. `gen` is the search the record
+ * belongs to - see EvalState.outGen - so clearing both tables is a counter, not a memset
+ * of a megabyte per `go`.
  *
- * Per-thread, like the accumulator stack it shadows (invariant 11).
+ * The level records live in a PARALLEL STACK, not a field on Accumulator: widening a
+ * level pushes consecutive accumulators apart and measured ~2% of nps on a net WITH NO
+ * STACK. Both are allocated on first use, so a flat net never touches either.
+ *
+ * Per-thread, like the accumulator stack they shadow (invariant 11).
  */
 typedef struct {
-    _Alignas(64) int16_t trunk[NNUE_MAX_STACK_WIDTH];
     Key key;
-    bool valid;
-} TrunkLevel;
+    int16_t value;
+    int16_t unc;
+    uint16_t gen;
+} StackOutputs;
+
+/* 4 MB a thread. At `bench 13` this size catches 24% of trunk builds, a quarter the size
+ * 21%, and an unbounded table 27%. The larger table measured WORSE until
+ * eval_state_push() started prefetching the line a probe will read - its extra hits cost
+ * more in misses than they saved - and better once it did. */
+#define OUTPUT_CACHE_ENTRIES (1u << 18)
 
 /* The search returns at ply >= MAX_PLY - 1 before making a move, so the deepest push is
  * shallower than this; the slack is deliberate. */
@@ -1234,8 +1626,12 @@ typedef struct {
  */
 struct EvalState {
     Accumulator *accStack;
-    TrunkLevel *trunkStack;
     int accTop;
+
+    /* See StackOutputs. `outGen` starts at 1, so a calloc'd record is never current. */
+    StackOutputs *outLevels;
+    StackOutputs *outCache;
+    uint16_t outGen;
 
     /* Sized by the net rather than by NNUE_MAX_HIDDEN: 128 entries at the maximum width
      * would be half a megabyte a thread to hold a net four times narrower. `refreshWidth`
@@ -1275,7 +1671,10 @@ EvalState *eval_state(void) {
 }
 
 size_t eval_state_bytes(void) {
-    return ACC_LEVELS * (sizeof(Accumulator) + (Loaded.hot.l1Size ? sizeof(TrunkLevel) : 0)) +
+    const size_t outputs =
+        Loaded.hot.l1Size ? (ACC_LEVELS + OUTPUT_CACHE_ENTRIES) * sizeof(StackOutputs) : 0;
+
+    return ACC_LEVELS * sizeof(Accumulator) + outputs +
            REFRESH_SLOTS * (sizeof(RefreshEntry) + Loaded.hot.hidden * sizeof(int16_t));
 }
 
@@ -1283,11 +1682,14 @@ void eval_state_free(void) {
     EvalState *const nt = &NnueTls;
 
     free(nt->accStack);
-    free(nt->trunkStack);
+    free(nt->outLevels);
+    free(nt->outCache);
     free(nt->refreshCache);
     free(nt->refreshAcc);
     nt->accStack      = NULL;
-    nt->trunkStack    = NULL;
+    nt->outLevels     = NULL;
+    nt->outCache      = NULL;
+    nt->outGen        = 0;
     nt->refreshCache  = NULL;
     nt->refreshAcc    = NULL;
     nt->refreshWidth  = 0;
@@ -1635,14 +2037,19 @@ void eval_state_clear(EvalState *nt) {
     /*
      * Everything below holds values the PREVIOUS net produced, and nothing about a key or
      * a bitboard says which net summed it - which is the whole reason this function is
-     * called when `setoption EvalFile` swaps one in. A trunk carries the same hazard: its
-     * level is validated by position key, and the root of the next search is very often
-     * the position the last one ended at.
+     * called when `setoption EvalFile` swaps one in. The stack's recorded outputs carry the
+     * same hazard - they are validated by position key, and the root of the next search is
+     * very often the position the last one ended at - and moving to the next generation
+     * retires every one of them at once. Only when the counter wraps are the tables
+     * actually wiped, so that no record from 65536 searches ago can come back to life.
      */
     if (nt->refreshCache)
         memset(nt->refreshCache, 0, REFRESH_SLOTS * sizeof(RefreshEntry));
-    if (nt->trunkStack)
-        memset(nt->trunkStack, 0, ACC_LEVELS * sizeof(TrunkLevel));
+    if (nt->outLevels && ++nt->outGen == 0) {
+        memset(nt->outLevels, 0, ACC_LEVELS * sizeof(StackOutputs));
+        memset(nt->outCache, 0, OUTPUT_CACHE_ENTRIES * sizeof(StackOutputs));
+        nt->outGen = 1;
+    }
 }
 
 /*
@@ -1665,6 +2072,12 @@ void eval_state_push(EvalState *nt, const Position *pos, Move m) {
     const Key parentKey = pos->history[pos->gamePly - 1].key;
 
     child->key = pos->key;
+
+    /* The line nnue_stack_outputs() will probe for this position, asked for now so that it
+     * has arrived by the time the evaluation is. The table is a megabyte of scattered
+     * reads, so otherwise nearly every probe waits on a miss. NULL for a flat net. */
+    if (nt->outCache)
+        __builtin_prefetch(&nt->outCache[pos->key & (OUTPUT_CACHE_ENTRIES - 1)]);
 
     NnueDelta d;
     nnue_delta(pos, m, &d);
@@ -1716,6 +2129,10 @@ void eval_state_push_null(EvalState *nt, const Position *pos) {
 
     child->key = pos->key;
 
+    /* As eval_state_push() does, for the same reason. */
+    if (nt->outCache)
+        __builtin_prefetch(&nt->outCache[pos->key & (OUTPUT_CACHE_ENTRIES - 1)]);
+
     for (Color c = WHITE; c <= BLACK; ++c) {
         child->computed[c] = parent->computed[c];
         if (parent->computed[c])
@@ -1753,63 +2170,6 @@ static const Accumulator *nnue_current(EvalState *const nt, const Position *pos)
     return a;
 }
 
-/*
- * This level's trunk, built at most once.
- *
- * Returns NULL for a net with no stack, where there is no trunk and the heads read the
- * accumulators directly. The debug assert in eval_evaluate() is what proves the cache
- * agrees with a from-scratch computation, since that is exactly what it compares against.
- */
-static const int16_t *nnue_cached_trunk(EvalState *const nt, const Accumulator *a,
-                                        const Position *pos, int bucket) {
-    if (!Loaded.hot.l1Size)
-        return NULL;
-
-    /* Lazily, because the net can change under a running engine - `setoption EvalFile` -
-     * and a thread that first searched with a flat net has no stack to shadow. A failed
-     * allocation is not fatal: the heads fall back to building their own trunk, which is
-     * the slow-and-correct path the from-scratch code already is. */
-    if (!nt->trunkStack) {
-        nt->trunkStack = (TrunkLevel *)calloc(ACC_LEVELS, sizeof(TrunkLevel));
-        if (!nt->trunkStack)
-            return NULL;
-    }
-
-    TrunkLevel *const t = &nt->trunkStack[nt->accTop];
-
-    if (!t->valid || t->key != pos->key) {
-        const Color stm = pos->sideToMove;
-
-        nnue_stack_trunk(a->acc[stm], a->acc[stm ^ 1], bucket, t->trunk);
-        t->key   = pos->key;
-        t->valid = true;
-    }
-    return t->trunk;
-}
-
-/* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is not set, so
- * which one the engine runs costs nothing at runtime. */
-Value eval_evaluate(EvalState *es, const Position *pos) {
-    const Accumulator *const a = nnue_current(es, pos);
-    if (!a)
-        return nnue_centipawns(nnue_raw(pos));
-
-    const Color stm            = pos->sideToMove;
-    const int bucket           = nnue_output_bucket(pos);
-    const int16_t *const trunk = nnue_cached_trunk(es, a, pos, bucket);
-
-    const int32_t raw =
-        trunk ? nnue_trunk_head(trunk, Loaded.hot.outWeight, Loaded.hot.outBias, bucket)
-              : nnue_output(a->acc[stm], a->acc[stm ^ 1], bucket);
-
-    /* The gate on the entire incremental path. Cheap to state, expensive to omit: an
-     * accumulator that drifts produces a legal-looking evaluation and surfaces only as
-     * blunders nobody can reproduce. */
-    assert(raw == nnue_raw(pos) && "incremental accumulator disagrees with a full recomputation");
-
-    return nnue_centipawns(raw);
-}
-
 bool nnue_has_uncertainty(void) { return Loaded.hot.uncWeight != NULL; }
 
 static int32_t nnue_unc_output(const int16_t *own, const int16_t *other, int bucket) {
@@ -1832,6 +2192,89 @@ static Value nnue_unc_centipawns(int32_t raw) {
     return (Value)cp;
 }
 
+/*
+ * The stack's two outputs for the position `a` describes: from this level, from the
+ * table, or - when neither has them - from a trunk built here, which then records both.
+ *
+ * NULL for a net with no stack, whose heads read the accumulators directly, and when the
+ * tables could not be allocated: the caller then builds its own trunk, which is the
+ * slow-and-correct path the from-scratch code already is. The debug asserts in
+ * eval_evaluate() and nnue_uncertainty() compare every answer from here against a
+ * from-scratch computation, which is what proves a hit is never stale.
+ */
+static const StackOutputs *nnue_stack_outputs(EvalState *const nt, const Accumulator *a,
+                                              const Position *pos) {
+    if (!Loaded.hot.l1Size)
+        return NULL;
+
+    /* Lazily, because the net can change under a running engine - `setoption EvalFile` -
+     * and a thread that first searched with a flat net has nothing to record. */
+    if (!nt->outLevels) {
+        nt->outLevels = (StackOutputs *)calloc(ACC_LEVELS, sizeof(StackOutputs));
+        nt->outCache  = (StackOutputs *)calloc(OUTPUT_CACHE_ENTRIES, sizeof(StackOutputs));
+        if (!nt->outLevels || !nt->outCache) {
+            free(nt->outLevels);
+            free(nt->outCache);
+            nt->outLevels = nt->outCache = NULL;
+            return NULL;
+        }
+        nt->outGen = 1;
+    }
+
+    StackOutputs *const level = &nt->outLevels[nt->accTop];
+    if (level->gen == nt->outGen && level->key == pos->key)
+        return level;
+
+    StackOutputs *const seen = &nt->outCache[pos->key & (OUTPUT_CACHE_ENTRIES - 1)];
+    if (seen->gen == nt->outGen && seen->key == pos->key) {
+        *level = *seen;
+        return level;
+    }
+
+    _Alignas(64) int16_t trunk[NNUE_MAX_STACK_WIDTH];
+    const Color stm  = pos->sideToMove;
+    const int bucket = nnue_output_bucket(pos);
+
+    nnue_stack_trunk(a->acc[stm], a->acc[stm ^ 1], bucket, trunk);
+
+    level->key   = pos->key;
+    level->gen   = nt->outGen;
+    level->value = (int16_t)nnue_centipawns(
+        nnue_trunk_head(trunk, Loaded.hot.outWeight, Loaded.hot.outBias, bucket));
+    level->unc = Loaded.hot.uncWeight
+                     ? (int16_t)nnue_unc_centipawns(
+                           nnue_trunk_head(trunk, Loaded.hot.uncWeight, Loaded.hot.uncBias, bucket))
+                     : 0;
+    *seen      = *level;
+    return level;
+}
+
+/* This build's evaluation. eval.c defines the same symbol when EVAL_NNUE is not set, so
+ * which one the engine runs costs nothing at runtime. */
+Value eval_evaluate(EvalState *es, const Position *pos) {
+    const Accumulator *const a = nnue_current(es, pos);
+    if (!a)
+        return nnue_centipawns(nnue_raw(pos));
+
+    /* The gate on the entire incremental path, and on the recorded outputs. Cheap to
+     * state, expensive to omit: an accumulator that drifts, or a record that outlived
+     * its position, produces a legal-looking evaluation and surfaces only as blunders
+     * nobody can reproduce. */
+    const StackOutputs *const s = nnue_stack_outputs(es, a, pos);
+    if (s) {
+        assert(s->value == nnue_centipawns(nnue_raw(pos)) &&
+               "recorded stack output disagrees with a full recomputation");
+        return s->value;
+    }
+
+    const Color stm   = pos->sideToMove;
+    const int32_t raw = nnue_output(a->acc[stm], a->acc[stm ^ 1], nnue_output_bucket(pos));
+
+    assert(raw == nnue_raw(pos) && "incremental accumulator disagrees with a full recomputation");
+
+    return nnue_centipawns(raw);
+}
+
 Value nnue_uncertainty(EvalState *es, const Position *pos) {
     const Accumulator *const a = nnue_current(es, pos);
     if (!a) {
@@ -1847,16 +2290,20 @@ Value nnue_uncertainty(EvalState *es, const Position *pos) {
             nnue_unc_output(acc[stm], acc[stm ^ 1], nnue_output_bucket(pos)));
     }
 
-    const Color stm            = pos->sideToMove;
-    const int bucket           = nnue_output_bucket(pos);
-    const int16_t *const trunk = nnue_cached_trunk(es, a, pos, bucket);
+    const Color stm  = pos->sideToMove;
+    const int bucket = nnue_output_bucket(pos);
 
-    /* The trunk the value head just built, almost always: unc_scale() asks at very nearly
-     * every node the evaluation is asked at, and building L1 twice for that was the whole
-     * of the stack's avoidable cost. */
-    if (trunk)
-        return nnue_unc_centipawns(
-            nnue_trunk_head(trunk, Loaded.hot.uncWeight, Loaded.hot.uncBias, bucket));
+    /* What the value head's trunk already recorded, almost always: unc_scale() asks at
+     * most nodes the evaluation is asked at, and building the trunk twice for that was
+     * the whole of the stack's avoidable cost. */
+    const StackOutputs *const s = nnue_stack_outputs(es, a, pos);
+    if (s) {
+        assert(Loaded.hot.uncWeight != NULL && "uncertainty asked of a net without the head");
+        assert(s->unc ==
+                   nnue_unc_centipawns(nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], bucket)) &&
+               "recorded uncertainty disagrees with a full recomputation");
+        return s->unc;
+    }
 
     return nnue_unc_centipawns(nnue_unc_output(a->acc[stm], a->acc[stm ^ 1], bucket));
 }
@@ -1886,10 +2333,11 @@ void nnue_print_info(void) {
             snprintf(stack, sizeof(stack), "->%u", h->l1Size);
     }
 
-    printf("info string net %.12s  %u->%ux2%s->%u%s  screlu halfka-32sq %s  qa %u qb %u "
+    printf("info string net %.12s  %u->%ux2%s->%u%s  %s halfka-32sq %s  qa %u qb %u "
            "scale %d  tag %s  from %s\n",
            Loaded.hash, h->features, h->hidden, stack, h->outputBuckets,
            Loaded.hot.uncWeight ? "+unc" : "",
+           h->activation == NNUE_ACT_PAIRWISE ? "pairwise" : "screlu",
 #ifdef NNUE_AVX2
            "avx2",
 #else

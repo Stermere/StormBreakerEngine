@@ -4,9 +4,9 @@
  * The architecture is DATA wherever it can be: a net file carries its own shape and
  * the loader believes the file rather than a constant compiled beside it, so
  * retraining wider or with more output buckets is a drop-in. The activation and
- * feature set are not choices - one of each is implemented, the loader rejects an
- * unknown tag by name, and adding one means C code at the `UPGRADE POINT` marks in
- * nnue.c.
+ * feature set are not free choices - the implemented ones are the enums below, the
+ * loader rejects an unknown tag by name, and adding one means C code at the
+ * `UPGRADE POINT` marks in nnue.c.
  */
 #ifndef NNUE_H
 #define NNUE_H
@@ -42,8 +42,13 @@ typedef struct EvalState EvalState;
 #define NNUE_TAG_LEN   32u
 
 /* SCReLU squares the clamped activation, so a term carries QA^2 rather than QA and
- * the output sum is divided by QA before the bias is added. */
-typedef enum { NNUE_ACT_SCRELU = 1 } NnueActivation;
+ * the output sum is divided by QA before the bias is added.
+ *
+ * PAIRWISE is a stacked net's alternative: each perspective's accumulator is split in
+ * half and the clamped halves multiplied, `(x * y) >> log2(QA)`, into the same [0, QA]
+ * range - so L1 reads `hidden` numbers rather than `2 * hidden`, which halves the layer
+ * that is most of a stacked evaluation. A flat net has no L1 and cannot use it. */
+typedef enum { NNUE_ACT_SCRELU = 1, NNUE_ACT_PAIRWISE = 2 } NnueActivation;
 
 /* A mirrored king stands on one of 32 squares, which the net indexes directly.
  * Deliberately not shared with eval.c's king_bucket(): the net's indexing can move
@@ -66,7 +71,8 @@ typedef enum { NNUE_FEATURES_HALFKA_32SQ = 1 } NnueFeatureSet;
  *     int16  ftWeight[features][hidden]   feature-major, so one feature's row is
  *                                         contiguous - the span the accumulator adds
  *     int16  ftBias[hidden]
- *     int16  l1Weight[outputBuckets][l1Size][2 * hidden]   only when l1Size > 0
+ *     int16  l1Weight[outputBuckets][l1Size][l1Inputs]     only when l1Size > 0;
+ *                                         l1Inputs is 2 * hidden, or hidden if pairwise
  *     int32  l1Bias[outputBuckets][l1Size]                 only when l1Size > 0
  *     int16  l2Weight[outputBuckets][l2Size][l1Size]       only when l2Size > 0
  *     int32  l2Bias[outputBuckets][l2Size]                 only when l2Size > 0

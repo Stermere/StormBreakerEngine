@@ -58,6 +58,7 @@ from torch import nn
 
 from .format import (
     ACTIVATION_NAME,
+    ACTIVATION_TAGS,
     DEFAULT_OUTPUT_BUCKETS,
     FEATURE_SET_NAME,
     L1_CLIP,
@@ -66,6 +67,7 @@ from .format import (
     NET_TO_CP,
     NUM_FEATURES,
     PAD_INDEX,
+    PAIRWISE_ACTIVATION_NAME,
     PIECE_PLANES,
     SQUARES,
     SOURCE_NAMES,
@@ -117,11 +119,21 @@ class NNUE(nn.Module):
     def __init__(self, hidden: int = DEFAULT_HIDDEN,
                  output_buckets: int = DEFAULT_OUTPUT_BUCKETS,
                  uncertainty: bool = False, feature_factorization: bool = False,
-                 l1_size: int = DEFAULT_L1_SIZE, l2_size: int = DEFAULT_L2_SIZE):
+                 l1_size: int = DEFAULT_L1_SIZE, l2_size: int = DEFAULT_L2_SIZE,
+                 pairwise: bool = False):
         super().__init__()
         if hidden < 1 or hidden % WIDTH_MULTIPLE:
             raise ValueError(f"hidden width must be a multiple of {WIDTH_MULTIPLE}, "
                              f"got {hidden} - src/nnue.c would refuse the net")
+        # Pairwise multiplies each perspective's halves, so each HALF is what the
+        # engine walks sixteen lanes at a time; and it feeds L1, so it needs one.
+        if pairwise and hidden % (2 * WIDTH_MULTIPLE):
+            raise ValueError(f"a pairwise net's hidden width must be a multiple of "
+                             f"{2 * WIDTH_MULTIPLE}, got {hidden}: each half is walked "
+                             f"{WIDTH_MULTIPLE} lanes at a time")
+        if pairwise and not l1_size:
+            raise ValueError("pairwise needs a layer stack (--l1-size): it halves what L1 "
+                             "reads, and the flat output layer is not an L1")
 
         l1_size, l2_size = int(l1_size), int(l2_size)
         for name, width in (("l1_size", l1_size), ("l2_size", l2_size)):
@@ -143,6 +155,7 @@ class NNUE(nn.Module):
         self.feature_factorization = bool(feature_factorization)
         self.l1_size = l1_size
         self.l2_size = l2_size
+        self.pairwise = bool(pairwise)
 
         # One extra row for the padding slot. padding_idx pins it to zero and
         # keeps it there: it takes no gradient, so a record with 12 pieces
@@ -157,7 +170,7 @@ class NNUE(nn.Module):
         # a gigabyte at batch 16384 - to save compute that measures at ~3% of a
         # step. See _pick_rows().
         if self.l1_size:
-            self.l1 = nn.Linear(2 * hidden, self.output_buckets * self.l1_size)
+            self.l1 = nn.Linear(self.l1_inputs, self.output_buckets * self.l1_size)
             if self.l2_size:
                 self.l2 = nn.Linear(self.l1_size, self.output_buckets * self.l2_size)
             self.l3 = nn.Linear(self.trunk_width, self.output_buckets)
@@ -236,6 +249,16 @@ class NNUE(nn.Module):
         return self.l2_size or self.l1_size
 
     @property
+    def l1_inputs(self) -> int:
+        """How many numbers the activation hands L1: two perspectives of H under
+        SCReLU, two of H/2 under pairwise multiplication."""
+        return self.hidden if self.pairwise else 2 * self.hidden
+
+    @property
+    def activation_name(self) -> str:
+        return PAIRWISE_ACTIVATION_NAME if self.pairwise else ACTIVATION_NAME
+
+    @property
     def stack_layers(self) -> list:
         """L1 and L2 - the layers with a clamp(x, 0, 1) after them.
 
@@ -260,7 +283,7 @@ class NNUE(nn.Module):
             "hidden": self.hidden,
             "output_buckets": self.output_buckets,
             "features": FEATURE_SET_NAME,
-            "activation": ACTIVATION_NAME,
+            "activation": self.activation_name,
             "uncertainty": self.uncertainty,
             "feature_factorization": self.feature_factorization,
             "l1_size": self.l1_size,
@@ -270,19 +293,26 @@ class NNUE(nn.Module):
     def describe(self) -> str:
         stack = "".join(f" -> {w}" for w in (self.l1_size, self.l2_size) if w)
         return (f"{NUM_FEATURES} -> {self.hidden}x2{stack} -> {self.output_buckets}, "
-                f"{ACTIVATION_NAME}, {FEATURE_SET_NAME}"
+                f"{self.activation_name}, {FEATURE_SET_NAME}"
                 + (", +uncertainty" if self.uncertainty else "")
                 + (", +training-only PSQT factor" if self.feature_factorization else ""))
 
     # -------------------------------------------------------- the forward --
 
     def activate(self, x: torch.Tensor) -> torch.Tensor:
-        """SCReLU, in the units the quantised net will use.
+        """One perspective's activation, in the units the quantised net will use,
+        over the LAST dimension - (B, H) and the sparse path's (2, B, H) alike.
 
-        Clamped to [0, 1] first - the float image of [0, QA] - and squared
-        after. Squaring first would make negative accumulators positive, which
-        is a different and much worse function that still trains.
+        SCReLU is clamped to [0, 1] first - the float image of [0, QA] - and
+        squared after. Squaring first would make negative accumulators positive,
+        which is a different and much worse function that still trains.
+
+        Pairwise clamps both halves the same way and multiplies them, so the
+        result has half the width and is zero wherever either factor is.
         """
+        if self.pairwise:
+            half = x.shape[-1] // 2
+            return torch.clamp(x[..., :half], 0.0, 1.0) * torch.clamp(x[..., half:], 0.0, 1.0)
         clamped = torch.clamp(x, 0.0, 1.0)
         return clamped * clamped
 
@@ -362,13 +392,16 @@ class NNUE(nn.Module):
         own = acc_black * stm + acc_white * (1.0 - stm)
         other = acc_white * stm + acc_black * (1.0 - stm)
 
-        return self.activate(torch.cat([own, other], dim=1))
+        # Per perspective, then concatenated: pairwise pairs units WITHIN an
+        # accumulator, so it cannot run over the two side by side.
+        return torch.cat([self.activate(own), self.activate(other)], dim=1)
 
     def _linear_2h_weights(self, weight: torch.Tensor, bias: torch.Tensor,
                            x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
             return torch.addmm(bias, x, weight.t())
-        half = self.hidden
+        # The split layout's own width, which is H/2 under pairwise.
+        half = x.shape[-1]
         y = torch.addmm(bias, x[0], weight[:, :half].t())
         return torch.addmm(y, x[1], weight[:, half:].t())
 
@@ -584,18 +617,23 @@ def arch_from_checkpoint(state: dict) -> dict:
             "which ones it used."
         )
 
-    for field, expected in (("features", FEATURE_SET_NAME), ("activation", ACTIVATION_NAME)):
-        if arch.get(field) != expected:
-            raise SystemExit(
-                f"checkpoint was trained with {field} {arch.get(field)!r}, this build runs "
-                f"{expected!r}. Retrain, or add the case to src/nnue.c and the exporter."
-            )
+    if arch.get("features") != FEATURE_SET_NAME:
+        raise SystemExit(
+            f"checkpoint was trained with features {arch.get('features')!r}, this build runs "
+            f"{FEATURE_SET_NAME!r}. Retrain, or add the case to src/nnue.c and the exporter."
+        )
+    if arch.get("activation") not in ACTIVATION_TAGS:
+        raise SystemExit(
+            f"checkpoint was trained with activation {arch.get('activation')!r}, this build "
+            f"runs {sorted(ACTIVATION_TAGS)}. Retrain, or add the case to src/nnue.c and "
+            f"the exporter."
+        )
 
     return {
         "hidden": int(arch["hidden"]),
         "output_buckets": int(arch["output_buckets"]),
         "features": FEATURE_SET_NAME,
-        "activation": ACTIVATION_NAME,
+        "activation": arch["activation"],
         # Absent from every checkpoint written before the head existed, and
         # absent means the same thing as False: no head. That is a safe
         # default in a way a shape default would not be - the weights either
@@ -624,7 +662,8 @@ def from_checkpoint(state: dict) -> NNUE:
     model = NNUE(hidden=arch["hidden"], output_buckets=arch["output_buckets"],
                  uncertainty=arch["uncertainty"],
                  feature_factorization=arch["feature_factorization"],
-                 l1_size=arch["l1_size"], l2_size=arch["l2_size"])
+                 l1_size=arch["l1_size"], l2_size=arch["l2_size"],
+                 pairwise=arch["activation"] == PAIRWISE_ACTIVATION_NAME)
     model.load_state_dict(state["model"])
     return model
 

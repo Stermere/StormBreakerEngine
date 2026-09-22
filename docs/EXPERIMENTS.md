@@ -2905,3 +2905,179 @@ selftests, `nnue verify` 10000 positions exact, `openbench-check`,
 from each other, and now cannot be - if any one of them was carrying real value
 it went out with the other two. That is the cost of having shipped them as a
 batch; E19b made the same point about the reverse case.
+
+---
+
+### E40: Making the layer stack cheap - exact speedups, then a pairwise L1
+
+**Date** 2026-09-21 · **Nets** `68628c124d51` (gen-6-3, `512x2 -> 16 -> 32 -> 8 +unc`,
+SCReLU) and `48428bbbd57e` (gen-6-pw, the same recipe with `--pairwise`) · **Bench** 218889 and
+7135323 at depth 13 on gen-6-3, unchanged by every exact change here · **Status** the
+exact work is a pure speedup (**+17.7% nps** on gen-6-3). The pairwise net changes the
+evaluation and has **no SPRT yet**.
+
+The target was a stacked evaluation no more than 1.5x the cost of the flat one:
+- The SCReLU stack reached **2.00x** through exact changes, and no exact change took
+  it further.
+- The pairwise architecture reaches **1.43x**, with L1 run dense. Its bench signature
+  is 291947 nodes; `stormbreaker-pw.exe` is built with it embedded, for the SPRT.
+
+#### How it was measured: replaying a real search
+
+`bench` nps cannot compare two nets, because each net searches its own tree. A fixed
+perft walk can compare them, but it evaluates every node, and a search does not.
+
+A throwaway harness therefore records every call `bench 13` makes into the
+evaluation: pushes, pops, null pushes, evaluations, uncertainty requests and clears,
+with the position key at each evaluation. It then replays that exact sequence against
+each net and subtracts the same walk with no evaluation. Both nets pay for identical
+work in the engine's real mix: 6.94M pushes, 4.68M evaluations, 3.70M uncertainty
+requests, 988K of them at nodes whose value came from the transposition table. The
+replay reproduces the recording's keys and values with 0 mismatches. The nets are
+interleaved per round, taking the minimum of 3-5 rounds each; run-to-run noise is
+about 3%.
+
+| inference over one `bench 13` | accumulators | trunk and heads | total | vs flat |
+|---|---|---|---|---|
+| flat gen-5 `f2886d3e2c71` | 569 ms | 312 ms | 881 ms | 1.00x |
+| gen-6-3 at HEAD | 569 ms | 1945 ms | 2514 ms | **2.85x** |
+| gen-6-3, this entry | 583 ms | 1199 ms | 1782 ms | **2.00x** |
+| gen-6-pw, epoch 3, this entry | 605 ms | 715 ms | 1320 ms | **1.43x** |
+| **gen-6-pw, final** | 595 ms | 708 ms | 1304 ms | **1.43x** |
+
+The final row and a gen-6-3 control were measured in the same session, five rounds
+each, at 1.426x and 2.153x; gen-6-3 read 2.00x in an earlier session, which is the
+size of the between-session drift. The accumulators are the same work for every net,
+about 575-600 ms. Everything a
+stacked net costs beyond a flat one is in the second column.
+
+#### Exact changes: gen-6-3 from 2.85x to 2.00x
+
+All of these are in `src/nnue.c`, verified by `nnue verify` at 10000/10000 on the AVX2
+and scalar builds, and by unchanged node counts.
+
+1. **Sparse L1.** 46% of the SCReLU activation's pairs are nonzero (27% of its
+   units), so L1 walks only those pairs:
+   - The activation lists them as it goes (`cmpgt` then `movemask`, a 2 KB lookup
+     table, `popcount`), with no branch per pair.
+   - L1's weights are re-laid out pair-major at load, `[bucket][pair][unit][2]`, so
+     each pair's weights for all 16 units are one cache line.
+   - Requantisation and packing happen in registers, which retires the `hadd`
+     reductions and the per-unit scalar requantise.
+2. **SCReLU as one `mulhi_epu16`.** `(x << k1) * (x << k2) >> 16` with
+   `k1 + k2 = 16 - log2(qa)` is `x*x >> log2(qa)` exactly, in one multiply rather
+   than two multiplies and three shifts.
+3. **A constant stride for 16-unit L1.** The per-pair address becomes a shift rather
+   than an `imul`.
+4. **The stack's outputs are recorded.**
+   - The first head asked for computes both, and stores them in a record per
+     accumulator level and in a 2^18-entry direct-mapped table per thread (4 MB).
+     Both are keyed on the full 64-bit key.
+   - 27% of the trunks `bench 13` built repeated a position already evaluated in the
+     same search, mostly nodes whose value came from the transposition table and
+     whose uncertainty did not. 24% of builds now hit the table.
+   - A generation counter makes the per-search clear O(1).
+5. **`eval_state_push()` prefetches the line** the evaluation will probe. Without it
+   the 2^18 table measured worse than a 2^16 one, because its extra hits cost more in
+   misses than they saved. With it, the 2^18 table is better.
+
+The debug build asserts every recorded value and uncertainty against a from-scratch
+computation, and ran `bench 10` clean.
+
+`bench 13` on gen-6-3, 8 interleaved rounds each, 7135323 nodes every run:
+
+| | max nps | median nps |
+|---|---|---|
+| HEAD | 1,597,341 | 1,591,108 |
+| **this entry** | **1,882,670** | **1,872,788** |
+
+That is **+17.9% / +17.7%**.
+
+#### Why SCReLU stops at 2.00x
+
+The first version of this entry blamed the multiply port. That was wrong. Measured on
+this machine, `vpmaddwd` issues **two per cycle**, `vpmulhuw` one, and `vpermd` one
+every 1.35 cycles. What bounds the SCReLU trunk is two things:
+
+- **Instructions and loads per pair.** The hot sparse loop runs at about 2.3 cycles a
+  pair against a floor of 1.
+- **Its weights arriving from L2.** Timed with its inputs hot, a trunk costs 199 ns.
+  Across 1000 varied positions it costs 258 ns, with 16 KB of unrelated traffic
+  between calls 293 ns, and with 32 KB 348 ns.
+
+A bucket's L1 is 32 KB, the size of the whole L1 data cache, and it cannot stay
+resident beside the accumulators.
+
+#### The pairwise architecture: gen-6-pw
+
+No exact change moves SCReLU past 2x, so the remaining lever was the architecture.
+Pairwise multiplication is NNUE.md's first listed follow-up, and in this format it is
+a new activation tag, `2`:
+- Each perspective's accumulator is split in half, and the clamped halves are
+  multiplied, `(x * y) >> log2(qa)`, into the same [0, qa] range SCReLU lands in.
+- L1 therefore reads 512 inputs rather than 1024, and a bucket's L1 is 16 KB rather
+  than 32.
+
+| file | change |
+|---|---|
+| `trainer/nnue/model.py`, `train.py` | `--pairwise`: L1's input width, `activate()` per perspective, the checkpoint round-trip |
+| `tools/export_net.py` | the integer activation in `stack_trunk()`, L1's width, the header tag |
+| `src/nnue.c`, `src/nnue.h` | validation (stacked only, hidden a multiple of 32), payload size, `hot->inputs`, and the activation taking two input pointers - the same one twice for SCReLU, which compiles to exactly the old code |
+| `trainer/tests/test_stack.py` | five new tests, among them float-vs-quantised tracking for pairwise |
+
+**A pairwise net runs L1 dense.** A product of two clamped units is nonzero far more
+often than one squared unit. Pair density was 71% at epoch 1, 63% at epoch 3 and 61%
+on the final net, and at that density skipping zeros costs more than
+multiplying them. The activation writes no list, and L1 is a dense pass over the same
+pair-major layout:
+- On the epoch-1 net, dense measured 1.553/1.554 against 1.68-1.76 sparse.
+- On the epoch-3 net, 1.496/1.509 against 1.58-1.62.
+- On the final net, 1.437/1.465 against 1.53-1.60.
+
+**The dense loop is bound by loads, not multiplies.** Each pair needs two 32-byte
+weight loads, and broadcasting its inputs from memory made a third. So four pairs'
+inputs arrive in one 16-byte load copied to both lanes, and `vpshufd` splits out each
+pair. That took the layer from 90 to 83 ns hot and the replay from 1.46-1.48 to
+**1.42-1.43**. The four products are summed as a tree before they meet the
+accumulator.
+
+Gates:
+- `nnue verify` is exact on pairwise nets on the AVX2 and scalar builds.
+- `make trainer-test` gives 188 passed.
+- `make smp-test` gives 11/0.
+- The debug build's pairwise bench is assert-clean.
+
+gen-6-3's bench node count is unchanged through all of it.
+
+The training run uses gen-6-3's exact recipe with `--pairwise`: gen-006, 24 epochs of
+500M plus one finishing epoch, lr 5e-4 with gamma 0.87, lambda 0.95.
+
+| val loss | gen-6-3 (SCReLU) | gen-6-pw |
+|---|---|---|
+| epoch 1 | 0.003647 | 0.003745 |
+| epoch 3 | 0.003501 | 0.003527 |
+| final | 0.003299 | 0.003320 |
+
+The final net quantises with 3.22 cp mean drift against the float model (gen-6-3:
+3.38 on the same positions). Its uncertainty head predicts a mean error of 78.7 cp
+(median 67), against gen-6-3's 77.4 (median 62), so `unc_scale()` is centred close
+enough that the SPRT does not wait on `make unc-probe`. Its sanity table matches
+gen-6-3's line for line in shape.
+
+**Lower loss is not Elo.** Whether gen-6-pw plays as well as gen-6-3 is an SPRT's
+question, and it decides whether the speed is worth having. The search's margins were
+SPSA-fitted against gen-5, as they were for gen-6-3.
+
+#### Measured, and not kept
+
+| change | result |
+|---|---|
+| compacting the pairs' values and offsets in the activation, so sparse L1 skips a load and shift per pair | L1 30 ns faster hot, activation 22 ns slower (a permute and a wider store); **+270 ms** on the replay |
+| prefetching the first half's weight lines while the second half activates | **+100-200 ms** |
+| L2 specialised to a constant 16 -> 32 shape, always inlined | 3-7 ns slower per trunk |
+| L2 on the pairwise L1's load-saving kernel | 1.472 vs 1.425 on pairwise, twice |
+| four accumulators in the dense loop | GCC re-associates them back into one chain, as its asm shows; replaced by the tree |
+| moving the trunk's 12 KB scratch off the stack (it costs a `___chkstk_ms` per call) | neutral |
+| permuting FT units so zeros share pairs | ceiling 43.5% nonzero pairs vs 46.4%, about 7 ns; not built |
+| updating L1 incrementally from the parent's sums | impossible: FT rows are 1.6% zeros, so a quiet move changes every pair |
+| int8 L1 weights (export at shift 6, clamp at 127; sign-extended on load), sparse and dense | about 1%, within noise, for 10.2 cp of quantisation drift against 3.4; removed |

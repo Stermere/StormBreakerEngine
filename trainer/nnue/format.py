@@ -137,12 +137,27 @@ MAX_PIECES = 32
 NUM_FEATURES = KING_SQUARES * PIECE_PLANES * SQUARES  # 24576
 PAD_INDEX = NUM_FEATURES
 
-# NnueFeatureSet and NnueActivation in src/nnue.h. One of each is implemented,
-# and the loader rejects anything else by name.
+# NnueFeatureSet and NnueActivation in src/nnue.h. The loader rejects anything
+# else by name.
 FEATURE_SET_TAG = 1
 FEATURE_SET_NAME = "halfka-32sq"
 ACTIVATION_TAG = 1
 ACTIVATION_NAME = "screlu"
+
+# The second activation, and a stacked net's only alternative to SCReLU: each
+# perspective's accumulator is split in half and the halves MULTIPLIED,
+#
+#     clamp(x[:H/2], 0, 1) * clamp(x[H/2:], 0, 1)          H/2 per perspective
+#
+# so L1 reads H numbers instead of 2H. In integers it is `(x * y) >> log2(QA)`,
+# the same [0, QA] range SCReLU's `(x * x) >> log2(QA)` lands in - which is why
+# everything after the activation is unchanged. It exists for speed: L1 is most
+# of a stacked evaluation and costs in proportion to its inputs, which this
+# halves. See E40 in docs/EXPERIMENTS.md.
+PAIRWISE_ACTIVATION_TAG = 2
+PAIRWISE_ACTIVATION_NAME = "pairwise"
+ACTIVATION_TAGS = {ACTIVATION_NAME: ACTIVATION_TAG,
+                   PAIRWISE_ACTIVATION_NAME: PAIRWISE_ACTIVATION_TAG}
 
 
 def king_index(normalised_king):

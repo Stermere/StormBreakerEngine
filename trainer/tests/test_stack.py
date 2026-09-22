@@ -329,7 +329,8 @@ def test_a_stacked_export_needs_a_power_of_two_qa():
     quantise(NNUE(16, 8).state_dict(), NNUE(16, 8).arch, 255, QB)
 
 
-def test_the_quantised_stack_tracks_its_own_float_model():
+@pytest.mark.parametrize("pairwise", [False, True])
+def test_the_quantised_stack_tracks_its_own_float_model(pairwise):
     """The end-to-end check on the numpy reference: quantise, put the SAME
     numbers back into the float model, and require the integer forward to land
     where the float one does.
@@ -342,7 +343,7 @@ def test_the_quantised_stack_tracks_its_own_float_model():
     passes it.
     """
     torch.manual_seed(0)
-    model = NNUE(hidden=32, output_buckets=8, l1_size=16, l2_size=32)
+    model = NNUE(hidden=32, output_buckets=8, l1_size=16, l2_size=32, pairwise=pairwise)
     with torch.no_grad():
         model.ft.weight.uniform_(-0.08, 0.08)
         model.ft_bias.uniform_(-0.05, 0.05)
@@ -410,3 +411,40 @@ FENS = [
     "8/8/8/4k3/8/8/8/4K3 w - - 0 1",
 ]
 
+
+# ------------------------------------------------------------- pairwise --
+
+
+def test_pairwise_halves_what_l1_reads():
+    """Each perspective's halves are multiplied, so L1 reads H numbers, not 2H,
+    and the engine reads exactly that many columns per unit."""
+    model = NNUE(32, 8, uncertainty=True, l1_size=16, l2_size=32, pairwise=True)
+    assert model.l1.weight.shape == (8 * 16, 32)
+    q = quantise(model.state_dict(), model.arch, STACK_QA, L3_SCALE)
+    assert q["activation"] == "pairwise" and q["l1_inputs"] == 32
+    assert q["l1_w"].shape == (8 * 16, 32)
+
+
+def test_pairwise_is_the_product_of_each_perspectives_halves():
+    model = NNUE(32, 1, l1_size=16, pairwise=True)
+    x = torch.linspace(-0.5, 1.5, 32).unsqueeze(0)
+    expected = torch.clamp(x[:, :16], 0, 1) * torch.clamp(x[:, 16:], 0, 1)
+    assert torch.equal(model.activate(x), expected)
+
+
+def test_pairwise_is_refused_where_the_engine_could_not_run_it():
+    with pytest.raises(ValueError, match="layer stack"):
+        NNUE(32, 8, pairwise=True)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        NNUE(48, 8, l1_size=16, pairwise=True)
+
+
+def test_a_pairwise_checkpoint_comes_back_pairwise():
+    model = NNUE(32, 4, uncertainty=True, l1_size=16, l2_size=32, pairwise=True)
+    state = {"model": model.state_dict(), "arch": model.arch}
+    assert arch_from_checkpoint(state)["activation"] == "pairwise"
+    restored = from_checkpoint(state)
+    assert restored.pairwise and restored.l1.weight.shape == model.l1.weight.shape
+    # ... and one written before the flag existed is SCReLU, which is what it was.
+    assert not from_checkpoint({"model": NNUE(32, 4, l1_size=16).state_dict(),
+                                "arch": NNUE(32, 4, l1_size=16).arch}).pairwise

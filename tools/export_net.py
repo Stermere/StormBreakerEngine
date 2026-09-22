@@ -51,7 +51,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trainer"))
 
 from nnue.format import (  # noqa: E402
-    ACTIVATION_TAG,
+    ACTIVATION_TAGS,
     FEATURE_SET_NAME,
     FEATURE_SET_TAG,
     L1_SHIFT,
@@ -59,6 +59,7 @@ from nnue.format import (  # noqa: E402
     L3_SCALE,
     NUM_FEATURES,
     PAD_INDEX,
+    PAIRWISE_ACTIVATION_NAME,
     QA,
     QB,
     SCALE,
@@ -211,6 +212,7 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
 
     l1_size = int(arch.get("l1_size", 0))
     l2_size = int(arch.get("l2_size", 0))
+    pairwise = arch["activation"] == PAIRWISE_ACTIVATION_NAME
 
     # A stacked net's activation is `(x * x) >> log2(qa)` rather than a divide
     # by qa, because it is applied per element instead of once at the end of a
@@ -270,6 +272,9 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
         "trunk": trunk,
         "l1_size": l1_size,
         "l2_size": l2_size,
+        "activation": arch["activation"],
+        # What L1 reads: two perspectives of H under SCReLU, two of H/2 pairwise.
+        "l1_inputs": hidden if pairwise else 2 * hidden,
         "l1_shift": L1_SHIFT if l1_size else 0,
         "l2_shift": L2_SHIFT if l2_size else 0,
         "uncertainty": bool(arch.get("uncertainty", False)),
@@ -286,9 +291,9 @@ def quantise(state: dict, arch: dict, qa: int, qb: int) -> dict:
         l1_scale = 1 << L1_SHIFT
         q["l1_w"] = np.rint(tensor("l1.weight") * l1_scale).astype(np.int32)
         q["l1_b"] = np.rint(tensor("l1.bias") * qa * l1_scale).astype(np.int32)
-        if q["l1_w"].shape != (buckets * l1_size, 2 * hidden):
+        if q["l1_w"].shape != (buckets * l1_size, q["l1_inputs"]):
             raise SystemExit(
-                f"L1 is {q['l1_w'].shape}, expected {(buckets * l1_size, 2 * hidden)}")
+                f"L1 is {q['l1_w'].shape}, expected {(buckets * l1_size, q['l1_inputs'])}")
         if l2_size:
             l2_scale = 1 << L2_SHIFT
             q["l2_w"] = np.rint(tensor("l2.weight") * l2_scale).astype(np.int32)
@@ -484,11 +489,22 @@ def stack_trunk(q: dict, x: np.ndarray, buckets: np.ndarray, qa: int) -> np.ndar
     act_shift = qa.bit_length() - 1
     assert 1 << act_shift == qa, "a stacked net's qa must be a power of two"
 
-    # The SCReLU output as the int16 vector L1 reads. The flat path never
+    # The activation as the int16 vector L1 reads. The flat path never
     # materialises this - it fuses the square into its own dot product and
     # divides by qa once at the end - which is why `>> act_shift` appears here
     # and nowhere above.
-    a = (x * x) >> act_shift
+    #
+    # `x` is [own ; other], each already clamped to [0, qa]. Pairwise multiplies
+    # each perspective's two halves - `(x * y) >> log2(qa)`, in the same [0, qa]
+    # range as SCReLU's square - so it has to split them per perspective, not
+    # across the concatenation.
+    if q["activation"] == PAIRWISE_ACTIVATION_NAME:
+        h = x.shape[1] // 2
+        quarter = h // 2
+        a = np.concatenate([(x[:, :quarter] * x[:, quarter:h]) >> act_shift,
+                            (x[:, h:h + quarter] * x[:, h + quarter:]) >> act_shift], axis=1)
+    else:
+        a = (x * x) >> act_shift
 
     hidden2, l1_size, l2_size = a.shape[1], q["l1_size"], q["l2_size"]
     l1_w = q["l1_w"].astype(np.int64).reshape(-1, l1_size, hidden2)
@@ -661,7 +677,7 @@ def write_net(path: str, q: dict, args, tag: str) -> bytes:
             q["l1_w"].astype(np.int16).tobytes(order="C"),
             q["l1_b"].astype(np.int32).tobytes(order="C"),
         ]
-        expect += buckets * q["l1_size"] * 2 * hidden * 2 + buckets * q["l1_size"] * 4
+        expect += buckets * q["l1_size"] * q["l1_inputs"] * 2 + buckets * q["l1_size"] * 4
         if q["l2_size"]:
             blocks += [
                 q["l2_w"].astype(np.int16).tobytes(order="C"),
@@ -697,7 +713,7 @@ def write_net(path: str, q: dict, args, tag: str) -> bytes:
         MAGIC,
         FORMAT_VERSION,
         FEATURE_SET_TAG,
-        ACTIVATION_TAG,
+        ACTIVATION_TAGS[q["activation"]],
         NUM_FEATURES,
         hidden,
         buckets,
@@ -817,7 +833,7 @@ def main() -> None:
     print(f"  from      {checkpoint}  ({checkpoint_hash[:12]})")
     stack = "".join(f" -> {w}" for w in (q["l1_size"], q["l2_size"]) if w)
     print(f"  arch      {NUM_FEATURES} -> {q['hidden']}x2{stack} -> {q['buckets']}, "
-          f"screlu, {FEATURE_SET_NAME}"
+          f"{q['activation']}, {FEATURE_SET_NAME}"
           + (", +uncertainty" if q["uncertainty"] else ""))
     print(f"  quant     qa {args.qa}  qb {args.qb}  scale {args.scale}"
           + (f"  shifts {q['l1_shift']}/{q['l2_shift']}" if q["l1_size"] else ""))
@@ -896,7 +912,7 @@ def main() -> None:
         "features": NUM_FEATURES,
         "hidden": q["hidden"],
         "output_buckets": q["buckets"],
-        "activation": "screlu",
+        "activation": q["activation"],
         "feature_set": FEATURE_SET_NAME,
         "uncertainty": q["uncertainty"],
         "qa": args.qa,

@@ -213,7 +213,8 @@ def load_resume(args, model, optimiser, scheduler, device):
     for field, asked in (("hidden", args.hidden), ("output_buckets", args.output_buckets),
                          ("uncertainty", args.uncertainty),
                          ("feature_factorization", args.feature_factorization),
-                         ("l1_size", args.l1_size), ("l2_size", args.l2_size)):
+                         ("l1_size", args.l1_size), ("l2_size", args.l2_size),
+                         ("activation", "pairwise" if args.pairwise else "screlu")):
         if arch[field] != asked:
             raise SystemExit(f"--resume: {net_path} has {field} {arch[field]}, this run "
                              f"asks for {asked}. Pass the flags the original run used, or "
@@ -363,11 +364,12 @@ def train(args) -> None:
         args.hidden, args.output_buckets = original.hidden, original.output_buckets
         args.uncertainty = original.uncertainty
         args.l1_size, args.l2_size = original.l1_size, original.l2_size
+        args.pairwise = original.pairwise
         args.feature_factorization = args.feature_factorization or original.feature_factorization
         model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
                      uncertainty=args.uncertainty,
                      feature_factorization=args.feature_factorization,
-                     l1_size=args.l1_size, l2_size=args.l2_size)
+                     l1_size=args.l1_size, l2_size=args.l2_size, pairwise=args.pairwise)
         weights = original.state_dict()
         if args.feature_factorization and not original.feature_factorization:
             weights["ft_shared.weight"] = model.ft_shared.weight.detach().clone()
@@ -379,7 +381,7 @@ def train(args) -> None:
         model = NNUE(hidden=args.hidden, output_buckets=args.output_buckets,
                      uncertainty=args.uncertainty,
                      feature_factorization=args.feature_factorization,
-                     l1_size=args.l1_size, l2_size=args.l2_size)
+                     l1_size=args.l1_size, l2_size=args.l2_size, pairwise=args.pairwise)
     model = model.to(device)
     print(f"net:    {model.describe()}")
 
@@ -679,6 +681,10 @@ def parse_args(argv=None):
     parser.add_argument("--l2-size", type=int, default=DEFAULT_L2_SIZE,
                         help="width of L2. 0 runs L1 straight into the output layer. "
                              "Requires --l1-size, and is a multiple of 16")
+    parser.add_argument("--pairwise", action="store_true",
+                        help="multiply each perspective's accumulator halves instead of "
+                             "squaring every unit, so L1 reads H inputs rather than 2H. "
+                             "Requires --l1-size and a hidden width that is a multiple of 32")
     parser.add_argument("--output-buckets", type=int, default=DEFAULT_OUTPUT_BUCKETS,
                         help="output rows, selected by piece count; must divide 32")
     parser.add_argument("--feature-factorization", action="store_true",
