@@ -20,9 +20,13 @@ typedef struct {
 } Pair;
 
 /* A brace initialiser, not a compound literal: a compound literal is not a constant
- * expression and so cannot initialise a static array. */
-#define S(mg, eg) \
-    { (int16_t)(mg), (int16_t)(eg) }
+ * expression and so cannot initialise a static array. Held off clang-format for the same
+ * reason as PSQK_IDX below: 15 splits the body onto its own line and 16+ join it back, so
+ * each rewrites the other's output and whoever has the other version fails
+ * `make format-check`. */
+/* clang-format off */
+#define S(mg, eg) { (int16_t)(mg), (int16_t)(eg) }
+/* clang-format on */
 
 /*
  * Piece placement conditioned on where a king stands. A plain piece-square table has

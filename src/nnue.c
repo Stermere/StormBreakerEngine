@@ -282,6 +282,17 @@ typedef struct {
 
 static Net Loaded;
 
+/*
+ * Which NET every thread's cached evaluations belong to.
+ *
+ * Bumped when a net is adopted, and by eval_state_retire() for `ucinewgame`. A thread
+ * compares it at the top of each search and throws its caches away only when it has
+ * moved - see eval_state_clear(), and the caches themselves for why nothing else can
+ * invalidate them: they are keyed by the full position key, or by the very bitboards
+ * they were summed from, so under one net a hit is what a recomputation would produce.
+ */
+static uint32_t EvalEpoch = 1;
+
 /* How many king slots a feature set folds the board onto, or 0 if this build has never
  * heard of it. The count is the feature set's shape, so the loader derives the expected
  * feature count from it rather than trusting the file to be self-consistent. */
@@ -661,6 +672,10 @@ static bool nnue_adopt(const unsigned char *blob, size_t bytes, unsigned char *o
     sha256_hex(blob, bytes, Loaded.hash);
     snprintf(Loaded.source, sizeof(Loaded.source), "%s", source);
     Loaded.loaded = true;
+
+    /* Every cached evaluation in every thread was produced by the net this one replaces,
+     * and nothing in a position key says which net scored it. */
+    ++EvalEpoch;
     return true;
 }
 
@@ -1123,6 +1138,7 @@ static inline void nnue_activate_half(const int16_t *lhs, const int16_t *rhs, in
     for (uint32_t j = 0; j < n; ++j) {
         const int32_t x = lhs[j] < 0 ? 0 : (lhs[j] > qa ? qa : lhs[j]);
         const int32_t y = rhs[j] < 0 ? 0 : (rhs[j] > qa ? qa : rhs[j]);
+
         out[j] = (int16_t)((x * y) >> shift);
     }
 }
@@ -1633,6 +1649,10 @@ struct EvalState {
     StackOutputs *outCache;
     uint16_t outGen;
 
+    /* The EvalEpoch this thread's caches were filled under; 0 until it has one, which no
+     * epoch is, so a thread retires on its first search and keeps nothing from before it. */
+    uint32_t epoch;
+
     /* Sized by the net rather than by NNUE_MAX_HIDDEN: 128 entries at the maximum width
      * would be half a megabyte a thread to hold a net four times narrower. `refreshWidth`
      * is what a net swap to a different width is noticed by. */
@@ -1690,6 +1710,7 @@ void eval_state_free(void) {
     nt->outLevels     = NULL;
     nt->outCache      = NULL;
     nt->outGen        = 0;
+    nt->epoch         = 0;
     nt->refreshCache  = NULL;
     nt->refreshAcc    = NULL;
     nt->refreshWidth  = 0;
@@ -2026,23 +2047,47 @@ static void nnue_refresh(EvalState *nt, const Position *pos, Color c, int16_t *d
     e->valid = true;
 }
 
+void eval_state_retire(void) { ++EvalEpoch; }
+
+/*
+ * Called by every thread at the top of every search.
+ *
+ * The accumulator stack is reset unconditionally, because `accTop` is where THIS search
+ * is in the tree and level 0 describes whatever the last one ended on.
+ *
+ * The caches below are not, and that is what the epoch is for. They hold what the net
+ * computed for positions, checked against the full 64-bit key or against the exact
+ * bitboards an accumulator was summed from, so under one net a hit is the number a
+ * recomputation would produce - no matter which search filled it. What makes one wrong is
+ * a DIFFERENT NET, and nothing in a key says which net scored it, so EvalEpoch says
+ * instead. Retiring them every `go` threw away a megabyte of live records at the start of
+ * each move, right where the transposition table was about to hand back evaluations from
+ * the previous one and ask for their uncertainty.
+ *
+ * `search_clear()` still retires everything through eval_state_retire(), so invariant 7
+ * holds: nothing survives `ucinewgame`. A record surviving a `go` cannot change a result
+ * either way - it is the same number, computed earlier.
+ */
 void eval_state_clear(EvalState *nt) {
     if (!nt)
         return;
 
     nt->accTop = 0;
-    if (nt->accStack)
-        memset(&nt->accStack[0], 0, sizeof(nt->accStack[0]));
 
-    /*
-     * Everything below holds values the PREVIOUS net produced, and nothing about a key or
-     * a bitboard says which net summed it - which is the whole reason this function is
-     * called when `setoption EvalFile` swaps one in. The stack's recorded outputs carry the
-     * same hazard - they are validated by position key, and the root of the next search is
-     * very often the position the last one ended at - and moving to the next generation
-     * retires every one of them at once. Only when the counter wraps are the tables
-     * actually wiped, so that no record from 65536 searches ago can come back to life.
-     */
+    /* Key 0 is what "this level describes nothing" means everywhere else in this file, so
+     * there is no reason to write 8 KB of accumulator to say it. */
+    if (nt->accStack) {
+        nt->accStack[0].key             = 0;
+        nt->accStack[0].computed[WHITE] = nt->accStack[0].computed[BLACK] = false;
+    }
+
+    if (nt->epoch == EvalEpoch)
+        return;
+    nt->epoch = EvalEpoch;
+
+    /* Moving to the next generation retires every recorded output at once. Only when the
+     * counter wraps are the tables actually wiped, so that no record from 65536 nets ago
+     * can come back to life. */
     if (nt->refreshCache)
         memset(nt->refreshCache, 0, REFRESH_SLOTS * sizeof(RefreshEntry));
     if (nt->outLevels && ++nt->outGen == 0) {

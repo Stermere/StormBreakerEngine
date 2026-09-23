@@ -304,8 +304,11 @@ void search_clear(void) {
 #endif
     }
 
-    /* The calling thread's, which is the one that has been evaluating outside a search.
-     * Every worker clears its own at the top of thread_search(). */
+    /* Every thread's cached evaluations, wherever that thread is: eval_state_clear()
+     * keeps them ACROSS searches now, and this is the hook that says a new game is not
+     * another search. The workers act on it at the top of thread_search(); the calling
+     * thread, which is the one that has been evaluating outside a search, does so here. */
+    eval_state_retire();
     eval_state_clear(eval_state());
 }
 
@@ -601,7 +604,7 @@ static const struct {
     {"FutilityMargin", &FUTILITY_MARGIN, 10, 150},
     {"RazorMargin", &RAZOR_MARGIN, 80, 600},
     {"SeeCaptureMargin", &SEE_CAPTURE_MARGIN, 20, 300},
-    {"SeeQuietMargin", &SEE_QUIET_MARGIN, 5, 120},
+    {"SeeQuietMargin", &SEE_QUIET_MARGIN, 1, 120},
     {"DeltaMargin", &DELTA_MARGIN, 50, 600},
     {"ProbCutMargin", &PROBCUT_MARGIN, 30, 300},
     {"ProbCutDepth", &PROBCUT_DEPTH, 5, 99},

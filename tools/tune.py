@@ -462,7 +462,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="tune.py", description="SPSA-tune the search parameters.")
     ap.add_argument("--engine", help="a TUNE_SEARCH=on build")
     ap.add_argument("--params", help="comma-separated subset; default is all of them")
-    ap.add_argument("--exclude", default="SeeCaptureMargin,SeeQuietMargin",
+    ap.add_argument("--exclude", default="",
                     help="comma-separated names to leave alone")
     ap.add_argument("--iterations", type=int, default=1000)
     ap.add_argument("--games-per-iter", type=int, default=0,

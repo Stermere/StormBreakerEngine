@@ -68,7 +68,14 @@ void eval_state_free(void);
  * multiplied by a hundred. */
 size_t eval_state_bytes(void);
 
+/* Resets one thread's stack, and retires its cached evaluations when the net they were
+ * produced under is no longer the loaded one. Called at the top of every search. */
 void eval_state_clear(EvalState *es);
+
+/* Declares every thread's cached evaluations stale, wherever those threads are. Loading
+ * a net does this by itself; `search_clear()` calls it so that `ucinewgame` leaves
+ * nothing at all behind (invariant 7). */
+void eval_state_retire(void);
 void eval_state_push(EvalState *es, const Position *pos, Move m);
 void eval_state_push_null(EvalState *es, const Position *pos);
 void eval_state_pop(EvalState *es);
@@ -81,6 +88,7 @@ static inline void eval_state_free(void) {}
 static inline size_t eval_state_bytes(void) { return 0; }
 
 static inline void eval_state_clear(EvalState *es) { (void)es; }
+static inline void eval_state_retire(void) {}
 static inline void eval_state_push(EvalState *es, const Position *pos, Move m) {
     (void)es;
     (void)pos;

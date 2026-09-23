@@ -186,8 +186,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # PINNED, and from pip rather than apt, because clang-format's output
+      # changes between major versions: `apt install clang-format` is whatever
+      # the runner image ships that month, so an image upgrade silently
+      # reformats the repo and fails this job on code nobody touched. The
+      # version here is the contract - a checkout formatted by any other one
+      # has to agree with it, which is what `make format-check` says locally.
       - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install clang-format==18.1.8
 
       - name: Check formatting
         run: make format-check

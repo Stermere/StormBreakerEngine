@@ -873,12 +873,13 @@ net-publish:
 # repository's style, and leaving them out of the check is how they stop being
 # that.
 FORMAT_FILES := $(SOURCES) $(HEADERS) tools/tuner.c tools/datagen.c
+CLANG_FORMAT ?= clang-format
 
 format:
-	clang-format -i $(FORMAT_FILES)
+	$(CLANG_FORMAT) -i $(FORMAT_FILES)
 
 format-check:
-	clang-format --dry-run --Werror $(FORMAT_FILES)
+	$(CLANG_FORMAT) --dry-run --Werror $(FORMAT_FILES)
 
 clean:
 	rm -f $(EXE) $(EXE).exe $(EXE)-debug $(EXE)-debug.exe Engine-* *.o *.d .ob*.txt
