@@ -3081,3 +3081,103 @@ SPSA-fitted against gen-5, as they were for gen-6-3.
 | permuting FT units so zeros share pairs | ceiling 43.5% nonzero pairs vs 46.4%, about 7 ns; not built |
 | updating L1 incrementally from the parent's sums | impossible: FT rows are 1.6% zeros, so a quiet move changes every pair |
 | int8 L1 weights (export at shift 6, clamp at 127; sign-extended on load), sparse and dense | about 1%, within noise, for 10.2 cp of quantisation drift against 3.4; removed |
+
+---
+
+### E41: The pairwise net measured - gen-6-pw adopted, gen-6-pw-big rejected
+
+**Date** 2026-09-22 · **Nets** `48428bbbd57e` (gen-6-pw, `512x2 -> 16 -> 32 -> 8
++unc`, pairwise, bench 291947) and `e6bfc4517795` (gen-6-pw-big, the same recipe at
+`--hidden 1024`, bench 234418) · **Baseline** `stormbreaker-base.exe`, gen-5
+`f2886d3e2c71`, bench 242977 · **Status** gen-6-pw **passed STC and LTC**;
+gen-6-pw-big is not adopted.
+
+E40 built the pairwise architecture, measured it at 1.43x a flat evaluation, and left
+its strength as "an SPRT's question". This is that SPRT. It also re-asks E27's
+question - whether a wider net pays - now that the L1 stack rather than the
+accumulator is where the capacity lives.
+
+#### The runs
+
+Every dev binary was built from `eafa8c3` and differs from the others **only** in
+`-DNNUE_EVALFILE`. Conditions throughout: 1 thread, 16 MB hash,
+`UHO_Lichess_4852_v1.epd`, concurrency 14, `model=normalized`, alpha = beta = 0.05.
+**Zero time losses and no engine anomalies in any of the five runs**, 11,646 games.
+
+| # | dev | vs | TC, bounds | games | Elo | nElo | LLR | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 1 | gen-6-pw | base | STC [0, 5] | 1128 | **+43.66 ± 12.90** | +69.40 ± 20.28 | 2.96 | **H1 accepted** |
+| 2 | gen-6-pw-big | base | STC [0, 5] | 1078 | **+45.38 ± 13.23** | +71.98 ± 20.74 | 2.96 | **H1 accepted** |
+| 3 | gen-5 net (control) | base | STC [0, 5] | 5000 | **+1.25 ± 5.09** | +2.37 ± 9.63 | -0.03 | truncated, see below |
+| 4 | gen-6-pw-big | gen-6-pw | STC [0, 5] | 3224 | **-3.23 ± 7.21** | -5.38 ± 11.99 | -1.05 | stopped by hand |
+| 5 | gen-6-pw | base | **LTC [0.5, 4.5]** | 1216 | **+43.08 ± 10.53** | +80.70 ± 19.53 | 2.94 | **H1 accepted** |
+
+| # | W-L-D | Ptnml(0-2) | draw % | pairs | wall | PGN |
+|---|---|---|---|---|---|---|
+| 1 | 382-241-505 (56.25%) | [14, 88, 243, 181, 38] | 43.09 | 2.15 | 35m42 | `20260922-093224-STC.pgn` |
+| 2 | 370-230-478 (56.49%) | [10, 93, 220, 179, 37] | 40.82 | 2.10 | 34m59 | `20260922-100808-STC.pgn` |
+| 3 | 1294-1276-2430 (50.18%) | [43, 522, 1346, 552, 37] | 53.84 | 1.04 | 2h37m | `20260922-104307-STC.pgn` |
+| 4 | 866-896-1462 (49.53%) | [53, 393, 743, 377, 46] | 46.09 | 0.95 | 1h44m | `20260922-132040-STC.pgn` |
+| 5 | 401-251-564 (56.17%) | [3, 93, 276, 223, 13] | 45.39 | 2.46 | 3h20m | `20260922-150520-LTC.pgn` |
+
+Logs and the run manifest: `external/games/sprt-20260922-gen6/`. The manifest is not
+decoration - `sprt.py` names every dev seat `dev`, so the PGN alone cannot say which
+net played it. That is the attribution E27 had to caveat after the fact, and
+`queue.json` records dev, net hash, bench, bounds, verdict and PGN per run.
+
+#### The control is the row the other four depend on
+
+Run 3 is the same binary build as runs 1 and 2 carrying **base's own net**, played
+against base. It reproduces base's node counts exactly - 242977 at depth 7, 5819071 at
+depth 13 - so it makes identical search decisions and the only thing it can measure is
+the speed E40's `nnue.c` work bought or cost on a flat net. It measured **+1.25 ±
+5.09** over 5000 games.
+
+That is what licenses reading runs 1 and 2 as the nets. Without it, +43 Elo against a
+baseline built before E40 is a claim about a net *and* 824 changed lines of inference
+code at once, which is two changes in one test.
+
+Its 2500-pair cap was declared before it started. An SPRT on [0, 5] whose true value
+is 0 expects roughly 25,000 games before a boundary, and the control's deliverable is
+the interval, not a verdict - so it was truncated on purpose and reports
+"inconclusive", which is the correct output of a truncated SPRT and not a failure.
+
+#### gen-6-pw: the two time controls agree
+
+**STC +43.66 ± 12.90, LTC +43.08 ± 10.53.** A five-fold increase in time control left
+the point estimate within 0.6 Elo and the intervals almost coincident. Gains usually
+shrink at LTC as the baseline's extra depth finds what the better evaluation was
+seeing earlier; this one did not, which is the strongest evidence in the entry that
+the net is better rather than better-suited to shallow search. LOS 100% in both.
+
+#### gen-6-pw-big: wider, slower, no better
+
+Exported and gated the same way: `24576 -> 1024x2 -> 16 -> 32 -> 8`, pairwise,
+halfka-32sq, +uncertainty; `nnue verify` **10000/10000 exact**; 3.46 cp mean
+quantisation drift against the float model (gen-6-pw: 3.22).
+
+Three readings, none of them favourable:
+
+1. **Against base it is indistinguishable from gen-6-pw** - +45.38 ± 13.23 against
+   +43.66 ± 12.90. A 1.7 Elo lead with intervals four times that wide is not a lead.
+2. **Head to head it is behind**, -3.23 ± 7.21 over 3224 games.
+3. **It is markedly slower.** Its accumulator is doubled; `bench` reads 1.15M nps
+   against gen-6-pw's 1.54M at depth 7. Read that as indicative only - the two nets
+   search different trees, which is exactly why E40 built the replay harness - but the
+   direction is not in doubt, and the head-to-head charged it for that cost at equal
+   time.
+
+This is E27's answer again through a different architecture: **coverage, not capacity,
+is the binding constraint**. E27's h1024 on the gen-5 corpus measured -7.0 ± 11.3, and
+moving the extra width behind a pairwise L1 did not change the verdict.
+
+**Two honest limits on that conclusion.** Run 4 was stopped by hand at 3224 games to
+free the machine for the LTC, so it is a standing and not a verdict; `queue.json`
+records it as killed, and `sprt.py`'s "inconclusive" line for it is an artifact of the
+kill. And gen-6-pw-big's uncertainty head predicts a mean error of **90.1 cp** (median
+71) against gen-6-pw's 78.7 (67) and gen-6-3's 77.4 (62), while `UncSigma*` has never
+been re-centred for a gen-6 net - so it played with pruning margins running wider than
+the constants assume. That confound cannot be excluded from its result. It was not
+treated as a blocker because E27's re-centring attempt on gen-5 measured -7.4 ± 20.0,
+i.e. re-centring did not convert into Elo there either; clearing gen-6-pw-big properly
+would need the re-centring first and then run 4 to a verdict.

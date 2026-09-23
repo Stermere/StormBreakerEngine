@@ -333,7 +333,12 @@ def main() -> int:
         print(f"  pgn {pgn}")
         print()
 
-        verdict = sprt_verdict(r.llr)
+        # fastchess states its own verdict, and that is the one to trust: the LLR it
+        # PRINTS is rounded to two decimals, so an accepted test that prints 2.94 read
+        # as short of the 2.9444 boundary sprt_verdict() compares against (E41).
+        accepted = re.search(r"SPRT \(.*\) completed - (H[01]) was accepted", output)
+        verdict = ({"H1": "PASSED", "H0": "REJECTED"}[accepted.group(1)]
+                   if accepted else sprt_verdict(r.llr))
         if verdict == "PASSED":
             c.ok(f"H1 accepted: the patch is better than elo0={elo0}.")
         elif verdict == "REJECTED":

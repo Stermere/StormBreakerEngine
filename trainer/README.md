@@ -89,6 +89,10 @@ cd trainer
 # Gen 5 + factorization + finish pass ~3450 -> ~3500 (net-f2886d3e2c71)
 .venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn --val ..\external\data\val.cnn --epochs 4 --checkpoint-every 1 --out ..\external\nets\net --output-buckets 8 --lr 0.0005 --lambda-start 0.95 --lambda-end 0.95 --hidden 512 --uncertainty --lambda-progress -0.2 --lambda-pieces -0.0 --score-clip 2000 --unc-weight 0.01 --feature-factorization --finish-epochs 1 --finish-lr 0.00001
 
+# Gen 6 ~3500 -> ????
+.venv\Scripts\python.exe -m nnue.train --train F:\chessData\gen-006.cnn --val ..\external\data\val.cnn --out ..\external\nets\net-gen-6-pw --epochs 24 --finish-epochs 1 --finish-lr 1e-5 --batch-size 16384 --hidden 512 --l1-size 16 --l2-size 32 --output-buckets 8 --feature-factorization --uncertainty --unc-weight 0.01 --lr 0.0005 --lr-gamma 0.87 --lambda-start 0.95 --lambda-end 0.95 --sigmoid-k 400 --lambda-progress -0.2 --lambda-pieces 0 --score-clip 2000 --positions-per-epoch 500000000 --workers 4 --seed 0 --log-every 50 --checkpoint-every 1 --pairwise
+
+
 
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..
