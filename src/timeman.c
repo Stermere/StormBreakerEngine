@@ -40,12 +40,33 @@ int64_t time_ms(void) {
 #endif
 }
 
-/* Never plan to use more than this fraction of the clock on one move: flagging loses
- * the whole game, where thinking briefly for one move costs a fraction of one. It
- * only bites once the clock has fallen to around fifteen times the increment, so its
- * job is leaving a clock to play the next move from when this one went badly. */
+/* Never plan to use more than this fraction of the clock above the bank on one move:
+ * flagging loses the whole game, where thinking briefly for one move costs a fraction
+ * of one. It only bites once the clock has fallen to around fifteen times the
+ * increment, so its job is leaving a clock to play the next move from when this one
+ * went badly. */
 #define MAX_CLOCK_FRACTION_NUM 1
 #define MAX_CLOCK_FRACTION_DEN 2
+
+/*
+ * The part of the clock no plan may touch, in milliseconds - held back from the
+ * fraction above, so the ceiling is half of what lies ABOVE it.
+ *
+ * Without it the ceiling was half the clock however little was left. Once the clock is
+ * low the allocation settles on three quarters of the increment, the stability and
+ * node-share scales push the soft target up to the ceiling on every unsettled move, and
+ * each such move spends half of what remains - so at 8+0.08 the clock came to rest near
+ * two increments, and fell below 0.2s in one game in six (E43). There, a move that
+ * arrives 150ms late forfeits.
+ *
+ * And moves do arrive late, through no fault of the search: logged under full match
+ * load, the search stopped within 2ms of its ceiling at the 99.9th percentile, while the
+ * GUI measured one move in 440 at least 50ms longer than the engine did - time lost
+ * waking to read `go` and getting `bestmove` back out, which no clock inside the
+ * process can see. So the bank is fixed rather than proportional to the clock or the
+ * increment: a scheduling delay's size depends on neither.
+ */
+#define CLOCK_BANK_MS 300
 
 /* The exception that lets the bound above be strict: when `movestogo` says this is
  * the last move before the clock is replenished, no further move comes out of it.
@@ -76,6 +97,8 @@ int64_t time_ms(void) {
 #define MOVESTOGO_CAP 50
 
 static int64_t clamp64(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : v > hi ? hi : v; }
+static int64_t imin64(int64_t a, int64_t b) { return a < b ? a : b; }
+static int64_t imax64(int64_t a, int64_t b) { return a > b ? a : b; }
 
 /* Percent of the nominal allocation to spend, by how far into the game we are. The
  * opening is near-book and shared by every game, the middlegame is where an extra ply
@@ -191,8 +214,19 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
 
     const int64_t nominal = budget / moves + inc * 3 / 4;
     const int64_t optimum = nominal * phase_percent(gamePly) / 100;
-    const int64_t ceiling = moves > 1 ? spendable * MAX_CLOCK_FRACTION_NUM / MAX_CLOCK_FRACTION_DEN
-                                      : spendable * LAST_MOVE_FRACTION_NUM / LAST_MOVE_FRACTION_DEN;
+
+    /* Inside the bank, what refills it: three quarters of the increment, so the clock
+     * climbs back by the last quarter each move, plus a share of the clock so a control
+     * without one still moves rather than answering in a millisecond. Never more than a
+     * quarter of what is physically left, which is what still refills a clock that is
+     * nearly gone. Half the increment refilled faster and measured -1.06 +/- 6.50 over
+     * 2956 games (E43); the moves spent refilling are the only price the bank has. */
+    const int64_t refill = imin64(inc * 3 / 4 + spendable / (2 * moves), spendable / 4);
+    const int64_t ceiling =
+        moves > 1
+            ? imax64((spendable - CLOCK_BANK_MS) * MAX_CLOCK_FRACTION_NUM / MAX_CLOCK_FRACTION_DEN,
+                     refill)
+            : spendable * LAST_MOVE_FRACTION_NUM / LAST_MOVE_FRACTION_DEN;
 
     /* The ceiling applies to the nominal allocation rather than the phase-scaled one, so
      * the phase curve moves the target without moving the limit that protects the
