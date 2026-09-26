@@ -429,7 +429,7 @@ static inline void update_seldepth(SearchThread *td, int ply) {
  * the released engine is unchanged, while `make TUNE_SEARCH=on` makes each a spin option
  * so a sweep costs a `setoption` instead of a rebuild.
  */
-TUNABLE(RFP_MARGIN, 71);
+TUNABLE(RFP_MARGIN, 67);
 #define RFP_DEPTH 7
 
 #define LMP_DEPTH 8
@@ -439,7 +439,7 @@ TUNABLE(RFP_MARGIN, 71);
 /* Much smaller than the "value of a quiet move" intuition suggests: at a null-window node
  * alpha tracks the evaluation, so staticEval sits close to alpha far more often than
  * not, and 100/ply measured at 0.008% of the bench tree. The useful range is narrow. */
-TUNABLE(FUTILITY_MARGIN, 59);
+TUNABLE(FUTILITY_MARGIN, 60);
 
 /* The depth below which the previous score is too unreliable to aim a window at. A
  * #define rather than a TUNABLE because SPSA perturbs continuously and then rounds, so
@@ -457,16 +457,16 @@ TUNABLE(FUTILITY_MARGIN, 59);
  * quiescence. Much larger than futility's because the claim is bigger - this discards
  * the whole node - and it is verified rather than assumed: the qsearch actually runs,
  * and only its result can prune. */
-TUNABLE(RAZOR_MARGIN, 311);
+TUNABLE(RAZOR_MARGIN, 319);
 #define RAZOR_DEPTH 3
 
 /* A move that loses material outright is worth searching only if there is depth left to
  * show what it wins back. Captures scale linearly and quiets quadratically, because a
  * quiet move that hangs a piece has no compensation to demonstrate in the first place. */
 #define SEE_CAPTURE_DEPTH 6
-TUNABLE(SEE_CAPTURE_MARGIN, 89);
+TUNABLE(SEE_CAPTURE_MARGIN, 87);
 #define SEE_QUIET_DEPTH 8
-TUNABLE(SEE_QUIET_MARGIN, 7);
+TUNABLE(SEE_QUIET_MARGIN, 8);
 
 /*
  * ProbCut, the mirror of razoring at the other end of the window: a capture that still
@@ -480,13 +480,13 @@ TUNABLE(SEE_QUIET_MARGIN, 7);
  */
 TUNABLE(PROBCUT_DEPTH, 5);
 #define PROBCUT_REDUCTION 4
-TUNABLE(PROBCUT_MARGIN, 111);
+TUNABLE(PROBCUT_MARGIN, 112);
 
 /* Standing pat is always available, so a capture that cannot bring the evaluation within
  * a minor piece of alpha even after winning its victim outright will not raise it. The
  * margin covers what the rest of the sequence might swing, hence a piece rather than a
  * pawn. */
-TUNABLE(DELTA_MARGIN, 409);
+TUNABLE(DELTA_MARGIN, 421);
 
 /* The shallowest depth worth a singular test, and how far below the stored score the
  * verification window sits (in sixteenths of a centipawn per ply). The floor keeps it
@@ -499,7 +499,7 @@ TUNABLE(SINGULAR_MARGIN, 33);
 /* How much the correction is believed, out of CORR_W_UNIT. A TUNABLE because how far to
  * trust a learned evaluation bias is the kind of question a sweep answers better than a
  * person; this was chosen rather than fitted. See E14. */
-TUNABLE(CORR_W_PAWN, 133);
+TUNABLE(CORR_W_PAWN, 134);
 
 /* Uncertainty scaling of the margins above: floor percentage, percent per centipawn of
  * learned correction, and the cap. The cap is SPSA-fitted (E22, E22a); the floor and
@@ -507,7 +507,7 @@ TUNABLE(CORR_W_PAWN, 133);
  * because unc_scale() returns on the sigma branch before reading them. */
 TUNABLE(UNC_SCALE_BASE, 89);
 TUNABLE(UNC_SCALE_SLOPE, 2);
-TUNABLE(UNC_SCALE_MAX, 144);
+TUNABLE(UNC_SCALE_MAX, 145);
 
 /* The same mapping for a net carrying the trained uncertainty head, whose signal is
  * predicted |eval error| rather than learned bias - a larger number with its own
@@ -515,9 +515,15 @@ TUNABLE(UNC_SCALE_MAX, 144);
  * on sigma over the d12 bench tree and then fitted by E22; E22a's re-sweep moved both one
  * unit and stopped, which read as converged until a third sweep at LTC pulled the slope
  * another three units at drift z +3.5. STC reaches depth 12-13 and LTC does not stop
- * there, so what E22a measured as flat was a mapping flat over the tree it played on. */
-TUNABLE(UNC_SIGMA_BASE, 75);
-TUNABLE(UNC_SIGMA_SLOPE, 16);
+ * there, so what E22a measured as flat was a mapping flat over the tree it played on.
+ *
+ * Re-centred 75/16 -> 99/9 for gen-6-pw. Not a drift in the mean - that moved 126.8
+ * to 121.2 - but in the SPREAD: the same constants on the new head give sd 21.8 where
+ * gen-5 gave 14.4, and 33.8% of nodes at the cap where gen-5 had 26.2%. These are the
+ * `unc-probe -ref` values, which reproduce gen-5's OUTPUT distribution rather than
+ * centring on 100, and that is what carries E22's fit across the retrain. */
+TUNABLE(UNC_SIGMA_BASE, 99);
+TUNABLE(UNC_SIGMA_SLOPE, 9);
 
 /*
  * How much of the mapping each margin actually wants. unc_scale() returns ONE number, and
@@ -533,9 +539,9 @@ TUNABLE(UNC_SIGMA_SLOPE, 16);
 #define UNC_W_UNIT 16
 TUNABLE(UNC_W_RFP, 17);
 TUNABLE(UNC_W_FUTILITY, 16);
-TUNABLE(UNC_W_RAZOR, 17);
+TUNABLE(UNC_W_RAZOR, 18);
 TUNABLE(UNC_W_PROBCUT, 17);
-TUNABLE(UNC_W_DELTA, 18);
+TUNABLE(UNC_W_DELTA, 20);
 
 /*
  * The second tier: constants that shape a formula rather than sit in a comparison.
@@ -552,15 +558,15 @@ TUNABLE(LMR_DIVISOR, 23);
 
 /* How much history is allowed to pull a reduction back. Larger means less influence,
  * which is why these are divisors and not multipliers. */
-TUNABLE(LMR_HIST_DIVISOR, 8591);
-TUNABLE(LMR_CONT_DIVISOR, 7528);
+TUNABLE(LMR_HIST_DIVISOR, 8493);
+TUNABLE(LMR_CONT_DIVISOR, 7334);
 TUNABLE(CAPHIST_DIVISOR, 5);
 
 /* Null-move reduction: base, how fast it grows with depth, and how much of the margin
  * above beta may buy extra reduction before it is capped. */
-TUNABLE(NMP_BASE, 6);
-TUNABLE(NMP_DEPTH_DIVISOR, 6);
-TUNABLE(NMP_EVAL_DIVISOR, 183);
+TUNABLE(NMP_BASE, 5);
+TUNABLE(NMP_DEPTH_DIVISOR, 5);
+TUNABLE(NMP_EVAL_DIVISOR, 180);
 TUNABLE(NMP_EVAL_MAX, 3);
 
 /* How much less a node that was on a principal variation, but is not one in this tree,
@@ -579,13 +585,13 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * second is levelled at up to sixty-three moves at once - so nothing says the answer to
  * one should size the other. The depth cap stays shared, because it is a statement about
  * the search and is equally true of evidence pointing either way. */
-TUNABLE(HIST_MALUS_MUL, 8);
+TUNABLE(HIST_MALUS_MUL, 9);
 
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 10);
 
 /* Half-width of the first aspiration window. */
-TUNABLE(ASPIRATION_DELTA, 17);
+TUNABLE(ASPIRATION_DELTA, 16);
 
 #ifdef TUNE_SEARCH
 
