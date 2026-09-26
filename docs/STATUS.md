@@ -75,6 +75,13 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | **Time management: LTC confirmation (E29 is STC-only)** | **TODO** |
 | Datagen: the accumulator stack was never claimed on the synchronous path | fixed, **1.81x labels/s**, shards byte-identical ([E38](EXPERIMENTS.md#e38-a-correctness-sweep-and-datagens-missing-accumulator-stack)) |
 | A zero or negative clock is a flagged clock, not an absent one | fixed; eight `go` spellings no longer search unbounded (E38) |
+| Time management: soft target scaled by the best move's share of the nodes | **+11.32 ± 6.02** STC, H1 ([E42](EXPERIMENTS.md#e42-one-nights-search-batch---node-share-time-management-and-four-search-changes-29-at-stc)) |
+| Search: double extensions, threat-indexed main history, quiet checks exempt from LMP and futility, cutoff-count LMR | with the line above, **+28.90 ± 6.98** STC over 3000 games and an STC SPRT pass (E42); **each only VSTC-screened, ablations pending** |
+| Search: the table score as the pruning eval (RFP, razoring, null move) | tried, **-33.41 ± 15.43** (E42), rejected |
+| Search: fail-low prior-move credit | tried, -2.43 ± 7.70 (E42), not kept |
+| Small batch: blended fail-highs, table-cutoff history, aspiration fail-high depth, fifty-move damping | VSTC +13.04 ± 8.29 (E42); **not in the tree** - `external/patches/e42-small-batch.patch`, STC SPRT pending |
+| **Time management: clocks fall below 0.2 s in ~12% of STC games, HEAD included** | **TODO** - the cause of every forfeit in E42 |
+| **E42 batch: LTC confirmation** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`

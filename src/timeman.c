@@ -103,9 +103,19 @@ static const int StabilityPercent[] = {170, 130, 110, 100, 92, 86, 82, 80};
 
 #define STABILITY_BUCKETS ((int)(sizeof(StabilityPercent) / sizeof(StabilityPercent[0])))
 
+/* Percent of the optimum by the share of the search's nodes the best move took, as
+ * (BASE - share) * SCALE with the share in thousandths: a move that took 90% of the tree
+ * spends 67%, one that took 40% spends 135%. BASE puts the neutral point on the share at
+ * which STC searches actually stop - a mean of 670 over 60 book positions at 6+0.08 -
+ * so this moves time between moves rather than changing how much a game uses. The
+ * textbook 1500 would have lengthened the average think by 11%, which is a second
+ * change riding on the first. */
+#define NODE_SHARE_BASE  1400
+#define NODE_SHARE_SCALE 135
+
 bool timeman_has_clock(const TimeManager *tm) { return tm->optimum < INT64_MAX / 256; }
 
-int64_t timeman_optimum(const TimeManager *tm, int stability) {
+int64_t timeman_optimum(const TimeManager *tm, int stability, int bestNodesPermille) {
     /* No clock at all - `go depth`, `go nodes`, `go infinite`, bench. Scaling a
      * sentinel would overflow, and there is nothing here to scale. */
     if (!timeman_has_clock(tm))
@@ -116,7 +126,10 @@ int64_t timeman_optimum(const TimeManager *tm, int stability) {
     else if (stability >= STABILITY_BUCKETS)
         stability = STABILITY_BUCKETS - 1;
 
-    const int64_t scaled = tm->optimum * StabilityPercent[stability] / 100;
+    const int64_t share       = clamp64(bestNodesPermille, 0, 1000);
+    const int64_t nodePercent = (NODE_SHARE_BASE - share) * NODE_SHARE_SCALE / 1000;
+
+    const int64_t scaled = tm->optimum * StabilityPercent[stability] * nodePercent / 10000;
 
     /* The soft target may never cross the hard ceiling. */
     return scaled < tm->maximum ? scaled : tm->maximum;

@@ -3181,3 +3181,195 @@ the constants assume. That confound cannot be excluded from its result. It was n
 treated as a blocker because E27's re-centring attempt on gen-5 measured -7.4 ± 20.0,
 i.e. re-centring did not convert into Elo there either; clearing gen-6-pw-big properly
 would need the re-centring first and then run 4 to a verdict.
+
+---
+
+### E42: One night's search batch - node-share time management and four search changes, +29 at STC
+
+**Date** 2026-09-26 · **Net** `48428bbbd57e` (gen-6-pw) · **Baseline** HEAD `7bd499e`, bench
+250106 (d7) / 6694801 (d13) · **Final bench** 289292 / 6514462 · **Status** time management
+**passed STC on its own** (+11.32 ± 6.02); the combined build **passed STC** against HEAD
+(+32.16 ± 10.63, H1) and measured **+28.90 ± 6.98 over 3000 fixed-length STC games**. The
+four search changes are attributed only by VSTC screens - see "What this does not show".
+
+The brief was a fixed budget - one night of machine time - for at least 30 Elo, proven at
+STC. That shaped the method more than anything else here, and the method is the thing to
+read before the numbers.
+
+#### Method
+
+- **Time management was confident and tree-neutral**, so it went straight to an STC SPRT.
+- **Every search change was screened at VSTC** (2+0.02) against HEAD, one change per
+  test, before any STC time was spent on it. The first two screens used [0, 5]; the rest
+  [0, 8] with a 3000-game cap, because at ~22 minutes a screen the queue would otherwise
+  not have fitted the night. A screen *selects*; it does not certify.
+- **The survivors were combined into one build and that build was SPRT'd at STC against
+  HEAD.** That test is the proof. The screens are what chose its contents.
+- **Then a fixed-length match of the same pairing**, because an SPRT that stops on H1
+  early overestimates: run 8 stopped at 1376 games on +32.16, and the unbiased 3000-game
+  run put the same build at +28.90. `gauntlet.py` with a single opponent plays exactly the
+  SPRT's conditions with no stopping rule.
+- Every candidate was a script of asserted text replacements against HEAD, so each could
+  be built alone for its screen and the survivors stacked onto one tree. The scripted
+  stack and the tree that ships bench identically (289292 / 6514462).
+
+Conditions throughout: 1 thread, 16 MB, `UHO_Lichess_4852_v1.epd`, concurrency 14,
+`model=normalized`, alpha = beta = 0.05. Logs and the run manifest are in
+`external/games/sprt-20260926-night/`; `queue.json` names the binary, bench and PGN of
+every run, since `sprt.py` calls every dev seat `dev`. Its ids differ from the numbering
+here, which drops the two held screens.
+
+#### The runs
+
+| # | change | vs | TC, bounds | games | Elo | LLR | verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | node-share time management | HEAD | STC [0, 5] | 4082 | **+11.32 ± 6.02** | 2.96 | **H1** |
+| 2 | double extensions | HEAD | VSTC [0, 5] | 2370 | **+14.23 ± 8.69** | 2.96 | **H1** |
+| 3 | threat-indexed main history | HEAD | VSTC [0, 8] | 3000 | +6.83 ± 7.86 | 1.36 | capped |
+| 4 | table score as the pruning eval | HEAD | VSTC [0, 8] | 824 | **-33.41 ± 15.43** | -2.97 | **H0** |
+| 5 | quiet checks exempt from LMP and futility | HEAD | VSTC [0, 8] | 3000 | +8.11 ± 8.22 | 1.64 | capped |
+| 6 | cutoff-count LMR | HEAD | VSTC [0, 8] | 3000 | +9.04 ± 7.87 | 2.04 | capped |
+| 7 | fail-low prior-move credit | HEAD | VSTC [0, 8] | 3000 | -2.43 ± 7.70 | -1.58 | capped, dropped |
+| 8 | **1 + 2 + 3 + 5 + 6** | HEAD | **STC [0, 5]** | 1376 | **+32.16 ± 10.63** | 2.95 | **H1** |
+| 9 | small batch (five, below) | HEAD | VSTC [0, 8] | 2718 | +13.04 ± 8.29 | 2.98 | H1 |
+| 10 | **8, fixed length** | HEAD | STC, none | 3000 | **+28.90 ± 6.98** | - | - |
+| 11 | 8 + 9, fixed length | HEAD | STC, none | 3000 | +32.17 ± 7.06 | - | - |
+| 12 | 9 on top of 8 | 8 | STC [0, 5] | running | - | - | see below |
+
+| # | W-L-D | Ptnml(0-2) | PGN |
+|---|---|---|---|
+| 1 | 1100-967-2015 | [29, 454, 960, 551, 47] | `20260926-005557-STC.pgn` |
+| 2 | 704-607-1059 | [34, 258, 521, 321, 51] | `20260926-030701-VSTC.pgn` |
+| 3 | 848-789-1363 | [46, 362, 649, 373, 70] | `20260926-032506-VSTC.pgn` |
+| 4 | 197-276-351 | [30, 115, 184, 70, 13] | `20260926-034755-VSTC.pgn` |
+| 5 | 870-800-1330 | [62, 355, 615, 387, 81] | `20260926-035406-VSTC.pgn` |
+| 6 | 867-789-1344 | [58, 328, 653, 400, 61] | `20260926-041651-VSTC.pgn` |
+| 7 | 846-867-1287 | [67, 331, 712, 336, 54] | `20260926-043933-VSTC.pgn` |
+| 8 | 434-307-635 | [8, 128, 304, 225, 23] | `20260926-050219-STC.pgn` |
+| 9 | 760-658-1300 | [43, 303, 589, 357, 67] | `20260926-054554-VSTC.pgn` |
+| 10 | 873-624-1503 | [21, 255, 723, 456, 45] | `20260926-060701-gauntlet.pgn` |
+| 11 | 918-641-1441 | [19, 260, 692, 483, 46] | `20260926-074201-gauntlet.pgn` |
+| 12 | - | - | `20260926-091612-STC.pgn` |
+
+Two screens were written and never run, held so the proof fitted the night: score-trend
+time management (a falling score lengthens the soft target, 80-140%) and one extra ply of
+LMR at cut nodes. Both are in the pending list below.
+
+#### What shipped, and what each change is
+
+**1. Node-share time management** (`timeman.c`, `search_root()`). `search_root()` credits
+every node it spends to the root move it was spent under, cumulatively over the search and
+keyed by from/to so the count survives the root list being re-sorted. At each iteration's
+stop check the soft target is scaled by `(1400 - share) * 135 / 1000` percent, the share
+being the best move's thousandths of the nodes: 67% when it took 90% of the tree, 135% when
+it took 40%. **BASE is 1400 rather than the textbook 1500 on a measurement**: over 60 book
+positions at 6+0.08 the share at the stopping check averaged 670, and 1500 would have
+lengthened the average think by 11% - a second change riding on the first. Bench identical
+at d7 and d13; bench has no clock, and the scale lives behind `timeman_has_clock()`.
+
+**2. Double extensions.** A singular move whose alternatives all fail more than
+`DextMargin` (20) below the singular window extends two plies instead of one, off the PV,
+at most `DextMax` (6) times per line - `SearchStack.doubleExtensions`, inherited on entry
+so null-move and ProbCut children read their own line's count. Both constants have sweep
+seats. **It fails the WAC.001 probe** (no mate by depth 16, where HEAD finds it at 13) and
+roughly doubles nodes to a fixed depth on two of four probe positions; it passed its screen
+at +14 anyway. The probe was measuring tree shape, not strength - see change 5 for why
+HEAD's own depth 13 on that position was never a good yardstick.
+
+**3. Threat-indexed main history.** `history[side][from attacked][to attacked][from][to]`,
+the attacks of the side not to move computed once per node before the move loop and kept
+in `SearchStack.threats`. Every reader and writer goes through `main_hist()`, so the index
+cannot be computed two ways. The table grows 16 KB to 64 KB per thread.
+
+**5. Quiet checks exempt from LMP and futility.** Both prunes run before the move is made,
+so a quiet check was pruned like any quiet move. **HEAD first finds WAC.001's mate in two
+at depth 13** - the mating move is a quiet check at a futile node. With the exemption it is
+found at depth 3. `gives_check()` decides before the move: pawn and knight direct checks,
+then one bishop and one rook lookup from the king with the moved piece placed on its
+destination, which covers direct slider checks and discovered ones together. The cost is
++24% nodes at d13. Exempting from futility alone found nothing by depth 14; a SEE-safe
+filter on the LMP exemption changed d7 by 35 nodes and was not pursued.
+
+**6. Cutoff-count LMR.** `SearchStack.cutoffCnt` counts beta cutoffs at a ply since the
+grandparent was entered (Stockfish's scheme); a move's reduction grows by one when its
+siblings' children have cut more than three times. `stack` is `MAX_PLY + 2` so the
+grandchild clear at the deepest ply stays in bounds.
+
+Gates on the combined build: bench deterministic, `smp selftest` 11/0, `movepick selftest`
+14/0, and an assertion build of every candidate stacked ran `bench 10` clean. Movegen is
+untouched, so perft is not in play.
+
+#### Rejected
+
+**The table score as the pruning eval, -33.41 ± 15.43.** Stockfish lets RFP, razoring and
+null move read `ttValue` where its bound points past the static evaluation. Here it lost
+heavily and quickly. The likeliest reading: every margin those three use was SPSA-fitted,
+under `unc_scale()`, against the corrected *static* evaluation, and a stored score -
+often a depth-0 quiescence bound - is a different distribution. Not worth re-trying without
+refitting the margins against it.
+
+**Fail-low prior-move credit, -2.43 ± 7.70** (ROAD_TO_3600 change 4). Written first as an
+unconditional credit, which grew bench 16% at both depths; then weighted as Stockfish does
+- by depth, node type and how late the move sat in its list - which is what was screened.
+Neutral to negative. The parent already credits the same move whenever it cuts, which is
+most of the time.
+
+#### The small batch - screened, not shipped
+
+Five small refinements, each expected to be worth a few Elo and so each unmeasurable alone
+in the time available, were screened as one: RFP and quiescence stand-pat returning
+`(value + beta) / 2`; history credit for a quiet table move on a table cutoff; each
+aspiration fail high re-searching one ply shallower (Stockfish's `failedHighCnt`); and the
+search's evaluation damped by `(200 - halfmoveClock) / 200` in `corrected_eval()` - there,
+not in the evaluation, so datagen labels, the tuner and `nnue-test` are untouched.
+
+It passed its VSTC screen at +13.04 ± 8.29, but at STC the evidence is thin: runs 10 and 11
+differ by +3.3 ± ~10, and run 12 is its own SPRT. That SPRT was still running when this entry was written; its `queue.json` record is the verdict, and it belongs here when it lands. It is **not in the tree**;
+`external/patches/e42-small-batch.patch` applies cleanly on top of it, and the build it
+makes benches 275098 / 6234144.
+
+#### Time losses, and a clock that runs too low
+
+STC forfeits: run 1 dev 1, HEAD 0; run 8 dev 4, HEAD 1; run 10 none; run 11 dev 4, HEAD 0.
+Nine to one is not chance. The VSTC screens were even at dev 15, HEAD 10.
+
+Every forfeiting move overran its own hard ceiling: rebuilding the clocks from the PGNs'
+move times, the flagging side held 0.1-0.3 s and took 0.18-0.35 s, where `maximum` at that
+clock is under half of it. That is a process that did not answer in time, not an
+allocation. But the reason a hiccup is fatal is the finding worth keeping: **at 8+0.08 both
+engines' clocks run far lower than the time manager intends.** Over the 3000 games of run
+10, HEAD fell below 0.2 s in 371 of them, 12%. The dev builds do so somewhat more often
+(456 in the same run), which is where the nine-to-one comes from.
+
+That is a pre-existing property of `timeman.c`, not of this batch. The soft target is only
+checked between iterations, an iteration started just under it can run on to `maximum`,
+and `maximum` is half of whatever is left - so a run of unsettled moves halves the clock
+each time. The remedy is its own test (a floor on the bank, or a mid-iteration check of
+the soft target), and forfeits count against whoever flags, so every dev result in this
+entry is biased down by them, not up.
+
+#### What this does not show
+
+- **No change except time management holds its own STC SPRT.** Double extensions passed a
+  VSTC screen; threat history, quiet checks and cutoff-count ran to the screen's cap at
+  LOS of roughly 95-99% each. The proof is runs 8 and 10, the sum. Ablating each out of the
+  final build at STC is the pending work that attributes it.
+- **The parts do not add up, and should not be expected to.** Their estimates total about
+  +49; the build measures +29. Changes that each reshape the same tree overlap, and VSTC and
+  STC Elo are not one scale.
+- **STC only.** LTC confirmation of the whole batch is owed, as it is for E20-E22a and E29.
+- **The new constants are chosen, not fitted.** `DextMargin`, `DextMax`,
+  `NODE_SHARE_BASE`/`SCALE` and `CUTOFF_CNT_THRESHOLD` are defensible defaults. The first
+  two have sweep seats; the time-management pair are `timeman.c` constants.
+
+#### Pending
+
+| change | why |
+|---|---|
+| the time manager's clock floor (above) | forfeits, and shallow endgames |
+| ablate each of the four search changes out of the final build, STC | attribution |
+| LTC confirmation of the batch | STC-only |
+| the small batch, run 12 | not yet decided at STC |
+| score-trend time management | held for time |
+| cut-node LMR +1 (E6 measured +2 at about -16) | held for time |
+| SPSA seats: `DextMargin`, `DextMax` | defaults are chosen |

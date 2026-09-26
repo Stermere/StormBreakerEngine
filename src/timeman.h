@@ -19,10 +19,11 @@ typedef struct {
  * and what it converges on has to cover every later move's latency too. */
 void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gamePly);
 
-/* `stability` is how many consecutive iterations agreed on the best move; a
- * settled search hands its time to later moves. Only the soft target moves -
- * `maximum` is enforced separately, so an unstable position cannot flag. */
-int64_t timeman_optimum(const TimeManager *tm, int stability);
+/* `stability` is how many consecutive iterations agreed on the best move, and
+ * `bestNodesPermille` the share of the search's nodes spent under it; a settled
+ * search hands its time to later moves. Only the soft target moves - `maximum` is
+ * enforced separately, so an unstable position cannot flag. */
+int64_t timeman_optimum(const TimeManager *tm, int stability, int bestNodesPermille);
 
 /* False for `go depth`, `go nodes`, `go infinite` and bench, where the budget is a
  * sentinel rather than a deadline. Anything that shortens a search to save time must

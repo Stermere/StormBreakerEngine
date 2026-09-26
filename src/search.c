@@ -73,6 +73,22 @@ typedef struct {
     /* Set only while a singular search runs at this ply: the move that search must
      * pretend does not exist. */
     Move excludedMove;
+
+    /* Every square the side NOT to move attacks here, computed once before the move loop.
+     * The main history is keyed on it, and every reader and writer of an entry for a move
+     * made at this ply must key it on this same bitboard. */
+    Bitboard threats;
+
+    /* Beta cutoffs produced at this ply since the grandparent was entered. Read by the
+     * parent as evidence rather than expectation: children that keep failing high cheaply
+     * say the moves leading into them are being refuted, so the rest can be reduced
+     * harder. Cleared two plies up, so it describes this visit and not an unrelated one. */
+    int cutoffCnt;
+
+    /* Double extensions taken on the line from the root through the move played at this
+     * ply. A line that keeps qualifying would otherwise extend without bound, since a
+     * two-ply extension outruns the one ply each move costs. */
+    int doubleExtensions;
 } SearchStack;
 
 #define CONT_SLOTS 3
@@ -129,7 +145,12 @@ typedef struct {
      * exact move.
      */
     Move killers[MAX_PLY][2];
-    int16_t history[COLOR_NB][SQUARE_NB][SQUARE_NB];
+
+    /* [side][from attacked][to attacked][from][to]. A quiet move that lifts a piece out of
+     * an attack and one that walks a piece into one are different moves, and without the
+     * two buckets they share an entry - so a retreat that saves a knight teaches the table
+     * that the same knight step is good when nothing was threatened. */
+    int16_t history[COLOR_NB][2][2][SQUARE_NB][SQUARE_NB];
     Move counterMoves[PIECE_NB][SQUARE_NB];
 
     /*
@@ -159,7 +180,9 @@ typedef struct {
     Move pvTable[MAX_PLY][MAX_PLY];
     int pvLength[MAX_PLY];
 
-    SearchStack stack[MAX_PLY];
+    /* Two spare entries: every node clears its grandchildren's cutoff counters, and the
+     * deepest node the ply guard admits would otherwise clear one past the end. */
+    SearchStack stack[MAX_PLY + 2];
 
     /* This thread's own board. Every thread starts from the same position and then plays
      * its own moves on it, so the copy is not an optimisation. */
@@ -209,6 +232,13 @@ typedef struct {
      * was interrupted. */
     Move rootPv[MAX_PLY];
     int rootPvLength;
+
+    /* Nodes spent under each root move since this search began, keyed by from and to so
+     * the count survives the root list being re-sorted every iteration. Cumulative rather
+     * than per iteration: an aspiration re-search is real effort spent on the move, and
+     * the share is read only as a ratio. Only thread 0's is consulted, since only thread
+     * 0 owns the clock; the helpers keep one because search_root() is shared code. */
+    uint64_t rootEffort[SQUARE_NB * SQUARE_NB];
 
     /* Thread 0 owns the clock, the `info` lines and the `bestmove`; every other thread
      * exists to disturb the shared table in a useful direction and nothing else. */
@@ -495,6 +525,13 @@ TUNABLE(DELTA_MARGIN, 421);
 #define SINGULAR_DEPTH 7
 TUNABLE(SINGULAR_MARGIN, 33);
 
+/* How far below the singular window the other moves must ALL fail before the table move
+ * is treated as forced rather than merely best, and how many such plies one line may
+ * take. The cap is what makes this safe: without it a line that keeps qualifying grows
+ * the tree without limit. */
+TUNABLE(DEXT_MARGIN, 20);
+TUNABLE(DEXT_MAX, 6);
+
 #define CORR_W_UNIT 128
 /* How much the correction is believed, out of CORR_W_UNIT. A TUNABLE because how far to
  * trust a learned evaluation bias is the kind of question a sweep answers better than a
@@ -587,6 +624,10 @@ TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
  * the search and is equally true of evidence pointing either way. */
 TUNABLE(HIST_MALUS_MUL, 9);
 
+/* How many cutoffs among this node's children make them "easy", and so the next move's
+ * reduction one ply deeper. A threshold, so a sweep seat only for the ablation switch. */
+#define CUTOFF_CNT_THRESHOLD 3
+
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 10);
 
@@ -615,6 +656,8 @@ static const struct {
     {"ProbCutMargin", &PROBCUT_MARGIN, 30, 300},
     {"ProbCutDepth", &PROBCUT_DEPTH, 5, 99},
     {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
+    {"DextMargin", &DEXT_MARGIN, 0, 100},
+    {"DextMax", &DEXT_MAX, 0, 16},
     {"CorrWPawn", &CORR_W_PAWN, 0, 256},
     {"UncScaleBase", &UNC_SCALE_BASE, 60, 120},
     {"UncScaleSlope", &UNC_SCALE_SLOPE, 0, 12},
@@ -777,6 +820,33 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
     return result != 0;
 }
 
+/* Squares `c` attacks. The occupancy is the full board, so a slider stops at the first
+ * piece either way - a threat is about what can be captured now, not x-rays. */
+static Bitboard attacked_by(const Position *pos, Color c) {
+    const Bitboard occ   = occupied_bb(pos);
+    const Bitboard pawns = pieces_bb(pos, c, PAWN);
+    Bitboard att         = c == WHITE ? shift_north_east(pawns) | shift_north_west(pawns)
+                                      : shift_south_east(pawns) | shift_south_west(pawns);
+
+    for (Bitboard b = pieces_bb(pos, c, KNIGHT); b; b &= b - 1)
+        att |= knight_attacks(lsb(b));
+    for (Bitboard b = pieces2_bb(pos, c, BISHOP, QUEEN); b; b &= b - 1)
+        att |= bishop_attacks(lsb(b), occ);
+    for (Bitboard b = pieces2_bb(pos, c, ROOK, QUEEN); b; b &= b - 1)
+        att |= rook_attacks(lsb(b), occ);
+
+    return att | king_attacks(king_square(pos, c));
+}
+
+/* The main-history entry for `m` by side `c`, keyed on the threats at the node it was
+ * played from. Every access goes through here: a scoring site that buckets one way and an
+ * update site that buckets another would leave a table that is incoherent rather than
+ * wrong in any way a test could name. */
+static inline int16_t *main_hist(SearchThread *td, Color c, Bitboard threats, Move m) {
+    const Square from = from_sq(m), to = to_sq(m);
+    return &td->history[c][bb_test(threats, from)][bb_test(threats, to)][from][to];
+}
+
 /* The continuation-history slice for the move played `back` plies above `ply`, or NULL
  * when there is no such move - the top of the tree, or a null move, which is nobody's
  * plan and must not have continuations attributed to it. */
@@ -875,7 +945,8 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
             else if (m == counter)
                 score = SCORE_COUNTER;
             else
-                score = td->history[us][from_sq(m)][to_sq(m)] + cont_score(slices, moved, to_sq(m));
+                score = *main_hist(td, us, td->stack[ply].threats, m) +
+                        cont_score(slices, moved, to_sq(m));
         }
 
         list[i].score = score;
@@ -968,7 +1039,7 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
             td->killers[ply][0] = best;
         }
 
-        history_update(&td->history[us][from_sq(best)][to_sq(best)], bonus);
+        history_update(main_hist(td, us, td->stack[ply].threats, best), bonus);
         cont_hist_update(td, ply, piece_on(pos, from_sq(best)), to_sq(best), bonus);
 
         const Move prev = td->stack[ply - 1].move;
@@ -981,13 +1052,51 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
     for (int i = 0; i < quietCount; ++i) {
         if (quiets[i] == best)
             continue;
-        history_update(&td->history[us][from_sq(quiets[i])][to_sq(quiets[i])], -malus);
+        history_update(main_hist(td, us, td->stack[ply].threats, quiets[i]), -malus);
         cont_hist_update(td, ply, piece_on(pos, from_sq(quiets[i])), to_sq(quiets[i]), -malus);
     }
 
     for (int i = 0; i < captureCount; ++i)
         if (captures[i] != best)
             capture_hist_update(td, pos, captures[i], -malus);
+}
+
+/*
+ * Whether `m` checks the opponent's king, decided before it is played. The pruning below
+ * runs before the move is made, and a quiet check pruned there is the most expensive kind
+ * of mistake - the mate that a futile-looking node was hiding.
+ *
+ * Direct and discovered checks through one slider test each: the moved piece is placed on
+ * its destination in the occupancy and the slider sets, so a slider that now sees the king
+ * - the piece itself, or one it uncovered - answers both. Only normal moves are judged;
+ * castling reports false, which just leaves it prunable exactly as before, and the other
+ * special moves are tactical and never reach the quiet prunes.
+ */
+static bool gives_check(const Position *pos, Move m) {
+    if (type_of_move(m) != MT_NORMAL)
+        return false;
+
+    const Color us       = pos->sideToMove;
+    const Square ksq     = king_square(pos, (Color)(us ^ 1));
+    const Square from    = from_sq(m);
+    const Square to      = to_sq(m);
+    const PieceType pt   = type_of(piece_on(pos, from));
+    const Bitboard kingB = square_bb(ksq);
+
+    if (pt == PAWN && (pawn_attacks(us, to) & kingB))
+        return true;
+    if (pt == KNIGHT && (knight_attacks(to) & kingB))
+        return true;
+
+    const Bitboard occ = (occupied_bb(pos) ^ square_bb(from)) | square_bb(to);
+    Bitboard diag      = pieces2_bb(pos, us, BISHOP, QUEEN) & ~square_bb(from);
+    Bitboard orth      = pieces2_bb(pos, us, ROOK, QUEEN) & ~square_bb(from);
+    if (pt == BISHOP || pt == QUEEN)
+        diag |= square_bb(to);
+    if (pt == ROOK || pt == QUEEN)
+        orth |= square_bb(to);
+
+    return (bishop_attacks(ksq, occ) & diag) || (rook_attacks(ksq, occ) & orth);
 }
 
 /* Anything but kings and pawns - the test that decides whether null-move pruning is
@@ -1298,12 +1407,12 @@ int search_test_picker_contracts(void) {
 #endif
     /* History is read when quiet scoring is reached, then frozen for that
      * batch, not silently re-read on every next(). */
-    td->history[WHITE][SQ_A2][SQ_A4] = HISTORY_MAX;
+    td->history[WHITE][0][0][SQ_A2][SQ_A4] = HISTORY_MAX;
     failures += picker_next(&parent, td, pos, 1) != deferred;
     MovePicker frozen = parent;
     for (int from = 0; from < SQUARE_NB; ++from)
         for (int to = 0; to < SQUARE_NB; ++to)
-            td->history[WHITE][from][to] = (int16_t)(to * 73 - from * 31);
+            td->history[WHITE][0][0][from][to] = (int16_t)(to * 73 - from * 31);
     for (int i = 0; i < MAX_MOVES; ++i) {
         const Move a = picker_next(&parent, td, pos, 1);
         const Move b = picker_next(&frozen, td, pos, 1);
@@ -1599,6 +1708,11 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
             alpha = best;
     }
 
+    /* Quiescence reaches quiet moves only when evading a check, and scoring those reads the
+     * main history, so it needs the same key the main search would give them. */
+    if (inCheck)
+        td->stack[ply].threats = attacked_by(pos, (Color)(pos->sideToMove ^ 1));
+
     ScoredMove moves[MAX_MOVES];
     const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_CAPTURES, moves);
     MP_ADD(td, genCalls[3], 1);
@@ -1714,6 +1828,12 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     const Move excluded         = td->stack[ply].excludedMove;
     td->stack[ply].excludedMove = MOVE_NONE;
     const bool isExcluded       = excluded != MOVE_NONE;
+
+    td->stack[ply + 2].cutoffCnt = 0;
+
+    /* Inherited on entry, so a null-move or ProbCut child - which never pass through the
+     * move loop that sets it - reads this line's count rather than a sibling's. */
+    td->stack[ply].doubleExtensions = td->stack[ply - 1].doubleExtensions;
 
     /* The root is handled by search_root, so this is never ply 0 - which is what lets the
      * draw and mate-distance tests below run unconditionally. */
@@ -1992,6 +2112,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         }
     }
 
+    td->stack[ply].threats = attacked_by(pos, (Color)(us ^ 1));
+
     MovePicker picker;
     picker_init(&picker, td, pos, ttMove, excluded, ply, counter_move(td, ply));
 
@@ -2044,19 +2166,28 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             /* Late move pruning: the list is ordered, so once this many quiets have been
              * tried without raising alpha the rest overwhelmingly will not. Unlike a
              * reduction this does not re-search, which is why it is confined to low depths -
-             * and half as many get a look when the position is not improving. */
-            if (depth <= LMP_DEPTH && moveCount >= (improving ? LMP_BASE + depth * depth
-                                                              : (LMP_BASE + depth * depth) / 2))
+             * and half as many get a look when the position is not improving.
+             *
+             * A quiet CHECK is exempt here and from futility below. Both prunes decide before
+             * the move is made, and a check is exactly the quiet move whose value the
+             * ordering cannot see: on WAC.001 the mate in two is a quiet check at a futile
+             * node, and with checks prunable the engine first found it at depth 13. */
+            if (depth <= LMP_DEPTH &&
+                moveCount >=
+                    (improving ? LMP_BASE + depth * depth : (LMP_BASE + depth * depth) / 2) &&
+                !gives_check(pos, m))
                 continue;
 
             /* Futility pruning: the position is so far below alpha that a quiet move, which
              * wins no material by definition, cannot close the gap in the depth remaining.
-             * This prunes the whole quiet TAIL rather than one move, since the test does not
-             * depend on which move it is; captures keep being searched, which is the point. */
+             * This prunes the whole quiet tail but its checks, since the test does not
+             * otherwise depend on which move it is; captures keep being searched, which is
+             * the point. */
             if (depth <= FUTILITY_DEPTH && staticEval <= alpha &&
                 staticEval + FUTILITY_MARGIN * depth *
                                  unc_apply(unc_get(&uncScale, td, pos), UNC_W_FUTILITY) / 100 <=
-                    alpha)
+                    alpha &&
+                !gives_check(pos, m))
                 continue;
         }
 
@@ -2133,8 +2264,14 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             if (search_stopped())
                 return VALUE_ZERO;
 
+            /* Every other move failing far below the window is a forced move, not merely
+             * the best one, and gets a second ply - off the principal variation only,
+             * where the tree is cheap, and never past the line's cap. */
             if (v < singularBeta)
-                extension = 1;
+                extension = !pvNode && v < singularBeta - DEXT_MARGIN &&
+                                    td->stack[ply - 1].doubleExtensions < DEXT_MAX
+                                ? 2
+                                : 1;
             else if (singularBeta >= beta && !pvNode)
                 return singularBeta;
             else if (ttValue >= beta)
@@ -2153,14 +2290,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         /* Check extension: a check is the most forcing move in chess - the reply set is tiny
          * and often single - so the branch costs little and the tactics that decide games
          * live there. Bounded by ply so a perpetual cannot extend forever, and never stacked
-         * on a singular extension: one ply is the answer to "this line is forced", however
-         * many reasons there are to think so. */
+         * on a singular extension, which has already priced how forced the line is - one
+         * ply, or two when every alternative failed far below the window. */
         if (extension == 0 && givesCheck && ply < 2 * td->rootDepth)
             extension = 1;
 
         const Depth childDepth = depth - 1 + extension;
         MP_ADD(td, mainSearched, 1);
-        Value v = VALUE_NONE;
+
+        td->stack[ply].doubleExtensions = td->stack[ply - 1].doubleExtensions + (extension >= 2);
+        Value v                         = VALUE_NONE;
 
         /* LMR retries reduced fail-highs at normal depth, but a false fail-low can still
          * hide a move. Forcing moves are exempt; failed-move learning below distinguishes
@@ -2182,10 +2321,13 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             if (!improving)
                 ++r;
 
+            if (td->stack[ply + 1].cutoffCnt > CUTOFF_CNT_THRESHOLD)
+                ++r;
+
             /* A move the history tables like gets some of its reduction back, on separate
              * divisors because the two tables answer different questions and nothing says
              * one ply of evidence in either is worth the same. */
-            r -= td->history[us][from_sq(m)][to_sq(m)] / LMR_HIST_DIVISOR;
+            r -= *main_hist(td, us, td->stack[ply].threats, m) / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
             if (r < 0)
@@ -2231,6 +2373,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 raisedAlpha = true;
                 update_pv(td, ply, m);
                 if (v >= beta) {
+                    ++td->stack[ply].cutoffCnt;
+
                     /* Fail high: the opponent would avoid this line. The move that cut is
                      * credited in whichever table describes it, and everything tried before it
                      * is blamed in both. */
@@ -2338,6 +2482,8 @@ static int collect_root_moves(const Position *pos, ScoredMove *out) {
     return n;
 }
 
+static inline int root_effort_key(Move m) { return (int)from_sq(m) * SQUARE_NB + (int)to_sq(m); }
+
 /* Insertion sort by descending score. Stable, so equal-scoring moves keep their generation
  * order and the node count stays reproducible. */
 static void sort_root_moves(ScoredMove *roots, int count) {
@@ -2361,7 +2507,9 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
                          Value alpha, Value beta, Move *bestMove) {
     Value best = -VALUE_INFINITE;
 
-    td->pvLength[0] = 0;
+    /* The root is not a negamax node, so it clears its grandchildren's counters itself. */
+    td->pvLength[0]        = 0;
+    td->stack[2].cutoffCnt = 0;
 
     for (int i = 0; i < count; ++i) {
         const Move m = roots[i].m;
@@ -2373,6 +2521,8 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
         board_do_move(pos, m);
         eval_state_push(td->es, pos, m);
         tt_prefetch(pos->key);
+
+        const uint64_t nodesBefore = td->nodeCount;
 
         Value v;
         if (i == 0) {
@@ -2389,6 +2539,8 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
 
         eval_state_pop(td->es);
         board_undo_move(pos, m);
+
+        td->rootEffort[root_effort_key(m)] += td->nodeCount - nodesBefore;
 
         if (search_stopped())
             return VALUE_NONE;
@@ -2551,6 +2703,7 @@ static void thread_search(SearchThread *td) {
     td->rootScore      = VALUE_NONE;
     td->completedDepth = 0;
     td->rootPvLength   = 0;
+    memset(td->rootEffort, 0, sizeof(td->rootEffort));
 
     if (isMain)
         timeman_init(&Timer, &Limits, pos->sideToMove, pos->gamePly);
@@ -2739,10 +2892,18 @@ static void thread_search(SearchThread *td) {
 
         /* Do not begin an iteration there is no realistic chance of finishing: each costs
          * several times the last, so starting one at 90% of the budget burns the remainder
-         * and throws the result away. */
-        if (!Limits.infinite && !atomic_load(&Pondering) &&
-            elapsed_ms() >= timeman_optimum(&Timer, stability))
-            break;
+         * and throws the result away.
+         *
+         * How much of the tree went into the move about to be played says how settled the
+         * choice is in a way stability cannot: a move that has survived five iterations
+         * while its rivals soaked up half the nodes is being chased, not confirmed. */
+        if (!Limits.infinite && !atomic_load(&Pondering)) {
+            const uint64_t effort = td->rootEffort[root_effort_key(iterationBest)];
+            const int permille    = td->nodeCount ? (int)(effort * 1000 / td->nodeCount) : 1000;
+
+            if (elapsed_ms() >= timeman_optimum(&Timer, stability, permille))
+                break;
+        }
     }
 
     atomic_store(&td->publishedNodes, td->nodeCount);
