@@ -3373,3 +3373,85 @@ entry is biased down by them, not up.
 | score-trend time management | held for time |
 | cut-node LMR +1 (E6 measured +2 at about -16) | held for time |
 | SPSA seats: `DextMargin`, `DextMax` | defaults are chosen |
+
+---
+
+### E43: Reverse futility on its own uncertainty curve
+
+**Date** 2026-09-27 · **Net** `48428bbbd57e` (gen-6-pw) · **Baseline** HEAD `874d4b2`, bench
+289292 (d7) / 6514462 (d13) · **Dev bench** 279977 / 6886996 · **Status** stopped by hand at
+3194 games, **-0.33 ± 7.03**, inconclusive; code removed.
+
+NNUE.md 5c's `probe err` found the shared mapping the wrong *shape* on gen-5, and the
+per-site `UNC_W_*` weights that followed can only rescale a shape. This tested the shape
+itself, on reverse futility alone: its own curve `max(floor, min(σ * slope / 16, cap))`,
+with razoring, futility, ProbCut and delta left on the shared mapping.
+
+#### The measurement it came from
+
+`probe err` at d12 on the shipped net, scaling neutral, 700,916 paired nodes. The 1%
+downside error each band showed, in percent of the whole tree's 1% margin (382 cp), against
+the shared mapping `min(99 + σ * 9 / 16, 145)`:
+
+| σ band | nodes | needs | shared mapping |
+|---|---|---|---|
+| 0-63 | 55% | 9-34 | 99-129 |
+| 64-127 | 30% | 57-58 | 142-145 |
+| 128-191 | 10% | 109 | 145 |
+| 192+ | 5% | 231-444 | 145 |
+
+`probe unc` on the same tree: the mapping holds every node between 115 and 145, with 34% at
+the cap. The 99/9 constants are the gen-6-pw `unc-probe -ref` re-centring, not an SPSA fit.
+
+#### The curve, and how it was centred
+
+Shape from the table: a floor near 30, about 0.75 per centipawn of σ above σ ~40, a plateau
+near 330. One scale factor was then solved so that the node-weighted mean over the nodes
+where RFP actually consults the head equals what the shipped mapping gave those same nodes:
+129, over 2,182,422 nodes at bench d13. The nodes were recorded by a throwaway build whose
+bench reproduced the baseline's, so the population is the baseline's own tree. Centring on
+100 instead would have added a 23% global tightening to the shape change, which is two
+changes. The result was `max(61, min(σ * 24 / 16, 667))`: tighter than shipped on 74% of
+those nodes, wider on 26%, and 39% at the floor.
+
+Because the head is a whole inference, the node cache was changed to hold σ rather than a
+scale. That refactor alone reproduced both bench counts and the neutral probe exactly
+before the curve went in. Gates: perft (all four suites), smp-test 11/0, openbench-check,
+movepick-test 14/0, chess960-test, and the debug bench and d16 searches assertion-clean.
+The classical bench was unchanged at 274441, since a net without the head keeps the shared
+mapping.
+
+#### The run
+
+| STC 8+0.08, 1 thread, 16 MB, UHO, normalized [0, 5] | |
+|---|---|
+| Games | 3194, stopped by hand at 1h40m |
+| **Elo / nElo** | **-0.33 ± 7.03** / -0.56 ± 12.07 |
+| LLR / LOS | -0.40 / 46.4% |
+| Ptnml | [40, 385, 740, 390, 36], draw 46.5%, pairs 1.00 |
+| PGN | `20260927-125032-STC.pgn` |
+
+The panel's W/L/D (794-797-1591) sums to 3182 against its own count of 3194. The PGN holds
+3194 games, dev 798-800-1596, all normal terminations and **no time losses**. The Elo and
+LLR above are the panel's.
+
+It was stopped rather than run to a boundary because the question was whether this is a
+30-50 Elo idea. The interval's upper end, +6.7, already answers that, and a [0, 5] test
+whose true value is near zero needs on the order of 25,000 games to decide (E41). This is
+not an H0 acceptance.
+
+#### What it says
+
+**The 1% quantile is not the margin the search wants.** The curve fired - bench moved -3.2%
+at d7 and +5.7% at d13 - and tighter margins on the confident three quarters and wider ones
+on the uncertain quarter came out even. Two readings, not separated here: the quantile was
+always a proxy for the optimal margin (NNUE.md 5c says so), and null move and futility
+catch much of what RFP stops pruning at the uncertain nodes. This is E27's re-centring
+lesson from the other side: the probe describes the error, but it does not choose the
+margin.
+
+**It closes the search side of the head for large gains.** Margin scaling banked about +47
+(E20, E21). Since then: re-centring -7.4, sigma-scaled LMR -29.9, sigma-weighted history
+-1.4, and this, about 0. An SPSA over the three curve seats might find a few Elo and was not
+judged worth the machine time. What would reopen it is a shape fitted by games rather than
+by the probe.

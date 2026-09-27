@@ -1325,6 +1325,12 @@ requirement of 272. So each site now carries its own weight on the mapping's
 deviation from 100, which is orthogonal to the margin constant beside it. See
 `UNC_W_UNIT` in `src/search.c`, and item 3 of [STATUS.md](STATUS.md).
 
+**The shape itself was then tested, and it did not pay.** On gen-6-pw, reverse futility got
+its own proportional-with-floor curve, shaped by this table's method and centred on the
+shipped mean: -0.33 ± 7.03 over 3194 games, stopped inconclusive
+([E43](EXPERIMENTS.md#e43-reverse-futility-on-its-own-uncertainty-curve)). Treat the table
+as a description of the error and not as a margin to adopt.
+
 ---
 
 ## Task 6 — a layer stack after the accumulator

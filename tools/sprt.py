@@ -185,7 +185,11 @@ def main() -> int:
     ap.add_argument("--bounds", help='"elo0,elo1"; defaults per time control')
     ap.add_argument("--concurrency", type=int, default=0)
     ap.add_argument("--hash", type=int, default=16, dest="hash_mb")
-    ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--threads", type=int, default=1,
+                    help="search threads per engine; base's alone when --dev-threads is given")
+    ap.add_argument("--dev-threads", type=int,
+                    help="search threads for dev only, e.g. 4 against base's --threads 1. "
+                         "Without --concurrency, concurrency is divided by the larger count")
     ap.add_argument("--rounds", type=int, default=40000, help="game-pair cap; default runs to a verdict")
     ap.add_argument("--book")
     ap.add_argument("--syzygy",
@@ -207,8 +211,41 @@ def main() -> int:
 
     tc, tc_label = c.resolve_tc(args.tc)
     elo0, elo1 = c.resolve_bounds(tc_label, args.bounds)
-    concurrency = args.concurrency if args.concurrency > 0 else c.default_concurrency()
     rounds = args.rounds
+
+    dev_options = {}
+    if args.dev_from:
+        dev_options.update(options_from_state(args.dev_from))
+    if args.dev_options:
+        dev_options.update(parse_options(args.dev_options))
+
+    # Threads and Hash also go on -each, which fastchess sends AFTER an engine's own
+    # options - so either one here would be silently overridden, and the test would
+    # measure something other than what its command line says.
+    if "Hash" in dev_options:
+        c.fail("--dev-options Hash would be overridden by --hash, which applies to both engines")
+        return 2
+    dev_threads = args.dev_threads
+    if "Threads" in dev_options:
+        try:
+            given = int(dev_options.pop("Threads"))
+        except ValueError:
+            c.fail("--dev-options Threads must be a whole number")
+            return 2
+        if dev_threads is not None and dev_threads != given:
+            c.fail(f"--dev-options Threads={given} disagrees with --dev-threads {dev_threads}")
+            return 2
+        dev_threads = given
+    if (dev_threads is not None and dev_threads < 1) or args.threads < 1:
+        c.fail("thread counts must be at least 1")
+        return 2
+
+    # Only the side to move searches, so a game's peak demand is the LARGER count, not
+    # the sum. The default assumes one thread per game; oversubscribing turns a
+    # time-control result into a measurement of the scheduler.
+    peak = max(args.threads, dev_threads or 1)
+    concurrency = (args.concurrency if args.concurrency > 0
+                   else max(1, c.default_concurrency() // peak))
 
     # ------------------------------------------------------------ engines --
 
@@ -242,11 +279,13 @@ def main() -> int:
         if Path(dev_path) == Path(base_path):
             dev_name, base_name = "tuned", "default"
 
-    dev_options = {}
-    if args.dev_from:
-        dev_options.update(options_from_state(args.dev_from))
-    if args.dev_options:
-        dev_options.update(parse_options(args.dev_options))
+    # Per-engine Threads when they differ, and then none on -each for the reason above.
+    base_options = {}
+    each_threads = args.threads
+    if dev_threads is not None:
+        dev_options["Threads"] = dev_threads
+        base_options["Threads"] = args.threads
+        each_threads = None
 
     book = args.book or c.get_book()
 
@@ -263,14 +302,14 @@ def main() -> int:
     fc_args = c.match_args(
         engines=[
             c.engine_args(dev_path, dev_name, dev_options),
-            c.engine_args(base_path, base_name),
+            c.engine_args(base_path, base_name, base_options),
         ],
         tc=tc,
         rounds=rounds,
         concurrency=concurrency,
         pgn=pgn,
         hash_mb=args.hash_mb,
-        threads=args.threads,
+        threads=each_threads,
         book=book,
         extra=extra,
         syzygy=args.syzygy,
@@ -283,7 +322,10 @@ def main() -> int:
     if not args.smoke:
         print(f"  bounds       [{elo0}, {elo1}]  alpha=0.05 beta=0.05")
     print(f"  concurrency  {concurrency}")
-    print(f"  hash/threads {args.hash_mb} MB / {args.threads}")
+    if dev_threads is None:
+        print(f"  hash/threads {args.hash_mb} MB / {args.threads}")
+    else:
+        print(f"  hash/threads {args.hash_mb} MB / dev {dev_threads}, base {args.threads}")
     if book:
         print(f"  book         {book}")
     if args.syzygy:

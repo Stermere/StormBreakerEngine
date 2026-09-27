@@ -50,6 +50,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | `make unc-probe`: the sigma distribution the margin scaling is centred on | built (NNUE.md 5c) |
 | The mapping re-centred onto the gen-5 net (`UncSigmaBase` 57, `UncSigmaSlope` 12) | tried, **-7.4 ± 20.0** (E27), rejected |
 | Search: sigma-scaled LMR (`LmrSigmaLo` / `LmrSigmaHi`) | tried, **-29.9 ± 29.6** (E27), reverted |
+| Search: reverse futility on its own σ curve, shaped by `probe err` | stopped inconclusive, **-0.33 ± 7.03** at 3194 games; code removed ([E43](EXPERIMENTS.md#e43-reverse-futility-on-its-own-uncertainty-curve)) |
 | Search: surprise-weighted quiet rewards | stopped inconclusive, **-1.40 ± 11.94** at 1238 games; code removed ([E30](EXPERIMENTS.md#e30-surprise-weighted-quiet-history)) |
 | Search: pawn-structure move history, rescue credit, evidence penalties | tried, **removing them is not a loss** — +1.53 ± 3.35 over 13,830 games, LLR +2.95 on [-5, 0]; code removed ([E39](EXPERIMENTS.md#e39-the-pawn-history-stack-is-removed)) |
 | Correction history (pawn-structure keyed) — **kept**, not the same feature | +25.8 Elo (E14), untouched by E39 |

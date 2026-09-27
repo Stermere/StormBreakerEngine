@@ -326,7 +326,7 @@ def match_args(
     concurrency: int,
     pgn: Path | None,
     hash_mb: int = 16,
-    threads: int = 1,
+    threads: int | None = 1,
     book: str | None = None,
     extra: list[str] | None = None,
     depth: int | None = None,
@@ -347,6 +347,11 @@ def match_args(
     is played, so pointing one side at them and not the other measures the
     tables rather than the patch. The engine loads none unless told to, which
     is why a change to tablebase code is invisible to a match without this.
+
+    `threads=None` leaves Threads off `-each`, for a caller that puts it on
+    each engine instead. It cannot simply be given twice: fastchess APPENDS an
+    `-each` option after the engine's own and sends both in order, so a shared
+    Threads=1 silently overrides a per-engine Threads=4.
     """
     args: list[str] = []
     for e in engines:
@@ -355,8 +360,9 @@ def match_args(
         "-each",
         f"depth={depth}" if depth else f"tc={tc}",
         f"option.Hash={hash_mb}",
-        f"option.Threads={threads}",
     ]
+    if threads is not None:
+        args.append(f"option.Threads={threads}")
     if syzygy:
         args.append(f"option.SyzygyPath={Path(syzygy).resolve()}")
     args += [
