@@ -418,7 +418,7 @@ perturbations, and of nothing else.**
 | `-openingscore N` | 300 | throw the game away if the opening is already decided by more than this |
 | `-dfrc P` | 0 (off) | P percent of games start from a Double Fischer Random array instead — see below |
 | `-dfrcopening N` or `MIN-MAX` | 2-3 | random plies after a DFRC start, in place of `-opening` |
-| `-random N` | 0 (off) | 1-in-N chance per ply that a random legal move is played instead of the search's — see below |
+| `-random N` | 0 (off) | 1-in-N chance per ply that the search's move is replaced — by a random legal move, or with `-randompick uncertain` by a verified move into a position the net is unsure of; see "Directing a generation at the net's uncertainty" |
 | `-randomply MIN-MAX` | 8-60 | the plies `-random` may fire in |
 
 Only the line offsets of a book are held in memory, so a 50 MB book costs ~6 MB
@@ -466,7 +466,8 @@ mixture away from P; and nothing is drawn at all when P is 0, so older shards
 still reproduce. The records carry their own source tag, `dfrc`, which is what
 makes the share an experiment rather than a commitment: `--sources` and the
 per-source weights can lower it at training time, never raise it. gen-006 is
-the first generation to use it, at 10%, with no book and `-opening 8-9`.
+the first generation to use it, at 10%, with no book and `-opening 8-21` (its
+shard manifests say so; `8-9` was the plan before the run).
 
 Castling in those records is encoded from the position's own geometry rather
 than inferred as "the outermost rook", which is wrong on a 960 board once the
@@ -533,6 +534,110 @@ variation, which quietly made the engine's own opening taste the only opening
 the net ever sees — and made the game result nearly uninformative, since two
 games share no position to attribute a differing result to. `-book` replaced
 that; see "Openings" above.
+
+### Directing a generation at the net's uncertainty
+
+Coverage, not labels and not capacity, is what has bounded every net since
+E18: a much better labeller on the same positions bought little (E18), and a
+twice-wider net on the same positions bought nothing (E27, E41). `-random`
+exists for coverage - self-play walks the lines the engine already likes -
+but what it plays when it fires is a uniformly random legal move, which is
+usually a blunder: the game after it is a conversion the net already
+evaluates well, and every record before it inherits a result the blunder
+decided. The uncertainty head (Task 5b) is a map of where the current net
+expects to be wrong, so it can say where a perturbation should send the game
+instead:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `-randompick uniform\|uncertain` | uniform | what a `-random` perturbation plays |
+| `-randommargin M` | 100 | centipawns an uncertain pick may concede to the search's own move |
+
+`uncertain` keeps the firing - same `-random` chance, same `-randomply`
+window, same plies for one seed - and changes the move. It ranks the QUIET,
+non-checking alternatives by the signal of the position each leads to, keeps
+the four that beat the search's own move, and runs a real search restricted
+to them (`searchmoves`, the game's node budget). Its choice is played if it
+concedes at most `-randommargin`; otherwise the search's own move stands. It
+never falls back to a random move, which is the move this mode exists to
+replace. It is refused on a net without the head, and `uniform` stays the
+default and byte-identical to what `-random` always played.
+
+Quiet because the head was trained on quiet positions: after a capture the
+child has a recapture pending, its evaluation is off by a piece, and it looks
+uncertain for a reason the next ply resolves. A child in check is never ranked
+for the same reason, and neither is anything the tablebases already answer.
+
+The point is not only the one position. The engine then plays the game on
+from somewhere the net is unsure of, so the positions that follow get labels,
+and the game's result says how that kind of position actually resolves.
+
+**The signal is not the head's raw sigma.** Sigma is a predicted error in
+centipawns, and the trainer's loss is taken in win-probability space
+(`--sigmoid-k 400`, `--score-clip 2000`). An evaluation that says +1500 where
+the truth is +1800 is 300cp wrong and almost exactly right about the result,
+so ranking by raw sigma would steer toward decided positions. The signal is
+`sigma * 4p(1-p)` at the position's evaluation - the error as the loss will
+see it, still in centipawns at equality. Mate and tablebase scores clip to
+the edge of the curve and count for almost nothing, which is right: they are
+proven.
+
+**Whether the head can rank anything was measured before any of this was
+built on it.** gen-6-pw's checkpoint scored 983,040 records of `val-006`, and
+each keying was compared against the record's real win-probability error
+`|sigmoid(value / 400) - sigmoid(label / 400)|`:
+
+| key | Spearman with the real error | real error by decile, lowest to highest key (x mean) |
+|---|---|---|
+| **signal** | **0.572** | 0.07 0.32 0.81 0.81 0.92 1.02 1.13 1.26 1.47 **2.17** |
+| 4p(1-p) alone | 0.252 | 0.14 0.35 1.28 1.61 1.47 1.23 1.09 0.98 0.91 0.94 |
+| raw sigma | - | 0.32 0.64 0.87 1.08 1.27 1.28 1.26 1.04 1.29 0.95 |
+
+Raw sigma is flat past its fifth decile, which is the decided-position problem
+above made visible. The signal is monotonic. Restricted to balanced positions
+(|label| < 300, 479,030 records) raw sigma alone still sorts the error at
+0.494, 0.26x in its bottom decile to 2.36x in its top: the head is not merely
+rediscovering which positions are balanced.
+
+**What it does, measured.** Both modes report, per perturbation actually
+played, what it cost the side that played it by the engine's next search
+(`random_drop_mean_cp`) and the signal of the position it landed in
+(`random_land_signal_mean`). gen-6's own settings (no book, `-opening 8-21`,
+`-dfrc 10`, `-dfrcopening 2-5`, 3-4-5 tables, `-nodes 10000`), HEAD's
+gen-6-pw engine, 1,600 games a row on one seed; "run signal" is the mean over
+every quiet position the run played through:
+
+| | played per game | cost each | lands at signal | run signal | quiet positions per game |
+|---|---|---|---|---|---|
+| none | 0 | - | - | 37.6 | 100.5 |
+| uniform, `-random 32` | 1.44 | 500cp | 34.1 | 33.1 | 87.2 |
+| uncertain, `-random 32`, margin 100 | 0.28 | 53cp | 52.6 | 38.2 | 101.4 |
+| uncertain, `-random 8`, margin 100 | 1.04 | 57cp | 51.7 | 38.7 | 99.5 |
+| uncertain, `-random 8`, margin 200 | 1.95 | 107cp | 52.5 | 37.1 | 98.5 |
+
+A uniform move lands somewhere *more* certain than the plain game line - the
+net is rarely unsure what a blunder is worth - and ends games early. An
+uncertain pick lands near the game line's 75th percentile at a tenth of the
+cost. It passes the margin less often than it fires (20% of ranked picks at
+100cp, 37% at 200), so it wants `-random` about four times as frequent as a
+uniform setting would for the same number played. The extra search per firing
+did not show in wall time at `-random 8`, and `-random 8` with a 100cp margin
+writes 97.1 records per game - no fewer than an unperturbed generation.
+
+**Two things built on the way and removed, recorded so neither is re-derived.**
+
+- *The same pick as a separate `-steer` flag,* judged on whether it raised the
+  mean signal of every position written. It barely did - +1.6% at 2.4 steered
+  moves a game - and it was removed on that basis. The comparison was wrong: a
+  perturbation replaces a *random* move, not nothing, so the baseline is the
+  uniform row above, and the gain is in where the game goes and how it
+  resolves from there, not in an average over positions it never touched.
+- *`-focus`, a filter that wrote only the positions above a signal threshold.*
+  It worked as designed - a step at 40 kept 46.8% of positions holding x1.40
+  the real error per record, and cut decisive scores from 7.5% to 2.0% - and
+  was removed by choice rather than on a measurement: every position it
+  dropped had already cost its search, so dropping it saves disk and training
+  time and nothing else, and the extension is to be trained on all of them.
 
 ### What the first dataset looked like
 

@@ -640,6 +640,33 @@ datagen-test: datagen
 	    || { echo 'FAIL: a perturbed shard did not reproduce from its seed'; exit 1; }
 	@echo "PASS: a perturbed shard reproduces from its seed"
 
+# And that -randompick is what it claims. uniform is the default and has to be
+# the perturbation -random always played, byte for byte; uncertain has to play
+# something else, still verify, and still be a function of its seed - it runs
+# an extra search per firing, and a search is exactly where a stray source of
+# nondeterminism would get in.
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/pick-uniform.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 4 -randompick uniform -quiet
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-on.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/pick-uniform.cnn -n 100000); \
+	 [ "$$a" = "$$b" ] \
+	    || { echo 'FAIL: -randompick uniform is not the default perturbation'; exit 1; }
+	@echo "PASS: -randompick uniform is what -random always played"
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/pick-uncertain.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 4 -randompick uncertain -quiet
+	./datagen$(SUFFIX) selfplay -o $(DATAGEN_TEST_DIR)/pick-again.cnn \
+	    -games 6 -nodes 2000 -seed 7 -random 4 -randompick uncertain -quiet
+	./datagen$(SUFFIX) verify $(DATAGEN_TEST_DIR)/pick-uncertain.cnn
+	@a=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-on.cnn -n 100000); \
+	 b=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/noise-off.cnn -n 100000); \
+	 c=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/pick-uncertain.cnn -n 100000); \
+	 d=$$(./datagen$(SUFFIX) dump $(DATAGEN_TEST_DIR)/pick-again.cnn -n 100000); \
+	 [ "$$c" != "$$a" ] && [ "$$c" != "$$b" ] \
+	    || { echo 'FAIL: -randompick uncertain played no pick of its own'; exit 1; }; \
+	 [ "$$c" = "$$d" ] \
+	    || { echo 'FAIL: an uncertain-pick shard did not reproduce from its seed'; exit 1; }
+	@echo "PASS: -randompick uncertain plays its own moves, verifies, and reproduces"
+
 # And that a game stopped by the ply cap records NO result rather than a
 # fabricated draw. Every game in range.cnn was cut off by -maxplies 4, so
 # every record must carry WDL 3 (unknown) - the value the trainer treats as

@@ -173,6 +173,10 @@ run_selfplay() {
     [ -z "${SELFPLAY_RANDOM:-}" ] || _sp_opts="$_sp_opts -random $SELFPLAY_RANDOM"
     [ -z "${SELFPLAY_RANDOM_PLY:-}" ] \
         || _sp_opts="$_sp_opts -randomply $SELFPLAY_RANDOM_PLY"
+    [ -z "${SELFPLAY_RANDOM_PICK:-}" ] \
+        || _sp_opts="$_sp_opts -randompick $SELFPLAY_RANDOM_PICK"
+    [ -z "${SELFPLAY_RANDOM_MARGIN:-}" ] \
+        || _sp_opts="$_sp_opts -randommargin $SELFPLAY_RANDOM_MARGIN"
     log "selfplay options:${_sp_opts:- (datagen defaults)}"
 
     _i=0

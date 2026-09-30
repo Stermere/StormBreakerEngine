@@ -3455,3 +3455,78 @@ margin.
 -1.4, and this, about 0. An SPSA over the three curve seats might find a few Elo and was not
 judged worth the machine time. What would reopen it is a shape fitted by games rather than
 by the probe.
+
+---
+
+### E44: Perturbations into uncertainty, and a gen-6 val set
+
+**Date** 2026-09-27 to 09-29 · **Net** `48428bbbd57e` (gen-6-pw) · **Engine** `884e652`,
+search identical to `874d4b2` · **Status** built and gated; no net trained on it yet, so
+**no Elo claim**. The design and every table are in [NNUE.md](NNUE.md), "Directing a
+generation at the net's uncertainty"; this entry records what was measured and what it
+licenses.
+
+E43 closed the search side of the uncertainty head for large gains. This spends it where
+E18, E27 and E41 say the constraint is - coverage - by deciding where a generation's
+perturbations send its games.
+
+#### A gen-6 validation set
+
+`external/data/val-006.cnn`: **1,969,285 records** from 20,000 games at gen-6's exact
+settings (no book, `-opening 8-21`, `-dfrc 10`, `-dfrcopening 2-5`, `-openingscore 300`,
+3-4-5 tables, 10,000 nodes, 64 MB), seed 900000001, built from a clean worktree so every
+manifest reads `884e652`. Shuffled with cross-worker dedup (23,227 dropped); `verify` passes.
+It replaces a gen-5 set labelled by a weaker engine, which every gen-6 run so far has been
+validated against. Unperturbed on purpose: it is the distribution the engine plays.
+
+#### Does the head rank the error that the loss sees?
+
+Scored on 983,040 `val-006` records with the gen-6-pw checkpoint: the signal (sigma weighted
+by `4p(1-p)` at the label) has Spearman **0.572** with the real win-probability error, against
+0.252 for `4p(1-p)` alone. Its top decile carries **2.17x** the mean error and its bottom
+0.07x. Raw sigma is flat past its fifth decile, because decided positions have large
+centipawn errors and almost no win-probability error. Among balanced positions raw sigma
+still sorts the error at 0.494.
+
+#### `-randompick uncertain`: what a perturbation plays
+
+`-random` fires as before; this changes the move. The four quiet, non-checking alternatives
+whose resulting positions have the highest signal - above the search's own move's - go to a
+`searchmoves` search at the game's node budget, and its choice is played if it concedes at
+most `-randommargin`; otherwise the search's move stands. Per perturbation played, both modes
+report the cost by the next search and the signal of the position it landed in. gen-6's
+settings, 1,600 games a row on one seed:
+
+| | played per game | cost each | lands at signal | run signal |
+|---|---|---|---|---|
+| none | 0 | - | - | 37.6 |
+| uniform, `-random 32` | 1.44 | 500cp | 34.1 | 33.1 |
+| uncertain, `-random 8`, 100cp | 1.04 | 57cp | 51.7 | 38.7 |
+| uncertain, `-random 8`, 200cp | 1.95 | 107cp | 52.5 | 37.1 |
+
+A uniform move lands somewhere more certain than the plain game line and shortens games (87
+quiet positions against 100); an uncertain pick lands near the line's 75th percentile at a
+tenth of the cost, and `-random 8` at 100cp still writes **97.1 records per game**. `uniform`
+is the default and is byte-identical to HEAD's `-random` on three command lines (plain,
+`-random 4`, and with DFRC and tablebases), policy sidecars included.
+
+#### Built and removed on the way
+
+**The same pick as a `-steer` flag,** judged on the mean signal of every position written -
++1.6% at 2.4 moves a game - and removed. That was the wrong comparison: a perturbation
+replaces a random move, not nothing, so the baseline is the uniform row, and the gain is in
+where the game goes and how it resolves from there.
+
+**`-focus`, a filter writing only positions above a signal threshold.** A step at 40 kept
+46.8% of positions with x1.40 the real error per record (a proportional ramp plateaued at
+x1.35) and cut decisive scores from 7.5% to 2.0%. Removed by choice, not on a measurement:
+every position it dropped had already cost its search, and the extension is to be trained on
+all of them.
+
+#### What this does not show
+
+That a net trained on this data is stronger. That is the gen-6 extension's SPRT: the same
+recipe on gen-006 plus an extension generated with uncertain perturbations, against
+gen-6-pw, both validated on val-006. gen-006 had no perturbations at all, so that SPRT prices
+"perturbed games" and "perturbed toward uncertainty" together; separating them would need a
+uniform-perturbation extension of the same size.

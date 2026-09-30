@@ -243,7 +243,7 @@ every game in the generation on the same side.
 Double Fischer Random array instead, with `SELFPLAY_DFRC_OPENING` random plies
 after it. Those records carry the `dfrc` source tag, so the trainer can lower
 the share later without a regeneration. `gen-006` runs with no book,
-`SELFPLAY_OPENING=8-9` and `SELFPLAY_DFRC=10`.
+`SELFPLAY_OPENING=8-21` and `SELFPLAY_DFRC=10`.
 
 Unlike the net, the book is **not** part of the provisioning stamp — it is a
 runtime input, not a build input, so changing it does not cost the fleet a

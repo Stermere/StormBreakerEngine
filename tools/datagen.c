@@ -831,6 +831,13 @@ typedef struct {
     int randomChance;
     int randomPlyMin;
     int randomPlyMax;
+    const char *randomPick;
+    int randomMargin;
+    uint64_t randomFired;
+    uint64_t randomRanked;
+    uint64_t randomPlayed;
+    double randomDrop;
+    double randomLand;
     int maxPlies;
 
     bool gameProgress;
@@ -924,6 +931,19 @@ static void manifest_write(const char *shardPath, const Manifest *m, uint64_t re
         fprintf(f, "    \"random_chance\": %d,\n", m->randomChance);
         fprintf(f, "    \"random_ply_min\": %d,\n", m->randomPlyMin);
         fprintf(f, "    \"random_ply_max\": %d,\n", m->randomPlyMax);
+        fprintf(f, "    \"random_pick\": ");
+        json_string(f, m->randomPick ? m->randomPick : "uniform");
+        fprintf(f, ",\n");
+        fprintf(f, "    \"random_margin\": %d,\n", m->randomMargin);
+        fprintf(f, "    \"random_fired\": %llu,\n", (unsigned long long)m->randomFired);
+        fprintf(f, "    \"random_ranked\": %llu,\n", (unsigned long long)m->randomRanked);
+        fprintf(f, "    \"random_played\": %llu,\n", (unsigned long long)m->randomPlayed);
+        /* What a perturbation cost the side that played it, by the engine's own next search:
+         * the number that says how much of each earlier record's game result it spent. */
+        fprintf(f, "    \"random_drop_mean_cp\": %.1f,\n", m->randomDrop);
+        /* And the uncertainty signal of the position it landed in - 0 on a net without the
+         * head. The two together say whether a pick mode is doing its job. */
+        fprintf(f, "    \"random_land_signal_mean\": %.1f,\n", m->randomLand);
         fprintf(f, "    \"max_plies\": %d,\n", m->maxPlies);
         fprintf(f, "    \"game_progress\": %s\n", m->gameProgress ? "true" : "false");
         fprintf(f, "  },\n");
@@ -1465,6 +1485,9 @@ typedef struct {
     int randomChance;
     int randomPlyMin;
     int randomPlyMax;
+    /* What a perturbation plays: any legal move, or uncertain_move()'s. */
+    bool randomUncertain;
+    int randomMargin;
 
     int maxPlies;
     const char *syzygyPath;
@@ -1548,6 +1571,149 @@ static bool random_opening(Position *pos, int plies, Rng *rng) {
     return board_checkers(pos) == BB_EMPTY;
 }
 
+/*
+ * UNCERTAINTY-DIRECTED PERTURBATION. Coverage, not label quality or capacity, is what bounds
+ * the net (E18, E27, E41), and the uncertainty head is a map of where the net expects to be
+ * wrong. `-randompick uncertain` uses it to decide what a -random perturbation PLAYS: a sound
+ * move into a position the net is unsure of, rather than any legal move - so the game goes
+ * on to show how such a position is actually played.
+ *
+ * The head is read through a full accumulation with no accumulator stack. That is a few
+ * microseconds against a search of thousands of nodes, and it keeps this file out of the
+ * per-thread state the search owns.
+ */
+#ifdef EVAL_NNUE
+static bool sigma_available(void) { return nnue_has_uncertainty(); }
+static int position_sigma(const Position *pos) { return (int)nnue_uncertainty(NULL, pos); }
+static int position_eval(const Position *pos) { return (int)nnue_evaluate(pos); }
+#else
+static bool sigma_available(void) { return false; }
+static int position_sigma(const Position *pos) {
+    (void)pos;
+    return 0;
+}
+static int position_eval(const Position *pos) {
+    (void)pos;
+    return 0;
+}
+#endif
+
+/* The trainer's --sigmoid-k and --score-clip for every gen-6 net. The loss is MSE in
+ * win-probability space, so these two decide how much a centipawn of error is worth. */
+#define SIGNAL_SIGMOID_K  400.0
+#define SIGNAL_SCORE_CLIP 2000
+
+static int clip_score(int score) {
+    return score < -SIGNAL_SCORE_CLIP  ? -SIGNAL_SCORE_CLIP
+           : score > SIGNAL_SCORE_CLIP ? SIGNAL_SCORE_CLIP
+                                       : score;
+}
+
+/*
+ * sigma as the LOSS sees it rather than as the head reports it, still in centipawns at
+ * equality: sigma * 4p(1-p) at the position's score. Without this the ranking prefers
+ * lopsided positions, because an evaluation that says +1500 where the truth is +1800 has
+ * a large error in centipawns and almost none in win probability - which is the only error
+ * the trainer can see and the only one that costs games. Mate and tablebase scores clip
+ * to the edge of the curve and weigh almost nothing, which is correct: they are proven.
+ */
+static int uncertainty_signal(int sigma, int score) {
+    const double p = 1.0 / (1.0 + exp(-(double)clip_score(score) / SIGNAL_SIGMOID_K));
+    return (int)lround((double)sigma * 4.0 * p * (1.0 - p));
+}
+
+/* How many of the most uncertain alternatives the verification search chooses among. Wider
+ * finds a playable move more often, and dilutes the pick toward moves barely more uncertain
+ * than the one the search wanted. */
+enum { UNCERTAIN_CANDIDATES = 4 };
+
+/*
+ * What `-randompick uncertain` plays when a perturbation fires, or MOVE_NONE to let the
+ * search's own `best` stand.
+ *
+ * A uniformly random move is usually a blunder: the game after it is a conversion the net
+ * already knows how to evaluate, and every record before it inherits a result the blunder
+ * decided. This picks instead a move into a position the net is UNSURE of, and lets the
+ * engine play the game on from there - which is the point: those positions get labels, and
+ * the game shows how they actually resolve.
+ *
+ * Candidates are the QUIET, non-checking alternatives whose resulting position has a higher
+ * uncertainty_signal() than the one `best` leads to. Quiet because the head was trained on quiet
+ * positions: after a capture the child has a recapture pending, its evaluation is off by a
+ * piece, and it looks uncertain for a reason the next ply resolves. A child in check is never
+ * ranked for the same reason, and neither is anything the tablebases already answer.
+ *
+ * The ranking is static, so it never picks the move alone. A real search restricted to the
+ * top candidates (`searchmoves`, the game's own node budget) chooses among them, and its
+ * choice is played only if it concedes at most `-randommargin` to the search that chose
+ * `best`. The search costs one more search per firing, which at a perturbation's rate is
+ * noise against the hundred a game runs.
+ */
+static Move uncertain_move(Position *pos, const Move *legal, int legalCount, Move best,
+                           int bestScore, const SelfplayOpts *o, bool *ranked) {
+    *ranked = false;
+
+    const int tbMen = syzygy_max_pieces();
+    if (tbMen > 0 && popcount(occupied_bb(pos)) <= tbMen)
+        return MOVE_NONE;
+
+    board_do_move(pos, best);
+    const int bestSignal = uncertainty_signal(position_sigma(pos), position_eval(pos));
+    board_undo_move(pos, best);
+
+    Move cand[UNCERTAIN_CANDIDATES];
+    int candSignal[UNCERTAIN_CANDIDATES];
+    int count = 0;
+
+    for (int i = 0; i < legalCount; ++i) {
+        const Move m = legal[i];
+        if (m == best || move_is_tactical(pos, m))
+            continue;
+
+        board_do_move(pos, m);
+        const bool check = board_checkers(pos) != BB_EMPTY;
+        const int signal = check ? 0 : uncertainty_signal(position_sigma(pos), position_eval(pos));
+        board_undo_move(pos, m);
+
+        if (check || signal <= bestSignal)
+            continue;
+
+        /* Kept highest first. A newcomer replaces the last entry and bubbles up; ties keep
+         * generation order, so the candidate set is a function of the position alone. */
+        int at;
+        if (count < UNCERTAIN_CANDIDATES)
+            at = count++;
+        else if (signal > candSignal[UNCERTAIN_CANDIDATES - 1])
+            at = UNCERTAIN_CANDIDATES - 1;
+        else
+            continue;
+        for (; at > 0 && candSignal[at - 1] < signal; --at) {
+            cand[at]       = cand[at - 1];
+            candSignal[at] = candSignal[at - 1];
+        }
+        cand[at]       = m;
+        candSignal[at] = signal;
+    }
+
+    if (count == 0)
+        return MOVE_NONE;
+    *ranked = true;
+
+    SearchLimits limits;
+    search_limits_clear(&limits);
+    limits.nodes = (uint64_t)o->nodes;
+    for (int i = 0; i < count; ++i)
+        limits.searchmoves[i] = cand[i];
+    limits.searchmovesCount = count;
+
+    SearchResult res;
+    search_run_sync(pos, &limits, &res);
+
+    if (!is_ok_move(res.best) || res.score == VALUE_NONE || res.score < bestScore - o->randomMargin)
+        return MOVE_NONE;
+    return res.best;
+}
+
 static int selfplay_worker(int index, int workers, void *ctx) {
     const SelfplayOpts *o = (const SelfplayOpts *)ctx;
 
@@ -1609,6 +1775,18 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     double lastReport     = start;
     double lastCheckpoint = start;
     int played            = 0;
+
+    /* `perturbed` above counts the perturbations PLAYED. With -randompick uncertain they are
+     * fewer than the ones that fired, by two different gaps - no alternative was more
+     * uncertain than the search's move, or none was affordable - and only these say which. */
+    uint64_t perturbFired  = 0;
+    uint64_t perturbRanked = 0;
+    /* Per played perturbation, read at the next ply: what it cost the side that played it,
+     * and how uncertain the position it landed in is. The first is how much of every earlier
+     * record's game result it spent; the second is whether it went anywhere worth going. */
+    int64_t dropSum    = 0;
+    int64_t landSum    = 0;
+    uint64_t dropCount = 0;
 
     /* Games are dealt out round-robin by GLOBAL ordinal and each is seeded from that ordinal
      * alone, so game g is the same game whatever worker draws it and however many workers
@@ -1691,6 +1869,11 @@ static int selfplay_worker(int index, int workers, void *ctx) {
             bool restart = false;
             result       = RES_UNKNOWN;
 
+            /* The score the search gave the ply a perturbation replaced, held until the next
+             * search says what the position is worth now. */
+            bool dropPending = false;
+            int dropBefore   = 0;
+
             for (;;) {
                 ScoredMove list[MAX_MOVES];
                 const int n =
@@ -1731,6 +1914,17 @@ static int selfplay_worker(int index, int workers, void *ctx) {
 
                 if (!is_ok_move(res.best) || res.score == VALUE_NONE)
                     break;
+
+                /* This search is from the opponent's side, so what the perturbing side now
+                 * holds is -res.score. Both ends are clipped as the trainer clips a label, so
+                 * one blundered mate does not stand in for a hundred ordinary moves. */
+                if (dropPending) {
+                    dropSum += clip_score(dropBefore) + clip_score(res.score);
+                    if (sigma_available())
+                        landSum += uncertainty_signal(position_sigma(&pos), res.score);
+                    ++dropCount;
+                    dropPending = false;
+                }
 
                 /* A randomised opening that is already decided teaches the net nothing about
                  * the middlegame, so the game is thrown away rather than played out. Tested
@@ -1784,8 +1978,26 @@ static int selfplay_worker(int index, int workers, void *ctx) {
                 if (o->randomChance > 0 && legalCount > 1 && pos.gamePly > plies &&
                     pos.gamePly >= o->randomPlyMin && pos.gamePly <= o->randomPlyMax &&
                     rng_below(&rng, (uint64_t)o->randomChance) == 0) {
-                    chosen = legal[rng_below(&rng, (uint64_t)legalCount)];
-                    ++perturbed;
+                    ++perturbFired;
+                    /* An uncertain pick that finds nothing playable lets the search's move
+                     * stand - it never falls back to a random one, which is the move this
+                     * mode exists to replace. It draws nothing either way, so the plies a
+                     * perturbation fires on are the same in both modes for one seed. */
+                    if (o->randomUncertain) {
+                        bool ranked;
+                        const Move m = uncertain_move(&pos, legal, legalCount, res.best, res.score,
+                                                      o, &ranked);
+                        perturbRanked += ranked;
+                        if (m != MOVE_NONE)
+                            chosen = m;
+                    } else {
+                        chosen = legal[rng_below(&rng, (uint64_t)legalCount)];
+                    }
+                    if (chosen != res.best || !o->randomUncertain) {
+                        ++perturbed;
+                        dropPending = true;
+                        dropBefore  = res.score;
+                    }
                 }
 
                 board_do_move(&pos, chosen);
@@ -1823,10 +2035,17 @@ static int selfplay_worker(int index, int workers, void *ctx) {
             const double elapsed = now - start > 0.001 ? now - start : 0.001;
             fprintf(stdout,
                     "[w%02d] games %d/%d  records %llu  labels %llu  %.0f labels/s"
-                    "  rejected %d  random %llu  dfrc %d\n",
+                    "  rejected %d  random %llu  dfrc %d",
                     index, played, games, (unsigned long long)writer.count,
                     (unsigned long long)labelled, (double)labelled / elapsed, rejected,
                     (unsigned long long)perturbed, dfrcGames);
+            if (o->randomUncertain)
+                fprintf(stdout, "  uncertain %llu/%llu/%llu", (unsigned long long)perturbed,
+                        (unsigned long long)perturbRanked, (unsigned long long)perturbFired);
+            if (dropCount)
+                fprintf(stdout, "  drop %.0fcp land %.0f", (double)dropSum / (double)dropCount,
+                        (double)landSum / (double)dropCount);
+            fprintf(stdout, "\n");
             fflush(stdout);
             lastReport = now;
         }
@@ -1853,6 +2072,13 @@ static int selfplay_worker(int index, int workers, void *ctx) {
     man.randomChance    = o->randomChance;
     man.randomPlyMin    = o->randomPlyMin;
     man.randomPlyMax    = o->randomPlyMax;
+    man.randomPick      = o->randomUncertain ? "uncertain" : "uniform";
+    man.randomMargin    = o->randomMargin;
+    man.randomFired     = perturbFired;
+    man.randomRanked    = perturbRanked;
+    man.randomPlayed    = perturbed;
+    man.randomDrop      = dropCount ? (double)dropSum / (double)dropCount : 0.0;
+    man.randomLand      = dropCount ? (double)landSum / (double)dropCount : 0.0;
     man.maxPlies        = o->maxPlies;
     man.gameProgress    = true;
 
@@ -1945,20 +2171,37 @@ static void usage_selfplay(void) {
            "\n"
            "middlegame perturbation\n"
            "  -random N          1-in-N chance, per ply in the window below, that a\n"
-           "                     uniformly random legal move is played instead of the\n"
-           "                     search's. 0 is off; 1 is refused. Self-play walks the\n"
-           "                     lines the engine already likes, and this is what puts\n"
-           "                     damaged structures and odd material splits in the\n"
-           "                     corpus at all. It replaces the move PLAYED only - the\n"
-           "                     record's score is still a real search of a real\n"
-           "                     position. What it does cost is the game RESULT for the\n"
-           "                     records BEFORE it, so keep it low: 128 fires on about a\n"
-           "                     third of games, which is the recommended setting.  (0)\n"
+           "                     uniformly random legal move - or, with -randompick\n"
+           "                     uncertain, a verified move into uncertainty - is played\n"
+           "                     instead of the search's. 0 is off; 1 is refused.\n"
+           "                     Self-play walks the lines the engine already likes,\n"
+           "                     and this is what takes games anywhere else. It\n"
+           "                     replaces the move PLAYED only - the record's score is\n"
+           "                     still a real search of a real position. What it does\n"
+           "                     cost is the game RESULT for the records BEFORE it: a\n"
+           "                     uniform move about 500cp, an uncertain one about 60.\n"
+           "                     Uniform at 128 fires on about a third of games; an\n"
+           "                     uncertain pick passes about one firing in five, so 8\n"
+           "                     plays about one per game.                        (0)\n"
            "  -randomply MIN-MAX plies, counted from the game's start position, that\n"
            "                     -random may fire in. Out of a ply-20 book the default\n"
            "                     is roughly real moves 15-40. The ply -openingscore\n"
            "                     screened is never perturbed, whatever this says.\n"
            "                                                              (8-60)\n"
+           "\n"
+           "uncertainty-directed perturbation  (needs a net with the uncertainty head; the\n"
+           "          signal is its predicted |error| weighted to win-probability space at\n"
+           "          the position's score, so decided positions count for little)\n"
+           "  -randompick uniform|uncertain\n"
+           "                     what a -random perturbation plays. uniform is any legal\n"
+           "                     move. uncertain is the best, by a searchmoves search at\n"
+           "                     -nodes, of the four quiet non-checking moves into the\n"
+           "                     positions the net is least sure of - played only if it\n"
+           "                     concedes at most -randommargin, and otherwise the\n"
+           "                     search's own move stands. Reported as uncertain\n"
+           "                     played/ranked/fired, and both modes report the mean\n"
+           "                     drop a perturbation cost by the next search. (uniform)\n"
+           "  -randommargin M    centipawns an uncertain pick may concede.     (100)\n"
            "\n"
            "endings  (there is NO adjudication: games end by mate, stalemate, the\n"
            "          fifty-move rule, repetition or insufficient material. Endgame\n"
@@ -2027,7 +2270,10 @@ static int cmd_selfplay(int argc, char **argv) {
     o.randomChance = 0;
     o.randomPlyMin = 8;
     o.randomPlyMax = 60;
-    o.maxPlies     = 400;
+    /* Uniform, so every existing command line still plays the games it always did. */
+    o.randomUncertain = false;
+    o.randomMargin    = 100;
+    o.maxPlies        = 400;
     /* 0: games are played to their natural end, and the conversion of a decisive advantage
      * is precisely what gen-5 onward trains - capping the label magnitude would drop every
      * position of the grind. */
@@ -2069,7 +2315,17 @@ static int cmd_selfplay(int argc, char **argv) {
         else if (!strcmp(argv[i], "-randomply") && i + 1 < argc) {
             if (!parse_ply_range(argv[++i], &o.randomPlyMin, &o.randomPlyMax))
                 dief("-randomply wants N or MIN-MAX, 0 <= MIN <= MAX <= 200 (got '%s')", argv[i]);
-        } else if (!strcmp(argv[i], "-maxplies") && i + 1 < argc)
+        } else if (!strcmp(argv[i], "-randompick") && i + 1 < argc) {
+            ++i;
+            if (!strcmp(argv[i], "uncertain"))
+                o.randomUncertain = true;
+            else if (!strcmp(argv[i], "uniform"))
+                o.randomUncertain = false;
+            else
+                dief("-randompick wants uniform or uncertain (got '%s')", argv[i]);
+        } else if (!strcmp(argv[i], "-randommargin") && i + 1 < argc)
+            o.randomMargin = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-maxplies") && i + 1 < argc)
             o.maxPlies = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-syzygy") && i + 1 < argc)
             o.syzygyPath = argv[++i];
@@ -2115,6 +2371,18 @@ static int cmd_selfplay(int argc, char **argv) {
         die("-random wants 0 (off) or 2 and above: it is a 1-in-N chance per ply");
     if (o.dfrcPercent < 0 || o.dfrcPercent > 100)
         die("-dfrc wants a percentage, 0 to 100");
+
+    if (o.randomMargin < 0)
+        die("-randommargin wants a non-negative number of centipawns");
+    /* A pick mode with nothing to pick for is a command line that does not do what it says,
+     * and the manifest would record a generation with "uncertain" perturbations and none. */
+    if (o.randomUncertain && o.randomChance == 0)
+        die("-randompick uncertain chooses what a -random perturbation plays; set -random too");
+    /* Said here, once, rather than discovered by every worker at its first position: a net
+     * without the head has nothing to read, and a classical build has no net at all. */
+    if (o.randomUncertain && !sigma_available())
+        die("-randompick uncertain reads the network's uncertainty head, and the loaded net "
+            "has none");
 
     if (o.openingPlies < 0)
         o.openingPlies = o.book ? 2 : 8;

@@ -66,6 +66,9 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Syzygy prober rewritten for this engine, Fathom removed | built, verified over 4.1M positions (E24) |
 | Datagen: middlegame perturbation (`-random`), `-openingscore` 800 → 300 | built, gated by `make datagen-test`; **no net trained on it yet** |
 | **A generation run using `-random`, and a net trained on it** | **TODO** |
+| Datagen: `-randompick uncertain`, perturbations into positions the net is unsure of | built, gated by `make datagen-test`; 57cp a move landing at signal 52, against 500cp at 34 for a uniform one ([E44](EXPERIMENTS.md#e44-perturbations-into-uncertainty-and-a-gen-6-val-set)) |
+| `val-006`: 1.97M unperturbed records at gen-6's settings from the gen-6-pw engine | built (E44); replaces the gen-5 val set for gen-6 runs |
+| **A gen-6 extension with uncertain perturbations, and a net trained on gen-006 plus it** | **TODO** |
 | gen-5 data generated with tablebases and no adjudication | done — `gen-005.cnn`, 549M records, what E34 and E37 train and profile on |
 | Lazy SMP: per-thread state, parked pool, `Threads` 1–1024, Windows processor groups | built, **scaling measured, no SPRT** |
 | Staged movegen 1: try the TT move before generating anything | tried, neutral (E15), reverted |
