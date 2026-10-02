@@ -52,6 +52,14 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Search: sigma-scaled LMR (`LmrSigmaLo` / `LmrSigmaHi`) | tried, **-29.9 ± 29.6** (E27), reverted |
 | Search: reverse futility on its own σ curve, shaped by `probe err` | stopped inconclusive, **-0.33 ± 7.03** at 3194 games; code removed ([E43](EXPERIMENTS.md#e43-reverse-futility-on-its-own-uncertainty-curve)) |
 | Search: surprise-weighted quiet rewards | stopped inconclusive, **-1.40 ± 11.94** at 1238 games; code removed ([E30](EXPERIMENTS.md#e30-surprise-weighted-quiet-history)) |
+| **Search: z-scored reductions, promising side — a late quiet whose child sits at or above α in its own σ (z = (−v − α)/σ, both heads) is reduced a ply less, and re-searched a ply past normal if its reduced search fails high at z ≥ +1** | **shipped: +8.30 ± 4.28 over 8000 STC games; fresh 5000-game confirmation +7.02 ± 5.41, LOS 99.4%** ([E45](EXPERIMENTS.md#e45-the-two-heads-as-a-probability---z-scored-children-a-wdl-model-and-what-reached-stc)) |
+| **z-scored reductions: LTC confirmation, and an STC fit of its three seats** | **TODO** |
+| Search: z-LMR in both directions (night 1) | VSTC +11.35 ± 7.85, STC +3.47 ± 7.07; at STC the hopeless-side arm alone is −2.90 ± 6.82, the promising side +4.30 ± 4.27 over 8000 (E45) |
+| Search: z-reduction variants — wider or stronger promising tier, hopeless moves counting half in LMR's index, z-weighted history | neutral, within ±7 (E45) |
+| Search: z-LMR + outer tiers + evasion reductions + VSTC-SPSA'd LMR constants | STC **-0.84 ± 2.85** over 17,716 games, H0 (E45) |
+| Search: z-prune, capture z-reductions, σ-weighted correction history | neutral at VSTC (E45) |
+| Eval: static eval shrunk by σ, from a WDL model of both heads | VSTC **-16.91 ± 8.56**, H0 — the relationship holds at played positions, not in the tree (E45) |
+| Time management: WDL outcome variance at the root; easy move by root children's z | STC +0.43 ± 9.61 (stopped flat) and -3.94 ± 6.66; not shipped (E45) |
 | Search: pawn-structure move history, rescue credit, evidence penalties | tried, **removing them is not a loss** — +1.53 ± 3.35 over 13,830 games, LLR +2.95 on [-5, 0]; code removed ([E39](EXPERIMENTS.md#e39-the-pawn-history-stack-is-removed)) |
 | Correction history (pawn-structure keyed) — **kept**, not the same feature | +25.8 Elo (E14), untouched by E39 |
 | NNUE: a wider net (h1024) on the gen-5 corpus | tried, **-7.0 ± 11.3** (E27), rejected |

@@ -3530,3 +3530,221 @@ recipe on gen-006 plus an extension generated with uncertain perturbations, agai
 gen-6-pw, both validated on val-006. gen-006 had no perturbations at all, so that SPRT prices
 "perturbed games" and "perturbed toward uncertainty" together; separating them would need a
 uniform-perturbation extension of the same size.
+
+---
+
+### E45: The two heads as a probability - z-scored children, a WDL model, and what reached STC
+
+**Date** 2026-09-29 to 10-01, two nights · **Net** `48428bbbd57e` (gen-6-pw) · **Baseline**
+`stormbreaker-wdl-base.exe` = HEAD `1ef61c3`, bench 289292 (d7) / 6514462 (d13) · **Status**
+**shipped: z-scored reductions, the promising side only, +8.30 +/- 4.28 over 8000 STC games**,
+of which a fresh 5000-game confirmation alone measured +7.02 +/- 5.41 (LOS 99.4%). Bench
+333802 (d7) / 7285139 (d13). Every other candidate is in `external/patches/e45-wdl-research.patch`
+(night 1) and `e45-wdl-research-night2.patch`; the shipped change alone is `e45-zlessdeep.patch`.
+
+The brief was a night and a day of machine time for 30-60 Elo at STC, from the uncertainty head
+used as a win/draw/loss signal rather than only as a margin scale. Since E21 the head has done
+one job - widening and tightening five pruning margins at the NODE, about +47 at STC over E20
+and E21 - and every attempt to use the node's sigma for anything else measured neutral or
+negative: re-centring and sigma-LMR (E27), RFP's own curve (E43), sigma-weighted history (E30).
+This entry asked what the value and uncertainty heads say TOGETHER, and where that is
+information the search does not already have.
+
+**The short answer.** They say a great deal - the tables below are the cleanest signal this
+search has been offered - and the first night's form of it did not survive the trip from VSTC
+to STC: z-scored late-move reductions measured +11.35 +/- 7.85 at VSTC and +3.47 +/- 7.07 at
+STC. The second night ablated it at STC and found why: z's value at STC is entirely on the side
+of searching PROMISING moves deeper, and cutting hopeless ones harder costs a little. Built in
+that direction it is a confirmed +8 at STC - short of the 30-60 the brief asked for.
+
+#### Method
+
+Measure first, build second. A stats build (`-DWDL_STATS`, in the research patch) instruments
+the d13 bench tree; its node count reproduces the baseline's to the node, because it only READS
+evaluations nnue.c has already cached. A candidate was built only where a table said the signal
+separated something the search decides. Each candidate was an `#ifdef` in `src/search.c`, built
+with `CFLAGS=-D...` in the ENVIRONMENT - given on the command line it replaces the Makefile's
+own flags and drops `-Isrc`. Screens at VSTC 2+0.02, [0, 5], 3000-game cap; then STC 8+0.08.
+1 thread, 16 MB, UHO_Lichess_4852_v1, concurrency 14 throughout. Queue, logs, binaries and a
+run-by-run log: `external/games/sprt-20260929-wdl/` (`NOTES.md`).
+
+#### The number: z
+
+For a move m at a node with bound alpha, after making it:
+
+    z = (-v_child - alpha) / max(sigma_child, 16)
+
+v_child the child's corrected static evaluation, sigma_child the head's predicted error AT THE
+CHILD: how many of its own error scales the move sits below the bound. P(m beats alpha) is
+monotone in it. It costs nothing - the child evaluates itself on entry, and nnue.c's recorded
+stack outputs hand the parent the same (value, sigma) pair.
+
+#### What the tables said (d13 bench, baseline tree unless noted)
+
+**Reduced quiets** (depth >= 3, move > 2), how often the move's search ended above alpha:
+
+| z | share of reduced moves | beat alpha |
+|---|---|---|
+| <= -4 | ~29% | 0.00% |
+| -4 .. -2 | ~24% | 0.02 - 0.10% |
+| -2 .. 0 | ~30% | 0.2 - 2% |
+| > 0 | ~7% | 4.5 - 14% |
+
+Both heads are needed. At the same gap of -128 .. -64cp below alpha the rate runs 0.02%
+(sigma < 32), 0.18%, 0.37%, 1.38%, 1.90%, 3.01% (sigma 512+) - a hundredfold spread the value
+head cannot see. The ratio of child to parent sigma alone was weak and non-monotone; the child's
+evaluation alone was strong; z was the cleanest of the three.
+
+**Where z is not the signal:**
+
+| population | z <= -3 beats alpha | reading |
+|---|---|---|
+| late quiets, non-PV, depth 1-10 | < 0.1% at every depth | the clean case |
+| captures | 0 - 0.3%, small samples | same shape - but see run 8 |
+| checking moves | 1 - 7% at depth 1-3 | an in-check child's evaluation is not trusted |
+| evasions, move > 2 | ~0% | the child is quiet again |
+| second moves (killers) | 0.3 - 1.5% | ordering evidence outranks the static verdict |
+
+z orders nothing. At quiet cutoffs with k failed quiets before the cutter, ordering by z would
+have left 0.506 of them ahead at k = 1 (chance: 0.5) and 0.88 at k = 2 (chance: 1.0). It says
+which moves cannot matter, not which one is best.
+
+**Node sigma is not the move's sigma.** Moves LMP would have pruned, searched anyway: 0.41% beat
+alpha overall, and 0.3 - 0.9% at depth 1 in EVERY node-sigma band. Nothing to scale.
+
+**Null move.** z of the null child against beta: below -1 the null search succeeded under 2% at
+depth 3-4 and under 5% at 5-7, on 45% of the attempts there; break-even near -2 at depth 8-11.
+
+**Aspiration.** Root score swing between iterations, by root sigma: median 4cp (p90 16) under
+32, median 48cp (p90 514) over 256.
+
+**Inside the z-LMR tree**: z <= -4 now reduced 3.9 plies on average and still 0.00% beating
+alpha; z >= +0.25 beating it 3-10% at r ~ 1.9 - which is what the outer tiers of run 11 were.
+
+**The child's table entry** adds little: where it already bounds the move under alpha at the
+reduced depth the child cuts on it anyway, and the case it would add - an entry saying the move
+beats alpha - is 4k of 1.3M reduced moves.
+
+#### A WDL model from both heads
+
+1.0M val-006 records scored by the gen-6-pw checkpoint, against the game's result, favoured side
+W/D/L in percent:
+
+| abs(v) | sigma < 32 | 32-64 | 64-128 | 128-256 | 256+ |
+|---|---|---|---|---|---|
+| 0-25 | 14/75/12 | 23/58/19 | 23/55/21 | 25/50/25 | - |
+| 100-200 | 39/53/8 | 40/51/8 | 39/51/10 | 37/50/13 | 37/51/12 |
+| 300-450 | 51/48/1 | 68/31/1 | 68/29/3 | 61/34/6 | 51/43/6 |
+| 450-600 | - | 81/19/0 | 82/17/1 | 75/22/3 | 65/30/6 |
+| 600-800 | - | 90/10/0 | 92/7/0 | 87/12/1 | 72/24/3 |
+
+p = sigmoid(v/400) cannot tell a dead draw (0cp, quiet sigma, 75% drawn) from an open fight (0cp,
+large sigma, 50%); the pair can. The evaluation implied by the actual expected score is ~1.8x
+|v| for sigma 40-96 in every band from 100 to 1200cp - monotone compression, invisible to minimax
+- and falls with sigma to ~1.0x past 256, which is not.
+
+Time use at STC (E43's 3194-game PGN): 0-50cp took 14.6% of the thinking and was 95% drawn;
+>= 600cp took 17% of it and the side ahead never lost.
+
+#### The runs
+
+| # | change | vs | TC | games | W-L-D | Elo | verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | **z-LMR**: r+1 at z < -2, r+2 at z < -4, r-1 at z >= 0 | base | VSTC | 3000 | 859-761-1380 | **+11.35 +/- 7.85** | capped, LLR 1.92 |
+| 2 | z-prune: skip non-PV quiets at depth <= 6, z < -3 | base | VSTC | 3000 | 827-827-1346 | 0.00 +/- 7.98 | capped |
+| 8 | captures reduced at z < -3 / -6 | 1 | VSTC | 3000 | 798-803-1399 | -0.58 +/- 7.80 | capped |
+| 14 | WDL-eval: static eval x clamp(1 - (sigma-64)/512, 0.5, 1) | base | VSTC | 2406 | 552-669-1185 | **-16.91 +/- 8.56** | **H0** |
+| 11 | z-LMR outer tiers: r+3 at z < -6, r-2 at z >= +1 | 1 | VSTC | 3000 | 810-776-1414 | +3.94 +/- 7.70 | capped |
+| 12 | evasions reduced at z < -3 / -6 | 1 | VSTC | 3000 | 833-816-1351 | +1.97 +/- 7.70 | capped |
+| - | SPSA, 13 seats, 700 x 28 games | - | VSTC | 19600 | - | - | see below |
+| 18 | 1 + 11 + 12 + the SPSA output | base | STC | 17716 | 4293-4336-9087 | -0.84 +/- 2.85 | **H0** (uncapped, 9h18m) |
+| 19 | precision-weighted corrhist (weight x 64/sigma) | 18 | VSTC | 3000 | 806-809-1385 | -0.35 +/- 7.87 | capped |
+| 23 | **z-LMR**, run 1's build | base | STC | 3000 | 777-747-1476 | **+3.47 +/- 7.07** | capped, LLR 0.45 |
+| 15 | TM: soft target x outcome variance from the table above, at the root | base | STC | 1600 | 390-388-822 | +0.43 +/- 9.61 | stopped flat |
+| 17 | TM: easy move - every alternative's child > 2.5 sigma under the best | base | STC | 3000 | 736-770-1494 | -3.94 +/- 6.66 | capped |
+
+Ptnml: 1 [49, 330, 668, 380, 73]; 18 [153, 2176, 4224, 2171, 134]; 23 [27, 358, 704, 380, 31];
+17 [28, 346, 775, 334, 17]. No time losses in run 18, and the two engines' think time by
+|score| band matched to the millisecond, so it measured the search and nothing else.
+
+The SPSA left every z seat within 2 of where the tables put it (ZlmrMore 32 -> 31, ZlmrVdeep
+96 -> 98, the capture/evasion pair 48/96 -> 49/97; the rest unmoved) and moved only the old LMR
+constants: LmrBase 13 -> 14, LmpBase 10 -> 12, LmrHistDivisor 8493 -> 8050, LmrContDivisor
+7334 -> 7213.
+
+Built and never played: z-null-move (skip below z -1 / -2, and the reduction re-based on the
+null child), root z-LMR, sigma-sized aspiration windows, a widened z-prune, signed leaf-sigma
+terms. All are in the research patch.
+
+#### Night 2: ablating z-LMR at STC, and building it the way STC wants
+
+Every run capped (STC 3000 or 5000, VSTC kill-screens 2000), against `stormbreaker-wdl-base.exe`
+unless noted; the user's NNUE-data aggregation shared the machine from 22:10, and the only time
+losses all night were one per side in one VSTC screen. Logs: `external/games/sprt-20260930-zlmr/`.
+
+| # | change | vs | TC | games | W-L-D | Elo |
+|---|---|---|---|---|---|---|
+| 1 | **less arm only**: r-1 at z >= 0 | base | STC | 3000 | 751-714-1535 | **+4.29 +/- 7.06** |
+| 2 | more arm only: r+1 at z < -2, r+2 at z < -4 | base | STC | 3000 | 732-757-1511 | -2.90 +/- 6.82 |
+| 3 | earlier hopeless quiets count half in LMR's move index | z-LMR | VSTC | 2000 | 515-534-951 | -3.30 +/- 9.67 |
+| 4 | history weighted by z (residual learning) | z-LMR | VSTC | 2000 | 545-551-904 | -1.04 +/- 9.50 |
+| 5 | less arm + r-2 at z >= +1 | base | STC | 3000 | 722-724-1554 | -0.23 +/- 6.72 |
+| 6 | less arm from z >= -0.5, r-2 at z >= +1 | base | STC | 3000 | 736-715-1549 | +2.43 +/- 6.84 |
+| 7 | **less arm + deeper re-search**: a reduced fail-high at z >= +1 re-searched a ply PAST normal | base | STC | 3000 | 757-667-1576 | **+10.43 +/- 6.99** |
+| 8 | run 1 again | base | STC | 5000 | 1242-1180-2578 | +4.31 +/- 5.35 |
+| 9 | **run 7 again** | base | STC | 5000 | 1257-1156-2587 | **+7.02 +/- 5.41** |
+
+Pooled pentanomial: runs 1 + 8, [57, 952, 1910, 997, 84] -> **+4.30 +/- 4.27** over 8000, LOS
+97.6%; runs 7 + 9, [54, 921, 1894, 1042, 89] -> **+8.30 +/- 4.28** over 8000. Run 7 was the best
+of five variants, so its +10.43 is selection-biased; run 9 is the clean measurement, and it alone
+clears zero at LOS 99.4%. Nightly ptnml: 7 [15, 345, 716, 383, 41], 9 [39, 576, 1178, 659, 48].
+
+**What shipped** is runs 7/9, 38 lines in `negamax()`: for a late quiet LMR candidate, z from the
+child's corrected evaluation and sigma (one cached lookup), one ply less reduction at z >= 0
+(`ZlmrLess` 0), and if its reduced search then fails high with z >= +1 (`ZdeeperZ` 16), the
+re-search runs one ply past `childDepth`, bounded by the check extension's `ply < 2 * rootDepth`.
+Three sweep seats. Gates: bench deterministic, perft (4 suites) 0 failures, `smp-test` 11/0,
+`movepick-test` 14/0, `chess960 selftest`, `openbench-check` PASS, a debug build's bench 11
+assertion-clean, `make format-check` clean.
+
+#### What it says
+
+**Sigma is a property of the child, not the node.** Every table that conditioned on the node's
+sigma came back flat; every table conditioned on the child's z separated its population by
+orders of magnitude. If the head is used again in the search, read it where a move LANDS.
+
+**At STC, z pays only on the promising side.** The night-2 ablation split z-LMR's +3.5 into
++4.3 for searching promising moves (z >= 0) deeper and -2.9 for cutting hopeless ones harder.
+At STC depths the base engine already disposes of hopeless late moves cheaply - LMR reduces them
+hard and the child's own reverse futility cuts them on entry - so extra cutting buys nothing and
+occasionally misses; night 1's z-prune at exactly 0.00 is the same lesson in its purest form.
+What the search does NOT already know is which of its heavily reduced late moves deserve depth,
+and z names them. Spending that depth twice - less reduction up front, and a ply past normal on
+the re-search once the reduced search agrees - is the shipped +8. VSTC, being node-starved,
+rewarded the cutting arm instead, which is why night 1's VSTC screen overstated the idea.
+
+**Constants fitted at VSTC took back what was left.** Run 18 is runs 1, 11 and 12 plus the SPSA
+drift toward more aggressive LMR and LMP, and it was -0.84 +/- 2.85 over 17,716 STC games.
+Whatever z-LMR keeps at STC, 2+0.02 constants removed. SPSA at VSTC is not evidence for STC.
+
+**The WDL table is real and belongs at the root - where it did not pay either.** Applied to
+every static evaluation (run 14) it lost 17 Elo: in the tree, high sigma mostly marks
+mid-exchange debris - the hanging piece, the capture not yet answered - where the value's
+material count is right and sigma is high only because no such position was trained on.
+Shrinking those toward zero makes the blunder that created them look cheaper. The relationship
+was measured on PLAYED positions, and the only played position a search has is its root. There,
+as time management, it moved thinking between positions without moving the result (15, 17).
+
+**Process.** Run 18 ran uncapped: a [0, 5] SPRT on a patch worth zero took 9h18m to reject, the
+best hours of the budget. Every STC run after it was capped at 3000 or 5000 games. Cap them from
+the start, and confirm the best of several variants on fresh games before believing it.
+
+#### Pending
+
+| item | why |
+|---|---|
+| LTC confirmation of the shipped change | STC-only, like E20-E22a, E29 and E42 |
+| SPSA of `ZlmrLess`, `ZdeeperZ`, `ZlmrSigmaFloor` **at STC** | chosen, not fitted; night 1 showed a VSTC fit does not carry to STC |
+| a deeper re-search for z >= +2 (two plies), or for checks the reduced search confirms | the deeper side is where z paid; only one ply at one threshold was tried |
+| WDL-eval restricted to quiet leaves | the in-tree failure mode is specific - mid-exchange sigma - and untested |
+| datagen labels | the shipped change alters search trees, so `search_run_sync()` labels change with it; the next generation should be produced by the engine it trains for |

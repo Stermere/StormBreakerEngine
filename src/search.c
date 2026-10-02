@@ -634,6 +634,22 @@ TUNABLE(LMP_BASE, 10);
 /* Half-width of the first aspiration window. */
 TUNABLE(ASPIRATION_DELTA, 16);
 
+/*
+ * The child's own verdict on a late quiet move, read before searching it: its corrected static
+ * evaluation against alpha in units of the uncertainty head's predicted error AT THE CHILD,
+ * z = (-v_child - alpha) / max(sigma_child, floor). Both heads are needed - over the d13 bench
+ * tree the same centipawn gap below alpha beat it a hundred times more often at high child
+ * sigma than at low - and the number prices how likely the move is to matter.
+ *
+ * At STC only one direction of it pays (E45): a move z says is promising is reduced a ply
+ * less, and if its reduced search then fails high it is re-searched a ply PAST normal depth.
+ * Reducing hopeless moves harder on the same signal measured slightly negative at STC, and is
+ * not here. Thresholds in sixteenths of a sigma.
+ */
+TUNABLE(ZLMR_LESS, 0);
+TUNABLE(ZDEEPER_Z, 16);
+TUNABLE(ZLMR_SIGMA_FLOOR, 16);
+
 #ifdef TUNE_SEARCH
 
 /* The sweep's view of the margins above: a name to set them by and the range a sweep may
@@ -684,6 +700,9 @@ static const struct {
     {"LmpBase", &LMP_BASE, 1, 24},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
+    {"ZlmrLess", &ZLMR_LESS, -48, 48},
+    {"ZdeeperZ", &ZDEEPER_Z, 0, 64},
+    {"ZlmrSigmaFloor", &ZLMR_SIGMA_FLOOR, 1, 48},
 };
 
 int search_tunable_count(void) { return (int)(sizeof(Tunables) / sizeof(Tunables[0])); }
@@ -2304,7 +2323,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         /* LMR retries reduced fail-highs at normal depth, but a false fail-low can still
          * hide a move. Forcing moves are exempt; failed-move learning below distinguishes
          * a reduced-only rejection from one that received a normal-depth search. */
-        Depth r = 0;
+        Depth r   = 0;
+        int moveZ = INT32_MIN; /* this quiet's z, where one was computed */
         if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && !givesCheck) {
             r = Reductions[imin(depth, 63)][imin(moveCount, 63)];
 
@@ -2330,6 +2350,18 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             r -= *main_hist(td, us, td->stack[ply].threats, m) / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
+#ifdef EVAL_NNUE
+            /* The child evaluates itself on entry anyway, and the stack's recorded outputs
+             * hand it back this same pair, so asking here costs one lookup, not an inference. */
+            if (nnue_has_uncertainty() && !is_mate_score(alpha)) {
+                const Value cv = corrected_eval(td, pos, eval_evaluate(td->es, pos));
+                const int sig  = imax(nnue_uncertainty(td->es, pos), ZLMR_SIGMA_FLOOR);
+                moveZ          = (-cv - alpha) * 16 / sig;
+                if (moveZ >= ZLMR_LESS)
+                    --r;
+            }
+#endif
+
             if (r < 0)
                 r = 0;
             else if (r > childDepth - 1)
@@ -2342,8 +2374,13 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
          * move fails low, so the child is by definition expected to fail high. */
         if (r > 0) {
             v = -negamax(td, pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
+            /* A move z called promising, now confirmed by the reduced search: one ply past
+             * the normal depth, bounded by the same ply limit as the check extension. */
             if (v > alpha)
-                v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
+                v = -negamax(td, pos,
+                             childDepth + (moveZ != INT32_MIN && moveZ >= ZDEEPER_Z &&
+                                           ply < 2 * td->rootDepth),
+                             -alpha - 1, -alpha, ply + 1, !cutNode);
         } else if (!pvNode || moveCount > 1) {
             v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
