@@ -56,6 +56,11 @@ typedef struct {
      * which is what makes it a good key for evidence gathered across a whole tree. */
     Key pawnKey;
 
+    /* One key per colour over that colour's non-pawn pieces, king included, kept by the
+     * same mutators. The non-pawn correction history is keyed on them: what the pieces are
+     * doing is a second structure the evaluation can be persistently wrong about. */
+    Key nonPawnKey[COLOR_NB];
+
     Bitboard checkers;
     Bitboard pinned;
 
@@ -153,6 +158,8 @@ void board_to_fen(const Position *pos, char *buf);
 Key board_compute_key(const Position *pos);
 
 Key board_compute_pawn_key(const Position *pos);
+
+Key board_compute_non_pawn_key(const Position *pos, Color c);
 
 /* Board, FEN and key - the UCI `d` command. */
 void board_print(const Position *pos);

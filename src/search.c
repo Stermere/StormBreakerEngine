@@ -129,8 +129,8 @@ typedef struct {
  * by somebody else: every hit is verified against the position and every move that
  * comes back out of it is validated before it is played.
  *
- * The tables dominate the size: 6 MB of continuation history and 1 MB of pawn history,
- * with the accumulator stack in nnue.c beside them. Hence heap blocks claimed when
+ * The tables dominate the size: 6 MB of continuation history and 2 MB of two-move correction
+ * history, with the accumulator stack in nnue.c beside them. Hence heap blocks claimed when
  * `Threads` is set, rather than anything a `go` has to allocate.
  */
 typedef struct {
@@ -170,10 +170,17 @@ typedef struct {
      * recent success can, which in a sharp middlegame is most of them. */
     int16_t captureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
-    /* Correction history, [side to move][pawn key]. Three further keys were tried - minor
-     * pieces, non-pawn material, and the move that led to the node - at two weightings,
-     * and both measured slightly negative over 2076 games (E16). */
+    /* Correction history, [side to move][pawn key]. */
     int16_t pawnCorrHist[COLOR_NB][CORRHIST_SIZE];
+
+    /* Two more keys for the same residual (E46): each colour's non-pawn pieces,
+     * [side to move][whose pieces][that colour's key], and the last two moves,
+     * [piece][to] two plies up and [piece][to] of the move that led here - a bias that
+     * follows a plan rather than a structure. E16 tried non-pawn, minor-piece and
+     * one-move keys together on a much weaker engine and measured -6.5 +/- 9.9; alone,
+     * on this one, these two screened +8 and +14. */
+    int16_t nonPawnCorrHist[COLOR_NB][COLOR_NB][CORRHIST_SIZE];
+    int16_t contCorrHist[PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 
     /* Triangular PV table: pvTable[ply] is the principal variation from `ply` downwards,
      * and a child's line is copied up behind the move that produced it. */
@@ -328,6 +335,8 @@ void search_clear(void) {
         memset(td->contHist, 0, sizeof(td->contHist));
         memset(td->captureHist, 0, sizeof(td->captureHist));
         memset(td->pawnCorrHist, 0, sizeof(td->pawnCorrHist));
+        memset(td->nonPawnCorrHist, 0, sizeof(td->nonPawnCorrHist));
+        memset(td->contCorrHist, 0, sizeof(td->contCorrHist));
         memset(td->stack, 0, sizeof(td->stack));
 #ifdef MOVE_PICKER_PROFILE
         memset(&td->moveProfile, 0, sizeof(td->moveProfile));
@@ -538,6 +547,12 @@ TUNABLE(DEXT_MAX, 6);
  * person; this was chosen rather than fitted. See E14. */
 TUNABLE(CORR_W_PAWN, 134);
 
+/* The same for the non-pawn keys, applied to each colour's entry, and for the two-move key.
+ * Chosen, not fitted: half weight per colour so the pair together believe as much as the
+ * pawn table does, and full weight for the continuation key. */
+TUNABLE(CORR_W_NONPAWN, 64);
+TUNABLE(CORR_W_CONT, 128);
+
 /* Uncertainty scaling of the margins above: floor percentage, percent per centipawn of
  * learned correction, and the cap. The cap is SPSA-fitted (E22, E22a); the floor and
  * slope are centred values, and cannot be swept against a net with an uncertainty head
@@ -598,6 +613,10 @@ TUNABLE(LMR_DIVISOR, 23);
 TUNABLE(LMR_HIST_DIVISOR, 8493);
 TUNABLE(LMR_CONT_DIVISOR, 7334);
 TUNABLE(CAPHIST_DIVISOR, 5);
+
+/* How much capture history gives back of a capture's reduction: a full-scale entry is two
+ * plies either way. */
+TUNABLE(LMR_CAPHIST_DIVISOR, 8192);
 
 /* Null-move reduction: base, how fast it grows with depth, and how much of the margin
  * above beta may buy extra reduction before it is capped. */
@@ -675,6 +694,8 @@ static const struct {
     {"DextMargin", &DEXT_MARGIN, 0, 100},
     {"DextMax", &DEXT_MAX, 0, 16},
     {"CorrWPawn", &CORR_W_PAWN, 0, 256},
+    {"CorrWNonPawn", &CORR_W_NONPAWN, 0, 256},
+    {"CorrWCont", &CORR_W_CONT, 0, 256},
     {"UncScaleBase", &UNC_SCALE_BASE, 60, 120},
     {"UncScaleSlope", &UNC_SCALE_SLOPE, 0, 12},
     {"UncScaleMax", &UNC_SCALE_MAX, 100, 200},
@@ -690,6 +711,7 @@ static const struct {
     {"LmrHistDivisor", &LMR_HIST_DIVISOR, 2048, 32768},
     {"LmrContDivisor", &LMR_CONT_DIVISOR, 2048, 32768},
     {"CapHistDivisor", &CAPHIST_DIVISOR, 1, 32},
+    {"LmrCapHistDivisor", &LMR_CAPHIST_DIVISOR, 1024, 32768},
     {"NmpBase", &NMP_BASE, 1, 6},
     {"NmpDepthDivisor", &NMP_DEPTH_DIVISOR, 1, 12},
     {"NmpEvalDivisor", &NMP_EVAL_DIVISOR, 50, 600},
@@ -1509,31 +1531,67 @@ static inline int16_t *corr_entry(SearchThread *td, const Position *pos) {
     return &td->pawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
 }
 
+static inline int16_t *non_pawn_corr_entry(SearchThread *td, const Position *pos, Color c) {
+    return &td->nonPawnCorrHist[pos->sideToMove][c][pos->nonPawnKey[c] & (CORRHIST_SIZE - 1)];
+}
+
+/* The two-move entry for the node at `ply`, or NULL where either move above it is missing
+ * or a null move - nobody's plan. Read off the search stack, which is why the correction
+ * needs to know the ply. */
+static inline int16_t *cont_corr_entry(SearchThread *td, int ply) {
+    if (ply < 2)
+        return NULL;
+
+    const Move m1 = td->stack[ply - 1].move;
+    const Move m2 = td->stack[ply - 2].move;
+    if (!is_ok_move(m1) || !is_ok_move(m2))
+        return NULL;
+
+    return &td->contCorrHist[td->stack[ply - 2].movedPiece][to_sq(m2)]
+                            [td->stack[ply - 1].movedPiece][to_sq(m1)];
+}
+
 /* Nothing the search reports is corrected. The corrected value feeds `improving`, the
  * margins and the reductions - decisions that are already bets - while the table keeps the
  * raw evaluation, so a later probe re-corrects with whatever has been learned since. */
-static Value corrected_eval(SearchThread *td, const Position *pos, Value raw) {
+static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, int ply) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
+
+    const int16_t *const cc = cont_corr_entry(td, ply);
+    const int nonPawn = *non_pawn_corr_entry(td, pos, WHITE) + *non_pawn_corr_entry(td, pos, BLACK);
 
     /* Mate and tablebase scores are clamped away deliberately: a correction is evidence
      * about an evaluation, and letting one push a score into a range reserved for proven
      * results would have the search report a proof that nothing proved. */
-    const int v = raw + (CORR_W_PAWN * *corr_entry(td, pos) / CORR_W_UNIT) / CORRHIST_GRAIN;
+    const int v = raw + (CORR_W_PAWN * *corr_entry(td, pos) / CORR_W_UNIT) / CORRHIST_GRAIN +
+                  (CORR_W_NONPAWN * nonPawn / CORR_W_UNIT) / CORRHIST_GRAIN +
+                  (cc ? (CORR_W_CONT * *cc / CORR_W_UNIT) / CORRHIST_GRAIN : 0);
     return (Value)iclamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 
 /* Folds one observation in as an exponential moving average, weighted by depth because a
  * deeper search is better evidence about the same question. What counts as an observation
  * is the decision that matters, and it is made at the call site. */
-static void corrhist_update(SearchThread *td, const Position *pos, Value searched, Value staticEval,
-                            Depth depth) {
-    int16_t *const e  = corr_entry(td, pos);
-    const int weight  = imin(depth + 1, 16);
-    const int diff    = (searched - staticEval) * CORRHIST_GRAIN;
+static void corrhist_fold(int16_t *e, int diff, int weight) {
     const int updated = (*e * (CORRHIST_WEIGHT_MAX - weight) + diff * weight) / CORRHIST_WEIGHT_MAX;
+    *e                = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
+}
 
-    *e = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
+/* Every key sees the same observation: each table is fitted to the one residual, conditioned
+ * on a different part of the position. */
+static void corrhist_update(SearchThread *td, const Position *pos, Value searched, Value staticEval,
+                            Depth depth, int ply) {
+    const int weight = imin(depth + 1, 16);
+    const int diff   = (searched - staticEval) * CORRHIST_GRAIN;
+
+    corrhist_fold(corr_entry(td, pos), diff, weight);
+    corrhist_fold(non_pawn_corr_entry(td, pos, WHITE), diff, weight);
+    corrhist_fold(non_pawn_corr_entry(td, pos, BLACK), diff, weight);
+
+    int16_t *const cc = cont_corr_entry(td, ply);
+    if (cc)
+        corrhist_fold(cc, diff, weight);
 }
 
 /* One consumer's share of the mapping; see the weights' declaration for why this scales
@@ -1675,7 +1733,7 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         return VALUE_ZERO;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(td, pos, eval_evaluate(td->es, pos));
+        return corrected_eval(td, pos, eval_evaluate(td->es, pos), ply);
 
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
@@ -1715,9 +1773,16 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
          * every reply must be searched. */
         rawEval    = ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
                                                                 : eval_evaluate(td->es, pos);
-        staticEval = corrected_eval(td, pos, rawEval);
+        staticEval = corrected_eval(td, pos, rawEval, ply);
         uncScale   = unc_start(false, td, pos);
         best       = staticEval;
+
+        /* A stored bound that points past the static evaluation is a better stand-pat: it
+         * came from a search of this very position. Proven scores are left out, and the
+         * delta prunes below still reason from staticEval. */
+        if (ttValue != VALUE_NONE && !is_decisive_score(ttValue) &&
+            (tt_entry_bound(&tte) & (ttValue > best ? BOUND_LOWER : BOUND_UPPER)))
+            best = ttValue;
 
         if (best >= beta) {
             tt_store(key, MOVE_NONE, best, rawEval, 0, BOUND_LOWER, ttPv, ply);
@@ -1862,7 +1927,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         return VALUE_DRAW;
 
     if (ply >= MAX_PLY - 1)
-        return corrected_eval(td, pos, eval_evaluate(td->es, pos));
+        return corrected_eval(td, pos, eval_evaluate(td->es, pos), ply);
 
     /* Determined before mate distance pruning narrows the window: a node is a PV node
      * because of where it sits in the tree, and must keep being treated as one even if the
@@ -1988,7 +2053,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
                                                               : eval_evaluate(td->es, pos));
 
-    const Value staticEval = corrected_eval(td, pos, rawEval);
+    const Value staticEval = corrected_eval(td, pos, rawEval, ply);
     int uncScale           = unc_start(inCheck, td, pos);
 
     td->stack[ply].staticEval = staticEval;
@@ -2297,6 +2362,9 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 extension = -2;
         }
 
+        /* Read before the move is made: afterwards the victim is gone from the board. */
+        const int capHistScore = tactical ? td->captureHist[moved][to_sq(m)][victim_of(pos, m)] : 0;
+
         td->stack[ply].move       = m;
         td->stack[ply].movedPiece = moved;
 
@@ -2306,14 +2374,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
         const bool givesCheck = board_checkers(pos) != BB_EMPTY;
 
-        /* Check extension: a check is the most forcing move in chess - the reply set is tiny
-         * and often single - so the branch costs little and the tactics that decide games
-         * live there. Bounded by ply so a perpetual cannot extend forever, and never stacked
-         * on a singular extension, which has already priced how forced the line is - one
-         * ply, or two when every alternative failed far below the window. */
-        if (extension == 0 && givesCheck && ply < 2 * td->rootDepth)
-            extension = 1;
-
+        /* No check extension. Every check used to get a ply, and with checks also exempt from
+         * LMR that bought a great deal of tree for lines that are seldom forced; singular
+         * extensions already find the checks that are, and the quiet-check exemptions from LMP
+         * and futility keep the mates visible (WAC.001 still mates at depth 3). Removing it
+         * measured +23.42 +/- 8.66 at STC on top of the rest of E46. */
         const Depth childDepth = depth - 1 + extension;
         MP_ADD(td, mainSearched, 1);
 
@@ -2354,13 +2419,26 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             /* The child evaluates itself on entry anyway, and the stack's recorded outputs
              * hand it back this same pair, so asking here costs one lookup, not an inference. */
             if (nnue_has_uncertainty() && !is_mate_score(alpha)) {
-                const Value cv = corrected_eval(td, pos, eval_evaluate(td->es, pos));
+                const Value cv = corrected_eval(td, pos, eval_evaluate(td->es, pos), ply + 1);
                 const int sig  = imax(nnue_uncertainty(td->es, pos), ZLMR_SIGMA_FLOOR);
                 moveZ          = (-cv - alpha) * 16 / sig;
                 if (moveZ >= ZLMR_LESS)
                     --r;
             }
 #endif
+
+            if (r < 0)
+                r = 0;
+            else if (r > childDepth - 1)
+                r = childDepth - 1;
+        }
+        /* Late captures. The good ones are tried first, so a capture this far down the list is
+         * a losing one or one of many: half the quiet curve, given back by capture history.
+         * Promotions and checks stay exempt, as they are for quiets. */
+        else if (depth >= 3 && moveCount > 1 + pvNode && tactical &&
+                 type_of_move(m) != MT_PROMOTION && !inCheck && !givesCheck) {
+            r = Reductions[imin(depth, 63)][imin(moveCount, 63)] / 2;
+            r -= capHistScore / LMR_CAPHIST_DIVISOR;
 
             if (r < 0)
                 r = 0;
@@ -2375,12 +2453,15 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         if (r > 0) {
             v = -negamax(td, pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
             /* A move z called promising, now confirmed by the reduced search: one ply past
-             * the normal depth, bounded by the same ply limit as the check extension. */
-            if (v > alpha)
-                v = -negamax(td, pos,
-                             childDepth + (moveZ != INT32_MIN && moveZ >= ZDEEPER_Z &&
-                                           ply < 2 * td->rootDepth),
-                             -alpha - 1, -alpha, ply + 1, !cutNode);
+             * the normal depth, or two where z is at least twice the threshold. Bounded by
+             * ply < 2 * rootDepth, so a line that keeps qualifying cannot deepen without limit. */
+            if (v > alpha) {
+                const int deeper =
+                    moveZ != INT32_MIN && moveZ >= ZDEEPER_Z && ply < 2 * td->rootDepth
+                        ? 1 + (moveZ >= 2 * ZDEEPER_Z)
+                        : 0;
+                v = -negamax(td, pos, childDepth + deeper, -alpha - 1, -alpha, ply + 1, !cutNode);
+            }
         } else if (!pvNode || moveCount > 1) {
             v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
@@ -2486,7 +2567,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
             !(bound == BOUND_LOWER && best <= staticEval) &&
             !(bound == BOUND_UPPER && best >= staticEval))
-            corrhist_update(td, pos, best, staticEval, depth);
+            corrhist_update(td, pos, best, staticEval, depth, ply);
     }
 
     return best;

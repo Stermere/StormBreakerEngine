@@ -37,7 +37,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | NNUE inference: int16 accumulator, AVX2, SCReLU, output buckets | complete |
 | NNUE integration: incremental accumulator, per-ply stack, refresh on king bucket | complete |
 | Correction history (pawn-structure keyed, +25.8 Elo) | complete |
-| Correction history: minor / non-pawn / continuation keys | tried, neutral (E16), reverted |
+| Correction history: minor / non-pawn / continuation keys | tried together, neutral (E16), reverted; non-pawn and two-move keys re-tested alone and shipped in E46 |
 | NNUE: re-tuned search parameters (21 by SPSA, +66.1 Elo, E17) | complete |
 | Search: ProbCut, ttPv, history split (E19, E19b) | **+7.50 ± 8.71** |
 | Search: cut-node retry | tried twice, costs ~19 Elo (E6, E19a, E19b), removed |
@@ -94,6 +94,17 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Small batch: blended fail-highs, table-cutoff history, aspiration fail-high depth, fifty-move damping | VSTC +13.04 ± 8.29 but flat at STC, -0.12 ± 7.13 over 2982 games (E42); **not kept** - `external/patches/e42-small-batch.patch` |
 | Time management: a 300 ms bank under the ceiling (clocks fell below 0.2 s in one STC game in six) | shipped: forfeits 0 vs HEAD's 5, -1.06 ± 6.50 over 2956 games with a ½-increment refill; the shipped ¾ refill is unplayed ([E43](EXPERIMENTS.md#e43-a-bank-under-the-time-managers-ceiling---the-forfeits-e42-reported)) |
 | **E42 batch: LTC confirmation** | **TODO** |
+| Correction history: non-pawn keys per colour, and a two-move continuation key | shipped in the E46 stack (screens +8.40 and +14.19 at VSTC) |
+| Search: late captures reduced (half the quiet curve, less capture history) | shipped in the E46 stack (screen +7.24 at VSTC) |
+| Quiescence: the table bound as a better stand-pat | shipped in the E46 stack (screen +6.37 at VSTC) |
+| z-deeper re-search two plies past normal at twice the z threshold | shipped in the E46 stack (screen +10.72 at VSTC) |
+| **E46 stack: the four rows above** | **+11.35 +/- 7.08** over 3000 STC games against HEAD ([E46](EXPERIMENTS.md#e46-one-night-twenty-five-candidates---two-correction-keys-capture-reductions-and-no-check-extension)) |
+| **Search: no check extension** | **STC H1 on top of the E46 stack, +23.42 +/- 8.66 over 1768 games** |
+| **E46 final build (all of the above), fixed length** | **+39.55 +/- 7.11 over 3000 STC games against HEAD** |
+| Search: quiet checks into LMR at r-1 | +5.21 +/- 6.56 over 3000 STC games on top of the final build, inconclusive; not shipped (E46) |
+| Time management: soft target lengthened after a falling score | STC -4.52 +/- 6.84, rejected (E46) |
+| Search: Stockfish's cut-node and table-capture LMR, doDeeper/doShallower, post-LMR history, qsearch move-count pruning, capture futility, hindsight depth | flat or negative at VSTC, not shipped (E46) |
+| **E46: LTC confirmation, and an STC fit of `CorrWNonPawn`, `CorrWCont`, `LmrCapHistDivisor`** | **TODO** |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`

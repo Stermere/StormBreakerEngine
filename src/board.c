@@ -41,6 +41,11 @@ static inline Key pawn_key_term(Piece pc, Square s) {
     return ZobristPiece[pc][s] & ZobristPawnSelect[pc];
 }
 
+/* The complement, for the moving piece's own colour: branch-free for the same reason. */
+static inline Key non_pawn_key_term(Piece pc, Square s) {
+    return ZobristPiece[pc][s] & ~ZobristPawnSelect[pc];
+}
+
 void board_put_piece(Position *pos, Piece pc, Square s) {
     pos->board[s] = pc;
     pos->byType[NO_PIECE_TYPE] |= square_bb(s);
@@ -48,6 +53,7 @@ void board_put_piece(Position *pos, Piece pc, Square s) {
     pos->byColor[color_of(pc)] |= square_bb(s);
     pos->pieceCount[pc]++;
     pos->pawnKey ^= pawn_key_term(pc, s);
+    pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, s);
 }
 
 void board_remove_piece(Position *pos, Square s) {
@@ -58,6 +64,7 @@ void board_remove_piece(Position *pos, Square s) {
     pos->pieceCount[pc]--;
     pos->board[s] = NO_PIECE;
     pos->pawnKey ^= pawn_key_term(pc, s);
+    pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, s);
 }
 
 void board_move_piece(Position *pos, Square from, Square to) {
@@ -69,6 +76,7 @@ void board_move_piece(Position *pos, Square from, Square to) {
     pos->board[from] = NO_PIECE;
     pos->board[to]   = pc;
     pos->pawnKey ^= pawn_key_term(pc, from) ^ pawn_key_term(pc, to);
+    pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, from) ^ non_pawn_key_term(pc, to);
 }
 
 /* The ep file belongs in the hash only when the right can be exercised, or the table splits
@@ -107,6 +115,18 @@ Key board_compute_pawn_key(const Position *pos) {
     Bitboard pawns = pos->byType[PAWN];
     while (pawns) {
         const Square s = pop_lsb(&pawns);
+        k ^= ZobristPiece[piece_on(pos, s)][s];
+    }
+
+    return k;
+}
+
+Key board_compute_non_pawn_key(const Position *pos, Color c) {
+    Key k = 0;
+
+    Bitboard pieces = pos->byColor[c] & ~pos->byType[PAWN];
+    while (pieces) {
+        const Square s = pop_lsb(&pieces);
         k ^= ZobristPiece[piece_on(pos, s)][s];
     }
 
@@ -621,7 +641,9 @@ bool board_is_consistent(const Position *pos) {
         }
     }
 
-    return pos->key == board_compute_key(pos) && pos->pawnKey == board_compute_pawn_key(pos);
+    return pos->key == board_compute_key(pos) && pos->pawnKey == board_compute_pawn_key(pos) &&
+           pos->nonPawnKey[WHITE] == board_compute_non_pawn_key(pos, WHITE) &&
+           pos->nonPawnKey[BLACK] == board_compute_non_pawn_key(pos, BLACK);
 }
 
 void board_do_move(Position *pos, Move m) {

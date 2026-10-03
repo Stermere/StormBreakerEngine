@@ -194,8 +194,6 @@ What is left is structural rather than incremental:
   at the same ply. Evasions, quiescence and ProbCut remain eager. STC favoured
   the patch but stopped for machine-time budget before a verdict; LTC is pending. See
   [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md) for contracts and measurements.
-- **No correction history.** Nothing feeds the difference between the static
-  evaluation and the searched score back into later static evaluations.
 
 ---
 

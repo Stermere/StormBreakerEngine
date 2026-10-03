@@ -3748,3 +3748,171 @@ the start, and confirm the best of several variants on fresh games before believ
 | a deeper re-search for z >= +2 (two plies), or for checks the reduced search confirms | the deeper side is where z paid; only one ply at one threshold was tried |
 | WDL-eval restricted to quiet leaves | the in-tree failure mode is specific - mid-exchange sigma - and untested |
 | datagen labels | the shipped change alters search trees, so `search_run_sync()` labels change with it; the next generation should be produced by the engine it trains for |
+
+---
+
+### E46: One night, twenty-five candidates - two correction keys, capture reductions, and no check extension
+
+**Date** 2026-10-02/03 · **Net** `48428bbbd57e` (gen-6-pw) · **Baseline** HEAD `519a152`, bench
+333802 (d7) / 7285139 (d13) · **Final bench** 237294 / 5314637 · **Status** **shipped: the final build
+measured +39.55 +/- 7.11 over 3000 fixed-length STC games against HEAD.** It was built in two STC
+steps: five changes at +11.35 +/- 7.08 over 3000 games against HEAD, then no check extension on
+top of them, H1 at +23.42 +/- 8.66 over 1768 games. Quiet checks into LMR, tested on top of that, measured +5.21 +/- 6.56 over 3000
+games and is not shipped.
+
+The brief was one night of machine time to find ~50 Elo anywhere in the engine. Of twenty-five
+candidates, five survived their screens and one more came out of a direction the screens kept
+pointing at - the engine spends too much of its tree on checks.
+
+#### Method
+
+Each candidate was an `#ifdef CAND_*` block in `src/search.c` (`tt.c`, `timeman.c` and `board.c` for
+three of them), built alone with `CFLAGS` in the environment as E45 did, and benched at d7 and d13 to
+prove it fired. The flag-free build was re-benched after every batch: it reproduced HEAD every time.
+Screens ran at VSTC 2+0.02 against HEAD. The first ran at 2000 games and the rest were capped at 1200
+(`--rounds 600`): a 2000-game VSTC screen resolves only about +/-10 Elo, and these candidates were
++2-5 by prior, so a screen could only catch clear losers and was not worth paying more for. The
+survivors were stacked and the stack proved at STC 8+0.08 against HEAD, capped at 3000 games. Later
+survivors were tested ON TOP of the stack, never against HEAD alone. 1 thread, 16 MB,
+`UHO_Lichess_4852_v1`, concurrency 14 throughout. The machine was otherwise idle all night.
+Queue, logs, binaries and run notes are in `external/games/sprt-20261002-night/` (`NOTES.md`).
+Every candidate, rejected ones included, is in `external/patches/e46-night-candidates.patch`.
+
+Time management was never screened at VSTC. At 2+0.02 the 520 ms overhead reserve (10 ms x 52
+moves) and the 300 ms bank are a large slice of a 2 s clock, so a VSTC result describes a different
+allocator.
+
+#### The screens (VSTC, against HEAD)
+
+| # | candidate | games | Elo |
+|---|---|---|---|
+| 23 | **no check extension** (singular extensions alone decide what is forced) | 1200 | **+25.52 +/- 11.54** |
+| 24 | **quiet checks enter LMR at r-1** (check extension kept) | 1200 | **+20.87 +/- 12.99** |
+| 14 | **continuation correction history** (last two moves, weight 128/128) | 1200 | **+14.19 +/- 11.67** |
+| 26 | **z-deeper re-search two plies past normal at z >= 2 x `ZdeeperZ`** | 1200 | **+10.72 +/- 11.93** |
+| 13 | **non-pawn correction history**, per colour, weight 64/128 each | 1200 | **+8.40 +/- 12.26** |
+| 2 | **captures reduced**: half the quiet curve, less capture history / 8192 | 1200 | **+7.24 +/- 12.55** |
+| 6 | **qsearch stand-pat raised or lowered by the table bound** | 1200 | **+6.37 +/- 12.76** |
+| 11 | hindsight depth (Stockfish's priorReduction +1 / -1) | 1200 | +0.87 +/- 12.14 |
+| 7 | check extension only for SEE >= 0 checks | 1200 | +0.29 +/- 12.48 |
+| 1 | quiet LMR +1 at cut nodes (E6 measured +2 at about -16) | 2000 | +0.17 +/- 9.67 |
+| 30 | `LMR_BASE` 13 -> 12 | 1200 | -1.74 +/- 12.44 |
+| 25 | aspiration half-width sized by root sigma (E45's ZASP) | 1200 | -2.90 +/- 11.85 |
+| 29 | quiet LMR -1 for a move out of attack onto a safe square | 1200 | -2.90 +/- 12.62 |
+| 3 | Stockfish's doDeeper / doShallower, beside z-deeper | 1200 | -4.34 +/- 12.50 |
+| 10 | 10-byte TT entries, 1.5x the entries per MB | 1200 | -4.63 +/- 11.43 |
+| 21 | `SINGULAR_DEPTH` 7 -> 6 | 1200 | -6.95 +/- 12.17 |
+| 22 | qsearch: captures past the second skipped unless they recapture, promote or check | 1200 | -7.82 +/- 11.64 |
+| 18 | capture futility at depth <= 6 | 1200 | -8.69 +/- 12.24 |
+| 5 | quiet LMR +1 when the table move is a capture | 1200 | -10.14 +/- 11.93 |
+| 4 | post-LMR continuation-history update | 1200 | -11.88 +/- 12.46 |
+| 28 | static evaluation damped by the fifty-move counter (E42's `fifty`, alone) | 1200 | -16.81 +/- 12.39 |
+
+The 10-byte TT's screen could not judge it. At 2+0.02 a 16 MB table is barely filled, so capacity
+cannot pay there; at STC-like budgets it was 70% full within ten moves of a game.
+
+Written and never played, held for time: IIR only at PV and cut nodes; no null move under a table
+upper bound below beta; `RFP_DEPTH` 9; a quiet-check ordering bonus; Stockfish's multi-cut on the
+verification value; a -1 singular extension at cut nodes; and two time-management variants
+(`MOVESTOGO_CAP` 40, and the whole increment in the nominal allocation).
+
+#### STC
+
+| # | change | vs | games | W-L-D | Elo | LLR |
+|---|---|---|---|---|---|---|
+| 12 | time: soft target x clamp(100 + 2(prev - v) + (v[d-4] - v), 70, 150)%, where prev is our previous move's root score | HEAD | 3000 | 724-763-1513 | -4.52 +/- 6.84 | -1.33 |
+| 31 | **stack1**: screens 2 + 6 + 13 + 14 + 26 | HEAD | 3000 | 788-690-1522 | **+11.35 +/- 7.08** | 2.16 |
+| 34 | **stack2**: stack1 + no check extension | stack1 | 1768 | 481-362-925 | **+23.42 +/- 8.66** | 2.96, **H1** |
+| 35 | stack3: stack2 + quiet checks into LMR at r-1 | stack2 | 3000 | 742-697-1561 | +5.21 +/- 6.56 | 0.91 |
+| 37 | **stack2, fixed length (the final build)** | HEAD | 3000 | 895-555-1550 | **+39.55 +/- 7.11** | - |
+
+Ptnml: 31 [27, 326, 702, 412, 33]; 34 [10, 151, 451, 254, 18]; 35 [16, 332, 759, 377, 16];
+37 [14, 245, 688, 493, 60] (PGN `20261003-081955-gauntlet.pgn`). No time losses in any STC run. Runs 31 and 35
+went to their caps and run 37 had no stopping rule, so those estimates carry no early-stopping bias.
+Run 34 stopped on H1 and does carry one. The fixed-length total is the number to quote: +39.55
+against the two steps' +11.35 + 23.42 = +34.8, a difference well inside either interval.
+
+Run 12 changed only how the clock is shared out. Mean think time over its 3000 games was 155.2 ms
+for dev against 155.0 ms for HEAD, so the -4.5 is the redistribution itself and not a different
+amount of time.
+
+#### What shipped
+
+**No check extension.** Every check used to get a ply, bounded only by `ply < 2 * rootDepth`. Checks
+were also exempt from LMR, so a check cost a full extra ply wherever it appeared. That bought a
+great deal of tree for lines that are seldom forced: the d13 bench falls 23%. Singular extensions
+still find the checks that are forced, and quiet checks keep their E42 exemption from LMP and
+futility. WAC.001's mate is still found at depth 3. Gating the extension on SEE >= 0 measured flat
+(+0.29); only removing it paid.
+
+**Continuation correction history.** `contCorrHist[piece][to][piece][to]`, keyed on the move two
+plies up and the move that led here, 2 MB a thread. It has the same update and the same clamp as the
+pawn table, and full weight (`CORR_W_CONT` 128).
+
+**Non-pawn correction history.** Each colour's non-pawn pieces, king included, now have a Zobrist key.
+The three board mutators maintain both keys branch-free, as they do the pawn key, and
+`board_is_consistent()` recomputes both from scratch. The table is
+`[side to move][colour][that colour's key]`, at half weight per colour (`CORR_W_NONPAWN` 64), so the
+pair together believe what the pawn table does. E16 tried this key together with minor-piece and
+one-move keys on a much weaker engine and measured -6.5 +/- 9.9. Alone, on this engine, it screened
++8, and the continuation key screened +14. Both new tables live in `SearchThread`, and
+`search_clear()` resets both.
+
+**Captures reduced.** Once a node is three plies deep, every capture after the first (after the
+second at a PV node) is reduced, unless it promotes, checks or the node is in check. The reduction is
+half the quiet table's, less capture history over `LMR_CAPHIST_DIVISOR` (8192, two plies either way
+at full scale). Captures were never reduced before. The good ones are tried first, so a capture far
+down the list is a losing one or one of many.
+
+**The table bound as a better stand-pat.** In quiescence, a table value whose bound points past the
+corrected static evaluation replaces it as the stand-pat. Proven scores are excluded, and the delta
+prunes still reason from the static evaluation.
+
+**z-deeper by two.** E45's re-search one ply past normal now goes two plies past normal where
+z >= 2 x `ZdeeperZ`. That item was on E45's pending list.
+
+The three new weights, `CorrWNonPawn`, `CorrWCont` and `LmrCapHistDivisor`, have sweep seats. Gates
+on the final tree: bench deterministic; perft (standard, tricky, Chess960) 0 failures; the four perft
+suites at depth 4 run under an assertion build, with both non-pawn keys checked at every move,
+0 failures; debug bench 10 clean; `movepick selftest` 14/0; `chess960 selftest`; `smp selftest` 11/0;
+`openbench-check` PASS; `make classical` (bench 233632), datagen and tuner all build. The final
+tree was written from scratch on HEAD in a separate worktree rather than stripped out of the
+candidate tree, and it reproduces the tested binary's bench to the node.
+
+#### What it says
+
+**The largest gain was a deletion.** This engine spent more of its tree on checks than any modern
+search does. It extended every one and reduced none. The screens kept pointing the same way:
+removing the extension gave +25, letting checks into LMR gave +21, and the SEE-gated half-measure
+gave nothing. At STC the removal held at +23 on top of everything else.
+
+**Stockfish's pruning and reduction rules transplant badly here; its correction keys transplant
+well.** Of the Stockfish-derived candidates that change WHICH NODES get searched - cut-node and
+table-capture LMR, doDeeper/doShallower, the post-LMR history update, qsearch move-count pruning,
+capture futility, hindsight depth - none was positive, and three were -8 or worse, at a time
+control that normally flatters pruning. This search's margins and reductions were SPSA-fitted in its
+own shape, and they already absorb what those rules add. The two correction keys are evidence about
+the EVALUATION rather than about the tree, and they were the transplants that worked.
+
+**Reducing more keeps losing; searching promising things deeper keeps winning.** Every candidate that
+reduced quiet moves harder was flat or negative. The z-deeper extension to two plies was positive
+even at VSTC, which is biased against extending. This repeats E45's lesson: at STC the value lies in
+which moves deserve depth, not in cutting harder.
+
+**Time management: the clock is shared out about right.** Lengthening the soft target after a
+falling score lost 4.5 at STC. Today's 8,397-game PGN (HEAD's allocator on both sides) shows where
+the clock goes: about 260 ms a move just past the book, 130 ms by move 45, then the increment alone
+from move ~60, with the clock parked at ~1.5 s and drifting up in long games. Median game length is
+151 plies past the book exit, and 8 games in 8,397 were lost on time. The parked reserve is
+520 ms + 50 x inc/4. Spending it is the untested `TM_INC_QUARTERS` 4 and `MOVESTOGO_CAP` 40.
+
+#### Pending
+
+| item | why |
+|---|---|
+| LTC confirmation | STC-only, like E20-E22a, E29, E42 and E45 |
+| SPSA of `CorrWNonPawn`, `CorrWCont`, `LmrCapHistDivisor` at STC | chosen, not fitted |
+| quiet checks into LMR on top of the final build | +20.87 at VSTC, independent of the extension; +5.21 +/- 6.56 over 3000 STC games on top of the final build (run 35, LOS 94%); another 3000-5000 fresh games settles it (`stack3.exe` vs `stack2.exe`) |
+| 10-byte TT at STC | its VSTC screen could not see capacity (`stack1tt10` is built) |
+| spending the parked clock: `TM_INC_QUARTERS` 4, `MOVESTOGO_CAP` 40 | built, never played (`stack1inc4`, `tmh40`) |
+| datagen labels | search trees changed again, so `search_run_sync()` labels change with them |
