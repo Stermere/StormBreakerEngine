@@ -1438,6 +1438,38 @@ as a description of the error and not as a margin to adopt.
 
 ---
 
+### 5d. A move prior beside the value net - tried, and removed
+
+5b's head answers one question per POSITION, and E45 found where that runs out: the Elo z did
+find was in deciding which late MOVE deserves depth. So a second predictor was built for that
+per-move question - a move prior, `logit(m) = w_from[from] · a + w_to[piece, to] · a` over the
+activation vector L1 reads - and taken as far as it would go (E47-E49): a `.mv` legal-move
+sidecar and a loader that generated legal lists on the fly, a frozen-trunk head, then one trained
+jointly with the value net, an exact int16 payload in the net file (`reserved[1]`/`[2]`), a
+`PolicyHead` option, a read-only stats build of the engine's own tree as the offline gate, and
+seventeen uses in the search.
+
+**It is removed** (code, net-file flag, trainer, datagen sidecar, stats build), because:
+
+- **No search use gained.** Ordering (14 shapes) was flat at STC; every use that changed how much
+  effort a move got - LMR either way, pruning exemption - was negative (E48). At depth >= 4 only
+  2-3% of nodes even end on a quiet cutoff after a failed quiet, so ordering had almost no room.
+- **Training it on the search's own question did not help**, and neither could it gate singular
+  extensions (E49). Within a node it knows a little the search does not (+0.035 AUC over every
+  signal the search already reads) - real, and too small to pay for itself anywhere.
+- **As a training loss it cost the value net ~22 Elo**: the joint run's exact recipe and seed
+  without `--move-prior` beat it by +22.27 +/- 8.51 (E49), and is +25.41 +/- 8.68 over gen-6-pw.
+  Validation loss showed only -0.6%; E47's pilot read "0.0005 costs the value loss nothing
+  measurable" off the same metric, and was wrong.
+
+A net exported with a prior is refused at load by the reserved-byte check, which names
+`reserved[1]`, and a checkpoint carrying the prior's rows no longer loads in the trainer. What survives from the work: the uncertainty head's own
+toggles - `UncertaintyHead` in the engine and `--drop-uncertainty` in the exporter, which bench
+node for node alike - and the lesson in E49: fit baselines to convergence before crediting a new
+signal, and judge a training-time change by games, not by its validation loss.
+
+---
+
 ## Task 6 — a layer stack after the accumulator
 
 Task 5 is about what the search does with the network's number. This is about

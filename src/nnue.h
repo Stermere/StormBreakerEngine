@@ -133,9 +133,16 @@ bool nnue_load_file(const char *path);
  * see NNUE_EVAL_LIMIT in nnue.c. */
 Value nnue_evaluate(const Position *pos);
 
-/* Constant between loads, so callers may branch on it per node without paying for
- * the nets that lack the head. */
+/* Whether the loaded net carries the uncertainty head AND the `UncertaintyHead` option has
+ * it on. Constant between loads and option changes, so callers may branch on it per node
+ * without paying for the nets that lack the head. */
 bool nnue_has_uncertainty(void);
+
+/* The `UncertaintyHead` option: false runs the net as if exported without its uncertainty
+ * head - the margins fall back to the corrhist signal, z-LMR is off, and the head is never
+ * computed - so an A/B of the head needs one file. Never during a search. Returns whether the
+ * net carries the head at all. */
+bool nnue_set_uncertainty(bool on);
 
 /* The head's prediction of the evaluation's own |error| in centipawns, >= 0, for one
  * extra output pass over an accumulator the evaluation already keeps. Asserted

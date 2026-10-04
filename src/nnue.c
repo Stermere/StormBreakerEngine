@@ -282,6 +282,13 @@ typedef struct {
 
 static Net Loaded;
 
+/* The `UncertaintyHead` option. A preference rather than a property of the net, so it survives
+ * an `EvalFile` change exactly as the GUI that set it believes. Off, the head is not merely
+ * ignored but never computed: the net then runs as if it had been exported without it, which
+ * is what makes the option an A/B on ONE file - two exports would differ in the value trunk
+ * as well, since the head trains against it. */
+static bool UncertaintyWanted = true;
+
 /*
  * Which NET every thread's cached evaluations belong to.
  *
@@ -2215,7 +2222,17 @@ static const Accumulator *nnue_current(EvalState *const nt, const Position *pos)
     return a;
 }
 
-bool nnue_has_uncertainty(void) { return Loaded.hot.uncWeight != NULL; }
+bool nnue_has_uncertainty(void) { return Loaded.hot.uncWeight != NULL && UncertaintyWanted; }
+
+bool nnue_set_uncertainty(bool on) {
+    if (on != UncertaintyWanted) {
+        UncertaintyWanted = on;
+        /* Every thread's recorded stack outputs carry a sigma computed - or skipped - under
+         * the other setting, and nothing in a position key says which. */
+        ++EvalEpoch;
+    }
+    return Loaded.hot.uncWeight != NULL;
+}
 
 static int32_t nnue_unc_output(const int16_t *own, const int16_t *other, int bucket) {
     assert(Loaded.hot.uncWeight != NULL && "uncertainty asked of a net without the head");
@@ -2286,7 +2303,7 @@ static const StackOutputs *nnue_stack_outputs(EvalState *const nt, const Accumul
     level->gen   = nt->outGen;
     level->value = (int16_t)nnue_centipawns(
         nnue_trunk_head(trunk, Loaded.hot.outWeight, Loaded.hot.outBias, bucket));
-    level->unc = Loaded.hot.uncWeight
+    level->unc = Loaded.hot.uncWeight && UncertaintyWanted
                      ? (int16_t)nnue_unc_centipawns(
                            nnue_trunk_head(trunk, Loaded.hot.uncWeight, Loaded.hot.uncBias, bucket))
                      : 0;
@@ -2378,10 +2395,13 @@ void nnue_print_info(void) {
             snprintf(stack, sizeof(stack), "->%u", h->l1Size);
     }
 
+    /* Said either way when the net has the head, because an A/B run whose head was silently
+     * off - or silently on - measures something other than what its log claims. */
+    const char *unc = !Loaded.hot.uncWeight ? "" : UncertaintyWanted ? "+unc" : "+unc(off)";
+
     printf("info string net %.12s  %u->%ux2%s->%u%s  %s halfka-32sq %s  qa %u qb %u "
            "scale %d  tag %s  from %s\n",
-           Loaded.hash, h->features, h->hidden, stack, h->outputBuckets,
-           Loaded.hot.uncWeight ? "+unc" : "",
+           Loaded.hash, h->features, h->hidden, stack, h->outputBuckets, unc,
            h->activation == NNUE_ACT_PAIRWISE ? "pairwise" : "screlu",
 #ifdef NNUE_AVX2
            "avx2",
@@ -2405,8 +2425,9 @@ int nnue_verify_vectors(const char *path) {
 
     /* The net says whether every line carries the two uncertainty columns. The vectors
      * were written beside the net they describe, so a count that disagrees means these
-     * vectors belong to a different net. */
-    const bool wantUnc = nnue_has_uncertainty();
+     * vectors belong to a different net. Asked of the FILE, not the option: the gate checks
+     * what the net carries whatever UncertaintyHead is set to. */
+    const bool wantUnc = Loaded.hot.uncWeight != NULL;
 
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')

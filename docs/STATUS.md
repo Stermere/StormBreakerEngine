@@ -105,6 +105,22 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Time management: soft target lengthened after a falling score | STC -4.52 +/- 6.84, rejected (E46) |
 | Search: Stockfish's cut-node and table-capture LMR, doDeeper/doShallower, post-LMR history, qsearch move-count pruning, capture futility, hindsight depth | flat or negative at VSTC, not shipped (E46) |
 | **E46: LTC confirmation, and an STC fit of `CorrWNonPawn`, `CorrWCont`, `LmrCapHistDivisor`** | **TODO** |
+| **Move prior (E47-E49): REMOVED** - code, net-file flag (`reserved[1]`, now refused by name), trainer, `.mv` sidecar, `make policy-stats` | no search use gained and, as a training loss, it cost the value net ~22 Elo; the rows below are its record ([NNUE.md](NNUE.md) 5d) |
+| Move prior: `datagen legal` sidecar, frozen-trunk head, `make policy-stats` dump (removed) | was built; val top-1 20.0% against 5.5% uniform ([E47](EXPERIMENTS.md#e47-a-move-prior-beside-the-value-net---built-gated-offline-and-its-first-use)) |
+| Move prior, offline gate: does it separate late quiets that beat alpha INSIDE history x z cells? | passed, moderately: AUC 0.593 - and still gained nothing in games (E47, E48) |
+| Move prior in the net file, `nnue_policy_scores()`, UCI `PolicyHead` (removed) | was built; `nnue verify` exact on 10,000 positions and 4.48M rows, AVX2 and scalar (E47) |
+| Search: the frozen prior's top-2 late quiets reduced a ply less (depth >= 4) | **-14.05 +/- 7.80** over 2424 STC games, rejected; `PolLmrRank` defaults to 0 (E47) |
+| Move prior trained jointly (`--move-prior`, `net-gen-6-prior`), legal lists generated in the loader (`make policy-lib`) (removed) | was built; val top-1 **25.6%** (frozen 20.0%); gate AUC 0.638 (frozen 0.593) ([E48](EXPERIMENTS.md#e48-the-joint-move-prior-in-the-search---what-it-knows-and-every-use-tried)) |
+| Time management: spend the whole increment (`TM_INC_QUARTERS` 4) | +7.53 +/- 8.81 over 1800 STC games (E48), then +0.46 +/- 6.81 over 3000 fresh (E49) - settled, knob off |
+| Search: quiet checks into LMR at r-1 (`QCHECK_LMR`) | 0.00 +/- 8.80 over 2000 fresh STC games; ~+3 +/- 5 pooled with E46 - settled, off (E48) |
+| The joint net as a value net (`net-gen-6-prior`, prior unused) vs the shipped gen-6-pw | +7.47 +/- 8.64 over 2000 STC games (E48) - held back by its prior: the same run without it is +25 (E49) |
+| UCI `UncertaintyHead`, exporter `--drop-uncertainty` | built; off benches node for node like the export without the head (its `PolicyHead` / `--drop-prior` twins went with the prior) |
+| Joint prior in the search: ordering (14 shapes), LMR (3), pruning exemption | **no gain**: ordering at 6000 -4.79 +/- 9.44 over 1596 STC games, the late switch +1.56 +/- 8.58 over 2000; LMR and pruning uses -9 to -25 at VSTC (E48). Every use is a `POL_*` knob, off by default |
+| Move prior trained on the search's own late-quiet labels (4,000 roots); prior gating singular extensions | **no**: +0.003 AUC over converged baselines, none of it within a node; singular AUC 0.514 (E49) |
+| **The prior as a training loss** - no-prior retrain vs the joint net, same recipe and seed | **-22.27 +/- 8.51** over 2000 STC games: the prior COST the value net ~22 Elo. Do not train with `--move-prior` (E49) |
+| **`net-gen-6-noprior`** (`49e4301d6224`: gen-006 + gen-006-u, `--unc-weight 0.0005`, no prior), sigma 100/7 | **+25.41 +/- 8.68** over 2000 fixed STC games vs the shipped gen-6-pw (SPRT +26.54, passed). **Shipped**: the `NET_SHA256` pin and sigma defaults 100/7; bench 207432, node for node the binary measured. LTC not yet run (E49) |
+| Search: threat-aware quiet ordering (`THREAT_ORDER`), LMR +1 at cut nodes (`LMR_CUTNODE`) | ~+3.4 and ~+4.9 pooled over 6000 STC games each; together on the new net +3.24 +/- 6.88. Small, unproven; knobs, off (E49) |
+| Search: LMR +1 SEE-losing quiets, -1 escapes; quiet-check ordering; spend the whole increment | +3.36, -2.66, -4.29, +0.46 (fresh) over 3000 STC games each - off (E49) |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`
@@ -303,8 +319,9 @@ These items are not currently planned:
   any. The pending table at the end of [EXPERIMENTS.md](EXPERIMENTS.md) is
   kept for the day the queue is empty; it should not compete with anything
   above.
-- **A policy head for move ordering.** Cancelled: the track record in
-  alpha-beta engines is thin, history heuristics are already very good, and
-  the seat went to the uncertainty head instead ([NNUE.md](NNUE.md), Task 5b).
-  The `.pol` sidecar machinery in datagen remains for shard alignment;
-  `-nopolicy` turns it off for new runs.
+- **A policy head for move ordering** - tried and removed. Brought back after
+  E45 as a move prior gated offline first, it passed its offline gate, was
+  trained jointly, and was given seventeen uses in the search: none gained,
+  and as a training loss it cost the value net ~22 Elo (E47-E49, [NNUE.md](NNUE.md)
+  5d). Not to be revisited without a materially different idea of what it would
+  know that history learns within a search anyway.

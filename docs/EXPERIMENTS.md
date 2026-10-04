@@ -3916,3 +3916,499 @@ from move ~60, with the clock parked at ~1.5 s and drifting up in long games. Me
 | 10-byte TT at STC | its VSTC screen could not see capacity (`stack1tt10` is built) |
 | spending the parked clock: `TM_INC_QUARTERS` 4, `MOVESTOGO_CAP` 40 | built, never played (`stack1inc4`, `tmh40`) |
 | datagen labels | search trees changed again, so `search_run_sync()` labels change with them |
+
+---
+
+### E47: A move prior beside the value net - built, gated offline, and its first use
+
+**Date** 2026-10-03 · **Net** `48428bbbd57e` (gen-6-pw) plus a 448-row move prior, exported as
+`8002f68c2a92` (`net-gen-6-pw-pol.nnue`: the same value bytes, the prior appended) · **Baseline** HEAD
+`fadb7a7`, bench 237294 (default) / 5314637 (d13) · **Status** Phase 1 gate passed, Phase 2 built and
+exact, the first search use **lost -14.05 +/- 7.80** at STC. Continued in E48; **the prior was removed
+in E49**, so the code this entry describes is no longer in the tree.
+
+Every use of the uncertainty head so far has asked one question per POSITION - how wrong is this
+evaluation likely to be - and its in-tree uses that CUT have faded with time control (E45: z-prune
+0.00, the hopeless-side arm -2.9 at STC) while the side that spends depth on promising moves held at
++8. E45 also found that sigma is a property of the child and that z "orders nothing". Which late
+move deserves depth is a question about each MOVE, and a number per position cannot answer it. So
+this asks a second, purpose-built predictor - a move prior - and gates it offline before building
+anything that plays.
+
+A separate network was ruled out on cost: evaluation and accumulator pushes are ~30% of cycles
+(NNUE.md, "Where the time goes now"), so a second feature transformer would cost ~20-25% nps before
+doing anything. The prior is a head on the accumulator the value net already keeps.
+
+#### What was built
+
+- **`datagen legal`** writes `<shard>.mv`: every record's legal moves as the prior's row indices, and
+  where `.pol best` sits among them. The row normalisation - rank-flip for black, file-mirror with the
+  king kingside, castling as the king's real step, promotions by the promoted piece - is
+  `nnue_policy_index()` in `src/nnue.h`, the ONE copy datagen, the stats dump and the engine share.
+  `datagen verify` regenerates every list byte for byte; `make datagen-test` checks that and that a
+  corrupted `.mv` is refused. `trainer/tests/test_policy.py` checks on datagen's real output that a
+  position and its colour-flipped and file-mirrored twins list identical rows.
+- **`python -m nnue.policy train`**: `logit(m) = w_from[from]·a + w_to[piece, to]·a`, 64 + 384 rows
+  over the activated accumulator `a` (the 512 numbers L1 reads), trained by cross-entropy over the
+  legal list against `.pol best`, on a FROZEN gen-6-pw trunk - so the value weights stay bit-identical
+  and the prior is the only thing being measured.
+- **`make policy-stats`**: a d13 bench whose late quiets (the LMR branch) and quiet cutoffs are
+  dumped, with each node's FEN and legal rows. Read-only: the target fails unless its node count
+  equals the playing build's (5314637 both). **`python -m nnue.policy tables`** scores the dump.
+
+#### Training (20M gen-005 records, val-006, 8 epochs, ~20 s each on a 3070)
+
+| | CE | top-1 | top-3 |
+|---|---|---|---|
+| uniform over the legal list | 3.170 | 5.5% | - |
+| prior, val-006 | **2.717** | **20.0%** | **41.9%** |
+
+Flat from epoch 4: a linear read of value features is what limits it, not data. val-006 is
+quiet-filtered (its `best` is never a capture), which is the population the prior serves.
+
+#### The gate (d13 bench tree, 1,256,601 late quiets, 1.38% beat alpha)
+
+Beat-alpha rate by the prior's rank among the node's legal moves:
+
+| rank | share | beat alpha |
+|---|---|---|
+| 1 | 4.7% | 5.72% |
+| 2-3 | 9.4% | 3.51% |
+| 4-6 | 13.6% | 2.05% |
+| 7-10 | 15.8% | 1.29% |
+| 11+ | 56.5% | 0.52% |
+
+Inside each z band, the prior's top three against its rank 7+: **4.0x** (z <= -4), **4.0x** (-4..-2),
+**3.1x** (-2..0), **3.0x** (z > 0, where rank 1 beats alpha 17.3% and rank 11+ 4.2%).
+
+| AUC for "beat alpha" (0.5 is nothing) | |
+|---|---|
+| history (main + continuation) alone | 0.786 |
+| z alone | 0.897 |
+| prior alone | 0.752 |
+| z inside history quintiles - what z adds to history | 0.871 |
+| prior inside history quintiles | 0.678 |
+| **prior inside history x z cells - the gate** | **0.593** |
+| the same at node depth 3-4 / 5-7 / 8+ | 0.591 / 0.598 / 0.599 |
+
+**Ordering, which z cannot do.** At 93,051 quiet cutoffs that came after at least one failed quiet,
+the prior would keep only **0.37** of the failed quiets above the cutter (the search's own order 1.00
+by construction, chance 0.50; E45 measured z at 0.506 for k = 1). With one failed quiet it ranks
+the cutter first 62.8% of the time against 50% by chance, with two 47.5% against 33.3%.
+
+**Cost.** Negamax nodes at depth >= 4 / 5 / 6 / 8: 16.8% / 9.9% / 6.0% / 2.1%.
+
+Read: the prior knows something history and z together do not, by a moderate margin that does
+not fade with depth - unlike sigma's cutting uses, which faded with time control. It is much weaker
+than z as a beat-alpha signal and much stronger as an ordering one. The caveat is selection: the
+cutoff table samples only the cases where history's order was wrong, and whether reordering costs
+the cases it got right is a question only a game can answer.
+
+#### Phase 2: export and inference
+
+`tools/export_net.py --policy <head.pt>` appends int16 rows at scale 2^10 (`reserved[2]`) and int32
+biases, flagged in `reserved[1]`; it refuses a head trained on a different trunk and a flat net, and
+bounds every row to half of int32 since a move sums two. `src/nnue.c` reads it, rejects unknown flag
+values by name, and computes `nnue_policy_scores()` as one activation plus two `nnue_dot()` rows per
+move, origin rows shared. **`nnue verify`: 10,000 positions and 4,480,000 prior rows exact, on the
+AVX2 and the scalar build.** Quantised against float, rows drift 0.0095 logits on average, 0.22 at
+worst. Re-exporting gen-6-pw without a prior reproduces `48428bbbd57e` byte for byte, and the
+prior's net benches 237294 - the shipped tree - until the search reads it. UCI `PolicyHead`
+(default true) runs a net as if it had no prior: an A/B on one file.
+
+#### Phase 3.1: the promising side of LMR
+
+At depth >= `PolMinDepth` (4), the first late quiet at a node generates the legal quiets and scores
+them - at the PARENT, before the move is made, because the prior reads the accumulator of the side
+choosing. A late quiet among the prior's top `PolLmrRank` (2) is reduced a ply less. Bench 231634
+(default) / 6373741 (d13: the tree is 20% larger, which is what reducing less buys). Gates:
+`PolicyHead=false` and the shipped net both bench 237294; `smp selftest` 11/0, `movepick selftest`
+14/0, `chess960 selftest`, `openbench-check` PASS, trainer suite 198 passed.
+
+| # | change | vs | TC | games | W-L-D | Elo | verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | prior top-2 late quiets r-1, depth >= 4 | shipped net | STC | 2424 | 535-633-1256 | **-14.05 +/- 7.80** | stopped by hand at LLR -2.73 |
+
+Binaries, notes and log: `external/games/sprt-20261003-prior/`. Ptnml [24, 340, 583, 240, 25], no time losses.
+
+**Rejected.** Reducing the frozen prior's favourite late quiets less made the d13 tree 20% bigger,
+and the prior's picks were not good enough to pay for it. That is consistent with the gate: inside
+history x z cells the prior's AUC was 0.593, against z's 0.871 over history - a modest signal
+spent on the expensive side of LMR. `PolLmrRank` now defaults to 0, so a net that carries a prior
+does not switch the rejected use on by itself, and the prior is not computed unless something
+reads it. The next step is not a different use of this head but a better head: a prior trained
+jointly with the value net, so the feature transformer learns move choice too (`--move-prior`).
+
+#### Joint training: what the pilot said
+
+The frozen head plateaued at 20% top-1 by epoch 4: a linear read of features learned for
+EVALUATION, which more data cannot fix. Trained jointly (`--move-prior`), the prior's gradient
+reaches the feature transformer, and then the whole of gen-6 is worth reading. The loader makes
+each batch's legal lists through `make policy-lib` - `tools/datagen.c` as a shared library, the
+same `moves_encode()` that writes `.mv`, byte-identical on 500,000 val-006 records - because a
+stored `.mv` for 2.5B records would be ~640 GB.
+
+gen-6-pw's own recipe, from scratch, 100M positions of gen-006, val-006, 8 workers:
+
+| `--prior-weight` | val value loss | vs no prior | prior val CE | prior top-1 |
+|---|---|---|---|---|
+| 0 (no prior) | 0.005862 | - | - | - |
+| **0.0005** | 0.005876 | **+0.2%** | 2.704 | 19.6% |
+| 0.002 | 0.005975 | +1.9% | 2.584 | 22.1% |
+| 0.008 | 0.006217 | +6.1% | 2.473 | 24.5% |
+
+A real trade, priced: every step of weight buys prior and costs value. At 0.0005 the value cost
+is inside single-seed noise, and after 100M positions the joint prior already equals the frozen
+head that needed a fully trained net under it. Throughput at steady state: 1.16M positions/s
+without the prior, ~820k with it (8 workers; 4 is too few to keep up, 12 oversubscribes 16
+threads). `--prior-fraction` labels only a share of each batch, but bought back only ~10% at
+0.25 - the extra columns cost as much as the generation - so the first run labels everything.
+
+A first full run: gen-6-pw's command plus `--move-prior --prior-weight 0.0005 --workers 8` and
+`--val val-006` (the old val set has no `.pol`). Then two SPRTs: the new net's VALUE against the
+shipped net, with every use of the prior off (the default), and only if that holds, the prior's
+uses one at a time - `-DPOL_ORDER_W_DEFAULT=5500` first, the table it is strongest on.
+
+#### Pending
+
+| item | why | what happened |
+|---|---|---|
+| a joint gen-6 run at `--prior-weight 0.0005`, and its value SPRT | above | E48: +7.47 vs gen-6-pw; E49: the same run without the prior is +22 better still |
+| quiet ordering by the prior (Phase 3.2) | the table it is strongest on; one SPRT, after run 1 | E48: 14 shapes, flat at STC |
+| LMP / futility exemption for the prior's top quiets (3.3) | only if 3.1 and 3.2 pass; z cannot do this, it needs the move made | E48: tried anyway, -24.94 at VSTC |
+| sigma at LTC: the head on/off on one net | the user's thesis that sigma's uses fade at the highest Elo | **still not run.** The `UncertaintyHead` option it needs is now in the tree (built in E48, kept when the prior went) |
+| a joint-trained or nonlinear prior | only if the frozen linear head is what caps it - top-1 flattened at 20% by epoch 4 | E48: joint 25.6% top-1; 64/256-unit heads no better than linear |
+
+---
+
+### E48: The joint move prior in the search - what it knows, and every use tried
+
+**Date** 2026-10-04 · **Net** `ac080356d440` (`net-gen-6-prior.pt`: gen-006 + gen-006-u, `--move-prior
+--prior-weight 0.0005`, `--unc-weight 0.0005`, gen-6-pw's recipe otherwise) · **Baseline** the same net
+with every use of the prior off, bench 184909 / 5200865 (d13) · **Status** **no use of the prior gains
+Elo**; ordering is flat at STC, every use that changes how much effort a move gets is negative. The
+prior was removed in E49.
+Binaries, queue and logs: `external/games/sprt-20261004-prior/` (`NOTES.md`).
+
+E47's frozen-trunk prior lost 14 Elo in its one game test and plateaued at 20% top-1, which said
+the head could only re-weight features learned for evaluation. This is the jointly trained one
+E47 pointed to, and a day of asking what the search can do with it.
+
+#### What the joint prior knows
+
+Training: val-006 top-1 **25.6%** (frozen: 20.0%), CE 2.450 (2.717), still creeping up at epoch 25.
+On the new net's own d13 bench tree (`make policy-stats`, 1,280,683 late quiets, 1.41% beat alpha):
+
+| | frozen (E47) | joint |
+|---|---|---|
+| prior alone, AUC for "beat alpha" | 0.752 | **0.785** (history alone: 0.779) |
+| prior inside history x z cells - the gate | 0.593 | **0.638** |
+| beat-alpha rate, rank 1 vs rank 11+ | 5.72% / 0.52% | **7.35% / 0.38%** |
+| failed quiets the prior keeps above the cutter (chance 0.50) | 0.37 | **0.33** |
+| cutter ranked first after one failed quiet (chance 50%) | 62.8% | **66.9%** |
+
+Refitted against history, one logit of prior is worth ~5,500-6,400 history units (7,300 at depth
+3-4, 3,600 at 8+); LMR's own history divisor makes that ~0.7 ply.
+
+**Where it knows more than history** - AUC inside bands of |main + continuation history|:
+
+| \|history\| | share | history AUC | prior AUC |
+|---|---|---|---|
+| 0-250 | 32.7% | 0.624 | 0.768 |
+| 250-1,000 | 27.3% | 0.704 | 0.774 |
+| 1,000-2,500 | 21.9% | 0.746 | 0.774 |
+| 2,500-5,000 | 11.3% | 0.783 | 0.774 |
+| 5,000+ | 6.8% | 0.767 | 0.754 |
+
+**The head's shape is not what limits it.** On the joint net's frozen trunk, 20M gen-006 records, 4
+epochs: linear 25.2% top-1 (CE 2.469), 64 clipped-ReLU hidden units 22.7% (2.591), 256 units 24.8%
+(2.483). The ceiling is in the activations, not in how they are read.
+
+#### Every use, one at a time
+
+Each candidate is the baseline plus one `-DPOL_*_DEFAULT` flag (src/search.c, all off by default),
+benched at d7 and d13 to prove it fired. VSTC 2+0.02, 1200 games, [0, 5], against the baseline:
+
+| use | flag | bench d13 | Elo |
+|---|---|---|---|
+| quiet ordering, 6000 history units per logit, depth >= 4 | `POL_ORDER_W=6000` | 4396186 | **+8.11 +/- 11.95** |
+| ordering at 12000 | `POL_ORDER_W=12000` | 5335925 | -9.56 +/- 11.71 |
+| ordering at 4000 | `POL_ORDER_W=4000` | 5802511 | -6.08 +/- 11.39 |
+| ordering 6000, -600 per ply above depth 4 | `+POL_ORDER_SLOPE=600` | 5582972 | -1.45 +/- 11.84 |
+| ordering 6000 from depth 5 | `+POL_MIN_DEPTH=5` | 5802783 | -3.47 +/- 11.55 |
+| ordering 6000, cut-nodes only | `+POL_ORDER_CUTONLY=1` | 5083218 | +2.90 +/- 11.91 |
+| ordering 8000 tapered to 0 by \|history\| 3000 | `POL_ORDER_GAP=3000` | 5056522 | -10.14 +/- 12.17 |
+| the same at 12000 | | 5014636 | **-21.16 +/- 12.28** |
+| the same at 8000, cut-nodes only | | 4276226 | -5.50 +/- 12.08 |
+| LMR: prior read like history, 12/16 ply per logit, both ways | `POL_LMR_K=12` | 5800868 | -13.32 +/- 11.90 |
+| LMR: +1 ply 2+ logits below the node's mean | `POL_LMR_MORE=32` | 4813531 | -9.27 +/- 11.87 |
+| LMR: -1 ply for the prior's top 2 | `POL_LMR_RANK=2` | 5496960 | +3.47 +/- 11.55 |
+| top-2 exempt from late-move and futility pruning | `POL_PRUNE_RANK=2` | 4623684 | **-24.94 +/- 11.41** |
+| history orders the first 2 quiets, then the prior re-sorts the rest at 12000 | `POL_LATE_AFTER=2` | 4791621 | **+12.75 +/- 11.85** |
+| the same after 1 quiet | `POL_LATE_AFTER=1` | 5585792 | +0.87 +/- 11.42 |
+| after 2, at 32768 (the prior dominates the rest) | `+POL_LATE_W=32768` | 5923642 | 0.00 +/- 11.85 |
+
+Ordering from depth 2 was dropped before playing: 10% slower to d13 than the baseline, where
+ordering from depth 4 was 14% faster (2.16 s against 2.51 s, interleaved). LMR at 24/16 ply per
+logit (`POL_LMR_K=24`, d7 bench 218899) was skipped once 12/16 had lost 13. A "ship" test -
+the joint net with ordering at 6000 against the old shipped engine - was queued and never played,
+since ordering itself was flat.
+
+**STC 8+0.08, ordering at 6000: -4.79 +/- 9.44 over 1596 games** (ptnml [16, 198, 386, 188, 10]),
+stopped by hand once +5 was out of reach. The VSTC +8 was the best of five ordering variants
+and did not survive fresh games - the selection-bias trap E45 also fell into.
+
+**STC, the late switch after 2 quiets: +1.56 +/- 8.58 over 2000 games** (ptnml [17, 249, 455, 266,
+13]). It is the use the offline cutoff table pointed at - the prior only where history's own first
+picks have failed - and its VSTC +12.75 was the best of three. It too did not survive fresh games.
+
+#### What it says
+
+**The prior's knowledge does not convert, in any of the shapes tried.** It separates late quiets as
+well as history, it orders cutoffs better than chance where history has failed, and it buys 14%
+time-to-depth on the bench - and the games are flat. What the static tables measure is mostly
+what history learns DURING the search anyway: history is weak on a move the search has never
+tried, but within a few hundred nodes it has tried it.
+
+**Every use that decides how much effort a move gets is negative**, and the harder the prior pushes,
+the worse: pruning exemption -25, reading it into LMR -13, a gap-filling weight of 12000 -21. A move
+the prior likes and history does not is usually a move the search has not yet tried - promoting it
+delays the cutter history already knows.
+
+**Ordering is the only use that is not clearly harmful**, and at STC both shapes that screened best
+- a blend at the fitted weight, and the late switch - are flat: -4.79 +/- 9.44 and +1.56 +/- 8.58.
+
+**Process.** Twice today a best-of-N VSTC screen (+8.11, +12.75) measured zero on fresh STC games.
+At 1200 games a screen resolves +/-12 Elo, and the effects being looked for are a few Elo: a screen
+here can drop a clear loser (prune2, gap12k) but cannot pick a winner. A future attempt should go
+straight to STC, or screen at 3000+ games.
+
+#### The net itself: better, and correctly centred
+
+**The joint net against the old shipped one, every use of the prior off: +7.47 +/- 8.64 over 2000
+STC games** (ptnml [11, 242, 466, 255, 26], LLR +1.30 on non-regression bounds [-5, 0], capped).
+The 95% interval is about -1 to +16: at least as strong, probably a few Elo stronger. Two changes
+went into it at once - the prior's loss on the shared feature transformer, and gen-006-u's 596M
+extra positions - so this does not say which one paid; it says the joint run is a better VALUE
+net, which is the thing a net is shipped for. **(E49 split them: the prior's loss was costing ~22
+Elo, and the same run without it is +25.41 over gen-6-pw.)**
+
+**Its sigma margins need no re-centring.** The run trained the uncertainty head at a twentieth of
+gen-6-pw's weight (`--unc-weight 0.0005` against 0.01), which is the change NNUE.md 5c warns can
+silently de-centre `unc_scale()`. Probed on today's search under today's constants (99/9/145):
+old net mean scale 128.7, sd 14.7, 33.1% at the cap; new net 128.4, sd 14.9, 31.4%. Matching the
+two solves to exactly the shipped 99 and 9.
+
+#### Two of E46's open items, on the old net against HEAD's tree
+
+Both re-added as off-by-default knobs, built on the shipped gen-6-pw net, against a base that
+reproduces HEAD exactly (bench 237294 / 5314637):
+
+| change | knob | games | Elo | |
+|---|---|---|---|---|
+| quiet checks into LMR at r-1 | `QCHECK_LMR=1` (search.c) | 2000 | 0.00 +/- 8.80 | with E46 run 35's +5.21 over 3000: ~+3 +/- 5 over 5000. Settled: not worth shipping |
+| spend the whole increment, not 3/4 | `TM_INC_QUARTERS=4` (timeman.c) | 1800 | **+7.53 +/- 8.81** | ptnml [13, 201, 432, 242, 12], LLR +0.83, **no time losses**. Promising, not proven |
+
+#### Where this leaves the prior
+
+The second model is built, exact, toggleable at every stage, and measurably informative - and the
+search cannot yet use what it knows. What would change that is a prior that knows something
+history cannot LEARN within a search, not one that predicts the same thing a little earlier: a
+much stronger head (more weight, more data, a policy-sized net), or a use outside the move loop.
+Every `POL_*` knob stays at 0, so the shipped behaviour is unchanged. (E49 tried both of those
+routes and the prior was then removed.)
+
+#### Evening follow-up: is there room, and can the model get better? (cut short - machine needed)
+
+**Ordering has almost no room at the nodes the prior is asked.** From the d13 dump: at depth >= 4
+only **2.0-2.8% of nodes** end on a quiet cutoff that came after a failed quiet (mean 2.6 failed
+quiets before the cutter); everywhere else, quiet order cannot change which move cuts, only which
+moves LMR reduces. So ordering's 15% smaller bench tree was reductions moving around, not earlier
+cutoffs - which is why it was flat in games. Depth 1-3 nodes have more (1.8-4.5%) but are 82% of
+the tree, where the prior costs too much.
+
+**Joint training weight is a weak lever.** Fine-tunes of `net-gen-6-prior.pt`, 250M-position
+epochs at lr 5e-5, identical but for `--prior-weight`:
+
+| weight | epochs | val value loss | prior CE | top-1 |
+|---|---|---|---|---|
+| 0.0005 (control) | 2 | 0.003889 | 2.450 | 25.6% |
+| 0.002 | 2 | 0.003916 (+0.7%) | 2.417 | 26.2% |
+| 0.008 | 1 (stopped) | 0.004013 (+2.9% vs control's epoch 1) | 2.382 | 27.0% |
+
+Sixteen times the weight buys about 1.5 points of top-1 and visibly costs the value head.
+
+**The prior's edge is not classical tactics.** The stats dump now records each late quiet's facts
+(polstats v2: origin/destination attacked, SEE-safe, escaping or walking into a lesser attacker,
+piece type). Beat-alpha rates: SEE-safe 1.61% vs 0.20%; escaping a lesser attacker 4.40% vs 1.30%;
+into a lesser attacker 0.09% vs 1.51%. But the prior's AUC inside history x z cells only falls
+from 0.638 to **0.623** once facts x piece are held fixed as well - what it knows beyond history is
+mostly not these. (The facts-only and logistic-fit rows did not finish.)
+
+**Not run:** a head trained on the search's own labels. 4,000 gen-006 roots were searched to depth
+12 by the stats build (~8 GB of late-quiet labels; `intree_collect.py` / `intree_train.py` in the
+session scratchpad): a residual 448-row head on the frozen trunk, scored against the joint prior on
+held-out roots. That is the next experiment if the prior is pursued. (Run in E49: nothing once the
+baselines are fitted properly.)
+
+---
+
+### E49: The move prior's last tries, and what its stats harness found instead
+
+**Date** 2026-10-04/05 (overnight) · **Nets** joint `ac080356d440` for prior work; shipped gen-6-pw
+`48428bbbd57e` for everything played against HEAD · **Status** the prior gains nothing in the
+search and **costs ~22 Elo as a training loss**; the same retrain without it, `net-gen-6-noprior` (`49e4301d6224`), is **+25.41 +/- 8.68** over the shipped net.
+Binaries, queue and logs: `external/games/sprt-20261004-prior/` (`NOTES.md`).
+
+#### Training the prior on the search's own question: no
+
+The joint prior imitates datagen's root best move. The search's question is different: which late
+quiet, inside its own tree, deserves depth. The stats build (`make policy-stats`, polstats v2)
+answers that directly, so it was run over 4,000 gen-006 roots to depth 12 (UCI, `ucinewgame`
+between roots): ~8 GB of late-quiet outcomes. Depth >= 4 nodes, one node in four: 18.5M late
+quiets from five shards for fitting, 3.75M from a sixth (different roots) for scoring.
+
+| model of "this late quiet beats alpha" (held-out roots) | AUC | AUC within a node |
+|---|---|---|
+| history alone | 0.799 | 0.397 (*) |
+| joint prior alone | 0.780 | 0.761 |
+| (a) logistic: history, cont, z, moveCount, r, depth, tactical facts | 0.937 | 0.733 |
+| (b) (a) + joint prior | 0.940 | **0.768** |
+| (b) held fixed + a 448-row head trained on these labels | 0.9435 | 0.769 |
+
+(*) below chance by selection: a cut node stops at its first move above alpha, so within a node
+the mover is the last one tried - the one history ranked lowest.
+
+The head trained on in-tree labels adds +0.003 AUC, all of it node-level (within node +0.001), and
+overfits by its third epoch. A first run reported 0.928 and "0.741 inside history x z" for it -
+an artifact: its (a) and (b) were SGD fits that had not converged (BCE above a constant
+predictor's), and the head's rows absorbed what the linear part had not learned. **Fit the
+baselines to convergence before crediting a new signal.**
+
+What survives: within a node, the joint prior is the only signal that separates moves, worth
++0.035 AUC over everything the search already reads. That is real per-move knowledge, and small.
+
+#### The prior as a training aid for the value net: no
+
+E48's joint net played +7.47 +/- 8.64 against gen-6-pw, but that run changed three things at once:
+gen-006-u added to the data, `--unc-weight` 0.0005 instead of 0.01, and the prior loss. A retrain
+with the joint run's exact recipe and seed but no `--move-prior` (`net-gen-6-noprior`) has the
+lower validation value loss at every matched epoch so far - e1 0.004819 vs 0.004862, e2 0.004623
+vs 0.004657, e3 0.004373 vs 0.004392 - and the fine-tunes agree: more prior weight, worse value
+head. Whatever the joint net gained, the prior did not give it.
+
+#### Gating singular extensions on the prior: no signal
+
+polstats v3 adds an S line per singular verification (the table move, the result against the
+singular beta). Over the d13 bench tree, 28,064 verifications, 44.6% extend: the prior's
+log-probability of the table move separates "extends" from not at AUC **0.514** (0.53-0.58 by
+depth). A third of table moves get under 2% from the prior and still extend 46% of the time;
+only the 2.4% it rates above 0.7 stand out (76%). The prior does not understand the positions
+singular search is asked about, so it cannot skip or force the verification.
+
+#### What the stats harness found instead: a quiet move's own safety
+
+polstats v2 records each late quiet's tactical facts. History keys only "origin attacked" and
+"destination attacked"; inside every history quintile of the d13 bench tree:
+
+| late quiet | share | beats alpha (history q0-q3) | mean r today |
+|---|---|---|---|
+| all | 100% | 0.36-0.96% | 2.20 |
+| SEE calls it losing | 14% | **0.06-0.10%** | 2.78 |
+| walking into a lesser attacker | 7% | 0.03-0.09% | 2.83 |
+| escaping a lesser attacker | 3.5% | **1.5-2.2%** (q4: 12.5% vs 4.6%) | 2.05 |
+
+Each became an off-by-default knob in src/search.c, with two standard terms the survey of the move
+loop turned up missing. All STC 8+0.08, shipped gen-6-pw net, against `oldnet.exe` (HEAD's tree,
+bench 237294; `thr-base` with every knob off reproduces it):
+
+| change | knob | d13 bench | first 3000 | fresh 3000 | pooled 6000 |
+|---|---|---|---|---|---|
+| LMR +1 at an expected cut node | `LMR_CUTNODE=1` | 5458505 | +9.27 +/- 6.92 | +0.58 +/- 6.63 | **~+4.9** |
+| threat-aware quiet ordering, 8192 (x2 rook, x3 queen) | `THREAT_ORDER=8192` | 5244546 | +6.02 +/- 6.98 | +0.81 +/- 6.86 | **~+3.4** |
+| LMR +1 for a late quiet SEE calls losing | `LMR_SEE_BAD=1` | 4950065 | +3.36 +/- 7.10 | | |
+| LMR -1 for a quiet escaping a lesser attacker | `LMR_ESCAPE=1` | 4978283 | -2.66 +/- 7.07 | | |
+| quiet ordering +8192 for a quiet check | `CHECK_ORDER=8192` | 5592627 | -4.29 +/- 6.99 | | |
+| spend the whole increment (E48's +7.53) | `TM_INC_QUARTERS=4` | 5314637 | | +0.46 +/- 6.81 | ~+3 over 4800 |
+
+**The two leaders were the best of five, and both shrank to near zero on fresh games** - the same
+selection effect E45 and E48 met. What remains is two small positives, neither proven alone.
+
+The facts that separate moves best did not pay as reductions: escaping moves beat alpha 2-5x more
+often, yet reducing them less lost; the same pattern as every prior-based LMR use in E48. A
+signal that predicts which moves matter is not, by that alone, a better reduction than the tuned
+LMR it is added to.
+
+#### The result of the night: the same retrain without the prior
+
+`net-gen-6-noprior` finished at 09:05: the joint run's recipe and seed (gen-006 + gen-006-u,
+`--unc-weight 0.0005`, 24 x 500M + a finishing pass), no `--move-prior`. Its validation value loss
+was lower than the joint net's at **all 24 matched epochs and the finish** (0.003789 vs 0.003812).
+Exported and exact on 10,000 vectors (`make nnue-test ARGS="net-gen-6-noprior"
+EVALFILE=external/nets/net-gen-6-noprior.nnue`, sha in `net-gen-6-noprior.json`).
+
+Its sigma runs ~2% wide under the shipped 99/9 (`make unc-probe`: mean scale 131.6, 39.7% at the
+cap, against gen-6-pw's 128.7 / 33.1%); 100/7 matches it, and every game below gives it those.
+`UNC_SIGMA_BASE` / `UNC_SIGMA_SLOPE` gained `-D..._DEFAULT` overrides for that, defaults unchanged.
+
+| test | games | Elo | |
+|---|---|---|---|
+| no-prior net vs shipped gen-6-pw (SPRT [0, 5]) | 1600 | **+26.54 +/- 9.49** | **PASSED**, LLR +2.95, ptnml [7, 153, 371, 249, 20], no time losses |
+| the same, fixed length (no early-stop bias), 100/7 compiled in | 2000 | **+25.41 +/- 8.68** | ptnml [13, 199, 431, 330, 19], no time losses |
+| **no-prior net vs the joint net** (same recipe and seed, each centred) | 2000 | **+22.27 +/- 8.51** | ptnml [8, 208, 440, 316, 19] - what the prior loss cost |
+| threat ordering + cut-node LMR on top of the no-prior net (SPRT [0, 5]) | 3000 | +3.24 +/- 6.88 | LLR +0.42 - the classical pair, still not proven |
+
+**The prior was not a free passenger in training: it cost the value net about 22 Elo.** The joint
+net's +7.47 over gen-6-pw was the extra data and the 20x smaller sigma weight, net of that loss;
+without the prior the same run is +25. The validation loss saw it (-0.6% at every epoch, from the
+first) but undersold it badly - 0.6% of loss is not what 22 Elo usually looks like. E48 read the
+joint net's +7.47 as "the prior is at worst harmless to the value"; it was the opposite.
+
+#### Where this leaves the move prior
+
+Every route E47-E49 could think of was measured: 17 search shapes (E48), training it on the
+search's own labels, gating singular extensions, more training weight, and the prior as a training
+aid. **None gains, and the last one loses ~22 Elo.** What it knows that the search does not is
+real but small - +0.035 AUC within a node - and every use that spends effort on that knowledge
+costs more than it returns. The infrastructure stays (`--move-prior`, `make policy-lib`,
+`make policy-stats`, the `POL_*` knobs, `PolicyHead`), all off; **do not train with
+`--move-prior`.**
+
+What the work produced instead is the recipe the joint run carried: gen-006 + gen-006-u at
+`--unc-weight 0.0005`, without the prior - `net-gen-6-noprior`, +25 at STC, and the night's three
+new knobs, `THREAT_ORDER` and `LMR_CUTNODE` small unproven positives (~+3 to +5 each over 6000
+games), the rest settled negative.
+
+**Shipped:** `net-gen-6-noprior` is the pinned net, with `UNC_SIGMA_BASE` 100 / `UNC_SIGMA_SLOPE` 7 as
+the defaults; the default build benches **207432** (d13 5853074), node for node `np-base-c`, the
+binary the +25.41 was measured with. An LTC check is still to run. The no-prior recipe is also the
+right baseline for any later gen-7 run.
+
+#### Built, and never played
+
+Recorded so nobody rebuilds them thinking they are new. All in `external/games/sprt-20261004-prior/bin/`:
+- `thr4k` / `thr16k`: threat ordering at 4096 and 16384 (d13 5593295 / 5292029) - the dose
+  follow-up for 8192, dropped once 8192's fresh games came back +0.81.
+- `combo3`: threat ordering + cut-node LMR + SEE-losing LMR on the shipped net (d13 5020522).
+- `31-stc-newnet-confirm`: fresh games for the joint net vs gen-6-pw, held in favour of the cleaner
+  no-prior test. `36-stc-combo2` (the pair on the shipped net) was stopped at its start for the
+  same pair on the no-prior net (39).
+
+#### The removal
+
+With every route measured, the move prior is taken out of the tree entirely: the search's
+`PriorCache` and every `POL_*` knob, `nnue_policy_*` and the net-file payload (a net flagged in
+`reserved[1]` is refused by the loader's reserved-byte check, and a checkpoint carrying the
+prior's `prior.*` weights no longer loads in the trainer - no shim for either), `PolicyHead`,
+the exporter's `--policy` / `--drop-prior`, the trainer's `--move-prior` path (`legal.py`,
+`policy.py`, their tests), `datagen legal` and the `.mv` sidecar, `make policy-lib`, and the stats
+build `make policy-stats` (`src/test/polstats.*`) with it. `.pol` sidecars stay: they predate the
+prior. Kept: `UncertaintyHead` and `--drop-uncertainty`, built alongside the prior but about the
+other head; the night's classical knobs (`THREAT_ORDER`, `LMR_CUTNODE`, `LMR_SEE_BAD`, `LMR_ESCAPE`,
+`CHECK_ORDER`, `QCHECK_LMR`, `TM_INC_QUARTERS`), all off; and `-DUNC_SIGMA_*_DEFAULT` overrides.
+The default build benches 237294, exactly the pre-prior HEAD; `nnue verify`, `make trainer-test`
+(188), `make datagen-test` and `make format-check` pass; `net-gen-6-noprior.pt` re-exports to the
+same bytes (`49e4301d6224`) with the restored exporter.
+
+Still open and untested: the thesis that started E47 - that sigma's uses fade at the highest Elo -
+has never been measured. `UncertaintyHead=false` against the same net at LTC is the test.

@@ -74,6 +74,19 @@ means the win is real but does not fit in the halfmoves left.
 | `UCI_Chess960` | check | false | | Chess960 castling notation (see below) |
 | `SyzygyPath` | string | `<empty>` | | directory of Syzygy tablebases; empty disables probing |
 | `EvalFile` | string | `<internal>` | | **nnue builds only**, which is the default — load a net from disk |
+| `UncertaintyHead` | check | true | | **nnue builds only** — false runs a net as if exported without its uncertainty head: margins fall back to the corrhist signal, z-LMR is off, the head is never computed |
+
+`UncertaintyHead` exists for A/B tests on ONE net file. A head retrained away changes the
+value trunk too, so two exports cannot isolate what the head's use is worth; switching it off
+can. The `info string net` line marks a head that is present but off as `+unc(off)`, and a net
+that never had the head says so rather than silently measuring nothing. A typical run, with
+`sprt.py`'s `--dev-options` on the side that turns it off:
+
+```sh
+make sprt ARGS='--dev stormbreaker.exe --base stormbreaker.exe --dev-options UncertaintyHead=false --rounds 1500'
+```
+
+(A `PolicyHead` option did the same for the move prior; it went with the prior, E49.)
 
 `UCI_Chess960` selects how castling is **spelled**, not which rules apply. The
 rules come from the position: `board_set_fen` derives the castling geometry

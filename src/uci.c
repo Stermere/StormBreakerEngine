@@ -182,6 +182,9 @@ static void cmd_uci(void) {
      * evaluation without a rebuild, which is what makes a candidate net cheap to try. */
 #ifdef EVAL_NNUE
     printf("option name EvalFile type string default <internal>\n");
+    /* For an A/B of the uncertainty head on one net: false runs the net as if it had been
+     * exported without it, which two exports could only approximate. */
+    printf("option name UncertaintyHead type check default true\n");
 #endif
     /* A tuning build advertises every search margin, so a sweep can drive the whole set
      * through one binary rather than one build per candidate. */
@@ -314,6 +317,11 @@ static void cmd_setoption(char *args) {
                 nnue_print_info();
             }
         }
+    } else if (strcmp(name, "UncertaintyHead") == 0 && value) {
+        end_search_for_option(name);
+        if (!nnue_set_uncertainty(strcmp(value, "true") == 0))
+            printf("info string UncertaintyHead: net %.12s has no uncertainty head\n", nnue_hash());
+        nnue_print_info();
 #endif
         /* Seeds the POSITION's flag, which is what every spelling decision reads.
          * board_set_fen carries it across position changes and latches it on by itself
@@ -353,9 +361,9 @@ static void cmd_setoption(char *args) {
          * fault instead.
          */
         static const char *const Known[] = {
-            "Hash",     "Threads", "Ponder", "Move Overhead", "SyzygyPath", "UCI_Chess960",
+            "Hash",     "Threads",         "Ponder", "Move Overhead", "SyzygyPath", "UCI_Chess960",
 #ifdef EVAL_NNUE
-            "EvalFile",
+            "EvalFile", "UncertaintyHead",
 #endif
         };
 

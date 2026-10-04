@@ -573,9 +573,21 @@ TUNABLE(UNC_SCALE_MAX, 145);
  * to 121.2 - but in the SPREAD: the same constants on the new head give sd 21.8 where
  * gen-5 gave 14.4, and 33.8% of nodes at the cap where gen-5 had 26.2%. These are the
  * `unc-probe -ref` values, which reproduce gen-5's OUTPUT distribution rather than
- * centring on 100, and that is what carries E22's fit across the retrain. */
-TUNABLE(UNC_SIGMA_BASE, 99);
-TUNABLE(UNC_SIGMA_SLOPE, 9);
+ * centring on 100, and that is what carries E22's fit across the retrain.
+ *
+ * Re-centred 99/9 -> 100/7 for gen-6-noprior (E49), the same way: under 99/9 it gave mean
+ * scale 131.6 and 39.7% at the cap against gen-6-pw's 128.7 and 33.1%, and `unc-probe -ref`
+ * against gen-6-pw matches it at 100/7 (128.4, 30.1%). Its +25 Elo was measured at 100/7. */
+/* Build-time overrides, so a candidate net can carry the centring `make unc-probe` solved for it
+ * into a binary that plays without UCI options. */
+#ifndef UNC_SIGMA_BASE_DEFAULT
+#define UNC_SIGMA_BASE_DEFAULT 100
+#endif
+#ifndef UNC_SIGMA_SLOPE_DEFAULT
+#define UNC_SIGMA_SLOPE_DEFAULT 7
+#endif
+TUNABLE(UNC_SIGMA_BASE, UNC_SIGMA_BASE_DEFAULT);
+TUNABLE(UNC_SIGMA_SLOPE, UNC_SIGMA_SLOPE_DEFAULT);
 
 /*
  * How much of the mapping each margin actually wants. unc_scale() returns ONE number, and
@@ -665,6 +677,50 @@ TUNABLE(ASPIRATION_DELTA, 16);
  * Reducing hopeless moves harder on the same signal measured slightly negative at STC, and is
  * not here. Thresholds in sixteenths of a sigma.
  */
+/* Quiet checks into LMR, a ply less than a quiet: E46's run 35 measured +5.21 +/- 6.56 over 3000
+ * STC games on top of today's HEAD (LOS 94%) and was never settled. Off by default until it is. */
+#ifndef QCHECK_LMR_DEFAULT
+#define QCHECK_LMR_DEFAULT 0
+#endif
+TUNABLE(QCHECK_LMR, QCHECK_LMR_DEFAULT);
+
+/* What a quiet move does to its own piece's safety, which history keys only as "attacked or
+ * not" (E49). Over the d13 bench tree, inside every history quintile, a late quiet SEE calls
+ * losing beat alpha 5-10x less often than the rest, and one escaping a LESSER attacker 2-5x more
+ * often. Off by default; each is one candidate.
+ *   THREAT_ORDER  history units for escaping a lesser attacker (and the same malus for walking
+ *                 into one), x2 for a rook, x3 for a queen - Stockfish's shape, at its scale over
+ *                 this engine's quiet range
+ *   LMR_SEE_BAD   plies more for a late quiet SEE calls losing
+ *   LMR_ESCAPE    plies less for a late quiet escaping a lesser attacker to a square none hits */
+#ifndef THREAT_ORDER_DEFAULT
+#define THREAT_ORDER_DEFAULT 0
+#endif
+#ifndef LMR_SEE_BAD_DEFAULT
+#define LMR_SEE_BAD_DEFAULT 0
+#endif
+#ifndef LMR_ESCAPE_DEFAULT
+#define LMR_ESCAPE_DEFAULT 0
+#endif
+TUNABLE(THREAT_ORDER, THREAT_ORDER_DEFAULT);
+
+/* History units for a quiet move that gives check. The prunes and LMR already exempt quiet
+ * checks; ordering alone gives them no credit, so one waits behind every quiet history likes.
+ * Off by default. */
+#ifndef CHECK_ORDER_DEFAULT
+#define CHECK_ORDER_DEFAULT 0
+#endif
+TUNABLE(CHECK_ORDER, CHECK_ORDER_DEFAULT);
+
+/* Plies more for a late quiet at an expected cut node. E6 removed a two-ply version in August
+ * (-16 on a stopped test, on a far weaker search) and left one ply untested. Off by default. */
+#ifndef LMR_CUTNODE_DEFAULT
+#define LMR_CUTNODE_DEFAULT 0
+#endif
+TUNABLE(LMR_CUTNODE, LMR_CUTNODE_DEFAULT);
+TUNABLE(LMR_SEE_BAD, LMR_SEE_BAD_DEFAULT);
+TUNABLE(LMR_ESCAPE, LMR_ESCAPE_DEFAULT);
+
 TUNABLE(ZLMR_LESS, 0);
 TUNABLE(ZDEEPER_Z, 16);
 TUNABLE(ZLMR_SIGMA_FLOOR, 16);
@@ -722,6 +778,12 @@ static const struct {
     {"LmpBase", &LMP_BASE, 1, 24},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
+    {"QcheckLmr", &QCHECK_LMR, 0, 1},
+    {"ThreatOrder", &THREAT_ORDER, 0, 32768},
+    {"CheckOrder", &CHECK_ORDER, 0, 32768},
+    {"LmrCutNode", &LMR_CUTNODE, 0, 3},
+    {"LmrSeeBad", &LMR_SEE_BAD, 0, 3},
+    {"LmrEscape", &LMR_ESCAPE, 0, 3},
     {"ZlmrLess", &ZLMR_LESS, -48, 48},
     {"ZdeeperZ", &ZDEEPER_Z, 0, 64},
     {"ZlmrSigmaFloor", &ZLMR_SIGMA_FLOOR, 1, 48},
@@ -879,6 +941,38 @@ static Bitboard attacked_by(const Position *pos, Color c) {
     return att | king_attacks(king_square(pos, c));
 }
 
+/* The squares `c` attacks with pieces worth at most a pawn, a minor, a rook - each set
+ * includes the cheaper ones, so "attacked by something worth less than a rook" is one test. */
+typedef struct {
+    Bitboard pawn, minor, rook;
+} LesserThreats;
+
+static LesserThreats lesser_threats(const Position *pos, Color c) {
+    const Bitboard occ   = occupied_bb(pos);
+    const Bitboard pawns = pieces_bb(pos, c, PAWN);
+    LesserThreats t;
+
+    t.pawn  = c == WHITE ? shift_north_east(pawns) | shift_north_west(pawns)
+                         : shift_south_east(pawns) | shift_south_west(pawns);
+    t.minor = t.pawn;
+    for (Bitboard b = pieces_bb(pos, c, KNIGHT); b; b &= b - 1)
+        t.minor |= knight_attacks(lsb(b));
+    for (Bitboard b = pieces_bb(pos, c, BISHOP); b; b &= b - 1)
+        t.minor |= bishop_attacks(lsb(b), occ);
+    t.rook = t.minor;
+    for (Bitboard b = pieces_bb(pos, c, ROOK); b; b &= b - 1)
+        t.rook |= rook_attacks(lsb(b), occ);
+    return t;
+}
+
+/* Where a `pt` stands attacked by something worth less than itself. Pawns and kings never are. */
+static inline Bitboard lesser_for(const LesserThreats *t, PieceType pt) {
+    return pt == QUEEN                    ? t->rook
+           : pt == ROOK                   ? t->minor
+           : pt == KNIGHT || pt == BISHOP ? t->pawn
+                                          : BB_EMPTY;
+}
+
 /* The main-history entry for `m` by side `c`, keyed on the threats at the node it was
  * played from. Every access goes through here: a scoring site that buckets one way and an
  * update site that buckets another would leave a table that is incoherent rather than
@@ -936,6 +1030,8 @@ static inline PieceType victim_of(const Position *pos, Move m) {
  * already touching every score, and saves the longest scan there is: the first selection
  * in the loop below, over the whole list.
  */
+static bool gives_check(const Position *pos, Move m);
+
 static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove *list, int count,
                                Move ttMove, int ply, Move counter, Move killer0, Move killer1) {
     const Color us = pos->sideToMove;
@@ -944,6 +1040,10 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
     int16_t *slices[CONT_SLOTS];
     for (int i = 0; i < CONT_SLOTS; ++i)
         slices[i] = cont_slice(td, i, ply, ContPlies[i]);
+
+    LesserThreats lesser = {BB_EMPTY, BB_EMPTY, BB_EMPTY};
+    if (THREAT_ORDER)
+        lesser = lesser_threats(pos, (Color)(us ^ 1));
 
     for (int i = 0; i < count; ++i) {
         const Move m      = list[i].m;
@@ -985,9 +1085,21 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
                 score = SCORE_KILLER_2;
             else if (m == counter)
                 score = SCORE_COUNTER;
-            else
+            else {
                 score = *main_hist(td, us, td->stack[ply].threats, m) +
                         cont_score(slices, moved, to_sq(m));
+                if (CHECK_ORDER && gives_check(pos, m))
+                    score += CHECK_ORDER;
+                if (THREAT_ORDER) {
+                    const PieceType pt = type_of(moved);
+                    const Bitboard lt  = lesser_for(&lesser, pt);
+                    const int scale    = pt == QUEEN ? 3 : pt == ROOK ? 2 : 1;
+                    if (bb_test(lt, from_sq(m)))
+                        score += bb_test(lt, to_sq(m)) ? 0 : THREAT_ORDER * scale;
+                    else if (bb_test(lt, to_sq(m)))
+                        score -= THREAT_ORDER * scale;
+                }
+            }
         }
 
         list[i].score = score;
@@ -2198,6 +2310,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
     td->stack[ply].threats = attacked_by(pos, (Color)(us ^ 1));
 
+    /* Computed at the first late quiet that asks (LMR_ESCAPE); a node that never gets that far
+     * never pays for it. */
+    LesserThreats lesser = {BB_EMPTY, BB_EMPTY, BB_EMPTY};
+    bool lesserKnown     = false;
+
     MovePicker picker;
     picker_init(&picker, td, pos, ttMove, excluded, ply, counter_move(td, ply));
 
@@ -2365,6 +2482,22 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         /* Read before the move is made: afterwards the victim is gone from the board. */
         const int capHistScore = tactical ? td->captureHist[moved][to_sq(m)][victim_of(pos, m)] : 0;
 
+        /* The late-quiet facts LMR may read (E49), also from the board before the move. */
+        int factR = 0;
+        if ((LMR_SEE_BAD || LMR_ESCAPE) && depth >= 3 && moveCount > 2 && !tactical && !inCheck) {
+            if (LMR_SEE_BAD && !see_ge(pos, m, VALUE_ZERO))
+                factR += LMR_SEE_BAD;
+            if (LMR_ESCAPE) {
+                if (!lesserKnown) {
+                    lesser      = lesser_threats(pos, (Color)(us ^ 1));
+                    lesserKnown = true;
+                }
+                const Bitboard lt = lesser_for(&lesser, type_of(moved));
+                if (bb_test(lt, from_sq(m)) && !bb_test(lt, to_sq(m)))
+                    factR -= LMR_ESCAPE;
+            }
+        }
+
         td->stack[ply].move       = m;
         td->stack[ply].movedPiece = moved;
 
@@ -2390,8 +2523,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
          * a reduced-only rejection from one that received a normal-depth search. */
         Depth r   = 0;
         int moveZ = INT32_MIN; /* this quiet's z, where one was computed */
-        if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && !givesCheck) {
-            r = Reductions[imin(depth, 63)][imin(moveCount, 63)];
+        if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && (QCHECK_LMR || !givesCheck)) {
+            r = Reductions[imin(depth, 63)][imin(moveCount, 63)] - (QCHECK_LMR && givesCheck);
 
             /* The principal variation is where accuracy is worth paying for, and a position
              * that was on one before is still that position whatever window this visit uses.
@@ -2408,6 +2541,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
             if (td->stack[ply + 1].cutoffCnt > CUTOFF_CNT_THRESHOLD)
                 ++r;
+
+            r += factR;
+            if (cutNode)
+                r += LMR_CUTNODE;
 
             /* A move the history tables like gets some of its reduction back, on separate
              * divisors because the two tables answer different questions and nothing says

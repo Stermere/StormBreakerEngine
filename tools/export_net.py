@@ -772,6 +772,11 @@ def main() -> None:
                         help="up to 32 bytes of provenance stamped into the header")
     parser.add_argument("-f", "--overwrite", action="store_true",
                         help="explicitly replace an existing export from a different checkpoint")
+    # The engine's UncertaintyHead option claims to run a net exactly as if exported
+    # without the head; an export made with this is how that claim is checked - the two
+    # must bench to the node.
+    parser.add_argument("--drop-uncertainty", action="store_true",
+                        help="export without the checkpoint's uncertainty head")
     args = parser.parse_args()
 
     checkpoint = resolve_checkpoint(args.checkpoint or DEFAULT_CHECKPOINT)
@@ -817,6 +822,11 @@ def main() -> None:
 
     if q["hidden"] != int(state.get("hidden", q["hidden"])):
         raise SystemExit("checkpoint's hidden field disagrees with its own weights")
+
+    if args.drop_uncertainty:
+        q["uncertainty"] = False
+        q.pop("unc_w", None)
+        q.pop("unc_b", None)
 
     limits = check_ranges(q, args.qa)
     tag = args.tag or f"e{state.get('epoch', '?')}-h{q['hidden']}-{checkpoint_hash[:12]}"

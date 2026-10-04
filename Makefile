@@ -65,8 +65,8 @@ EVALFILE         ?= $(DEFAULT_EVALFILE)
 #  docs/EXPERIMENTS.md records WHY that one was adopted, beside the SPRT that
 #  adopted it. Bump them together. tools/publish-net.ps1 uploads a net and
 #  prints the replacement lines.
-NET_TAG    ?= net-48428bbbd57e
-NET_SHA256 ?= 48428bbbd57e469b5228fc6a25080e84de2839a3b67023f1bbf3f2b79d731db2
+NET_TAG    ?= net-49e4301d6224
+NET_SHA256 ?= 49e4301d6224bfa415265da8c238b821525cc34d3175c92c019cc5655382688c
 NET_URL    ?= https://github.com/Stermere/StormBreakerEngine/releases/download/$(NET_TAG)/net.nnue
 
 # `CC ?= gcc` would NOT work here: make predefines CC as `cc`, so the variable

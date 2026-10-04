@@ -212,7 +212,13 @@ void timeman_init(TimeManager *tm, const SearchLimits *limits, Color us, int gam
     const int64_t spendable = clamp64(clock - overhead, 1, INT64_MAX);
     const int64_t budget    = clamp64(clock - reserve, 1, INT64_MAX);
 
-    const int64_t nominal = budget / moves + inc * 3 / 4;
+    /* E46 found the clock parked at ~1.5 s at 8+0.08 - the reserve plus moves * inc / 4, never
+     * spent. TM_INC_QUARTERS 4 spends the whole increment instead; built for that test, and 3,
+     * today's behaviour, until it has passed one. */
+#ifndef TM_INC_QUARTERS
+#define TM_INC_QUARTERS 3
+#endif
+    const int64_t nominal = budget / moves + inc * TM_INC_QUARTERS / 4;
     const int64_t optimum = nominal * phase_percent(gamePly) / 100;
 
     /* Inside the bank, what refills it: three quarters of the increment, so the clock
