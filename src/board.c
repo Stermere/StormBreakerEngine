@@ -899,6 +899,95 @@ static bool is_repetition(const Position *pos, int ply) {
     return false;
 }
 
+/*
+ * Every reversible move a non-pawn piece can make on an empty board, keyed by the Zobrist
+ * difference it makes to a position, side to move included: 3668 of them in 8192 slots, placed
+ * by cuckoo hashing so a lookup is two probes at most (Marcel van Kervinck's method, as
+ * Stockfish uses it).
+ */
+static Key CuckooKey[8192];
+static Move CuckooMove[8192];
+
+static inline int cuckoo_h1(Key h) { return (int)(h & 0x1fff); }
+static inline int cuckoo_h2(Key h) { return (int)((h >> 16) & 0x1fff); }
+
+void board_cuckoo_init(void) {
+    memset(CuckooKey, 0, sizeof(CuckooKey));
+    memset(CuckooMove, 0, sizeof(CuckooMove));
+    int count = 0;
+
+    for (int c = WHITE; c <= BLACK; ++c)
+        for (int pt = KNIGHT; pt <= KING; ++pt) {
+            const Piece pc = make_piece((Color)c, (PieceType)pt);
+            for (int s1 = 0; s1 < SQUARE_NB; ++s1)
+                for (int s2 = s1 + 1; s2 < SQUARE_NB; ++s2) {
+                    if (!(attacks_bb((PieceType)pt, (Square)s1, BB_EMPTY) & square_bb((Square)s2)))
+                        continue;
+
+                    Move move = make_move((Square)s1, (Square)s2);
+                    Key key   = ZobristPiece[pc][s1] ^ ZobristPiece[pc][s2] ^ ZobristSideToMove;
+                    int i     = cuckoo_h1(key);
+
+                    /* Insert, evicting whatever sits in the slot to its other home, until an
+                     * empty slot ends the chain. */
+                    for (;;) {
+                        const Key tk  = CuckooKey[i];
+                        CuckooKey[i]  = key;
+                        key           = tk;
+                        const Move tm = CuckooMove[i];
+                        CuckooMove[i] = move;
+                        move          = tm;
+                        if (move == MOVE_NONE)
+                            break;
+                        i = i == cuckoo_h1(key) ? cuckoo_h2(key) : cuckoo_h1(key);
+                    }
+                    ++count;
+                }
+        }
+    assert(count == 3668);
+    (void)count;
+}
+
+/*
+ * is_repetition() sees a cycle once it has been played; this sees one the side to move can
+ * still choose to close. Walking back two plies at a time, `other` accumulates what the
+ * OPPONENT's moves changed - when that cancels, the difference between now and the position
+ * `i` plies up is the work of the side to move alone, and if it is one reversible move with a
+ * clear path, playing it repeats that position.
+ */
+bool board_upcoming_repetition(const Position *pos, int ply, int limit) {
+    int end = pos->halfmoveClock < pos->gamePly ? pos->halfmoveClock : pos->gamePly;
+    if (limit < end)
+        end = limit;
+    if (end < 3)
+        return false;
+
+    const Key original = pos->key;
+    Key other          = original ^ pos->history[pos->gamePly - 1].key ^ ZobristSideToMove;
+
+    for (int i = 3; i <= end; i += 2) {
+        other ^= pos->history[pos->gamePly - (i - 1)].key ^ pos->history[pos->gamePly - i].key ^
+                 ZobristSideToMove;
+        if (other != 0)
+            continue;
+
+        const Key moveKey = original ^ pos->history[pos->gamePly - i].key;
+        int j             = cuckoo_h1(moveKey);
+        if (CuckooKey[j] != moveKey) {
+            j = cuckoo_h2(moveKey);
+            if (CuckooKey[j] != moveKey)
+                continue;
+        }
+
+        /* Only cycles inside the search: one reaching back past the root needs the threefold
+         * count is_repetition() keeps, which a single reachable position does not give. */
+        const Move move = CuckooMove[j];
+        if (!(SquaresBetween[from_sq(move)][to_sq(move)] & occupied_bb(pos)) && ply > i)
+            return true;
+    }
+    return false;
+}
+
 bool board_is_draw(const Position *pos, int ply) {
     if (pos->halfmoveClock > 99) {
         /* Checkmate outranks the fifty-move rule, so the position is drawn only if the

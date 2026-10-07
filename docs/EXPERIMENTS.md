@@ -4412,3 +4412,176 @@ same bytes (`49e4301d6224`) with the restored exporter.
 
 Still open and untested: the thesis that started E47 - that sigma's uses fade at the highest Elo -
 has never been measured. `UncertaintyHead=false` against the same net at LTC is the test.
+
+---
+
+### E50: One night against berserk-8.5 - a repetition detector, two extension changes and a correction key
+
+**Date** 2026-10-05/06 (overnight) · **Net** `49e4301d6224` (gen-6-noprior) · **Baseline** HEAD `9c6275d`,
+bench 207432 (d7) / 5853074 (d13) · **Final bench** 207253 / 4606293 · **Status** **stack B shipped
+(uncommitted): +16.42 +/- 7.29 over 2626 STC games against HEAD, SPRT [0, 5] passed (H1).** Against
+berserk-8.5 it measured **-20.17 +/- 7.80** over 3000 fixed STC games (implied CCRL 3555 +/- 14), and
+HEAD **-20.99 +/- 7.79**: **the gap is not closed, and the self-play gain did not visibly transfer.**
+
+The brief was to match berserk-8.5 (CCRL 3575) in one night. Its measured gap at the start was
+**-23.39 +/- 19.18** over 488 STC games (PGN `20261005-201305-STC.pgn`). Queue, logs, binaries and run
+notes are in `external/games/sprt-20261005-night/` (`NOTES.md`); every candidate, rejected ones
+included, is in `external/patches/e50-night-candidates.patch` as `#ifdef CAND_*` blocks.
+
+#### Where the gap is not
+
+**Time.** Over those 488 games dev used 155.6 ms a move against berserk's 157.6 and reached depth
+19.37 against 19.32. The median clock at the end was 0.91 s against 0.73 s. Neither allocator
+starves the other.
+
+**Foresight.** Most decisive games are decided early, as UHO openings make them: in 80 of 100
+decisive losses the winner already saw +1.5 within 40 plies of the book exit. In its losses dev
+saw the result a median 5 plies after berserk did. In its wins berserk lagged by 9.
+
+**Speed, partly - and more than it first looked.** Measured again on an idle machine the next
+morning (CPU ~6%, no match running), at `go movetime 2000` on five positions, single thread, 16 MB,
+three interleaved rounds, medians: berserk searches **2.98M nps in middlegames to HEAD's 1.93M -
+54% faster** (all five positions: 3.12M to 2.06M; the endgame 3.69M to 2.64M). Stack B runs at
+HEAD's speed, 1.88M. Both engines reach about the same depth in the middlegames (HEAD 18-25,
+berserk 19-20), so this engine is getting there on fewer nodes. Nps across two engines compares
+how each counts nodes as well as how fast it is, so read the ratio as approximate. Measured first
+during the night's screens, with 14 games sharing the cores, both figures were less than half of
+these (0.84M and 1.22M) and the ratio was only 1.30-1.45: the contention hid part of the gap.
+
+Sampled on the search thread on the idle machine (`bench 18`, two 30 s runs, 17.3k samples each,
+agreeing to within a point): `nnue_stack_trunk` 17.0-18.0%, negamax 16.7%, `eval_state_push`
+12.8-13.0%, `tt_probe` 9.0%, move scoring 5.4%, `nnue_refresh` 4.2-4.5%, `nnue_stack_outputs`
+3.5-3.9%, `board_attackers_to` 3.5-3.8%, `corrected_eval` 1.8%. Under load, `corrected_eval` had
+read 5.0% and `tt_probe` 5.8%: cache contention moves the misses around, which is a reason never
+to profile beside a match. Two levers were tried and neither paid:
+
+- A lazy accumulator (`CAND_LAZYACC`): each move's feature delta recorded at push and applied only
+  when an evaluation needs it, with the recorded outputs answered before any accumulator is built.
+  Bench identical and asserted clean, but **3.7% slower** on the idle machine - five interleaved
+  `bench 13` pairs, median 1.999M nps against base's 2.076M, maxima 2.014M against 2.079M. (During
+  the screens it had read ~10% slower; that was contention.) The eager update overlaps with the
+  work around it; done late, it sits on the evaluation's critical path waiting on cold weight rows.
+- `___chkstk_ms` takes ~1% of samples on the idle machine (1.6% under load). `MAX_MOVES` 512 puts negamax at 4.7 KB of frame and
+  qsearch at 4.3 KB. `nnue_stack_trunk` sits at 12.7 KB, with `NnzList` sized for
+  `NNUE_MAX_HIDDEN`, and `nnue_uncertainty` at 8 KB, for a fallback accumulator it almost never
+  uses. Worker stacks are committed in full (`CreateThread` without the reservation flag), so the
+  probes are redundant there. The main thread runs bench's and datagen's searches, though, and
+  needs them. Not pursued for ~1%.
+
+#### The screens (VSTC 2+0.02, 1200 games, against HEAD)
+
+| candidate | Elo |
+|---|---|
+| **triple extension**: a quiet singular move with v < singularBeta - 80 gets a third ply | **+7.82 +/- 11.94** |
+| **-1 singular extension at cut nodes** (not singular, ttValue < beta) | **+7.24 +/- 12.23** |
+| **upcoming repetition** (cuckoo tables): alpha raised to a draw the side to move can force | **+6.37 +/- 11.74** |
+| **RFP returns (eval + beta) / 2** | **+5.79 +/- 12.64** |
+| **history pruning**: late quiet at depth <= 4 with main + cont history < -4096 x depth | **+4.34 +/- 11.84** |
+| **second continuation correction key**, [ply-4 move][ply-1 move], full weight | **+4.34 +/- 12.08** |
+| LMR history terms in 1024ths over the table's fractional part | +3.18 +/- 11.73 |
+| no null move under a TT upper bound below beta | +2.90 +/- 12.36 |
+| PV recapture of the TT move extended a ply | +2.90 +/- 12.20 |
+| minor-piece (N, B, K) correction key, weight 128 | +2.03 +/- 11.76 |
+| history bonus a ply deeper when the cutoff beats beta by 80 | +1.45 +/- 11.76 |
+| eval swing across the parent's quiet move into its main history (x6, clamp 1000) | -2.32 +/- 12.04 |
+| LMR at the root (none before: d13 -20%) | -3.47 +/- 11.82 |
+| history pruning at -2048 x depth | -3.76 +/- 12.29 |
+| killers and counter-move reduced a ply less | -4.63 +/- 12.25 |
+| correction tables 16384 -> 65536 entries | -4.92 +/- 11.84 |
+| TT cutoff at depth <= 5 only when the bound agrees with the node's cut expectation | -13.90 +/- 12.97 |
+| small ProbCut: a TT lower bound >= beta + 416 at ttDepth >= depth - 4 returns beta + 416 | **-20.87 +/- 12.78** |
+
+Built and never played, held for time: opponent-worsening RFP, improving from four plies back,
+IIR only at PV and cut nodes, a second IIR ply at deep cut nodes, ProbCut returning v less its
+margin, RFP depth 9. Also held: the 10-byte TT from E46, built on both stacks (`stackAtt`,
+`stackBtt`). Its VSTC screen cannot see table capacity.
+
+#### STC (8+0.08, against HEAD)
+
+| # | build | games | W-L-D | Elo | LLR |
+|---|---|---|---|---|---|
+| 25 | **stack A**: the six bold screens | 3000 | 751-665-1584 | **+9.96 +/- 7.09** | 1.85 |
+| 26 | **stack B**: A + `THREAT_ORDER` 8192 + `LMR_CUTNODE` 1 (E49's knobs) | 2626 | 696-572-1358 | **+16.42 +/- 7.29** | 2.96, **H1** |
+| 27 | **stack B vs berserk-8.5**, fixed length | 3000 | 765-939-1296 | **-20.17 +/- 7.80** | - |
+| 28 | stack C: B + no-null-under-TT-bound + recapture + minor key + fractional LMR, against B | 3000 | 722-738-1540 | -1.85 +/- 6.91 | -0.73 |
+| 29 | **HEAD vs berserk-8.5**, fixed length | 3000 | 792-973-1235 | **-20.99 +/- 7.79** | - |
+
+Ptnml: 25 [24, 342, 691, 410, 33]; 26 [15, 268, 632, 374, 24]; 27 [65, 437, 657, 289, 52];
+28 [23, 378, 715, 360, 24]; 29 [69, 419, 696, 256, 60]. In 27 (`20261006-024025-gauntlet.pgn`) berserk
+lost three games on time and an abandoned one; in 29 (`20261006-055624-gauntlet.pgn`) seven and one.
+Without them 27 is about 1.5 Elo worse and 29 about 2.5. Run 25 went to its cap,
+so its estimate is unbiased. Run 26 stopped on H1 and carries the early-stopping bias. Against
+run 25 it says E49's two knobs, measured at ~+3 and ~+5 over 6000 games each, still pay on this
+tree. 1 thread, 16 MB, `UHO_Lichess_4852_v1`, concurrency 14.
+
+#### What shipped
+
+**Upcoming repetition.** `board_upcoming_repetition()` is van Kervinck's cuckoo method, as
+Stockfish uses it. Every reversible move of a non-pawn piece on an empty board is keyed by the
+Zobrist difference it makes, 3668 of them in two 8192-slot tables. Walking back two plies at a
+time, once the opponent's moves cancel, the difference between now and that position is one move
+of the side to move's own. If the path is clear, it can repeat the position. Only cycles inside
+the search count (i < ply), and the scan stops at the nearest null move. A node whose alpha is
+below the draw score is then raised to it.
+
+**Singular outcomes.** A quiet table move every alternative fails more than `TEXT_MARGIN` (80)
+below the singular window gets a third ply, under the same cap as the double extension. A table
+move that is NOT singular at a cut node, and whose stored value is below beta, gets one ply less.
+
+**RFP returns halfway to beta.** The margin says the node fails high, not by how much.
+
+**History pruning.** A late quiet at depth <= 4 whose main and continuation history sum below
+`-HIST_PRUNE` (4096) per ply is skipped. Quiet checks are exempt, as from LMP and futility. Twice
+as aggressive measured -3.76.
+
+**A second continuation correction key.** `contCorrHist4`, keyed on the move four plies up and the
+move that led here. Same update and clamp as the two-ply key, full weight (`CORR_W_CONT`), 2 MB a
+thread, reset by `search_clear()`.
+
+**`THREAT_ORDER` 8192 and `LMR_CUTNODE` 1** are now the defaults.
+
+`TextMargin` and `HistPrune` have sweep seats. Gates on the clean tree, which was written on HEAD in
+a separate worktree and reproduces the tested binary's bench to the node: perft (standard,
+tricky, both Chess960 suites) 0 failures; `movepick selftest` 14/0; `chess960 selftest`;
+`smp selftest` 11/0; asserted debug bench clean; `openbench-check` PASS; `make format`;
+`make classical` (bench 221962), the tuner and datagen build.
+
+#### What it says
+
+**The self-play gain did not reach berserk.** Stack B is +16.42 against HEAD in self-play, yet
+against berserk-8.5 the two measured -20.17 and -20.99 over 3000 games each: +0.82 +/- 11, about
++2 once the forfeits are taken out. The interval does not rule out a partial transfer - half of
++16 is inside one sigma - but the central estimate is near zero, where 50-100% is the usual
+expectation. Self-play SPRTs here are measuring something berserk does not pay for: the stack
+reshapes this engine's tree against an opponent with the same tree. **Before the next batch of
+search changes, gauntlet Elo has to be in the loop, not only self-play** - an SPRT against
+berserk-8.5 itself, or `make gauntlet` against the ladder, with self-play only as the screen.
+
+**The gap is about 20 Elo at STC, and it is not where it is cheap to look.** Not in time
+management - the two engines spend the clock alike. Not visibly in foresight. It is partly speed:
+berserk searches 54% more nodes per second in middlegames on an idle machine, and this engine
+reaches the same depth on fewer. The 488-game -23.39 that started the night was right.
+
+**Stockfish's pruning rules transplant badly here again; extensions and evidence transplant well.**
+Every candidate that cut harder lost: small ProbCut (-21), TT cutoffs gated on node type (-14),
+root LMR, killer LMR, and history pruning at twice the threshold. The winners extend forced lines
+(the triple extension), take the draw a line can force, or add evidence to the evaluation (the
+four-ply correction key). That is E46's lesson, a night later. The exception is the -1 at cut
+nodes, which takes back a ply only where the singular test has just shown the move is not forced.
+
+**`make debug` ignores `CFLAGS` from the environment.** Its recipe rebuilds `CFLAGS` from parts. A
+candidate built for an asserted bench the usual way, through `build.ps1`'s environment variable,
+is therefore the base build, and its "clean" run proves nothing. The tell is the same debug node
+count across different candidates. Pass the flags as `INCLUDES="-Isrc -DCAND_X"`, which the
+debug recipe does read.
+
+#### Pending
+
+| item | why |
+|---|---|
+| stack B against the gauntlet ladder | one opponent says the self-play gain did not transfer; the ladder says whether that is berserk or everyone |
+| LTC confirmation | STC-only, like every search result since E20 |
+| SPSA of `TextMargin`, `HistPrune` | chosen, not fitted |
+| the 10-byte TT at STC on top of stack B | `stackBtt` is built; VSTC cannot see capacity |
+| the held screens | six built candidates never played |
+| the four +2/+3 screens | together on top of B: -1.85 +/- 6.91 over 3000 (run 28) - not worth retrying as a bundle |

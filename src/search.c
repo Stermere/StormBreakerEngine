@@ -129,7 +129,7 @@ typedef struct {
  * by somebody else: every hit is verified against the position and every move that
  * comes back out of it is validated before it is played.
  *
- * The tables dominate the size: 6 MB of continuation history and 2 MB of two-move correction
+ * The tables dominate the size: 6 MB of continuation history and 4 MB of move-keyed correction
  * history, with the accumulator stack in nnue.c beside them. Hence heap blocks claimed when
  * `Threads` is set, rather than anything a `go` has to allocate.
  */
@@ -181,6 +181,10 @@ typedef struct {
      * on this one, these two screened +8 and +14. */
     int16_t nonPawnCorrHist[COLOR_NB][COLOR_NB][CORRHIST_SIZE];
     int16_t contCorrHist[PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
+
+    /* The same two-move key with the older move four plies up rather than two - this side's
+     * move before last, so a plan over two of its own moves (Stockfish keys both). */
+    int16_t contCorrHist4[PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 
     /* Triangular PV table: pvTable[ply] is the principal variation from `ply` downwards,
      * and a child's line is copied up behind the move that produced it. */
@@ -307,6 +311,7 @@ static void init_reductions(void);
 static void thread_pool_set(int count);
 
 void search_init(void) {
+    board_cuckoo_init();
     atomic_store(&Searching, false);
     atomic_store(&StopFlag, false);
     atomic_store(&Pondering, false);
@@ -337,6 +342,7 @@ void search_clear(void) {
         memset(td->pawnCorrHist, 0, sizeof(td->pawnCorrHist));
         memset(td->nonPawnCorrHist, 0, sizeof(td->nonPawnCorrHist));
         memset(td->contCorrHist, 0, sizeof(td->contCorrHist));
+        memset(td->contCorrHist4, 0, sizeof(td->contCorrHist4));
         memset(td->stack, 0, sizeof(td->stack));
 #ifdef MOVE_PICKER_PROFILE
         memset(&td->moveProfile, 0, sizeof(td->moveProfile));
@@ -541,6 +547,11 @@ TUNABLE(SINGULAR_MARGIN, 33);
 TUNABLE(DEXT_MARGIN, 20);
 TUNABLE(DEXT_MAX, 6);
 
+/* Further still below the window, a quiet table move gets a THIRD ply: the alternatives are
+ * not merely worse but lost. Quiet only - a capture that is forced is usually forced because
+ * it recaptures, and the recapture resolves itself without the depth. */
+TUNABLE(TEXT_MARGIN, 80);
+
 #define CORR_W_UNIT 128
 /* How much the correction is believed, out of CORR_W_UNIT. A TUNABLE because how far to
  * trust a learned evaluation bias is the kind of question a sweep answers better than a
@@ -662,6 +673,12 @@ TUNABLE(HIST_MALUS_MUL, 9);
 /* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 10);
 
+/* History pruning: a late quiet whose main and continuation history together sit this far
+ * below zero per ply of depth is skipped outright at depth 4 and below. The scale is the sum
+ * of four tables bounded by HISTORY_MAX each; half of this measured -4 where this measured +4
+ * at VSTC, so the threshold is on the cautious side of where the gain is. */
+TUNABLE(HIST_PRUNE, 4096);
+
 /* Half-width of the first aspiration window. */
 TUNABLE(ASPIRATION_DELTA, 16);
 
@@ -687,14 +704,15 @@ TUNABLE(QCHECK_LMR, QCHECK_LMR_DEFAULT);
 /* What a quiet move does to its own piece's safety, which history keys only as "attacked or
  * not" (E49). Over the d13 bench tree, inside every history quintile, a late quiet SEE calls
  * losing beat alpha 5-10x less often than the rest, and one escaping a LESSER attacker 2-5x more
- * often. Off by default; each is one candidate.
+ * often. THREAT_ORDER is on at 8192 (E50's stack, after ~+3 pooled over 6000 STC games in E49);
+ * the other two are off.
  *   THREAT_ORDER  history units for escaping a lesser attacker (and the same malus for walking
  *                 into one), x2 for a rook, x3 for a queen - Stockfish's shape, at its scale over
  *                 this engine's quiet range
  *   LMR_SEE_BAD   plies more for a late quiet SEE calls losing
  *   LMR_ESCAPE    plies less for a late quiet escaping a lesser attacker to a square none hits */
 #ifndef THREAT_ORDER_DEFAULT
-#define THREAT_ORDER_DEFAULT 0
+#define THREAT_ORDER_DEFAULT 8192
 #endif
 #ifndef LMR_SEE_BAD_DEFAULT
 #define LMR_SEE_BAD_DEFAULT 0
@@ -713,9 +731,9 @@ TUNABLE(THREAT_ORDER, THREAT_ORDER_DEFAULT);
 TUNABLE(CHECK_ORDER, CHECK_ORDER_DEFAULT);
 
 /* Plies more for a late quiet at an expected cut node. E6 removed a two-ply version in August
- * (-16 on a stopped test, on a far weaker search) and left one ply untested. Off by default. */
+ * E49 pooled one ply at ~+5 over 6000 STC games, and it shipped with THREAT_ORDER 8192 in E50's stack. */
 #ifndef LMR_CUTNODE_DEFAULT
-#define LMR_CUTNODE_DEFAULT 0
+#define LMR_CUTNODE_DEFAULT 1
 #endif
 TUNABLE(LMR_CUTNODE, LMR_CUTNODE_DEFAULT);
 TUNABLE(LMR_SEE_BAD, LMR_SEE_BAD_DEFAULT);
@@ -749,6 +767,7 @@ static const struct {
     {"SingularMargin", &SINGULAR_MARGIN, 4, 128},
     {"DextMargin", &DEXT_MARGIN, 0, 100},
     {"DextMax", &DEXT_MAX, 0, 16},
+    {"TextMargin", &TEXT_MARGIN, 0, 400},
     {"CorrWPawn", &CORR_W_PAWN, 0, 256},
     {"CorrWNonPawn", &CORR_W_NONPAWN, 0, 256},
     {"CorrWCont", &CORR_W_CONT, 0, 256},
@@ -776,6 +795,7 @@ static const struct {
     {"HistBonusDepthMax", &HIST_BONUS_DEPTH_MAX, 4, 32},
     {"HistMalusMul", &HIST_MALUS_MUL, 1, 32},
     {"LmpBase", &LMP_BASE, 1, 24},
+    {"HistPrune", &HIST_PRUNE, 512, 16384},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
     {"QcheckLmr", &QCHECK_LMR, 0, 1},
@@ -1663,6 +1683,20 @@ static inline int16_t *cont_corr_entry(SearchThread *td, int ply) {
                             [td->stack[ply - 1].movedPiece][to_sq(m1)];
 }
 
+/* The four-ply entry, on the same terms. */
+static inline int16_t *cont4_corr_entry(SearchThread *td, int ply) {
+    if (ply < 4)
+        return NULL;
+
+    const Move m1 = td->stack[ply - 1].move;
+    const Move m4 = td->stack[ply - 4].move;
+    if (!is_ok_move(m1) || !is_ok_move(m4))
+        return NULL;
+
+    return &td->contCorrHist4[td->stack[ply - 4].movedPiece][to_sq(m4)]
+                             [td->stack[ply - 1].movedPiece][to_sq(m1)];
+}
+
 /* Nothing the search reports is corrected. The corrected value feeds `improving`, the
  * margins and the reductions - decisions that are already bets - while the table keeps the
  * raw evaluation, so a later probe re-corrects with whatever has been learned since. */
@@ -1671,6 +1705,7 @@ static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, in
         return VALUE_NONE;
 
     const int16_t *const cc = cont_corr_entry(td, ply);
+    const int16_t *const c4 = cont4_corr_entry(td, ply);
     const int nonPawn = *non_pawn_corr_entry(td, pos, WHITE) + *non_pawn_corr_entry(td, pos, BLACK);
 
     /* Mate and tablebase scores are clamped away deliberately: a correction is evidence
@@ -1678,7 +1713,8 @@ static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, in
      * results would have the search report a proof that nothing proved. */
     const int v = raw + (CORR_W_PAWN * *corr_entry(td, pos) / CORR_W_UNIT) / CORRHIST_GRAIN +
                   (CORR_W_NONPAWN * nonPawn / CORR_W_UNIT) / CORRHIST_GRAIN +
-                  (cc ? (CORR_W_CONT * *cc / CORR_W_UNIT) / CORRHIST_GRAIN : 0);
+                  (cc ? (CORR_W_CONT * *cc / CORR_W_UNIT) / CORRHIST_GRAIN : 0) +
+                  (c4 ? (CORR_W_CONT * *c4 / CORR_W_UNIT) / CORRHIST_GRAIN : 0);
     return (Value)iclamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 
@@ -1704,6 +1740,10 @@ static void corrhist_update(SearchThread *td, const Position *pos, Value searche
     int16_t *const cc = cont_corr_entry(td, ply);
     if (cc)
         corrhist_fold(cc, diff, weight);
+
+    int16_t *const c4 = cont4_corr_entry(td, ply);
+    if (c4)
+        corrhist_fold(c4, diff, weight);
 }
 
 /* One consumer's share of the mapping; see the weights' declaration for why this scales
@@ -2056,6 +2096,25 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     if (alpha >= beta)
         return alpha;
 
+    /*
+     * A reversible move back into a position already on this line is a draw the side to move
+     * can always claim, so a node below the draw score is worth at least that. The scan stops
+     * at the nearest null move above, across which "the same position" means nothing.
+     */
+    if (alpha < VALUE_DRAW && ply >= 4) {
+        int limit = ply - 1;
+        for (int j = 1; j <= ply - 1; ++j)
+            if (td->stack[ply - j].move == MOVE_NULL) {
+                limit = j - 1;
+                break;
+            }
+        if (board_upcoming_repetition(pos, ply, limit)) {
+            alpha = VALUE_DRAW;
+            if (alpha >= beta)
+                return alpha;
+        }
+    }
+
     const Key key = pos->key;
 
     TTEntry tte;
@@ -2189,7 +2248,9 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         staticEval - RFP_MARGIN * (depth - improving) *
                          unc_apply(unc_get(&uncScale, td, pos), UNC_W_RFP) / 100 >=
             beta)
-        return staticEval;
+        /* Halfway back to beta: the margin says the node fails high, not by how much, and a
+         * parent reading the full static evaluation as a bound believes more than was shown. */
+        return (Value)((staticEval + beta) / 2);
 
     /* Razoring, the mirror image at the other end of the window: a position this far below
      * alpha is one the quiet moves will not save, and whether a tactic does is exactly what
@@ -2390,6 +2451,13 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                     alpha &&
                 !gives_check(pos, m))
                 continue;
+
+            /* History pruning: a quiet move both history tables have kept refuting is not
+             * searched near the leaves at all. Checks are exempt, as above. */
+            if (depth <= 4 &&
+                *main_hist(td, us, td->stack[ply].threats, m) + contScore < -HIST_PRUNE * depth &&
+                !gives_check(pos, m))
+                continue;
         }
 
         /*
@@ -2468,15 +2536,21 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             /* Every other move failing far below the window is a forced move, not merely
              * the best one, and gets a second ply - off the principal variation only,
              * where the tree is cheap, and never past the line's cap. */
-            if (v < singularBeta)
+            if (v < singularBeta) {
                 extension = !pvNode && v < singularBeta - DEXT_MARGIN &&
                                     td->stack[ply - 1].doubleExtensions < DEXT_MAX
                                 ? 2
                                 : 1;
-            else if (singularBeta >= beta && !pvNode)
+                if (extension == 2 && !tactical && v < singularBeta - TEXT_MARGIN)
+                    extension = 3;
+            } else if (singularBeta >= beta && !pvNode)
                 return singularBeta;
             else if (ttValue >= beta)
                 extension = -2;
+            /* Not singular, at a node expected to fail high anyway: the table move is one good
+             * move among several, and the ply it would have been given goes elsewhere. */
+            else if (cutNode)
+                extension = -1;
         }
 
         /* Read before the move is made: afterwards the victim is gone from the board. */

@@ -201,6 +201,14 @@ bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occ
  * a position from before the root needs the full threefold count. */
 bool board_is_draw(const Position *pos, int ply);
 
+/* The cuckoo tables board_upcoming_repetition() reads. Once, after bb_init() and
+ * zobrist_init(), since they are built from both. */
+void board_cuckoo_init(void);
+
+/* Whether the side to move has a reversible move back into a position already on this line,
+ * no more than `limit` plies up and strictly inside the search (fewer than `ply` plies up). */
+bool board_upcoming_repetition(const Position *pos, int ply, int limit);
+
 /* Validates that all representations agree. Debug builds only. */
 bool board_is_consistent(const Position *pos);
 

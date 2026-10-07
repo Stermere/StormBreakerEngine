@@ -121,6 +121,12 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | **`net-gen-6-noprior`** (`49e4301d6224`: gen-006 + gen-006-u, `--unc-weight 0.0005`, no prior), sigma 100/7 | **+25.41 +/- 8.68** over 2000 fixed STC games vs the shipped gen-6-pw (SPRT +26.54, passed). **Shipped**: the `NET_SHA256` pin and sigma defaults 100/7; bench 207432, node for node the binary measured. LTC not yet run (E49) |
 | Search: threat-aware quiet ordering (`THREAT_ORDER`), LMR +1 at cut nodes (`LMR_CUTNODE`) | ~+3.4 and ~+4.9 pooled over 6000 STC games each; together on the new net +3.24 +/- 6.88. Small, unproven; knobs, off (E49) |
 | Search: LMR +1 SEE-losing quiets, -1 escapes; quiet-check ordering; spend the whole increment | +3.36, -2.66, -4.29, +0.46 (fresh) over 3000 STC games each - off (E49) |
+| **Search: upcoming repetition (cuckoo), triple extension, -1 singular extension at cut nodes, RFP returns (eval+beta)/2, history pruning, four-ply continuation correction key** | stack A **+9.96 +/- 7.09** over 3000 STC games vs HEAD; each only VSTC-screened (+4.3 to +7.8) (E50) |
+| **E50 stack B: the above + `THREAT_ORDER` 8192 + `LMR_CUTNODE` 1 on by default** | **+16.42 +/- 7.29** over 2626 STC games vs HEAD, SPRT [0, 5] H1. Bench 207253. **Uncommitted** in the working tree (E50) |
+| **Against berserk-8.5 (CCRL 3575): E50 stack B vs HEAD** | stack B **-20.17 +/- 7.80**, HEAD **-20.99 +/- 7.79**, 3000 fixed STC games each: the gap is not closed, and **the +16 self-play gain did not visibly transfer** (+0.8 +/- 11) (E50) |
+| Search: small ProbCut, TT cutoff gated on node type, root LMR, killer LMR, eval-swing history, 4x correction tables | -21, -14, -3.5, -4.6, -2.3, -4.9 at VSTC; not kept (E50) |
+| NNUE: lazy accumulator updates | bench identical, 3.7% SLOWER on an idle machine; not kept (E50) |
+| Speed against berserk-8.5, idle machine, 1 thread | berserk 2.98M nps in middlegames to HEAD's 1.93M: **54% faster** at about the same depth (E50) |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`
