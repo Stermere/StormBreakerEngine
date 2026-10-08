@@ -4585,3 +4585,109 @@ debug recipe does read.
 | the 10-byte TT at STC on top of stack B | `stackBtt` is built; VSTC cannot see capacity |
 | the held screens | six built candidates never played |
 | the four +2/+3 screens | together on top of B: -1.85 +/- 6.91 over 3000 (run 28) - not worth retrying as a bundle |
+
+---
+
+### E51: Speed - +8.3% nps with an unchanged tree, and where the rest of berserk's lead is
+
+**Date** 2026-10-06 · **Baseline** HEAD `dd57a1b` (E50 stack B), bench 207253 / 4606293 · **Status**
+**+8.28% median / +7.08% max nps over HEAD**, node for node the same search (bench 207253 /
+4606293), uncommitted. Machine idle throughout (~6-14% CPU, no match). Harness, binaries, profiles
+and notes: `external/games/speed-20261006/` (`speedcmp.py`, `NOTES.md`).
+
+E50 measured berserk-8.5 at 54% more nps than this engine in middlegames, single thread, idle
+machine. This entry is the pure-speedup half of closing that: nothing here may move a node count.
+
+#### Method
+
+`speedcmp.py` runs `bench 13` for every build in turn, eight to ten rounds, rotating the order,
+and refuses to report a build whose node count differs from the base's. A delta is believed only
+when the median and the max agree: run to run, nps swings ~1-5% on an idle machine and far more
+under load. Profiles: a sampling profiler that suspends the search
+thread, reads RIP and maps it through `nm`, and for `-g` builds through `addr2line` to the
+innermost inlined source line (`-g` does not change GCC's code: the `-g` build benches the same).
+
+#### The profile (HEAD, `bench 18`, 14k samples on the search thread)
+
+| | share |
+|---|---|
+| `nnue_stack_trunk` (L1 madd/add/shuffle, L2) | 17-18% |
+| negamax + `picker_next` | ~17% (`pick_move` alone ~5%) |
+| `eval_state_push` (accumulator add/sub/store) | 13% |
+| `tt_probe` - **one line, the cluster key compare, 7.4%** | 8-9% |
+| `score_moves_context` (`cont_score`/`cont_index` ~3.6%) | 5.4% |
+| `nnue_refresh` / `nnue_stack_outputs` | 4.2-4.8% / 3.5-3.9% |
+| `board_attackers_to` (checkers per move, SEE) | 3.5-3.8% |
+
+#### Kept
+
+| # | change | median | max |
+|---|---|---|---|
+| S1 | `tt_prefetch()` issued BEFORE `eval_state_push()` at all five move sites (it came after) | **+5.93%** | **+5.70%** |
+| S3a | `pick_move` keeps the running maximum in a register | +0.3 to +1.0% | +0.5 to +0.7% |
+| S6 | negamax's picker and quiescence's move list moved into `SearchThread` | +0.75% | +0.78% |
+| S7 | the trunk's activation buffer moved into `EvalState` | +0.44% | +1.18% |
+| S5 | `lesser_threats` built lazily in move scoring; `nnue_uncertainty`'s fallback out of line | ~0 | ~0 |
+| | **all of the above against HEAD, 10 rounds** | **+8.28%** | **+7.08%** |
+
+**S1** is nearly all of it. The child's TT line was prefetched after the accumulator update, the
+one piece of work long enough to hide the miss, so the miss landed on the child's first
+instruction. After the swap `tt_probe` falls from 7.9% to 2.9% of the profile.
+
+**S6 and S7** remove every `___chkstk_ms` call from the hot path. `MAX_MOVES` is 512 on purpose,
+so a move list is 4 KB, and a frame past one page makes MinGW probe each page on every call.
+negamax (4.7 KB), qsearch (4.3 KB) and `nnue_stack_trunk` (12.7 KB, `NnzList` sized for
+`NNUE_MAX_HIDDEN`) all did. The picker now lives at `td->pickers[ply][isExcluded]`: a singular
+verification re-enters its ply while the parent's picker is live, and nothing nests deeper.
+ProbCut borrows slot 0's list before the picker exists. Quiescence never has two frames at one
+ply, so it gets `td->qsMoves[ply]`. That is 3 MB more per thread. The trunk scratch is aligned
+by hand, because UCRT has no `aligned_alloc`.
+
+Gates: perft (all four suites) 0 failures; `movepick selftest` 14/0; `chess960 selftest`;
+`smp selftest` 11/0, release and debug; the asserted debug bench gives 1128472 at d10, stack
+B's own count; `openbench-check` PASS; `make classical` benches 221962, unchanged; `make format`.
+
+#### Measured and not kept
+
+| change | median | max | why not |
+|---|---|---|---|
+| LTO (`-flto`) | +0.41 / -0.20 | +0.96 / -0.18 | noise across two batches |
+| PGO (trained on `bench 13`) | +0.45% | +0.41% | not worth the build machinery |
+| PGO + LTO | +0.61% | +0.37% | same |
+| S2: an extra, earlier prefetch from a predicted child key | +4.37% | +3.86% | worse than S1 alone |
+| S3b: two-pass AVX2 `pick_move` | -4.35% | -3.72% | most lists are short |
+| S4: push prefetches both perspectives' rows first (4 lines / whole rows) | -0.17 / -1.94 | +0.48 / -1.00 | the stream prefetcher already has them |
+| S8: prefetch the child's correction entries beside its TT line | +0.48 to +0.64 | +0.14 to +0.38 | noise |
+| lazy accumulator (E50's `CAND_LAZYACC`) | -3.7% | -3.1% | idle-machine re-measure |
+
+The compiler levers are worth nothing here. The hot code is hand-vectorised already, and the rest
+is waiting on memory.
+
+#### Where the rest of the gap is
+
+**Not the 25 MB feature table.** A measurement-only build put every king square on slot 0, so
+the table's working set was 768 KB (L2) and no king move reindexed. The evaluation is
+nonsense; the speed is real. It ran **+9.7%** on `bench 13` (a different tree) and **+4.7%** on
+five fixed positions. King buckets cost 5-10% of speed, no more.
+
+**The layer stack and the accumulator width are compute.** The trunk is ~18%: L1 is int16
+`madd` over 512 activations into 16 units, load-bound on 16 KB of weights per bucket, which
+E40 already tuned. With the output cache's 4%, the stack costs ~22%. The 512-wide accumulator
+update is 13%. A net with one output layer and no stack would not pay the 22%.
+
+**The search carries more per node.** Five correction tables, three continuation slots, the
+uncertainty head, threat-indexed history, z-LMR's child evaluations and the staged picker all
+cost nodes per second. Each was measured for Elo, not for nps, and the engine reaches berserk's
+depth on fewer nodes (E50): much of the per-node cost is paid back in tree size.
+
+For gen-007, the speed levers that remain are architectural, and every one is a trade against
+evaluation quality that only an SPRT can settle:
+- fewer king buckets: <= ~10% faster;
+- int8 L1 weights with `maddubs`, as Stockfish lays them out. A standalone microbenchmark of the
+  two L1 kernels, 512 -> 16 with 8 buckets' weights live, puts this engine's int16 kernel at
+  115-122 ns a call. The int8 kernel runs 57-58 ns if two `maddubs` results are summed in int16
+  first; that can overflow, so an exact kernel cannot do it. Widening each product separately,
+  it runs 66-68 ns: **1.78x**. L1 is ~14% of the search, so that is ~6% nps, if 7-bit
+  activations and 8-bit weights cost the evaluation nothing (`l1bench.c` in the run
+  directory, beside the two profilers and `npscmp.py`);
+- a flatter stack: up to ~20%.

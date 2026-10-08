@@ -102,6 +102,34 @@ static const int ContPlies[3] = {1, 2, 4};
 #define CORRHIST_LIMIT      (CORRHIST_GRAIN * 32)
 #define CORRHIST_WEIGHT_MAX 256
 
+typedef enum {
+    PICK_TT,
+    PICK_GENERATE_TACTICALS,
+    PICK_GOOD_TACTICALS,
+    PICK_KILLER_0,
+    PICK_KILLER_1,
+    PICK_COUNTER,
+    PICK_GENERATE_QUIETS,
+    PICK_QUIETS,
+    PICK_BAD_TACTICALS,
+    PICK_EVASIONS,
+    PICK_DONE
+} PickStage;
+
+/* One node's staged move list. The search's live in SearchThread, one per ply AND per
+ * singular nesting: a verification re-enters at the same ply while its parent's list is still
+ * alive. No allocation or buffer clear on the playing path. The two disjoint generators together
+ * fit MAX_MOVES. */
+typedef struct {
+    ScoredMove moves[MAX_MOVES];
+    Move tt, excluded;
+    Move refutations[3];
+    Move returned[3];
+    PickStage stage;
+    int cur, end, start;
+    int tacticalCount, quietCount, badBegin;
+} MovePicker;
+
 #ifdef MOVE_PICKER_PROFILE
 typedef struct {
     uint64_t mainNodes, mainPicked, mainLegal, mainSearched;
@@ -194,6 +222,15 @@ typedef struct {
     /* Two spare entries: every node clears its grandchildren's cutoff counters, and the
      * deepest node the ply guard admits would otherwise clear one past the end. */
     SearchStack stack[MAX_PLY + 2];
+
+    /* The move lists, here rather than in the frames that use them. MAX_MOVES lists are 4 KB,
+     * and a frame past a page makes Windows probe the stack (___chkstk_ms) on every call - ~1%
+     * of the search. negamax's picker is per ply and per singular nesting ([ply][isExcluded]:
+     * a verification re-enters at the same ply while its parent's picker is live, and nothing
+     * nests deeper); quiescence never has two frames at one ply. Scratch, so search_clear()
+     * leaves them alone. */
+    MovePicker pickers[MAX_PLY][2];
+    ScoredMove qsMoves[MAX_PLY][MAX_MOVES];
 
     /* This thread's own board. Every thread starts from the same position and then plays
      * its own moves on it, so the copy is not an optimisation. */
@@ -731,7 +768,8 @@ TUNABLE(THREAT_ORDER, THREAT_ORDER_DEFAULT);
 TUNABLE(CHECK_ORDER, CHECK_ORDER_DEFAULT);
 
 /* Plies more for a late quiet at an expected cut node. E6 removed a two-ply version in August
- * E49 pooled one ply at ~+5 over 6000 STC games, and it shipped with THREAT_ORDER 8192 in E50's stack. */
+ * E49 pooled one ply at ~+5 over 6000 STC games, and it shipped with THREAT_ORDER 8192 in E50's
+ * stack. */
 #ifndef LMR_CUTNODE_DEFAULT
 #define LMR_CUTNODE_DEFAULT 1
 #endif
@@ -1061,9 +1099,10 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
     for (int i = 0; i < CONT_SLOTS; ++i)
         slices[i] = cont_slice(td, i, ply, ContPlies[i]);
 
+    /* Built at the first quiet that needs it: most lists scored here are quiescence's captures,
+     * which never read it. */
     LesserThreats lesser = {BB_EMPTY, BB_EMPTY, BB_EMPTY};
-    if (THREAT_ORDER)
-        lesser = lesser_threats(pos, (Color)(us ^ 1));
+    bool lesserKnown     = false;
 
     for (int i = 0; i < count; ++i) {
         const Move m      = list[i].m;
@@ -1111,6 +1150,10 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
                 if (CHECK_ORDER && gives_check(pos, m))
                     score += CHECK_ORDER;
                 if (THREAT_ORDER) {
+                    if (!lesserKnown) {
+                        lesser      = lesser_threats(pos, (Color)(us ^ 1));
+                        lesserKnown = true;
+                    }
                     const PieceType pt = type_of(moved);
                     const Bitboard lt  = lesser_for(&lesser, pt);
                     const int scale    = pt == QUEEN ? 3 : pt == ROOK ? 2 : 1;
@@ -1290,10 +1333,19 @@ static inline void pick_first(ScoredMove *list, int best) {
 }
 
 static void pick_move(ScoredMove *list, int count, int index) {
-    int best = index;
-    for (int i = index + 1; i < count; ++i)
-        if (list[i].score > list[best].score)
-            best = i;
+    /* The running maximum in a register, not re-read through `best` each step. Strictly
+     * greater, so the first of equal scores still wins - the order is the tree, and unseen
+     * quiets tie at zero all the time. (A two-pass AVX2 scan measured 4% slower: most lists
+     * this sees are short.) */
+    int best      = index;
+    int bestScore = list[index].score;
+    for (int i = index + 1; i < count; ++i) {
+        const int s = list[i].score;
+        if (s > bestScore) {
+            bestScore = s;
+            best      = i;
+        }
+    }
 
     if (best != index) {
         const ScoredMove tmp = list[index];
@@ -1301,33 +1353,6 @@ static void pick_move(ScoredMove *list, int count, int index) {
         list[best]           = tmp;
     }
 }
-
-typedef enum {
-    PICK_TT,
-    PICK_GENERATE_TACTICALS,
-    PICK_GOOD_TACTICALS,
-    PICK_KILLER_0,
-    PICK_KILLER_1,
-    PICK_COUNTER,
-    PICK_GENERATE_QUIETS,
-    PICK_QUIETS,
-    PICK_BAD_TACTICALS,
-    PICK_EVASIONS,
-    PICK_DONE
-} PickStage;
-
-/* Invocation-local, NOT indexed by ply: singular verification re-enters at the
- * same ply while its parent's list is still alive. No allocation or buffer clear
- * on the playing path. The two disjoint generators together fit MAX_MOVES. */
-typedef struct {
-    ScoredMove moves[MAX_MOVES];
-    Move tt, excluded;
-    Move refutations[3];
-    Move returned[3];
-    PickStage stage;
-    int cur, end, start;
-    int tacticalCount, quietCount, badBegin;
-} MovePicker;
 
 static void picker_init(MovePicker *mp, SearchThread *td, const Position *pos, Move tt,
                         Move excluded, int ply, Move counter) {
@@ -1949,8 +1974,8 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
     if (inCheck)
         td->stack[ply].threats = attacked_by(pos, (Color)(pos->sideToMove ^ 1));
 
-    ScoredMove moves[MAX_MOVES];
-    const int count = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_CAPTURES, moves);
+    ScoredMove *const moves = td->qsMoves[ply];
+    const int count         = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_CAPTURES, moves);
     MP_ADD(td, genCalls[3], 1);
     MP_ADD(td, generated[3], count);
     MP_ADD(td, scored[3], count);
@@ -2003,8 +2028,8 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         td->stack[ply].staticEval = staticEval;
 
         board_do_move(pos, m);
-        eval_state_push(td->es, pos, m);
         tt_prefetch(pos->key);
+        eval_state_push(td->es, pos, m);
         const Value v = -qsearch(td, pos, -beta, -alpha, ply + 1);
         eval_state_pop(td->es);
         board_undo_move(pos, m);
@@ -2282,8 +2307,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         td->stack[ply].movedPiece = NO_PIECE;
 
         board_do_null_move(pos);
-        eval_state_push_null(td->es, pos);
         tt_prefetch(pos->key);
+        eval_state_push_null(td->es, pos);
         const Value v = -negamax(td, pos, depth - r, -beta, -beta + 1, ply + 1, !cutNode);
         eval_state_pop(td->es);
         board_undo_null_move(pos);
@@ -2319,8 +2344,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
     if (probCutGate && !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
         !(ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth - 3 && ttValue < probCutBeta)) {
-        ScoredMove pcMoves[MAX_MOVES];
-        const int pcCount = movegen_generate(pos, GEN_CAPTURES, pcMoves);
+        /* This node's own picker list, free until the move loop below: ProbCut never runs under
+         * a singular exclusion, so the slot is [ply][0], and it is done before picker_init(). */
+        ScoredMove *const pcMoves = td->pickers[ply][0].moves;
+        const int pcCount         = movegen_generate(pos, GEN_CAPTURES, pcMoves);
         MP_ADD(td, genCalls[4], 1);
         MP_ADD(td, generated[4], pcCount);
         MP_ADD(td, scored[4], pcCount);
@@ -2346,8 +2373,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             td->stack[ply].movedPiece = piece_on(pos, from_sq(m));
 
             board_do_move(pos, m);
-            eval_state_push(td->es, pos, m);
             tt_prefetch(pos->key);
+            eval_state_push(td->es, pos, m);
 
             Value v = -qsearch(td, pos, -probCutBeta, -probCutBeta + 1, ply + 1);
             if (v >= probCutBeta)
@@ -2376,8 +2403,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     LesserThreats lesser = {BB_EMPTY, BB_EMPTY, BB_EMPTY};
     bool lesserKnown     = false;
 
-    MovePicker picker;
-    picker_init(&picker, td, pos, ttMove, excluded, ply, counter_move(td, ply));
+    MovePicker *const picker = &td->pickers[ply][isExcluded];
+    picker_init(picker, td, pos, ttMove, excluded, ply, counter_move(td, ply));
 
     /* Moves already tried here, so the one that eventually cuts can penalise them. Bounded:
      * a node with more than this many is one where the ordering statistics were not going to
@@ -2407,7 +2434,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
      * fail-low entry BOUND_EXACT and a later probe would cut on it. */
     bool raisedAlpha = false;
 
-    for (Move m; (m = picker_next(&picker, td, pos, ply)) != MOVE_NONE;) {
+    for (Move m; (m = picker_next(picker, td, pos, ply)) != MOVE_NONE;) {
         MP_ADD(td, mainPicked, 1);
         if (!movegen_is_legal(pos, m))
             continue;
@@ -2576,8 +2603,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         td->stack[ply].movedPiece = moved;
 
         board_do_move(pos, m);
-        eval_state_push(td->es, pos, m);
+        /* The child's table line is asked for BEFORE the accumulator update, everywhere a move is
+         * made: the update is long enough to hide most of the miss, and issued after it the
+         * prefetch hid almost none - tt_probe's cluster load was 7.4% of the search (+5.9% nps). */
         tt_prefetch(pos->key);
+        eval_state_push(td->es, pos, m);
 
         const bool givesCheck = board_checkers(pos) != BB_EMPTY;
 
@@ -2710,13 +2740,13 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                     update_stats(td, pos, m, quiets, quietCount, captures, captureCount, depth,
                                  ply);
 #ifdef MOVE_PICKER_PROFILE
-                    const int stage = inCheck                                ? 6
-                                      : m == ttMove                          ? 0
-                                      : picker.stage == PICK_GOOD_TACTICALS  ? 1
-                                      : picker.stage == PICK_GENERATE_QUIETS ? 3
-                                      : picker.stage == PICK_QUIETS          ? 4
-                                      : picker.stage == PICK_BAD_TACTICALS   ? 5
-                                                                             : 2;
+                    const int stage = inCheck                                 ? 6
+                                      : m == ttMove                           ? 0
+                                      : picker->stage == PICK_GOOD_TACTICALS  ? 1
+                                      : picker->stage == PICK_GENERATE_QUIETS ? 3
+                                      : picker->stage == PICK_QUIETS          ? 4
+                                      : picker->stage == PICK_BAD_TACTICALS   ? 5
+                                                                              : 2;
                     ++td->moveProfile.cutoffs[stage];
 #endif
                     break;
@@ -2848,8 +2878,8 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
         td->stack[0].staticEval = VALUE_NONE;
 
         board_do_move(pos, m);
-        eval_state_push(td->es, pos, m);
         tt_prefetch(pos->key);
+        eval_state_push(td->es, pos, m);
 
         const uint64_t nodesBefore = td->nodeCount;
 

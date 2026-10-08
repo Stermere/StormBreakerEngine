@@ -1419,8 +1419,20 @@ static void nnue_layer(const int16_t *in, uint32_t n, const int16_t *w, const in
 }
 #endif
 
+/* What the trunk builds its activation in: sized for NNUE_MAX_HIDDEN, so 12 KB under AVX2. It
+ * is passed in rather than declared in nnue_stack_trunk(), whose frame it used to put three pages
+ * deep - and Windows probes every page of a frame past the first (___chkstk_ms) on every call. */
+#ifdef NNUE_AVX2
+typedef NnzList TrunkScratch;
+#else
+typedef struct {
+    _Alignas(64) int16_t act[2 * NNUE_MAX_HIDDEN];
+} TrunkScratch;
+#endif
+
 /* The vector both output heads read, for one bucket. */
-static void nnue_stack_trunk(const int16_t *own, const int16_t *other, int bucket, int16_t *trunk) {
+static void nnue_stack_trunk(const int16_t *own, const int16_t *other, int bucket, int16_t *trunk,
+                             TrunkScratch *scratch) {
     const NnueHot *const hot = &Loaded.hot;
     const uint32_t inputs    = hot->inputs;
     const int32_t qa         = hot->qa;
@@ -1433,20 +1445,18 @@ static void nnue_stack_trunk(const int16_t *own, const int16_t *other, int bucke
     const int32_t *const l1b = hot->l1Bias + b * hot->l1Size;
 
 #ifdef NNUE_AVX2
-    NnzList list;
-    const uint32_t count     = nnue_activate(hot, own, other, &list);
+    const uint32_t count     = nnue_activate(hot, own, other, scratch);
     const int16_t *const l1w = hot->l1Weight + b * hot->l1Size * inputs;
 
     if (hot->pairwise)
-        nnue_l1_dense(list.act, inputs, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
+        nnue_l1_dense(scratch->act, inputs, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
     else
-        nnue_l1_sparse(&list, count, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
+        nnue_l1_sparse(scratch, count, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
 #else
     const int16_t *const l1w = hot->l1Weight + b * hot->l1Size * inputs;
-    _Alignas(64) int16_t a[2 * NNUE_MAX_HIDDEN];
 
-    nnue_activate(hot, own, other, a);
-    nnue_layer(a, inputs, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
+    nnue_activate(hot, own, other, scratch->act);
+    nnue_layer(scratch->act, inputs, l1w, l1b, hot->l1Size, hot->l1Shift, qa, l1Out);
 #endif
 
     if (!hot->l2Size)
@@ -1476,8 +1486,9 @@ static int32_t nnue_head(const int16_t *own, const int16_t *other, const int16_t
         return nnue_flat_head(own, other, weights, biases, bucket);
 
     _Alignas(64) int16_t trunk[NNUE_MAX_STACK_WIDTH];
+    TrunkScratch scratch;
 
-    nnue_stack_trunk(own, other, bucket, trunk);
+    nnue_stack_trunk(own, other, bucket, trunk, &scratch);
     return nnue_trunk_head(trunk, weights, biases, bucket);
 }
 
@@ -1656,6 +1667,11 @@ struct EvalState {
     StackOutputs *outCache;
     uint16_t outGen;
 
+    /* The trunk's activation buffer, claimed with the output tables and aligned by hand (the
+     * C runtime here has no aligned_alloc); `trunkBlock` is what free() is owed. */
+    TrunkScratch *trunkScratch;
+    void *trunkBlock;
+
     /* The EvalEpoch this thread's caches were filled under; 0 until it has one, which no
      * epoch is, so a thread retires on its first search and keeps nothing from before it. */
     uint32_t epoch;
@@ -1711,11 +1727,14 @@ void eval_state_free(void) {
     free(nt->accStack);
     free(nt->outLevels);
     free(nt->outCache);
+    free(nt->trunkBlock);
     free(nt->refreshCache);
     free(nt->refreshAcc);
     nt->accStack      = NULL;
     nt->outLevels     = NULL;
     nt->outCache      = NULL;
+    nt->trunkScratch  = NULL;
+    nt->trunkBlock    = NULL;
     nt->outGen        = 0;
     nt->epoch         = 0;
     nt->refreshCache  = NULL;
@@ -2272,15 +2291,19 @@ static const StackOutputs *nnue_stack_outputs(EvalState *const nt, const Accumul
     /* Lazily, because the net can change under a running engine - `setoption EvalFile` -
      * and a thread that first searched with a flat net has nothing to record. */
     if (!nt->outLevels) {
-        nt->outLevels = (StackOutputs *)calloc(ACC_LEVELS, sizeof(StackOutputs));
-        nt->outCache  = (StackOutputs *)calloc(OUTPUT_CACHE_ENTRIES, sizeof(StackOutputs));
-        if (!nt->outLevels || !nt->outCache) {
+        nt->outLevels  = (StackOutputs *)calloc(ACC_LEVELS, sizeof(StackOutputs));
+        nt->outCache   = (StackOutputs *)calloc(OUTPUT_CACHE_ENTRIES, sizeof(StackOutputs));
+        nt->trunkBlock = calloc(1, sizeof(TrunkScratch) + 63);
+        if (!nt->outLevels || !nt->outCache || !nt->trunkBlock) {
             free(nt->outLevels);
             free(nt->outCache);
+            free(nt->trunkBlock);
             nt->outLevels = nt->outCache = NULL;
+            nt->trunkBlock               = NULL;
             return NULL;
         }
-        nt->outGen = 1;
+        nt->trunkScratch = (TrunkScratch *)(((uintptr_t)nt->trunkBlock + 63) & ~(uintptr_t)63);
+        nt->outGen       = 1;
     }
 
     StackOutputs *const level = &nt->outLevels[nt->accTop];
@@ -2297,7 +2320,7 @@ static const StackOutputs *nnue_stack_outputs(EvalState *const nt, const Accumul
     const Color stm  = pos->sideToMove;
     const int bucket = nnue_output_bucket(pos);
 
-    nnue_stack_trunk(a->acc[stm], a->acc[stm ^ 1], bucket, trunk);
+    nnue_stack_trunk(a->acc[stm], a->acc[stm ^ 1], bucket, trunk, nt->trunkScratch);
 
     level->key   = pos->key;
     level->gen   = nt->outGen;
@@ -2337,20 +2360,25 @@ Value eval_evaluate(EvalState *es, const Position *pos) {
     return nnue_centipawns(raw);
 }
 
+/* The from-scratch path, for a thread with no accumulator stack. Out of line so its 8 KB of
+ * accumulators are not in nnue_uncertainty()'s frame: a frame past a page costs a stack probe on
+ * every call, and this path is almost never the one taken. */
+static __attribute__((noinline)) Value nnue_uncertainty_scratch(const Position *pos) {
+    _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
+
+    for (Color c = WHITE; c <= BLACK; ++c) {
+        const Perspective p = nnue_perspective(pos, c);
+        nnue_accumulate(pos, &p, acc[c]);
+    }
+
+    const Color stm = pos->sideToMove;
+    return nnue_unc_centipawns(nnue_unc_output(acc[stm], acc[stm ^ 1], nnue_output_bucket(pos)));
+}
+
 Value nnue_uncertainty(EvalState *es, const Position *pos) {
     const Accumulator *const a = nnue_current(es, pos);
-    if (!a) {
-        _Alignas(64) int16_t acc[COLOR_NB][NNUE_MAX_HIDDEN];
-
-        for (Color c = WHITE; c <= BLACK; ++c) {
-            const Perspective p = nnue_perspective(pos, c);
-            nnue_accumulate(pos, &p, acc[c]);
-        }
-
-        const Color stm = pos->sideToMove;
-        return nnue_unc_centipawns(
-            nnue_unc_output(acc[stm], acc[stm ^ 1], nnue_output_bucket(pos)));
-    }
+    if (!a)
+        return nnue_uncertainty_scratch(pos);
 
     const Color stm  = pos->sideToMove;
     const int bucket = nnue_output_bucket(pos);

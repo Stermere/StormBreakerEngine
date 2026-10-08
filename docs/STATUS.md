@@ -127,6 +127,7 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Search: small ProbCut, TT cutoff gated on node type, root LMR, killer LMR, eval-swing history, 4x correction tables | -21, -14, -3.5, -4.6, -2.3, -4.9 at VSTC; not kept (E50) |
 | NNUE: lazy accumulator updates | bench identical, 3.7% SLOWER on an idle machine; not kept (E50) |
 | Speed against berserk-8.5, idle machine, 1 thread | berserk 2.98M nps in middlegames to HEAD's 1.93M: **54% faster** at about the same depth (E50) |
+| **Speed: TT prefetch before the accumulator update, no stack probes in the hot path, register max in `pick_move`** | **+8.28% median / +7.08% max nps**, bench unchanged (207253); compiler levers (LTO, PGO) worth <1%; king buckets cost only 5-10% of speed (E51) |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`
