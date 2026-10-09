@@ -4691,3 +4691,186 @@ evaluation quality that only an SPRT can settle:
   activations and 8-bit weights cost the evaluation nothing (`l1bench.c` in the run
   directory, beside the two profilers and `npscmp.py`);
 - a flatter stack: up to ~20%.
+
+---
+
+### E52: The NNUE recipe - game-result weight, per-generation label scale, and gen-005 pretraining
+
+**Date** 2026-10-07/08 · **Baseline** HEAD `c005c36` with the shipped net `49e4301d6224`
+(gen-6-noprior), bench 207253 · **Status** **P1u shipped (2026-10-09)**: net `93b2eecc8dbc`,
+UncSigma 98/5, bench 208681. It scored +23.78 +/- 7.97 against berserk-8.5, where the old pin
+scored -6.95 +/- 8.01 under the same conditions. Run directory: `external/games/nnue-20261007/`. It holds
+`NOTES.md`, `jobs.json`, `queue.json`, `chain.py`, `recentre.py` and every log.
+
+The architecture is fixed (halfka-32sq, 512 pairwise, 16 -> 32 -> 8, +uncertainty); only the
+recipe moved. The data is gen-006 + gen-006-u, with gen-005 for one pretraining run.
+
+#### Method
+
+Most candidates are **fine-tunes of the shipped checkpoint**. Each is one pass of gen-006 +
+gen-006-u (5 x 500M), LR 2e-5 halving per epoch to 1.25e-6, a fresh optimiser, and the shipped
+target except for the one thing under test. On an idle machine that is ~45 minutes. The shipped
+recipe from scratch is ~3.5 h (its own log's 440k pos/s was not reproduced: this trainer runs
+~1.16M idle, ~0.9M beside matches).
+
+Each net was exported, gated by `make nnue-test` (exact on 10,000 vectors), benched, and then
+**re-centred**. `make unc-probe PROBE_ARGS=-ref ref-shipped.unc` gives the UncSigma base/slope
+at which the candidate's margin distribution matches the shipped net's under 100/7. The
+candidate is rebuilt with `-DUNC_SIGMA_BASE_DEFAULT/_SLOPE_DEFAULT` (`bin/<id>u.exe`). Without
+this, a head that reads wider plays with wider margins, and the test measures both. F1's
+in-search sigma mean is 115 cp against 82.6; under 100/7 it hit the margin cap at 46% of nodes
+against base's 28%. Each SPRT ran at STC [0, 5], capped at 3000 games, concurrency 12.
+
+The pipeline was checked first on a copy of the shipped checkpoint: byte-identical re-export,
+10000/10000 exact, bench 207253.
+
+#### Results
+
+| run | change from the shipped net | UncSigma | vs | Elo | games | verdict |
+|---|---|---|---|---|---|---|
+| F0 | anneal only (same target) | 98/7, ran at 100/7 | base | -7.18 +/- 7.02 | 3000 | capped, LLR -1.89 |
+| **F1** | anneal at **lambda 0.75** | 98/5 | base | **+22.45 +/- 8.77** | 1968 | **H1** |
+| F2 | anneal at sigmoid K 230 | 97/9 | base | -1.62 +/- 6.78 | 3000 | capped |
+| F3 | anneal at lambda 1.0 (no result) | 96/9 | base | **-24.76 +/- 9.57** | 1518 | **H0** |
+| **F4** | anneal at **lambda 0.6** | 102/3 | **F1u** | **+13.44 +/- 6.61** | 3000 | capped, LLR 2.82 |
+| F5 | anneal at lambda 0.45 | 104/2 | F1u | +3.59 +/- 6.77 | 3000 | capped |
+| **P1** | from scratch on gen-005 (x1.122) + gen-006 + gen-006-u, then F1's finish | 98/5 | **F1u** | **+9.96 +/- 7.01** | 3000 | capped, LLR 1.88 |
+
+Lambda is the base weight on the search score; `--lambda-progress -0.2` was kept throughout,
+so the applied mean is ~0.07-0.08 lower.
+
+**Against berserk-8.5** (CCRL 3575): 3000 fixed STC games each, concurrency 14, no training
+running.
+
+| engine | Elo | W-L-D | time losses |
+|---|---|---|---|
+| base (`c005c36`, shipped net) | -6.95 +/- 8.01 | 821-881-1298 | 5 |
+| F1u | +9.61 +/- 8.00 | 890-807-1303 | 3 |
+| **P1u** | **+23.78 +/- 7.97** | 977-772-1251 | 6 |
+
+The self-play gains transferred: F1 +22.5 in self-play is +16.6 against berserk, and P1 +10.0 is
++14.2. E50's search batch did not transfer. Base's own -7 is 14 better than E50's -21 on
+`dd57a1b`, which is E51's speed work, within noise.
+
+#### The game-result weight is the lever
+
+The applied lambda against Elo relative to base, chaining F4 and F5 through F1u:
+
+| base lambda | 1.0 | 0.95 (shipped) | 0.75 | 0.6 | 0.45 |
+|---|---|---|---|---|---|
+| Elo | -25 | 0 | +22 | **~+36** | ~+26 |
+
+The optimum is near 0.6, about twice the result weight the shipped recipe used. F0 shows that the
+fine-tune itself is worth nothing (-7): a lower final LR on the shipped target finds nothing, and
+the shipped run was not under-trained. F2 shows that matching K to the data does nothing in a
+fine-tune. The labels come from a 10k-node search. That teacher is shallow enough that the game
+result carries information its score does not, and the shipped recipe was under-using it.
+
+#### Every data generation has its own label scale
+
+F0's val loss rose at every epoch, to 0.003957 from the shipped 0.003789, even at LR 1.25e-6.
+Between its last two epochs the weights moved 0.03-0.35% of their RMS, but the evals moved 14 cp
+RMS (max 77). The change was almost all confidence: `sign(eval) * change` averaged -8.6 cp.
+
+The cause is in the labels. For each file, take the factor `a` minimising
+`MSE(sigmoid(a*eval/400), sigmoid(clip(score)/400))` (search score only). Three different nets
+used as the ruler agree:
+
+| | gen-005 | gen-006 | gen-006-u | val-006 |
+|---|---|---|---|---|
+| label scale relative to gen-006 | **0.891** | 1 | **1.135** | 1.132 |
+
+gen-006 was labelled with a gen-5 net, and gen-006-u with a net trained on gen-006. The shipped
+net is 1/0.880 = 1.136x gen-006's labels, which is the same 13.5%. **A net trained with this
+target comes out ~13% more confident than its labels, and the next datagen inherits that.** The
+likely mechanism: the result term at K=400 pulls toward outcomes that fit K~230 (the best-fit K
+of score against result on gen-006). Mixed raw, gen-006 and gen-006-u ask for scales 13.5% apart.
+Each batch comes from one 2M-record chunk of one file, so the net's confidence follows the file
+mix of its last ~16M positions. That is the epoch-to-epoch val noise of the shipped run (±0.0001
+over its last ten epochs), and the reason averaging checkpoints made val worse at every window.
+
+#### An offline metric, and where it stops
+
+Refitting each net's eval scale on val-006 removes about two-thirds of that noise. Of the refitted
+columns, the **fixed WDL MSE** (the eval as a predictor of the game result) put F0-F3 and the
+shipped net in Elo order, at roughly 23 Elo per 0.001. It predicted F0's -7 almost exactly. Score
+MSE ranks them the other way: F3 imitates the teacher best and plays worst. Predictions were
+written down before F4 and F5 played:
+
+| | refit WDL MSE | predicted vs F1u | measured |
+|---|---|---|---|
+| F4 | 0.06014 | +12 | **+13.4** |
+| F5 | 0.05980 | +20 | **+3.6** |
+| P1 | 0.06074 | 0 | **+10.0** |
+
+It holds down to lambda ~0.6. Below that, nets keep improving at predicting results and get
+worse at chess. It is also blind to P1's gain. val-006 is gen-6 self-play, so extra coverage that
+pays off from the UHO book openings cannot show in it. It is a screen for target changes in the
+working range of lambda, not a substitute for an SPRT. Both checks are now `python -m
+nue.calibrate scale` / `refit` in the trainer (`trainer/README.md`, "Training a net that
+ships"). The original scripts are in the run directory's `analysis/`. On the module's wider
+scale grid F2's refit converges: 0.06198 at a = 1.205, not 0.06204 at the grid's edge.
+
+#### gen-005 pretraining (P1)
+
+P1-pre is the shipped recipe from scratch (24 x 500M, LR 5e-4, gamma 0.87, lambda 0.95). It
+trained on gen-005 + gen-006 + gen-006-u, 3.05B positions, 18% of them gen-005. gen-005's scores
+were multiplied by 1.122 (`--score-scale gen-005.cnn=1.122`) to put them on gen-006's scale.
+Unscaled, gen-005 would have added a third label scale 11% below gen-006's, and P1 would have
+tested the scale conflict as much as the positions. The finish was F1's (lambda 0.75), and the
+test was against F1u, so the result isolates the pretraining: **+9.96 +/- 7.01 in self-play,
++14.2 against berserk** (P1u +23.78 against F1u +9.61).
+
+#### Trainer change: `--score-scale SHARD=FACTOR`
+
+`trainer/nnue/dataset.py` and `train.py`. It multiplies one `--train` shard's search scores
+before the target is built. The shard is named by file name, and a name that matches none or
+more than one is fatal. Proven scores (|score| >= 30000) are untouched, and validation is never
+rescaled. The resume guard includes it. Default off: without the flag the loader yields exactly
+what it did. Tests are in `test_training.py`, covering both loader strategies and both batch
+presentations; the suite is 193/193.
+
+#### P2, and against viridithas-12.0.0 (2026-10-09)
+
+P2 is P1-pre with F4's finish: anneal at lambda 0.6. Net `b154ec12f2b5`; matched UncSigma
+**101/3** (sigma mean 149.9 cp); `P2u.exe` benches 208876. Every match ran on an idle machine.
+
+| test | Elo | games | CCRL estimate (gauntlet) | time losses |
+|---|---|---|---|---|
+| P2u vs P1u | +2.08 +/- 6.65 | 3000 | - | 0 |
+| P2u vs berserk-8.5 (3575) | +19.71 +/- 7.97 | 3000 | **3595 +/- 14** | 7, all berserk's |
+| **P2u vs viridithas-12.0.0 (3600)** | **-34.98 +/- 7.50** | 3000 | **3565 +/- 15** | 0 |
+| P2 at the shipped 100/7 vs berserk-8.5 | +27.27 +/- 8.00 | 3000 | - | 6 |
+| P2u vs berserk-8.5 at **LTC** (40+0.4) | +4.93 +/- 10.40 | 1340 | - | 0 |
+
+- On the gen-005-pretrained net, a lambda-0.6 finish is no better than lambda 0.75. Self-play
+  gives +2 +/- 7; against berserk, P2u's +19.7 is close to P1u's +23.8. On the gen-6-only net,
+  0.6 was +13 over 0.75 (F4). Either finish is fine. 0.75 keeps more of the uncertainty
+  head's signal: its matched slope is 5 against 3.
+- **The STC edge over berserk narrows at LTC**: +4.9 +/- 10.4, against +19.7 at STC. The run
+  was stopped by hand at 1340 of 2000 games once P1u had shipped, so it is a standing, not a
+  verdict.
+- **3600 is not reached yet.** The two anchors disagree by 30 Elo: we match up better against
+  berserk than against viridithas. Combined, the estimate is about **3580 +/- 10**.
+- The last row was meant to be P2u. The re-centring helper held only P2's first test while it
+  worked, so the idle runner started the second on the unmatched binary. It is reported as what
+  it is. It is a lead, not a result: at lambda 0.6 the shipped constants (100/7, wider margins)
+  scored +7.6 +/- 11 over the matched ones. Matching the margin distribution may not be optimal
+  for nets whose head reads this wide.
+
+#### Next
+
+- P1-pre with F4's finish (lambda 0.6) was P2, above: no better than 0.75 on a pretrained net.
+- The shipped recipe from scratch at lambda ~0.6 throughout, not only in the finish.
+- Normalise gen-006 / gen-006-u to one label scale (`--score-scale`) and re-test the from-scratch
+  run. The aim is to remove the confidence drift, not to change the overall scale.
+- **For gen-007 datagen:** the labelling net's ~13% inflation will be inherited again. Either fit
+  K so the target stops inflating, or record each generation's scale and normalise at training
+  time.
+- **Shipped 2026-10-09: P1u.** `net-g6-P1.nnue` (`93b2eecc8dbc`) is pinned as
+  `NET_TAG net-93b2eecc8dbc`, with `UNC_SIGMA_BASE` 98 / `UNC_SIGMA_SLOPE` 5 in `src/search.c`.
+  The rebuilt engine benches 208681, the count the tested `P1u.exe` gave. `nnue verify` is
+  10000/10000 exact and `openbench-check` passes. P1u was chosen over P2u, which tied it in
+  self-play (+2 +/- 7): P1u had the better berserk result, and its slope of 5 keeps more of
+  the uncertainty head's signal than P2u's 3. The release asset is published by
+  `tools/publish-net.ps1`.

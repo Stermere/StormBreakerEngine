@@ -128,6 +128,14 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | NNUE: lazy accumulator updates | bench identical, 3.7% SLOWER on an idle machine; not kept (E50) |
 | Speed against berserk-8.5, idle machine, 1 thread | berserk 2.98M nps in middlegames to HEAD's 1.93M: **54% faster** at about the same depth (E50) |
 | **Speed: TT prefetch before the accumulator update, no stack probes in the hot path, register max in `pick_move`** | **+8.28% median / +7.08% max nps**, bench unchanged (207253); compiler levers (LTO, PGO) worth <1%; king buckets cost only 5-10% of speed (E51) |
+| **NNUE recipe: more game result in the target (lambda 0.95 -> 0.75), a 45-min fine-tune of the shipped net** | **+22.45 +/- 8.77** vs base, SPRT [0, 5] H1 at 1968 STC games; lambda 1.0 **-24.76** (H0), K 230 -1.6, a lower final LR alone -7.2 (E52) |
+| NNUE recipe: lambda 0.6 / 0.45 against lambda 0.75 | **+13.44 +/- 6.61** / +3.59 +/- 6.77 over 3000 STC games: the optimum is near 0.6, about twice the shipped result weight (E52) |
+| **NNUE recipe: gen-005 pretraining (scores x1.122 onto gen-006's scale) + the lambda-0.75 finish** | **+9.96 +/- 7.01** vs the lambda-0.75 net over 3000 STC games (E52) |
+| **Against berserk-8.5, idle machine: base / lambda-0.75 net / gen-005-pretrained net** | **-6.95 / +9.61 / +23.78** (each +/- 8) over 3000 fixed STC games: the net gains transfer, and **berserk-8.5 is passed**. **P1u shipped**: net `93b2eecc8dbc`, UncSigma 98/5, bench 208681 (E52) |
+| Training data: label scale per generation | gen-005 0.891x, gen-006-u 1.135x gen-006's scores: each net comes out ~13% more confident than its labels and the next datagen inherits it. `--score-scale` added to the trainer (E52) |
+| NNUE recipe: the lambda-0.6 finish on the gen-005-pretrained net (P2) | +2.08 +/- 6.65 vs the lambda-0.75 one over 3000 STC games; vs berserk-8.5 +19.71 against its +23.78: no measurable difference (E52) |
+| **Against viridithas-12.0.0 (CCRL 3600), idle machine: the P2 net** | **-34.98 +/- 7.50** over 3000 fixed STC games. Estimate 3565 +/- 15 from viridithas and 3595 +/- 14 from berserk: **about 3580, 3600 not yet reached** (E52) |
+| Against berserk-8.5 at LTC (40+0.4): the P2 net | +4.93 +/- 10.40 over 1340 games, stopped by hand; STC was +19.71: the edge narrows at LTC (E52) |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`

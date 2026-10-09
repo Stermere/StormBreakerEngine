@@ -105,6 +105,40 @@ def _shard_lengths(paths):
     return paths, counts
 
 
+# The engine's proven bands - tablebase wins and mates - start just below 31,500. A score
+# that far out is a result, not an evaluation, and is not on any engine version's scale.
+PROVEN_SCORE = 30000
+
+
+def _score_scales(score_scale, n: int):
+    """One factor per shard, or None when no shard's labels are rescaled."""
+    if score_scale is None:
+        return None
+    scales = [float(s) for s in score_scale]
+    if len(scales) != n:
+        raise ValueError(f"score_scale has {len(scales)} factor(s) for {n} shard(s)")
+    if any(not np.isfinite(s) or s <= 0 for s in scales):
+        raise ValueError(f"score_scale factors must be positive and finite: {scales}")
+    return None if all(s == 1.0 for s in scales) else scales
+
+
+def _rescale(batch: dict, scale: float) -> dict:
+    """Bring one shard's search scores onto another's scale.
+
+    Every datagen generation labels with the net it had, and a net trained on
+    K=400 targets blended with results comes out more confident than its own
+    labels - so shards from different generations disagree about the size of
+    the same advantage (gen-006-u's scores are 1.135x gen-006's). Mixed raw,
+    the net can fit neither, and its scale drifts toward whichever shard the
+    last chunks came from. Proven scores are left alone: they are not on a
+    scale.
+    """
+    if scale != 1.0:
+        score = batch["score"]
+        batch["score"] = torch.where(score.abs() >= PROVEN_SCORE, score, score * scale)
+    return batch
+
+
 def _source_filter(sources):
     if not sources:
         return None
@@ -173,10 +207,11 @@ class ShardBatches(Dataset):
     """
 
     def __init__(self, paths, batch_size: int = 16384, sources=None,
-                 index_dtype=INDEX_DTYPE, sparse: bool = False):
+                 index_dtype=INDEX_DTYPE, sparse: bool = False, score_scale=None):
         self.paths, counts = _shard_lengths(paths)
         self.batch_size = int(batch_size)
         self.sources = _source_filter(sources)
+        self.score_scale = _score_scales(score_scale, len(self.paths))
         self.index_dtype = index_dtype
         self.sparse = bool(sparse)
         self._maps = None
@@ -227,7 +262,8 @@ class ShardBatches(Dataset):
             if len(records) == 0:
                 raise RuntimeError("shard changed after its filtered batch index was built")
 
-        return _tensors(records, self.index_dtype, self.sparse)
+        batch = _tensors(records, self.index_dtype, self.sparse)
+        return batch if self.score_scale is None else _rescale(batch, self.score_scale[file_index])
 
 
 class ShuffledChunks(IterableDataset):
@@ -245,13 +281,14 @@ class ShuffledChunks(IterableDataset):
     def __init__(self, paths, batch_size: int = 16384,
                  chunk_records: int = DEFAULT_CHUNK_RECORDS, sources=None,
                  shuffle: bool = True, seed: int = 0, index_dtype=INDEX_DTYPE,
-                 sparse: bool = False):
+                 sparse: bool = False, score_scale=None):
         self.paths, counts = _shard_lengths(paths)
         self.batch_size = int(batch_size)
         # A chunk smaller than a batch would make every batch short, which is
         # a silent 10x slowdown rather than an error.
         self.chunk_records = max(int(chunk_records), self.batch_size)
         self.sources = _source_filter(sources)
+        self.score_scale = _score_scales(score_scale, len(self.paths))
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.index_dtype = index_dtype
@@ -336,10 +373,11 @@ class ShuffledChunks(IterableDataset):
             # time keeps one chunk plus one batch resident instead of two
             # chunks, and the gather is inside RAM either way.
             perm = rng.permutation(n) if self.shuffle else None
+            scale = 1.0 if self.score_scale is None else self.score_scale[file_index]
             for lo in range(0, n, self.batch_size):
                 hi = min(lo + self.batch_size, n)
                 take = records[perm[lo:hi]] if perm is not None else records[lo:hi]
-                yield _tensors(take, self.index_dtype, self.sparse)
+                yield _rescale(_tensors(take, self.index_dtype, self.sparse), scale)
 
 
 def identity_collate(batch):
@@ -355,7 +393,7 @@ def identity_item(item):
 def make_loader(paths, batch_size: int = 16384, workers: int = 4,
                 shuffle: bool = True, sources=None, chunk_records=None,
                 seed: int = 0, index_dtype=INDEX_DTYPE,
-                sparse: bool = False) -> DataLoader:
+                sparse: bool = False, score_scale=None) -> DataLoader:
     """A loader over ``paths``, chunked if the dataset is big enough to need it.
 
     ``chunk_records`` picks the strategy: ``None`` decides from the total size
@@ -365,6 +403,9 @@ def make_loader(paths, batch_size: int = 16384, workers: int = 4,
     ``sparse`` picks the PRESENTATION, which is a separate axis from the
     strategy: batches come out as a sparsity pattern for
     ``NNUE.forward_sparse`` rather than as padded index matrices.
+
+    ``score_scale`` is one factor per path for that shard's search scores
+    (see ``_rescale``); None leaves every label as it is on disk.
     """
     paths, counts = _shard_lengths(paths)
     if chunk_records is None:
@@ -381,13 +422,14 @@ def make_loader(paths, batch_size: int = 16384, workers: int = 4,
     if chunk_records:
         dataset = ShuffledChunks(paths, batch_size=batch_size, chunk_records=chunk_records,
                                  sources=sources, shuffle=shuffle, seed=seed,
-                                 index_dtype=index_dtype, sparse=sparse)
+                                 index_dtype=index_dtype, sparse=sparse,
+                                 score_scale=score_scale)
         # No sampler and no collation: an IterableDataset shuffles itself, and
         # batch_size=None is what stops the DataLoader batching the batches.
         return DataLoader(dataset, batch_size=None, collate_fn=identity_item, **shared)
 
     dataset = ShardBatches(paths, batch_size=batch_size, sources=sources,
-                           index_dtype=index_dtype, sparse=sparse)
+                           index_dtype=index_dtype, sparse=sparse, score_scale=score_scale)
     if not len(dataset):
         raise ValueError("no records remain after source filtering")
     return DataLoader(dataset, batch_size=1, shuffle=shuffle,

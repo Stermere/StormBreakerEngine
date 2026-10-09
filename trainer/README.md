@@ -11,6 +11,7 @@ nnue/sparse.py    the feature transformer as a sparse matrix product
 nnue/model.py     the network and the loss
 nnue/train.py     the training loop
 nnue/sanity.py    score positions whose evaluation is known
+nnue/calibrate.py label scale per shard, and validation with each net's scale refitted
 tests/            the gates, run by `make trainer-test`
 ```
 
@@ -95,6 +96,11 @@ cd trainer
 # Gen 6 + gen-6-u, unc-weight 0.0005 ~3550 -> ~3575 (net-gen-6-noprior, +25.41 +/- 8.68 STC vs gen-6-pw, E49)
 .venv\Scripts\python.exe -m nnue.train --train F:\chessData\gen-006.cnn F:\chessData\gen-006-u.cnn --val ..\external\data\val-006.cnn --out ..\external\nets\net-gen-6-noprior --epochs 24 --finish-epochs 1 --finish-lr 1e-5 --batch-size 16384 --hidden 512 --l1-size 16 --l2-size 32 --output-buckets 8 --feature-factorization --uncertainty --unc-weight 0.0005 --lr 0.0005 --lr-gamma 0.87 --lambda-start 0.95 --lambda-end 0.95 --sigmoid-k 400 --lambda-progress -0.2 --lambda-pieces 0 --score-clip 2000 --positions-per-epoch 500000000 --seed 0 --log-every 50 --checkpoint-every 1 --pairwise --workers 8
 
+# E52 ~3575 -> ~3600 (-7 -> +24 vs berserk-8.5). Two runs, not one: see "Training a net that ships" below.
+# Pretrain on gen-005 (scores scaled onto gen-006's) + gen-006 + gen-006-u, then a 45-minute finish at lambda 0.75
+.venv\Scripts\python.exe -m nnue.train --train ..\external\data\gen-005.cnn F:\chessData\gen-006.cnn F:\chessData\gen-006-u.cnn --score-scale gen-005.cnn=1.122 --val ..\external\data\val-006.cnn --out ..\external\nets\net-g6-P1-pre --epochs 24 --batch-size 16384 --hidden 512 --l1-size 16 --l2-size 32 --output-buckets 8 --feature-factorization --uncertainty --unc-weight 0.0005 --lr 0.0005 --lr-gamma 0.87 --lambda-start 0.95 --lambda-end 0.95 --sigmoid-k 400 --lambda-progress -0.2 --score-clip 2000 --positions-per-epoch 500M --seed 0 --checkpoint-every 4 --pairwise --workers 8
+.venv\Scripts\python.exe -m nnue.train --train F:\chessData\gen-006.cnn F:\chessData\gen-006-u.cnn --val ..\external\data\val-006.cnn --out ..\external\nets\net-g6-P1 --init-from ..\external\nets\net-g6-P1-pre.pt --epochs 5 --lr 2e-5 --lr-gamma 0.5 --batch-size 16384 --unc-weight 0.0005 --lambda-start 0.75 --lambda-end 0.75 --sigmoid-k 400 --lambda-progress -0.2 --score-clip 2000 --positions-per-epoch 500M --seed 0 --workers 8
+
 # 6. quantise the checkpoint into the file the engine embeds
 cd ..
 make nnue-export        # net.pt -> net.nnue, plus .vectors and .sha256
@@ -131,6 +137,212 @@ replayed its neighbours' games. Its loss curve looked completely normal.
 Shuffle now drops duplicates by default and says how many; `-nodedup` makes it
 a pure permutation again. Read the number it prints: a large one on a fresh
 generation means the workers are not playing different games.
+
+---
+
+## Training a net that ships
+
+The pipeline above produces data. This section is the process that turns data
+into a net worth pinning: what to run, in what order, and why each step is
+there. It is the recipe E52 measured (October 2026, gen-006 data). That recipe
+took the engine from **-7 to +24 Elo against berserk-8.5** without touching the
+architecture or the search. Re-measure before trusting it on a new generation;
+the numbers below say which parts are measured and which are carried over.
+
+### The short version
+
+```
+check label scales  ->  pretrain from scratch  ->  short finish, lambda 0.6-0.75
+     (calibrate)          (all data, ~3.5 h)          (newest data, ~45 min)
+                                                              |
+ship  <-  confirm vs berserk  <-  SPRT vs current best  <-  export, gate,
+          (idle machine)          (STC, 3000-game cap)       re-centre UncSigma
+```
+
+### 1. Check the label scale of every shard you are going to mix
+
+Each datagen generation is labelled by the net that generation's engine
+carried, and **a net trained with this target comes out ~13% more confident
+than the labels it was trained on**. The next datagen inherits that. So shards
+from different generations disagree about how big the same advantage is:
+
+| shard | label scale relative to gen-006 |
+|---|---|
+| gen-005 | 0.892x |
+| gen-006 | 1 |
+| gen-006-u | 1.137x |
+
+Mixed raw, the net cannot fit all of them, and its confidence drifts toward
+whichever shard its last few million positions came from. Measure the scales
+with any recent net as the ruler (the ratios barely depend on which):
+
+```powershell
+.venv\Scripts\python.exe -m nnue.calibrate scale ..\external\nets\net-g6-P1.pt `
+    F:\chessData\gen-006.cnn ..\external\data\gen-005.cnn
+```
+
+The last column is the factor that puts each shard on the first one's scale.
+Pass it as `--score-scale gen-005.cnn=<factor>`. E52 ran 1.122; this command
+reads 1.121, and the difference is noise. Mates and tablebase scores are left
+alone, and validation is never rescaled.
+
+### 2. Pretrain from scratch on everything
+
+The main stage is the long run. Use all the data you have, older generations
+included, scale-matched. gen-005's positions added **+10 Elo in self-play and
++14 against berserk** on top of gen-6 alone (E52, P1), even though gen-005 came
+from a weaker engine. Coverage is worth more than label quality at the margin.
+
+```powershell
+.venv\Scripts\python.exe -m nnue.train `
+    --train ..\external\data\gen-005.cnn F:\chessData\gen-006.cnn F:\chessData\gen-006-u.cnn `
+    --score-scale gen-005.cnn=1.122 `
+    --val ..\external\data\val-006.cnn --out ..\external\nets\net-g6-P1-pre `
+    --epochs 24 --lr 0.0005 --lr-gamma 0.87 --positions-per-epoch 500M `
+    --hidden 512 --l1-size 16 --l2-size 32 --pairwise --output-buckets 8 `
+    --feature-factorization --uncertainty --unc-weight 0.0005 `
+    --lambda-start 0.95 --lambda-end 0.95 --lambda-progress -0.2 --sigmoid-k 400 `
+    --score-clip 2000 --batch-size 16384 --workers 8 --seed 0 --checkpoint-every 4
+```
+
+About 3.5 hours on the 3070 when nothing else is running, and noticeably longer
+beside a match. No `--finish-epochs` here: the finish is step 3, as a separate
+run.
+
+Open question: this stage still runs at lambda 0.95. Whether a lower lambda
+here, and not only in the finish, gains more is the next experiment.
+
+### 3. Finish at lambda 0.6-0.75 on the newest data
+
+A short fine-tune from the pretrained checkpoint does two jobs. It anneals the
+LR to near zero, and it moves the target toward the game result.
+
+```powershell
+.venv\Scripts\python.exe -m nnue.train `
+    --train F:\chessData\gen-006.cnn F:\chessData\gen-006-u.cnn `
+    --val ..\external\data\val-006.cnn --out ..\external\nets\net-g6-P2 `
+    --init-from ..\external\nets\net-g6-P1-pre.pt `
+    --epochs 5 --lr 2e-5 --lr-gamma 0.5 --positions-per-epoch 500M `
+    --unc-weight 0.0005 --lambda-start 0.6 --lambda-end 0.6 --lambda-progress -0.2 `
+    --sigmoid-k 400 --score-clip 2000 --batch-size 16384 --workers 8 --seed 0
+```
+
+One pass over the data (5 x 500M), LR 2e-5 halving every epoch, about 45
+minutes. `--init-from` brings the architecture with it; the target flags do
+not, so repeat them.
+
+On the gen-6-only net, 0.6 beat 0.75 by 13 Elo (E52's F4). On the
+gen-005-pretrained checkpoint, this exact run (**P2**) measured +2 +/- 7 over
+the same finish at 0.75 (P1). Against berserk-8.5 they were +19.7 and +23.8: no
+difference that could be measured. Either works. 0.75 keeps more of the
+uncertainty head's signal; its matched UncSigma slope is 5 against 3 (step 6).
+
+**The game-result weight is the biggest single lever found so far.** The
+labels come from a 10,000-node search, a shallow teacher, and the game result
+knows things its score does not. Fine-tuning the same net at each base lambda
+(the applied mean is ~0.07 lower, because of `--lambda-progress`):
+
+| base lambda | 1.0 | 0.95 (old recipe) | 0.75 | **0.6** | 0.45 |
+|---|---|---|---|---|---|
+| Elo vs the 0.95 net | -25 | 0 | +22 | **~+36** | ~+26 |
+
+What did *not* help, so you need not re-try it: an extra low-LR pass on the old
+target (-7), sigmoid K matched to the data (-2), and averaging epoch checkpoints
+(worse validation at every window).
+
+### 4. Screen offline before spending an SPRT
+
+Raw validation loss **does not track Elo**. It mostly measures how confident a
+net happens to be that epoch: E52's nets swung +-3% between epochs on a 0.1%
+weight change. Refit each net's scale first, then read the WDL column, which
+scores the eval as a predictor of the game result:
+
+```powershell
+.venv\Scripts\python.exe -m nnue.calibrate refit ..\external\data\val-006.cnn `
+    ..\external\nets\net-g6-P1.pt ..\external\nets\net-g6-P2.pt
+```
+
+Across E52's nets, about **0.001 lower WDL MSE was worth ~23 Elo**. Its limits
+are measured too:
+- It stops tracking Elo below a base lambda of ~0.6. Lambda 0.45 had the best
+  WDL MSE and was no better than 0.75.
+- It is blind to gains from data unlike the validation set. gen-005's +10 read
+  as zero.
+
+Use it to drop clear losers. It does not replace step 7.
+
+### 5. Export and gate
+
+```powershell
+cd ..
+make nnue-test ARGS="external/nets/net-g6-P2.pt" EVALFILE=external/nets/net-g6-P2.nnue EXE=sb-p2
+```
+
+Exact on 10,000 vectors, or it does not go further (see "Getting the net into
+the engine" below).
+
+### 6. Re-centre the uncertainty constants for the new net
+
+The search scales its pruning margins by the uncertainty head's prediction,
+through `UNC_SIGMA_BASE` / `UNC_SIGMA_SLOPE` in `src/search.c`. Those constants
+are centred on one net's head. A retrained head reads differently: lambda 0.75
+put its mean prediction at 115 cp against 83. Under the old constants the new
+net plays with different margins, and its SPRT measures net and margins
+together. Match the new net's margin distribution to the current net's:
+
+```powershell
+# once, on the net the constants were fitted for
+make unc-probe EVALFILE=external/nets/net.nnue EXE=sb-ref "PROBE_ARGS=-o external/nets/ref.unc"
+# per candidate: prints "UNC_SIGMA_BASE b   UNC_SIGMA_SLOPE s" under "matched by"
+make unc-probe EVALFILE=external/nets/net-g6-P2.nnue EXE=sb-p2 "PROBE_ARGS=-ref external/nets/ref.unc"
+# build the candidate with them (they are not UCI options in a playing build)
+make EXE=sb-p2u EVALFILE=external/nets/net-g6-P2.nnue `
+    "INCLUDES=-Isrc -DUNC_SIGMA_BASE_DEFAULT=<b> -DUNC_SIGMA_SLOPE_DEFAULT=<s>"
+```
+
+Pass the defines through `INCLUDES=`; a command-line `CFLAGS=` replaces the
+Makefile's own flags. The bench changes, which is how you know they took. As
+lambda drops, the head reads wider and the matched slope falls: 98/5 at lambda
+0.75, 102/3 at 0.6, 104/2 at 0.45, against the shipped 100/7.
+
+### 7. Test: self-play first, then an external engine
+
+1. **SPRT the candidate against the current best**, both binaries matched as
+   in step 6. Use STC, bounds [0, 5], `--rounds 1500` (3000 games at most).
+   Comparing against the current best rather than the shipped net isolates the
+   one change:
+   `make sprt ARGS="--dev sb-p2u.exe --base <current best>.exe --tc STC --bounds 0,5 --rounds 1500"`.
+2. **Confirm against berserk-8.5 over 3000 fixed games**, on an idle machine:
+   `make gauntlet ARGS="--engine sb-p2u.exe --opponents external/engines/berserk-8.5.exe --tc STC --games 3000"`.
+   Not beside training, datagen or another match: berserk's time management
+   keeps far less slack than ours, and under contention it flags (52 time
+   losses in 1694 games, a fake +68 Elo). Grep the log for "loses on time" by
+   side before believing the number. Net gains have transferred (+22 self-play
+   was +17 against berserk); E50's search gains did not, which is why this step
+   exists.
+
+### 8. Ship
+
+Three edits, made together:
+1. `tools/publish-net.ps1` uploads the `.nnue` as a release asset and prints
+   the replacement `NET_TAG` / `NET_SHA256` lines for the Makefile. Nets are
+   content-addressed: the tag is `net-` plus the hash's first 12 digits.
+2. Set `UNC_SIGMA_BASE_DEFAULT` / `UNC_SIGMA_SLOPE_DEFAULT` in `src/search.c` to
+   the matched values from step 6. The net and its constants are one change;
+   the net alone plays with someone else's margins.
+3. Copy the net over `external/nets/net.nnue` (or `make net-fetch` once it is
+   published), rebuild, and check `make bench` reads what the tested binary
+   read.
+
+Then record the run in [../docs/EXPERIMENTS.md](../docs/EXPERIMENTS.md) and
+[../docs/STATUS.md](../docs/STATUS.md).
+
+### Before the next datagen
+
+Whatever net labels gen-007 will put its own ~13% inflation into the new
+labels. Either stop the inflation at the source (the result term at K=400
+pulls toward outcomes that fit K~230), or keep running step 1 every
+generation. The second works today.
 
 ---
 
@@ -375,7 +587,10 @@ a draw.
 
 `lambda` is a real hyperparameter and worth two or three runs, not a guess to
 be lived with. Record what each one scored in
-[../docs/EXPERIMENTS.md](../docs/EXPERIMENTS.md).
+[../docs/EXPERIMENTS.md](../docs/EXPERIMENTS.md). It was 0.95 from gen 3
+through gen 6. E52 measured **0.6 as ~36 Elo better** in a finishing
+fine-tune, the largest single training gain to date (see "Training a net that
+ships").
 
 ### lambda per record, not per run
 
@@ -453,6 +668,7 @@ typo, and nothing else in the run would report it.
 | `--lambda-source human=1.0` | train a source on its search score alone, without dropping it |
 | `--score-clip 3000` | stop mate and tablebase labels asking for infinite confidence |
 | `--source-weight human=0.5` | set the mixture without regenerating |
+| `--score-scale gen-005.cnn=1.122` | put one shard's labels on another's scale (see "Training a net that ships") |
 
 Expect a few minutes per 100M-position epoch on an RTX 3070, and 5–15 epochs.
 The reference configuration — `--hidden 512 --output-buckets 8 --uncertainty
@@ -568,7 +784,9 @@ end-of-epoch checkpoint.
 Fixed `score_mse` and `wdl_mse` diagnostics use K=400, no source weights, no score
 clip, and no lambda schedule. WDL includes only known results. These support
 comparisons across recipes on the same validation set; they are not extra losses
-and do not replace engine matches. `lambda_applied` includes the forced lambda=1
+and do not replace engine matches. Read them after refitting each net's scale
+(`python -m nnue.calibrate refit`): raw, they mostly measure that epoch's
+confidence. `lambda_applied` includes the forced lambda=1
 for unknown WDL records.
 
 History/checkpoints carry `metrics_version: 2`. Legacy `train`/`train_loss` fields
@@ -617,7 +835,10 @@ What they actually check:
 - **`test_factorization.py`** — shared gradients, zero padding, folded-weight
   clipping, old checkpoints, and folding before quantization without a shape change.
 - **`test_training.py`** — filtering with multiple workers, metric denominators,
-  fixed diagnostics, low-LR stage boundaries, weights-only initialization and resume.
+  fixed diagnostics, low-LR stage boundaries, weights-only initialization and resume,
+  and `--score-scale` rescaling one shard and no proven score.
+- **`test_calibrate.py`** — the scale fit and the refit recover scales they are
+  handed, proven scores stay out of the fit, and both commands run on a shard.
 - **`test_provenance.py`** — checkpoint/network hashes, stale export protection,
   dataset inventory, and mixed-checkpoint/optimizer rejection.
 

@@ -12,7 +12,8 @@ from nnue.dataset import ShardBatches, ShuffledChunks, make_loader  # noqa: E402
 from nnue.format import pack_fen  # noqa: E402
 from nnue.model import NNUE, TargetPolicy  # noqa: E402
 from nnue.provenance import sha256_file  # noqa: E402
-from nnue.train import Metrics, evaluate, forever, parse_args, train  # noqa: E402
+from nnue.train import (Metrics, evaluate, forever, parse_args, parse_score_scale,  # noqa: E402
+                        train)
 
 
 @pytest.fixture
@@ -200,3 +201,31 @@ def test_fixed_validation_metrics_do_not_follow_lambda_or_score_clip(shard):
     assert first["value"] != second["value"]
     assert first["score_mse"] == second["score_mse"]
     assert first["wdl_mse"] == second["wdl_mse"]
+
+@pytest.mark.parametrize("chunks", [0, 4])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_score_scale_rescales_one_shard_and_leaves_proven_scores(tmp_path, chunks, sparse):
+    fen = "8/8/8/8/8/4k3/8/4K3 w - - 0 1"
+    scores = [100, -300, 31000, -31400]
+    for name in ("a.cnn", "b.cnn"):
+        np.array([pack_fen(fen, score=s, wdl=1, source=0) for s in scores]).tofile(tmp_path / name)
+    paths = [tmp_path / "a.cnn", tmp_path / "b.cnn"]
+    loader = make_loader(paths, 4, workers=0, shuffle=False, chunk_records=chunks,
+                         sparse=sparse, score_scale=[1.5, 1.0])
+    got = [b["score"].tolist() for b in loader]
+    assert got == [[150.0, -450.0, 31000.0, -31400.0], [100.0, -300.0, 31000.0, -31400.0]]
+    plain = [b["score"].tolist() for b in make_loader(paths, 4, workers=0, shuffle=False,
+                                                       chunk_records=chunks, sparse=sparse)]
+    assert plain == [[float(s) for s in scores]] * 2
+
+
+def test_score_scale_names_exactly_one_shard():
+    paths = ["F:/d/gen-005.cnn", "F:/d/gen-006.cnn", "F:/d/gen-006-u.cnn"]
+    assert parse_score_scale(None, paths) is None
+    assert parse_score_scale("gen-005.cnn=1.25", paths) == [1.25, 1.0, 1.0]
+    assert parse_score_scale("gen-006-u=0.8", paths) == [1.0, 1.0, 0.8]
+    for bad in ("gen-7=1.1", "gen-005=x", "gen-005=0", "gen-005=-1"):
+        with pytest.raises(SystemExit):
+            parse_score_scale(bad, paths)
+    with pytest.raises(SystemExit, match="exactly one"):
+        parse_score_scale("x=1.1", ["a/x.cnn", "b/x.cnn"])

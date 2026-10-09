@@ -123,6 +123,38 @@ def parse_source_map(text, flag: str) -> dict:
     return out
 
 
+def parse_score_scale(text, train_paths) -> list | None:
+    """``gen-005.cnn=1.122`` into one factor per --train path, or None.
+
+    A shard is named by its file name, with or without the extension, because
+    a position in the --train list is a number nobody checks against the
+    command line it came from. A name that matches no shard - or more than one
+    - is fatal for the same reason --source-weight's unknown tags are.
+    """
+    if not text:
+        return None
+    names = [os.path.basename(p) for p in train_paths]
+    scales = [1.0] * len(train_paths)
+    for item in str(text).replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, _, value = item.partition("=")
+        name = name.strip()
+        hits = [i for i, n in enumerate(names)
+                if n == name or os.path.splitext(n)[0] == name]
+        if len(hits) != 1:
+            raise SystemExit(f"--score-scale: '{name}' matches {len(hits)} of the --train "
+                             f"shards ({', '.join(names)}); it must name exactly one")
+        try:
+            scales[hits[0]] = float(value)
+        except ValueError:
+            raise SystemExit(f"--score-scale: '{item}' is not NAME=FACTOR") from None
+        if not math.isfinite(scales[hits[0]]) or scales[hits[0]] <= 0:
+            raise SystemExit(f"--score-scale: '{item}' must be positive and finite")
+    return scales
+
+
 def save_atomically(obj, path: str) -> None:
     """Write a checkpoint that a crash cannot half-replace.
 
@@ -197,7 +229,7 @@ def load_resume(args, model, optimiser, scheduler, device):
                  "chunk_records", "limit_batches", "sigmoid_k", "score_clip", "unc_weight",
                  "lambda_start", "lambda_end", "lambda_progress", "lambda_pieces",
                  "lambda_source", "lambda_min", "lambda_max", "source_weight", "sources",
-                 "no_weight_clip")
+                 "no_weight_clip", "score_scale")
         for key in fixed:
             if checkpoint["args"].get(key) != getattr(args, key):
                 raise SystemExit(f"--resume: {key} changed; use --init-from for a new recipe")
@@ -385,9 +417,10 @@ def train(args) -> None:
     model = model.to(device)
     print(f"net:    {model.describe()}")
 
+    score_scale = parse_score_scale(args.score_scale, args.train)
     train_loader = make_loader(args.train, args.batch_size, args.workers, shuffle=True,
                                sources=args.sources, chunk_records=args.chunk_records,
-                               seed=args.seed, sparse=True)
+                               seed=args.seed, sparse=True, score_scale=score_scale)
     val_loader = (make_loader(args.val, args.batch_size, max(args.workers // 2, 0),
                               shuffle=False, sources=args.sources,
                               chunk_records=args.chunk_records, seed=args.seed,
@@ -400,6 +433,10 @@ def train(args) -> None:
     if args.sources and hasattr(train_loader.dataset, "chunks"):
         print("       chunked source filtering: input counts above are upper bounds; "
               "epoch metrics report the records actually used")
+    if score_scale is not None:
+        print("scale: " + ", ".join(f"{os.path.basename(p)} scores x{s:g}"
+                                    for p, s in zip(args.train, score_scale) if s != 1.0)
+              + " (training only; validation labels as on disk)")
     if val_loader is not None:
         print(f"val:   {val_loader.dataset.records:,} records")
 
@@ -484,7 +521,7 @@ def train(args) -> None:
                 train_loader = make_loader(args.train, args.batch_size, args.workers,
                                            shuffle=True, sources=args.sources,
                                            chunk_records=args.chunk_records, seed=args.seed,
-                                           sparse=True)
+                                           sparse=True, score_scale=score_scale)
                 set_epoch(train_loader, epoch - 1)
         position_limit = 0 if finishing else args.positions_per_epoch
         planned = (math.ceil(position_limit / args.batch_size)
@@ -755,6 +792,13 @@ def parse_args(argv=None):
                              "mixture without regenerating anything, where --sources can "
                              "only drop a source entirely")
 
+    parser.add_argument("--score-scale", default=None, metavar="SHARD=F,...",
+                        help="multiply one --train shard's search scores by F before the "
+                             "target is built, e.g. 'gen-005.cnn=1.122'. Each datagen "
+                             "generation labels on its own net's scale, and shards mixed raw "
+                             "disagree about the size of the same advantage. Proven scores "
+                             "(mates, tablebase wins) are untouched; validation is never "
+                             "rescaled")
     parser.add_argument("--positions-per-epoch", type=count, default=0,
                         help="make an epoch this many positions rather than a whole pass, "
                              "so a 500M-position run checkpoints and prints its sanity "

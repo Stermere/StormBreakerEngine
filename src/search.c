@@ -625,14 +625,20 @@ TUNABLE(UNC_SCALE_MAX, 145);
  *
  * Re-centred 99/9 -> 100/7 for gen-6-noprior (E49), the same way: under 99/9 it gave mean
  * scale 131.6 and 39.7% at the cap against gen-6-pw's 128.7 and 33.1%, and `unc-probe -ref`
- * against gen-6-pw matches it at 100/7 (128.4, 30.1%). Its +25 Elo was measured at 100/7. */
+ * against gen-6-pw matches it at 100/7 (128.4, 30.1%). Its +25 Elo was measured at 100/7.
+ *
+ * Re-centred 100/7 -> 98/5 for gen-6-P1 (E52), the same way, against gen-6-noprior. The
+ * lambda-0.75 finish moves the head's mean sigma from 82.6 to 108.7 cp; under 100/7 that gives
+ * mean scale 132.4 and 42.1% at the cap against 126.1 and 28.1%, and `unc-probe -ref` matches
+ * it at 98/5 (125.9, 26.0%). Its +10 over the lambda-0.75 gen-6 net and +23.8 against
+ * berserk-8.5 were measured at 98/5. */
 /* Build-time overrides, so a candidate net can carry the centring `make unc-probe` solved for it
  * into a binary that plays without UCI options. */
 #ifndef UNC_SIGMA_BASE_DEFAULT
-#define UNC_SIGMA_BASE_DEFAULT 100
+#define UNC_SIGMA_BASE_DEFAULT 98
 #endif
 #ifndef UNC_SIGMA_SLOPE_DEFAULT
-#define UNC_SIGMA_SLOPE_DEFAULT 7
+#define UNC_SIGMA_SLOPE_DEFAULT 5
 #endif
 TUNABLE(UNC_SIGMA_BASE, UNC_SIGMA_BASE_DEFAULT);
 TUNABLE(UNC_SIGMA_SLOPE, UNC_SIGMA_SLOPE_DEFAULT);
