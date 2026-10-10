@@ -51,12 +51,8 @@ typedef struct {
     int score;
 } ScoredMove;
 
-/*
- * Long algebraic ("e2e4", "e7e8q") into `buf`, which must hold six bytes; returns
- * `buf`. `chess960` picks how CASTLING is spelled - false the king's destination
- * "e1g1", true king-takes-rook "e1h1" - and is a parameter because the answer
- * belongs to the position rather than the process, so pass pos->chess960.
- */
+/* Long algebraic into `buf` (six bytes); returns `buf`. `chess960` (pass pos->chess960)
+ * spells castling king-takes-rook ("e1h1") instead of "e1g1". */
 char *move_to_str(Move m, bool chess960, char *buf);
 
 #endif

@@ -17,26 +17,16 @@
 #include "tt.h"
 
 /*
- * uncprobe.c - the `probe unc` command. See uncprobe.h for why it exists.
- *
- * It searches a corpus (the bench positions by default, so the tree is the one every other
- * measurement here is taken on), records the signal unc_scale() consumes at every node
- * that consults it, holds the mapping neutral while it does, and reports the constants
- * that re-centre it. The distribution is NODE-WEIGHTED because a margin is applied per
- * node, so the average scale the search runs under is the average over nodes rather than
- * over the positions in a file.
- *
- * The histogram is written from the search worker and read after it is joined, so no
- * synchronisation is needed - the same argument bench.c makes for search_nodes().
+ * uncprobe.c - `probe unc` and `probe err`. Searches a corpus (the bench positions by
+ * default) with the mapping held neutral, records the signal unc_scale() reads at every
+ * node, and reports the constants that re-centre it. Node-weighted, because margins apply
+ * per node. The histogram is written by the search thread and read after it is joined.
  */
 
-/* One bucket per centipawn of signal. Sixteen thousand covers every sigma any net has
- * produced by a wide margin, and anything past it still counts in the mean and the maximum,
- * both accumulated exactly; only the percentiles would notice, and the report says so. */
+/* One bucket per cp of signal; overflow still counts in the mean and maximum. */
 #define UNC_PROBE_BUCKETS 16384
 
-/* Twelve because that is the depth E20 and E21 centred the mapping's constants on, so a
- * new measurement is comparable to the ones the shipped constants came from. */
+/* The depth the shipped constants were centred at (E20, E21). */
 #define UNC_PROBE_DEPTH 12
 
 static bool ProbeLive;
@@ -61,9 +51,7 @@ int unc_probe(int signal, int scale) {
     return ProbeLive ? scale : 100;
 }
 
-/* A measured distribution, compacted to the values that actually occurred. Both the run
- * just taken and a reference loaded from disk arrive in this shape, so every statistic
- * below is written once and applies to either. */
+/* A distribution compacted to the values that occurred: the current run or a reference. */
 typedef struct {
     int *value;
     uint64_t *count;
@@ -97,9 +85,7 @@ static bool dist_reserve(Dist *d, int n) {
     return true;
 }
 
-/* The run just taken, compacted out of the bucket array. The constants that were live when
- * it was taken travel with it: for a reference run that is the whole point, since they are
- * the mapping the fit was made under. */
+/* The current run, with the constants that were live when it was taken. */
 static bool dist_from_histogram(Dist *d, const UncMapping *m) {
     int distinct = 0;
     for (int i = 0; i < UNC_PROBE_BUCKETS; ++i)
@@ -130,8 +116,7 @@ static bool dist_from_histogram(Dist *d, const UncMapping *m) {
     return true;
 }
 
-/* The signal below which `q` of the NODES fall. Overflow samples sit above every bucket,
- * so they are answered with the true maximum. */
+/* The signal below which `q` of the nodes fall; overflow answers with the true maximum. */
 static int dist_percentile(const Dist *d, double q) {
     if (d->samples == 0)
         return 0;
@@ -146,8 +131,7 @@ static int dist_percentile(const Dist *d, double q) {
     return d->max;
 }
 
-/* Exactly what unc_scale() computes, and it must stay exactly that: the truncation in the
- * division is part of the mapping, not a rounding detail. */
+/* Must stay exactly unc_scale()'s arithmetic, truncation included. */
 static int map_scale(int base, int slope, int cap, int grain, int signal) {
     const int v = base + (int)((int64_t)signal * slope / grain);
     return v > cap ? cap : v;
@@ -160,9 +144,8 @@ typedef struct {
     int median, p25, p75;
 } ScaleStats;
 
-/* Overflow samples are above every bucket, so the mapping pins them at the cap - which is
- * where any signal that large lands anyway. The mapping is monotone non-decreasing, so a
- * percentile of the scale is the mapping of that percentile of the signal. */
+/* Overflow lands at the cap. The mapping is monotone, so scale percentiles are mapped
+ * signal percentiles. */
 static void scale_stats(const Dist *d, int base, int slope, int cap, ScaleStats *out) {
     memset(out, 0, sizeof(*out));
     if (d->samples == 0)
@@ -200,10 +183,8 @@ static void scale_stats(const Dist *d, int base, int slope, int cap, ScaleStats 
 #define BASE_SWEEP_MAX  200
 #define SLOPE_SWEEP_MAX 64
 
-/* The base that puts the node-weighted mean scale closest to `target` at this slope. Swept
- * rather than solved because the cap makes the mean a piecewise function of the base, and
- * the range is deliberately wider than the sweep seat's own: an answer outside it is
- * exactly the thing worth knowing, and a clamp would report a fit that does not fit. */
+/* The base whose mean scale is closest to `target` at this slope. Swept, since the cap
+ * makes the mean piecewise, over a range wider than the TUNABLE's. */
 static int best_base(const Dist *d, int slope, int cap, double target) {
     int best        = 0;
     double bestDiff = 1e18;
@@ -219,9 +200,7 @@ static int best_base(const Dist *d, int slope, int cap, double target) {
     return best;
 }
 
-/* A CSV with a commented header rather than JSON, so it can be plotted or diffed without a
- * parser. What makes it worth keeping is the header: a distribution without the constants
- * that were live when it was taken cannot be used as a reference. */
+/* CSV with the live constants in a commented header, so it can serve as a reference. */
 static bool dist_write(const Dist *d, const char *path, int positions) {
     FILE *f = fopen(path, "w");
     if (!f) {
@@ -243,8 +222,7 @@ static bool dist_write(const Dist *d, const char *path, int positions) {
     return true;
 }
 
-/* Two passes: count the rows, then fill. The file is a few thousand lines, and a growable
- * array here would be more code than a second fopen. */
+/* Two passes: count the rows, then fill. */
 static bool dist_read(Dist *d, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -305,8 +283,7 @@ static bool dist_read(Dist *d, const char *path) {
     return true;
 }
 
-/* Mirrors bench_run(): a fixed hash, cleared between positions, so the tree is a function
- * of the corpus and the depth alone. */
+/* As bench_run(): a fixed hash, cleared between positions. */
 static void probe_position(const char *fen, int depth, int *ok, int *bad) {
     Position pos;
     memset(&pos, 0, sizeof(pos));
@@ -329,9 +306,7 @@ static void probe_position(const char *fen, int depth, int *ok, int *bad) {
     ++*ok;
 }
 
-/* An EPD line is a FEN followed by operations. Cutting it after the fourth field and
- * supplying the clocks takes both spellings without a second parser; the halfmove clock a
- * probe throws away is worth nothing to it. */
+/* Accepts EPD or FEN: cut after the fourth field and supply the clocks. */
 static bool epd_to_fen(const char *line, char *out, size_t outSize) {
     int field       = 0;
     const char *c   = line;
@@ -419,10 +394,8 @@ static void report_mapping(const Dist *d, int base, int slope, int cap, const ch
            s.mean, s.sd, s.p25, s.median, s.p75, s.cappedPct);
 }
 
-/* The slope is the conditioning strength - how many percent of margin one centipawn of
- * predicted error buys - and it is the thing a person has to choose. The base is not a
- * choice once the slope is fixed, since the centring rule pins it, so the table fixes the
- * mean at 100 in every row and shows what the spread does. */
+/* The slope is the real choice; the base follows from centring the mean on 100. The
+ * table shows the spread each slope gives. */
 static void report_sweep(const Dist *d, int cap, int currentSlope) {
     static const int slopes[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 48, 64};
 
@@ -441,10 +414,8 @@ static void report_sweep(const Dist *d, int cap, int currentSlope) {
     }
 }
 
-/* Carrying a fit across a retrain. The reference is a run of this probe on the net the
- * constants were fitted for, and its mean and spread under those constants are what the
- * SPSA fit was actually looking at - so reproducing them on the new net's distribution is
- * what "the same margins" means once the signal has moved. */
+/* Carries a fit across a retrain: find constants that reproduce the reference run's mean
+ * and spread (what the SPSA fit saw) on the new net's distribution. */
 static void report_reference(const Dist *now, const Dist *ref, int cap) {
     ScaleStats target;
     scale_stats(ref, ref->base, ref->slope, ref->cap, &target);
@@ -638,19 +609,13 @@ int unc_probe_command(char *args) {
 }
 
 /*
- * `probe err`: is the net ever confident and wrong, and how badly? Where `probe unc`
- * measures what the mapping READS, this pairs the signal at a node with the error the
- * search went on to find there - the quantity every margin insures against.
- *
- * The question is about the TAIL, not the average: a margin does not care what the typical
- * error is at a given confidence, it cares how often the error exceeds it. The error is
- * recorded SIGNED because the two directions are different prunes - reverse futility bets
- * the evaluation is not too high, futility and delta that it is not too low.
+ * `probe err`: pairs each node's signal with the error the search then found, by signal
+ * band. What matters is the tail, how often the error exceeds a margin, and the sign:
+ * RFP bets the eval is not too high, futility and delta that it is not too low.
  */
 #define ERR_BUCKETS 4096
 
-/* Band edges, upper-exclusive, in centipawns of signal. Finer where the shipped mapping's
- * floor lives and the interesting question is; the last bands only have to exist. */
+/* Band edges, upper-exclusive, in cp of signal; finest near the mapping's floor. */
 static const int SigmaEdges[] = {8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, 1 << 30};
 #define SIGMA_BANDS ((int)(sizeof(SigmaEdges) / sizeof(SigmaEdges[0])))
 
@@ -671,11 +636,7 @@ static int sigma_band(int signal) {
     return SIGMA_BANDS - 1;
 }
 
-/* A mate or tablebase score is not an evaluation error of a size, and letting an
- * 8,000,000cp "residual" into the percentiles would make every band look identical - so it
- * is counted on its own, which is the more useful number anyway. Overflow is kept on its
- * own side: counted without its sign it lands in the wrong tail, and in a thin band that
- * is the whole answer. */
+/* Decisive scores are counted separately, not as huge errors. Overflow keeps its sign. */
 void unc_probe_residual(int signal, int err, bool exact, bool decisive, int depth) {
     if (depth < ResidMinDepth || depth > ResidMaxDepth || (ResidExactOnly && !exact))
         return;
@@ -708,10 +669,8 @@ void unc_probe_residual(int signal, int err, bool exact, bool decisive, int dept
 /* What a band's percentiles are drawn from: all it saw but the decisive scores. */
 static uint64_t band_sized(int b) { return BandNodes[b] - BandDecisive[b]; }
 
-/* The signed error at quantile `q` of a band, walking the two half-histograms from the most
- * negative error upward. Overflow sits at both ends and is answered with the band's true
- * extreme, and at least one observation is required or the target is met before the walk
- * starts. */
+/* The signed error at quantile `q` of a band, from the most negative upward; overflow
+ * answers with the band's true extreme. */
 static int band_quantile(int b, double q) {
     const uint64_t n = band_sized(b);
     if (n == 0)
@@ -738,8 +697,7 @@ static int band_quantile(int b, double q) {
     return BandErrMax[b];
 }
 
-/* The share of a band's observations at or beyond `k` centipawns, on the side `k`'s sign
- * names. This is the number a margin actually buys against. */
+/* The share of a band at or beyond `k` cp, on `k`'s side: what a margin insures against. */
 static double band_exceedance(int b, int k) {
     const uint64_t n = band_sized(b);
     if (n == 0)
@@ -756,9 +714,7 @@ static double band_exceedance(int b, int k) {
     return 100.0 * (double)hit / (double)n;
 }
 
-/* Below this a band cannot support the quantile the tables ask of it, and a number computed
- * from forty observations reads exactly like one from forty thousand. Marked rather than
- * hidden: which bands are thin is itself something to know. */
+/* Bands with fewer observations are marked thin rather than hidden. */
 #define BAND_MIN_OBS 400
 
 static void resid_usage(void) {

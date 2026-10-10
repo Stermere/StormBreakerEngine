@@ -1,4 +1,4 @@
-/* movepicktest.h - acceptance gate and narrow bridge to the private search picker. */
+/* movepicktest.h - the move picker gate, `make movepick-test`, and its bridge into search.c. */
 #ifndef MOVEPICKTEST_H
 #define MOVEPICKTEST_H
 
@@ -14,8 +14,7 @@ typedef struct {
     ScoredMove moves[MAX_MOVES];
 } PickerTestResult;
 
-/* These bridges allocate isolated history state, never access the playing threads,
- * and exercise the same picker functions negamax calls. */
+/* The picker negamax uses, on private state that never touches the thread pool. */
 bool search_test_picker(const Position *pos, PickerTestMoves hints, int limit,
                         PickerTestResult *out);
 int search_test_picker_contracts(void);

@@ -1,4 +1,4 @@
-/* bench.c - the deterministic node-count benchmark; bench.h has the why. */
+/* bench.c - the deterministic node-count benchmark. */
 #include "bench.h"
 
 #include <stdio.h>
@@ -10,10 +10,7 @@
 #include "timeman.h"
 #include "tt.h"
 
-/* Openings, quiet and tactical middlegames, and endgames of several material
- * configurations. Breadth matters more than count - a bench dominated by one phase
- * will happily report a speedup for a patch that only helps that phase - and the list
- * is frozen, because changing it invalidates every historical node count. */
+/* Spread over every phase of the game. Frozen: see BENCH_DEFAULT_DEPTH. */
 static const char *BenchPositions[] = {
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
@@ -69,25 +66,12 @@ void bench_run(int depth) {
     if (depth <= 0)
         depth = BENCH_DEFAULT_DEPTH;
 
-    /*
-     * Both of these are pinned for the run and put back afterwards. Pinned because the
-     * node count must not depend on what a session happened to set; put back because
-     * `bench` is also a UCI command, and an engine that answered it by quietly moving a
-     * GUI's 512 MB table down to 16 would play the rest of the game on a table nobody
-     * asked for and nothing reports. Thread count was already restored; the hash was not.
-     */
+    /* Hash and threads are pinned for the run (invariant 1) and restored afterwards, since
+     * `bench` is also a UCI command. One thread: a parallel search is not reproducible. */
     const size_t hashMb = tt_size_mb();
     const int threads   = search_threads();
 
     tt_resize(16);
-
-    /*
-     * One thread, for the same reason and a stronger one. A parallel search reaches the
-     * shared table in whatever order the scheduler produces, so its node count is not
-     * reproducible even on one machine - and invariant 1 is what makes every measurement
-     * in this repository comparable. `bench` is a measurement, not a benchmark of the
-     * machine.
-     */
     search_set_threads(1);
 
     uint64_t totalNodes = 0;
@@ -102,8 +86,6 @@ void bench_run(int depth) {
             continue;
         }
 
-        /* Leftover entries would make each result depend on the positions searched
-         * before it, and so on the order of the list. */
         tt_clear();
         search_clear();
 
@@ -118,14 +100,12 @@ void bench_run(int depth) {
     }
 
     int64_t elapsed = time_ms() - start;
-    /* Clamped so a sub-millisecond run cannot divide by zero. */
     if (elapsed <= 0)
         elapsed = 1;
 
     const uint64_t nps = (uint64_t)((double)totalNodes * 1000.0 / (double)elapsed);
 
-    /* Restored before the report, so a failure to give the table back is said out loud
-     * above the contract line rather than after it. */
+    /* Restored before the report, so any warning precedes the final line. */
     search_set_threads(threads);
     if (hashMb != 0 && hashMb != 16 && !tt_resize(hashMb))
         printf("info string could not restore the %zu MB hash after bench; it is 16 MB\n", hashMb);
@@ -133,8 +113,7 @@ void bench_run(int depth) {
     printf("\n===========================\n");
     printf("Positions  : %d\n", BENCH_POSITION_COUNT);
     printf("Depth      : %d\n", depth);
-    /* The node count depends on which net is embedded, so a bench that cannot name its
-     * net is not a measurement. It goes in the header, never on the last line. */
+    /* The node count depends on the net, so name it (above the final line). */
 #ifdef EVAL_NNUE
     printf("Eval       : nnue %.12s\n", nnue_hash());
 #else
@@ -142,7 +121,6 @@ void bench_run(int depth) {
 #endif
     printf("Time       : %lldms\n", (long long)elapsed);
 
-    /* THIS LINE IS THE CONTRACT. OpenBench parses exactly this shape: two numbers, the
-     * words `nodes` and `nps`, in this order. */
+    /* OpenBench parses exactly this line (invariant 2). */
     printf("%llu nodes %llu nps\n", (unsigned long long)totalNodes, (unsigned long long)nps);
 }

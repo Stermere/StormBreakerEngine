@@ -55,8 +55,6 @@ From the repository root:
 make EXE=stormbreaker-staged
 make EXE=stormbreaker-staged movepick-test perft chess960-test
 make EXE=stormbreaker-staged smp-test THREADS=4
-make EXE=stormbreaker-staged staged-eager
-make EXE=stormbreaker-staged staged-profile
 ```
 
 `movepick selftest` exercises the actual production picker via an isolated
@@ -67,12 +65,13 @@ stage laziness. Picker-driven perft runs all four EPD suites (depth 3, depth 2
 for all 960 starts), with deterministic random legal walks as additional input.
 Ordinary perft retains the independently sealed counts and its original code.
 
-The `-eager` binary generates both normal-node batches on construction but
-scores at the same times as the lazy binary. Its node count must match exactly.
-Do not use it as the SPRT baseline: use the preserved original engine.
+The measurements below also used two control builds, removed on 2026-10-09
+once the picker had shipped (`git show da3953c` has them). The `-eager` binary
+generated both normal-node batches on construction but scored at the same times
+as the lazy binary, and its node count matched exactly.
 
-The `-profile` binary adds per-thread counters only under `MOVE_PICKER_PROFILE`.
-It prints after helpers park and leaves the final bench line intact. It separates
+The `-profile` binary added per-thread counters under `MOVE_PICKER_PROFILE`.
+It printed after helpers parked and left the final bench line intact. It separated
 main tactical/quiet/evasion, qsearch and ProbCut generation/scoring; reports
 main picked/legal/searched moves, ordering/pruning SEE calls, and cutoff stages.
 Counts reset per search. These are work counts, NOT sampled CPU cycle costs;

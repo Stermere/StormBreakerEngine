@@ -100,15 +100,11 @@ static void test_laziness(void) {
     PickerTestMoves hints = {tt, k0, k1, counter, MOVE_NONE};
     PickerTestResult out;
     bool ok = search_test_picker(&pos, hints, 1, &out) && out.count == 1 && out.moves[0].m == tt;
-#ifndef MOVE_PICKER_EAGER
     ok &= out.tacticalCount == -1 && out.quietCount == -1;
-#endif
     report("TT prefix does not generate either main-search batch", ok);
     ok = search_test_picker(&pos, hints, 4, &out) && out.count == 4 && out.moves[1].m == k0 &&
          out.moves[2].m == k1 && out.moves[3].m == counter;
-#ifndef MOVE_PICKER_EAGER
     ok &= out.tacticalCount == 0 && out.quietCount == -1;
-#endif
     report("refutations are delivered before quiet generation", ok);
 
     hints = (PickerTestMoves){tt, tt, tt, tt, MOVE_NONE};
@@ -128,9 +124,7 @@ static void test_laziness(void) {
     ok &= search_test_picker(&pos, hints, 8, &out) && out.count == 8;
     for (int i = 0; i < out.count; ++i)
         ok &= type_of_move(out.moves[i].m) == MT_PROMOTION;
-#ifndef MOVE_PICKER_EAGER
     ok &= out.tacticalCount == 8 && out.quietCount == -1;
-#endif
     report("all eight capturing/pushing promotions precede quiet generation", ok);
 
     /* Qxd5 loses to ...exd5; unlike a good tactical it must survive in the

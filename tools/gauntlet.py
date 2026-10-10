@@ -214,6 +214,7 @@ def main() -> int:
     ap.add_argument("--tc", default="STC")
     ap.add_argument("--concurrency", type=int, default=0)
     ap.add_argument("--hash", type=int, default=16, dest="hash_mb")
+    ap.add_argument("--book", help="EPD opening book; default is the UHO book sprt.py uses")
     ap.add_argument("--include-stockfish", action="store_true",
                     help="add Stockfish to the field, alongside the rest of it")
     ap.add_argument("--skill-level", type=int, default=None,
@@ -307,7 +308,7 @@ def main() -> int:
         concurrency=concurrency,
         pgn=pgn,
         hash_mb=args.hash_mb,
-        book=c.get_book(),
+        book=args.book or c.get_book(),
         # Round-robin so the opponents also play each other, which anchors the
         # Elo table instead of leaving every rating relative to a single engine.
         extra=["-tournament", "roundrobin"],
@@ -321,6 +322,7 @@ def main() -> int:
     print(f"  time control {tc}  ({tc_label})")
     print(f"  games        ~{args.games} per pairing")
     print(f"  concurrency  {concurrency}")
+    print(f"  book         {args.book or c.get_book()}")
     print(f"  pgn          {pgn}")
     print()
 

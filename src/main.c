@@ -13,31 +13,25 @@
 #include "zobrist.h"
 
 int main(int argc, char **argv) {
-    /* A GUI launches the engine on a pipe, and C makes pipes fully buffered, so the
-     * handshake would sit in the buffer and the engine would appear to hang. */
+    /* Pipes are fully buffered by default, which would stall the UCI handshake. */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    /* Order matters: the attack tables underpin everything, and the Zobrist keys must
-     * exist before any position is hashed. */
+    /* Attack tables, then Zobrist keys, before any position exists. */
     bb_init();
     zobrist_init();
     eval_init();
-    /* Before search_init(), and fatal on failure: finding out at the first `go` rather
-     * than at startup wastes a match. */
+    /* Fatal at startup rather than at the first `go`. */
 #ifdef EVAL_NNUE
     nnue_init();
 #endif
     search_init();
 
-    /* A failed allocation is survivable - probe and store both check for a NULL table -
-     * but an engine playing a whole match without one is drastically weaker, so it must
-     * not be silent. */
+    /* Survivable, but not silently. */
     if (!tt_resize(16))
         printf("info string failed to allocate the default 16 MB hash\n");
 
     if (argc > 1) {
-        /* Re-joined into one line and run through the dispatcher the GUI drives, so
-         * `engine bench` and the UCI `bench` command cannot behave differently. */
+        /* Command-line arguments go through the same dispatcher as UCI input. */
         char line[4096] = {0};
         size_t used     = 0;
 
@@ -58,9 +52,7 @@ int main(int argc, char **argv) {
         uci_loop();
     }
 
-    /* Before tt_free(): a pooled thread that is still parked has a raw pointer to the
-     * table, and the search it is parked between could in principle be woken by nothing
-     * at all - but the ordering costs nothing and the reverse is a use-after-free. */
+    /* Before tt_free(): parked threads hold pointers into the table. */
     search_exit();
 
     syzygy_free();

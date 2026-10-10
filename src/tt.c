@@ -17,32 +17,23 @@ typedef struct {
 
 static TTCluster *Table;
 
-/* What free() is owed. The table is slid forward inside it so a cluster cannot straddle
- * two cache lines - see tt_resize(). */
+/* What free() is owed; Table is aligned inside it. */
 static void *TableBlock;
 
 static size_t ClusterCount;
 static size_t SizeMb;
-/*
- * Read by every thread on every probe and every store, and written once per search by
- * whoever starts one - so it is shared mutable state and has to say so. Relaxed, and
- * deliberately: a thread that reads the previous value stamps its entry one generation
- * old, which costs that entry some replacement priority and nothing else. Ordering this
- * would put a fence on the hottest shared path in the engine to protect a heuristic that
- * is allowed to be approximate.
- */
+
+/* Relaxed: a stale read only costs one entry some replacement priority. */
 static _Atomic uint8_t Generation;
 
 static inline uint8_t generation(void) {
     return atomic_load_explicit(&Generation, memory_order_relaxed);
 }
 
-/* The generation lives in the top 6 bits of genBound, so it advances in steps of 4
- * and wraps after 64 searches. Ages are computed modulo that cycle. */
+/* The generation is the top 6 bits of genBound: steps of 4, wrapping after 64 searches. */
 #define GENERATION_DELTA 4
 #define GENERATION_MASK  0xFCu
 
-/* High 64 bits of a 64x64 multiply. */
 static inline uint64_t mul_hi64(uint64_t a, uint64_t b) {
 #if defined(__SIZEOF_INT128__)
     return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) >> 64);
@@ -56,22 +47,16 @@ static inline uint64_t mul_hi64(uint64_t a, uint64_t b) {
 #endif
 }
 
-/* A multiply-shift rather than `key % ClusterCount`, a hardware division on the critical
- * path; unlike a power-of-two mask it does not discard half of Hash. Shifted left by 16
- * because key_verifier() takes the top bits, which must not also index the cluster. */
+/* Multiply-shift instead of `%`, and any size works. The top 16 bits are the verifier,
+ * so they are shifted out of the index. */
 static inline size_t cluster_index(Key key) {
     return (size_t)mul_hi64(key << 16, (uint64_t)ClusterCount);
 }
 
 static inline uint16_t key_verifier(Key key) { return (uint16_t)(key >> 48); }
 
-/*
- * A mate score means "mate in N plies from HERE", so the same position reached at a
- * different distance from the root carries a different absolute score - store the
- * absolute one and the engine announces mates that are a transposition away from
- * evaporating. Tablebase scores are ply-relative for the same reason, which is why
- * these tests run against the TB band edge rather than the mate one.
- */
+/* Mate and TB scores are stored relative to the node, not the root, so they stay right
+ * when the position is reached at another ply. */
 static Value value_to_tt(Value v, int ply) {
     if (v == VALUE_NONE)
         return VALUE_NONE;
@@ -92,18 +77,8 @@ Value tt_value_from_tt(Value v, int ply) {
     return v;
 }
 
-/*
- * A cluster is a cache line's worth of entries and the whole point of the layout is that
- * reading one costs ONE miss - which holds only if the cluster is on a line boundary.
- * malloc guarantees alignment for the fundamental types, which is 16 bytes here, so
- * three clusters in four would straddle two lines if the block landed on one.
- *
- * Over-allocate by a line and slide the table forward, the same trick nnue_load_file()
- * uses on the net blob. calloc rather than an aligned allocator with a memset, because
- * calloc's pages arrive zeroed from the OS and are faulted in as the search touches
- * them: writing a 16 GB table at startup just to zero it is not a cost a `setoption
- * name Hash` should pay.
- */
+/* Over-allocated by a line so clusters can be cache-aligned. calloc, so the zeroed pages
+ * are faulted in lazily rather than written at startup. */
 bool tt_resize(size_t mb) {
     if (mb == 0)
         mb = 1;
@@ -149,8 +124,7 @@ int tt_hashfull(void) {
     if (!Table || ClusterCount == 0)
         return 0;
 
-    /* Sample the first 1000 entries rather than walking a multi-gigabyte table; that is
-     * what `info hashfull` means by convention. */
+    /* The first 1000 entries, by convention. */
     int used        = 0;
     const int probe = 1000;
     for (int i = 0; i < probe; ++i) {
@@ -172,8 +146,7 @@ bool tt_probe(Key key, TTEntry *out) {
         TTEntry *const e = &cluster->entry[i];
 
         if (e->key16 == key16 && (e->genBound & 3) != BOUND_NONE) {
-            /* An entry the search keeps hitting is worth more than its depth suggests, so
-             * drag it forward to the current generation and out of replacement's sights. */
+            /* Refresh the generation of an entry still in use. */
             e->genBound = (uint8_t)(generation() | (e->genBound & 3));
             *out        = *e;
             return true;
@@ -182,7 +155,6 @@ bool tt_probe(Key key, TTEntry *out) {
     return false;
 }
 
-/* How many searches ago this entry was written, modulo the generation cycle. */
 static inline int entry_age(const TTEntry *e, uint8_t gen) {
     return (int)((uint8_t)(gen - (e->genBound & GENERATION_MASK)) / GENERATION_DELTA);
 }
@@ -209,7 +181,6 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
     for (int i = 0; i < TT_CLUSTER_SIZE; ++i) {
         TTEntry *const e = &cluster->entry[i];
 
-        /* Its own slot, or an empty one: nothing to weigh up. */
         if (e->key16 == key16 || (e->genBound & 3) == BOUND_NONE) {
             replace = e;
             break;
@@ -220,20 +191,13 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
 
     const bool sameSlot = replace->key16 == key16;
 
-    /* A node that failed low has no best move to report. Keep whatever a previous, and
-     * possibly deeper, search found here rather than erasing it. */
+    /* Keep the previous move when this node has none (a fail low). */
     if (!sameSlot || m != MOVE_NONE)
         replace->move = (uint16_t)m;
 
-    /* Sticky within the slot, and written even when the value below is not refreshed: a
-     * shallow re-visit that declines to overwrite the score has learned nothing that
-     * unsays the flag. */
     replace->pv = (uint8_t)(pv || (sameSlot && replace->pv));
 
-    /* Overwrite when the slot is not already ours, when the new result is exact, or when
-     * the new search is not meaningfully shallower. The four-ply slack matters: without
-     * it a reduced-depth re-search never refreshes the entry, so its generation goes
-     * stale while it is still in use and replacement evicts what the search relies on. */
+    /* The four-ply slack lets reduced re-searches refresh an entry still in use. */
     if (!sameSlot || bound == BOUND_EXACT || (Depth)replace->depth < depth + 4) {
         const Value stored = value_to_tt(value, ply);
         assert(stored >= INT16_MIN && stored <= INT16_MAX);

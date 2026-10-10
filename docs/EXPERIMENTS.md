@@ -4874,3 +4874,91 @@ P2 is P1-pre with F4's finish: anneal at lambda 0.6. Net `b154ec12f2b5`; matched
   self-play (+2 +/- 7): P1u had the better berserk result, and its slope of 5 keeps more of
   the uncertainty head's signal than P2u's 3. The release asset is published by
   `tools/publish-net.ps1`.
+
+---
+
+### E53: The last recipe follow-ups, and berserk-8.5 under CCRL-like conditions
+
+**Date** 2026-10-09/10 · **Baseline** HEAD `61b4e92` with the shipped P1u (net `93b2eecc8dbc`,
+UncSigma 98/5), bench 208681, node for node the tested `P1u.exe` · **Status** both recipe
+candidates rejected, nothing shipped. Against berserk-8.5, the STC/UHO edge mostly disappears
+on a balanced book (+3.2) and at LTC (+3.8). Run directory: `external/games/nnue-20261009/`.
+It holds `NOTES.md`, `jobs.json`, `queue.json`, `release.py` and every log.
+
+This entry covers two items from E52's "Next". It also has the first measurements under
+conditions closer to CCRL's, balanced openings and a longer clock, which is where a CCRL rating
+target is set.
+
+#### The recipe follow-ups
+
+E52's pipeline ran unchanged:
+- `chain.py` trains, gates (`make nnue-test`, exact) and benches each net.
+- `recentre.py` matches its UncSigma to `ref-shipped.unc`.
+- Each SPRT is STC [0, 5], capped at 3000 games, concurrency 12.
+
+| run | change | UncSigma | vs | Elo | games | verdict |
+|---|---|---|---|---|---|---|
+| S1 | P1's finish with one label scale: gen-006 x1.0321, gen-006-u x0.9094 | 98/5 | P1u | -6.14 +/- 6.95 | 3000 | capped, LLR -1.67 |
+| L6 | P1-pre's main stage at lambda 0.6 (not 0.95), then P2's lambda-0.6 finish | 101/3 | P2u | **-26.39 +/- 10.31** | 1530 | **H0** |
+
+- **S1** puts both files on one scale and keeps the record-weighted mean. 23.8% of the records
+  are gen-006-u, so the raw mix averages 1.0321 gen-006 units. Only the 13.5% conflict moves.
+  - It did what it was meant to: the finish's val range across epochs fell from 0.000072 (P1) to
+    0.000033.
+  - It does not play better. Before the SPRT, the refit WDL MSE predicted ~0 (0.06076 against
+    P1's 0.06077).
+  - The scale conflict is noise in the val number, not lost Elo.
+- **L6.** The finish wants a lot of game result (E52: +10 to +22); the main stage does not.
+  Through 12B positions at a high LR, the result displaces score information that one finish
+  pass cannot recover. Its sigma reads like P2u's: 149.3 against 149.9 cp, both matched to
+  101/3. So the loss is evaluation quality, not margins.
+
+With E52, the recipe for this data is settled:
+- gen-005 pretraining (scores x1.122);
+- the main stage at lambda 0.95;
+- a finish at lambda 0.6-0.75;
+- raw label scales.
+
+The next net Elo has to come from data.
+
+#### Against berserk-8.5 under CCRL-like conditions
+
+Every external match before this was STC on the UHO book, while CCRL Blitz is 2'+1" from balanced
+openings. Both matches below ran on an idle machine, nothing training, concurrency 14:
+1. P1u at STC on `ccrl4040_ply20.epd`, the positions at ply 20 of CCRL 40/40 games, using the new
+   `gauntlet.py --book`. It is the same binary as E52's UHO match.
+2. The 660 LTC games E52's test 18 (P2u) did not play: same binaries, book and concurrency, pooled
+   with its 1340.
+
+| condition | engine | Elo | nElo | ptnml | games | time losses (ours / theirs) |
+|---|---|---|---|---|---|---|
+| STC, UHO (E52) | P1u | +23.78 +/- 7.97 | +37.21 +/- 12.43 | [36, 320, 641, 409, 94] | 3000 | 0 / 6 |
+| **STC, balanced** | P1u | **+3.24 +/- 7.56** | +5.34 +/- 12.43 | [48, 336, 716, 340, 60] | 3000 | 0 / 6 |
+| STC, UHO (E52) | P2u | +19.71 +/- 7.97 | +30.81 +/- 12.43 | [35, 336, 649, 384, 96] | 3000 | 0 / 7 |
+| **LTC, UHO** (pooled) | P2u | **+3.82 +/- 8.48** | +6.87 +/- 15.22 | [10, 246, 479, 242, 23] | 2000 | 0 / 0 |
+
+- **The book.** On the same binary, the edge fell 20.5 +/- 11.0 from UHO to balanced.
+  - Normalised Elo falls just as much, +37.2 to +5.3. So this is not UHO stretching the Elo scale
+    through fewer draws: the engine's edge over berserk lives mostly in the lopsided positions UHO
+    starts from.
+  - gen-004 drew openings from this book and gen-006 used none, so if anything the book favoured
+    us. Familiarity cannot explain the drop.
+- **The clock.** P2u fell from +19.71 at STC to +3.82 at LTC, -15.9 +/- 11.6.
+- **A possible cause, not tested:** gen-006 has no book. It starts from the initial position plus
+  random plies, or from DFRC, so much of its play is lopsided, and it may under-cover balanced,
+  theory-like middlegames. That is a question for gen-007.
+
+**CCRL estimate.** Under either harder condition, the engine is level with berserk-8.5 (3575 +/-
+12): about **3575-3580**, not E52's 3595 from berserk. If the two effects stack, CCRL's own
+conditions put it lower, toward the viridithas-based 3565. **3625 is ~45-60 Elo away** in the
+conditions CCRL rates in.
+
+**For testing.** E52's "the net gains transfer" was measured on UHO at STC. External
+confirmations should use a balanced book from here; self-play SPRTs can stay on UHO, where the
+resolution is the point. No self-play gain has yet been checked on a balanced book, so whether
+UHO SPRTs rank changes the way balanced play would is unmeasured.
+
+#### Tool changes
+
+- `tools/gauntlet.py --book <epd>`. The default is still the UHO book.
+- In the run directory's copy of `sprt_queue.py`, fixed-length entries now pass `extra` through.

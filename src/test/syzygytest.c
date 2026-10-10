@@ -1,16 +1,8 @@
 /*
- * syzygytest.c - does the prober actually answer known endgames correctly?
- *
- * A wrong tablebase probe does not crash: it returns a plausible number, the search
- * believes it, and every label the generator writes for a low-piece position is quietly
- * wrong. Every expected result below came from the lichess.org tablebase API - an oracle
- * with no code in common with this integration - which earned its keep immediately, since
- * the first draft asserted a blocked KNPvKP is drawn and it is won.
- *
- * The cases are chosen so that agreeing with a material count is not enough: draws worth
- * several pawns on paper, two contrast pairs one square apart that no material evaluation
- * can separate, wins that need technique, losses so the sign is exercised both ways, and
- * a colour-reflected mirror of every case to catch a side-to-move mix-up.
+ * syzygytest.c - does the prober answer known endgames correctly? Every expected result
+ * comes from the lichess.org tablebase API, an independent oracle. The cases defeat a
+ * material count (contrast pairs one square apart, drawn material advantages), and each
+ * is also tested colour-mirrored.
  */
 #include "syzygytest.h"
 
@@ -168,55 +160,34 @@ static int check(const char *fen, Expect expect, const char *what, const char *h
 /* Defined with the position generator below; the conversion gate needs it first. */
 static bool has_any_legal(Position *pos);
 
-/*
- * Does a won root actually CONVERT? The suite above asks what a position is worth, which is
- * the question a wrong table answers wrongly. It is not the question that loses games: the
- * root probe also has to name a move, and a move that keeps the win without approaching it
- * holds the value at +win forever while the fifty-move rule runs out underneath it. Nothing
- * above can see that, because a shuffle scores exactly as well as a conversion.
- *
- * So these play the position out - BOTH sides from the root probe, which makes the defence
- * maximal resistance rather than a stand-in - and require checkmate, with the engine's own
- * draw test never firing on the way. A shuffle fails on the threefold or on the clock, and
- * it fails at the ply it happens rather than as a score nobody questions.
- *
- * Every FEN is a win for the side to move, at a nonzero clock where that is the point, and
- * lichess.org confirmed each one.
- */
+/* Does a won root convert? A move that keeps the win without progress scores just as well
+ * as one that converts, until the fifty-move rule takes it. These play both sides from the
+ * root probe and require mate with no draw on the way. Each FEN is a win for the side to
+ * move, confirmed on lichess.org. */
 typedef struct {
     const char *fen;
     const char *what;
 } ConvertCase;
 
 static const ConvertCase ConvertCases[] = {
-    /* The case this gate was written for: a queen one diagonal from the pawn that zeroes the
-     * clock, where ranking the raw table distance prefers standing next to the capture over
-     * making it, and the queen shuffles for forty moves. */
+    /* The original bug: the queen stood next to the zeroing capture instead of making it. */
     {"8/8/7p/4K2P/8/8/8/k2q4 b - - 17 80", "KQPvKP, the capture is one move away"},
-    /* The same position with the clock nearly out: the win is still there (distance 1 plus
-     * clock 90) and there is no room left to spend on anything but taking. */
+    /* The same with the clock nearly out. */
     {"8/8/7p/4K2P/8/8/8/k2q4 b - - 90 80", "KQPvKP, same, clock 90 of 100"},
-    /* Promotion is zeroing and the king step is not, and the king step is nearer to the
-     * promotion than the promotion is to the mate that follows it. */
+    /* The king step looks nearer than the promotion. */
     {"8/8/8/8/8/1K6/7p/k7 b - - 0 87", "KPvK, promote or shuffle the king"},
 
-    /* Wins with NO zeroing move anywhere, so the distance is the whole ranking and a high
-     * clock leaves little of it: these fail if preferring a zeroing move ever costs one. */
+    /* No zeroing move at all, with a high clock. */
     {"8/8/8/4k3/8/8/4K3/4Q3 w - - 30 1", "KQvK, clock 30, mate is the only zeroing"},
     {"8/8/8/3k4/8/8/3K4/3R4 w - - 60 1", "KRvK, clock 60, 23 plies to mate"},
 
-    /* Technique rather than counting: a blocked pawn the knight has to win first, and a
-     * bishop that has to let the pawn through. */
+    /* Wins that need technique. */
     {"8/8/8/4k3/4p3/4P3/4KN2/8 w - - 5 1", "KNPvKP, centre pawns, 37 plies to mate"},
     {"7k/8/5K2/7P/8/8/8/6B1 w - - 40 1", "KBPvK, right-colour bishop, clock 40"},
     {"8/8/8/4k3/8/8/3r4/3QK3 w - - 20 1", "KQvKR, clock 20"},
 };
 
-/*
- * Generous: the clock alone bounds one phase at 100 plies and a five-man win passes through
- * a handful of them. A bound is here so a prober that returns a legal move forever fails as
- * a failure rather than as a hung gate.
- */
+/* Generous; it exists so a shuffling prober fails instead of hanging the gate. */
 enum { CONVERT_MAX_PLIES = 600 };
 
 static int check_converts(const ConvertCase *c) {
@@ -239,8 +210,6 @@ static int check_converts(const ConvertCase *c) {
             return 1;
         }
 
-        /* The arbiter's three: threefold, the fifty-move rule, insufficient material. Reached
-         * from a won position, any of them means the win was played away. */
         if (board_is_draw(&pos, 0)) {
             printf("  FAIL  %-44s ply %d: drawn with the win still on the board (clock %d)\n",
                    c->what, ply, pos.halfmoveClock);
@@ -256,16 +225,12 @@ static int check_converts(const ConvertCase *c) {
             return 1;
         }
 
-        /* The winner's own turns are the ones that have to keep saying win: the defence is
-         * expected to report a loss, and does not get to end the gate by agreeing. */
         if (pos.sideToMove == winner && r.value != VALUE_TB_WIN) {
             printf("  FAIL  %-44s ply %d: the win became %s\n", c->what, ply, value_name(r.value));
             printf("        %s\n", c->fen);
             return 1;
         }
 
-        /* Invariant 6 applies to a test as much as to a search: the probe's move is matched
-         * against the generator inside syzygy_probe_root, and this is the second opinion. */
         if (!movegen_is_pseudo_legal(&pos, r.move) || !movegen_is_legal(&pos, r.move)) {
             char buf[6];
             printf("  FAIL  %-44s ply %d: illegal move %s\n", c->what, ply,
@@ -325,16 +290,9 @@ int syzygy_verify_suite(const char *path) {
     return failures + convFailures;
 }
 
-/*
- * The position generator. Material configurations are ENUMERATED and placements within
- * them sampled, because a wrong prober is wrong for a whole table at a time.
- *
- * A configuration is a multiset of coloured non-king pieces addressed by an integer, so
- * the whole space is walkable without holding it in memory: configuration N's k-th piece
- * is type (N / 10^k) % 10, and multisets are the codes whose digits are non-increasing.
- * Most integers in the range decode to nothing, which costs a divide each once per
- * configuration and buys a pure function with no table to build.
- */
+/* The position generator. A configuration (a multiset of non-king pieces) is an integer
+ * whose k-th decimal digit is the k-th piece's code, canonical when the digits are
+ * non-increasing; codes that are not canonical are skipped. */
 static const PieceType GenTypes[5] = {PAWN, KNIGHT, BISHOP, ROOK, QUEEN};
 
 enum { GEN_MAX_EXTRA = 5 };
@@ -411,18 +369,17 @@ static int config_split(int maxMen, int config, int *extraOut) {
     return 0;
 }
 
-int tbgen_config_count(int maxMen) {
+/* Every material configuration up to a piece count, each with seeded random legal
+ * placements. Material is covered exhaustively and only placement is random: a prober that
+ * is wrong is wrong for a whole table, which uniform sampling would find only in proportion
+ * to that table's size. Every position is a pure function of (config, seed), which is what
+ * lets the oracle's verdicts stay checkable after the oracle is gone. */
+static int tbgen_config_count(int maxMen) {
     const int maxExtra = maxMen - 2;
     int total          = 0;
     for (int extra = 0; extra <= maxExtra && extra <= GEN_MAX_EXTRA; ++extra)
         total += config_count_for(extra);
     return total;
-}
-
-int tbgen_config_men(int maxMen, int config) {
-    int extra;
-    config_split(maxMen, config, &extra);
-    return extra < 0 ? 0 : extra + 2;
 }
 
 static bool config_counts(int maxMen, int config, int counts[2][PIECE_TYPE_NB], int *extraOut) {
@@ -435,7 +392,7 @@ static bool config_counts(int maxMen, int config, int counts[2][PIECE_TYPE_NB], 
     return found && config_decode(code, *extraOut, counts) >= 0;
 }
 
-void tbgen_config_name(int maxMen, int config, char *buf, size_t cap) {
+static void tbgen_config_name(int maxMen, int config, char *buf, size_t cap) {
     int counts[2][PIECE_TYPE_NB];
     int extra;
 
@@ -461,9 +418,7 @@ void tbgen_config_name(int maxMen, int config, char *buf, size_t cap) {
     buf[n] = 0;
 }
 
-/* SplitMix64: a seed in, a well-distributed word out, no state to carry. Two positions
- * from adjacent seeds have to be unrelated, because the seeds ARE adjacent - the caller
- * counts up. */
+/* SplitMix64, so adjacent seeds give unrelated positions. */
 static uint64_t splitmix(uint64_t *x) {
     uint64_t z = (*x += 0x9E3779B97F4A7C15ULL);
     z          = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -471,10 +426,8 @@ static uint64_t splitmix(uint64_t *x) {
     return z ^ (z >> 31);
 }
 
-/* Built as a FEN and parsed rather than assembled through board_put_piece: board_set_fen
- * is the one path that fills in every derived field, and a generator that set them by hand
- * would be testing its own bookkeeping as much as the prober's answers. */
-bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
+/* Built as a FEN so board_set_fen fills in every derived field. */
+static bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
     int counts[2][PIECE_TYPE_NB];
     int extra;
     if (!config_counts(maxMen, config, counts, &extra))
@@ -499,10 +452,8 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
     board[bk] = 'k';
 
     int placedW = 0, placedB = 0;
-    /* When the material allows it, sometimes BUILD the en passant geometry rather than
-     * hoping for it - a white pawn on rank 4 with a black pawn beside it and the squares
-     * behind clear. Left to chance this arose in 63 placements out of 410,960, which is not
-     * coverage of the subtlest branch in the prober but a rounding error. */
+    /* Sometimes build en passant geometry on purpose: by chance it arose 63 times in
+     * 410,960 placements. */
     if (counts[0][PAWN] && counts[1][PAWN] && (splitmix(&rng) & 1)) {
         const int f  = (int)(splitmix(&rng) % 7);
         const int wq = 24 + f;
@@ -579,26 +530,19 @@ bool tbgen_position(int maxMen, int config, uint64_t seed, Position *pos) {
         }
     }
 
-    /* No castling, no en passant unless offered, a zero clock: the conditions under which a
-     * WDL probe is defined at all. An ep square is offered only when the double push that
-     * would have created it is consistent and an enemy pawn stands ready to take it, and it
-     * is taken whenever the geometry allows rather than at random - the material that can
-     * produce one is rare enough that sampling on top left the branch with a few dozen
-     * positions in four hundred thousand. */
+    /* No castling and a zero clock, as WDL requires; an ep square only when consistent. */
     n += (size_t)snprintf(fen + n, FEN_MAX_LEN - n, " %c - %s 0 1", stm, epField);
     (void)n;
 
     if (!board_set_fen(pos, fen))
         return false;
 
-    /* The side that just moved cannot still be in check. This also rejects adjacent kings,
-     * which is the same condition. */
+    /* The side not to move may not be in check (this also rejects adjacent kings). */
     const Color them = pos->sideToMove == WHITE ? BLACK : WHITE;
     return !board_square_attacked(pos, king_square(pos, them), pos->sideToMove, occupied_bb(pos));
 }
 
-/* The root probe is defined only where a legal reply exists, and both the sealer and this
- * file must skip the same positions or their checksums cannot agree. */
+/* The root probe needs a legal move; the sealer skipped the same positions. */
 static bool has_any_legal(Position *pos) {
     ScoredMove list[MAX_MOVES];
     const int n = movegen_generate(pos, board_checkers(pos) ? GEN_EVASIONS : GEN_ALL, list);
@@ -608,24 +552,20 @@ static bool has_any_legal(Position *pos) {
     return false;
 }
 
-/* FNV-1a over the two numbers, in a fixed order. A checksum rather than the values because
- * 286 configurations at `per 200` is 57,200 answers and the point is a file git can diff;
- * what is lost is which POSITION broke, which is why the seed is recorded. */
-uint64_t tbgen_checksum(uint64_t acc, int wdl, int dtz) {
+/* FNV-1a, so the manifest is one diffable line per configuration. */
+static uint64_t tbgen_checksum(uint64_t acc, int wdl, int dtz) {
     const uint64_t Prime = 0x100000001B3ULL;
     acc                  = (acc ^ (uint64_t)(uint32_t)wdl) * Prime;
     acc                  = (acc ^ (uint64_t)(uint32_t)dtz) * Prime;
     return acc;
 }
 
-/* The sentinel a declined probe folds in, so a prober that quietly refuses more positions
- * than the oracle did fails rather than agreeing. */
+/* Folded in for a declined probe, so declining more than the oracle did fails. */
 enum { TBGEN_DECLINED = 99 };
 
-/* The two normalisations here are the differential harness's and have to match the sealer
- * exactly: the root probe is skipped for positions with no legal move, and the distance is
- * folded in as a magnitude because the oracle's is unsigned. */
-uint64_t tbgen_config_checksum(int maxMen, int config, uint64_t seed, long per) {
+/* Must match the sealer exactly: the root probe is skipped without a legal move, and the
+ * distance folded in as a magnitude (the oracle's is unsigned). */
+static uint64_t tbgen_config_checksum(int maxMen, int config, uint64_t seed, long per) {
     uint64_t acc = 0xcbf29ce484222325ULL;
 
     for (long i = 0; i < per; ++i) {
@@ -710,9 +650,7 @@ int syzygy_verify_manifest(const char *tbPath, const char *manifestPath) {
         if (name[0] != 'K')
             continue;
 
-        /* The manifest is ordered as the generator enumerates, so the index is the line's
-         * position. Names are checked rather than assumed, because a manifest sealed by a
-         * different generator would otherwise be compared against the wrong endgames. */
+        /* Lines follow the generator's order; the names are checked anyway. */
         char expect[16];
         tbgen_config_name(maxMen, checked, expect, sizeof(expect));
         if (strcmp(expect, name) != 0) {

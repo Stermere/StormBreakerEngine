@@ -1,15 +1,8 @@
 /*
- * search.c - search driver and worker thread: iterative deepening over a principal
- * variation search, with a quiescence search at the leaves.
+ * search.c - iterative deepening PVS with quiescence, run on a Lazy SMP thread pool.
  *
- * Almost everything here exists to make alpha-beta see the best move first. That is not
- * a detail - alpha-beta only approaches its theoretical node count under good ordering,
- * and the gap between good and bad is a factor of ten in tree size. With the ordering
- * good enough to rely on, null-move pruning and late move reductions pay for themselves.
- *
- * Anything added from here is a BEHAVIOURAL change and must not be committed without a
- * passing SPRT: roughly half the patches that look obviously good measure neutral or
- * worse.
+ * Most of this file is move ordering: alpha-beta only approaches its best-case tree size
+ * when the best move comes first, and the pruning and reductions depend on that.
  */
 #include "search.h"
 
@@ -31,70 +24,51 @@
 #include "tt.h"
 #include "uci.h"
 
-/* Root state, shared by every searching thread: the position they all start from and
- * the limits they all answer to. Written before the threads are released and read-only
- * while they run, so no lock is needed. */
+/* Shared by every thread: written before the pool is released, read-only while it runs. */
 static Position RootPos;
 static SearchLimits Limits;
 static TimeManager Timer;
 
-/* Relaxed ordering would be enough for a stop flag, but sequential consistency costs
- * nothing at the rate these are polled. */
 static atomic_bool Searching;
 static atomic_bool StopFlag;
 static atomic_bool Pondering;
 
-/* When the clock the search is spending actually started running: normally the moment
- * `go` arrived, but a ponder search moves it forward on ponderhit, since the time spent
- * guessing was free. */
+/* When the clock started: at `go`, or at ponderhit for a ponder search. */
 static atomic_llong ClockOrigin;
 
-/* The piece-count gate, cached at search start so the per-node test is one comparison
- * against a local. TbLimit is 0 whenever no tablebases are loaded, which short-circuits
- * every probe and keeps bench identical across machines. */
+/* Max pieces for a TB probe, cached at search start. 0 when no tables are loaded, which
+ * keeps bench identical across machines. */
 static int TbLimit;
 
-/* Suppresses the `info` lines, for the duration of a synchronous search only: datagen
- * runs millions of them and wants its own stdout. */
+/* Suppresses `info` output during a synchronous (datagen) search. */
 static bool Silent;
 
-/* Late move reduction amounts by [depth][move number], built once by init_reductions().
- * Read-only once a search starts, so one copy serves every thread. */
+/* LMR amounts by [depth][move number]. Read-only during a search, so shared. */
 static uint8_t Reductions[64][64];
 
-/* What is being searched at each ply. The child needs the move that led to it - for its
- * counter-move, and to refuse a second null move in a row - and the piece that made it,
- * which the board no longer says once the move has been played. */
 typedef struct {
     Move move;
-    Piece movedPiece;
+    Piece movedPiece; /* the board no longer shows it once the move is played */
     Value staticEval;
 
-    /* Set only while a singular search runs at this ply: the move that search must
-     * pretend does not exist. */
+    /* The move a singular search at this ply must skip. */
     Move excludedMove;
 
-    /* Every square the side NOT to move attacks here, computed once before the move loop.
-     * The main history is keyed on it, and every reader and writer of an entry for a move
-     * made at this ply must key it on this same bitboard. */
+    /* Squares the opponent attacks. The main history is keyed on this, so every read and
+     * write for a move made at this ply must use this same bitboard. */
     Bitboard threats;
 
-    /* Beta cutoffs produced at this ply since the grandparent was entered. Read by the
-     * parent as evidence rather than expectation: children that keep failing high cheaply
-     * say the moves leading into them are being refuted, so the rest can be reduced
-     * harder. Cleared two plies up, so it describes this visit and not an unrelated one. */
+    /* Beta cutoffs at this ply since the grandparent was entered; the parent reduces harder
+     * when its children keep cutting. Cleared two plies up. */
     int cutoffCnt;
 
-    /* Double extensions taken on the line from the root through the move played at this
-     * ply. A line that keeps qualifying would otherwise extend without bound, since a
-     * two-ply extension outruns the one ply each move costs. */
+    /* Double extensions on the line to this ply, capped so a line cannot extend forever. */
     int doubleExtensions;
 } SearchStack;
 
 #define CONT_SLOTS 3
 
-/* How far back each slot looks. Sized independently of CONT_SLOTS so lowering the slot
- * count is a one-flag change; only the first CONT_SLOTS entries are read. */
+/* Plies back each continuation-history slot looks. */
 static const int ContPlies[3] = {1, 2, 4};
 
 #define CORRHIST_SIZE       16384
@@ -116,10 +90,8 @@ typedef enum {
     PICK_DONE
 } PickStage;
 
-/* One node's staged move list. The search's live in SearchThread, one per ply AND per
- * singular nesting: a verification re-enters at the same ply while its parent's list is still
- * alive. No allocation or buffer clear on the playing path. The two disjoint generators together
- * fit MAX_MOVES. */
+/* One node's staged move list. Kept in SearchThread per ply and per singular nesting, since a
+ * verification search re-enters the same ply while its parent's list is still live. */
 typedef struct {
     ScoredMove moves[MAX_MOVES];
     Move tt, excluded;
@@ -130,174 +102,84 @@ typedef struct {
     int tacticalCount, quietCount, badBegin;
 } MovePicker;
 
-#ifdef MOVE_PICKER_PROFILE
-typedef struct {
-    uint64_t mainNodes, mainPicked, mainLegal, mainSearched;
-    uint64_t genCalls[5], generated[5], scored[5];
-    uint64_t orderingSee, pruningSee, cutoffs[7];
-} MoveProfile;
-#define MP_ADD(td, field, amount) ((td)->moveProfile.field += (uint64_t)(amount))
-#else
-#define MP_ADD(td, field, amount) ((void)0)
-#endif
-
 /*
- * Everything one searching thread owns.
+ * Everything one searching thread owns. None of it may be shared (invariant 11): two
+ * threads writing one history table average two searches into a table neither can trust.
+ * Only the transposition table is shared, because its entries are verified on every hit.
  *
- * Lazy SMP is N threads searching the SAME tree with no work splitting. They diverge
- * because they reach the shared transposition table in different orders and because the
- * helpers skip iterations on their own schedule, and the entire gain is that a line one
- * of them refutes cheaply is a line none of the others has to search again.
- *
- * Nothing below may be shared, and that is a stronger statement than "it would race".
- * Two threads writing one history entry are two different searches averaging their
- * opinions into a table neither can then trust, and the ordering that results is worse
- * than either thread's alone. The transposition table is shared precisely because it is
- * the one structure whose entries are self-describing enough to survive being written
- * by somebody else: every hit is verified against the position and every move that
- * comes back out of it is validated before it is played.
- *
- * The tables dominate the size: 6 MB of continuation history and 4 MB of move-keyed correction
- * history, with the accumulator stack in nnue.c beside them. Hence heap blocks claimed when
- * `Threads` is set, rather than anything a `go` has to allocate.
+ * Heap-allocated when `Threads` is set, since the tables run to megabytes.
  */
 typedef struct {
-    /*
-     * The ordering heuristics, declared here rather than beside their use because
-     * search_clear() has to reset every one - anything carrying information from one
-     * search into the next makes a result depend on what was searched before it.
-     *
-     * Killers are quiet moves that cut at this ply elsewhere in the tree, since siblings
-     * tend to share refutations; history is how well a quiet move has been doing lately,
-     * untied to a ply; counterMoves is the quiet reply that most recently refuted this
-     * exact move.
-     */
+    /* Every table here must be reset by search_clear(). */
     Move killers[MAX_PLY][2];
 
-    /* [side][from attacked][to attacked][from][to]. A quiet move that lifts a piece out of
-     * an attack and one that walks a piece into one are different moves, and without the
-     * two buckets they share an entry - so a retreat that saves a knight teaches the table
-     * that the same knight step is good when nothing was threatened. */
+    /* [side][from attacked][to attacked][from][to]. Escaping an attack and walking into one
+     * are different moves and must not share an entry. */
     int16_t history[COLOR_NB][2][2][SQUARE_NB][SQUARE_NB];
     Move counterMoves[PIECE_NB][SQUARE_NB];
 
-    /*
-     * Continuation history, [slot][previous piece][previous to][this piece][this to], 2 MB
-     * a slot. Where counterMoves remembers a single best reply, this scores EVERY reply
-     * against the same context, which is what lets ordering understand plans rather than
-     * one-move refutations.
-     *
-     * Three slots, keyed one, two and four plies back: the direct reply, the same side's
-     * own previous move (so "knight to d2 then f1" scores as a unit), and the slower
-     * manoeuvres a two-ply window reads as noise.
-     */
+    /* [slot][previous piece][previous to][this piece][this to], keyed ContPlies back. */
     int16_t contHist[CONT_SLOTS][PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 
-    /* Capture history, [moving piece][to][captured type]. MVV-LVA says what a capture
-     * takes and SEE what it wins, and neither can separate two equal-looking exchanges;
-     * recent success can, which in a sharp middlegame is most of them. */
+    /* [moving piece][to][captured type]. */
     int16_t captureHist[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
 
-    /* Correction history, [side to move][pawn key]. */
+    /* Correction history, by [side to move] and one key each: the pawn structure, each
+     * colour's non-pawn pieces, and the moves two and four plies up paired with the last. */
     int16_t pawnCorrHist[COLOR_NB][CORRHIST_SIZE];
-
-    /* Two more keys for the same residual (E46): each colour's non-pawn pieces,
-     * [side to move][whose pieces][that colour's key], and the last two moves,
-     * [piece][to] two plies up and [piece][to] of the move that led here - a bias that
-     * follows a plan rather than a structure. E16 tried non-pawn, minor-piece and
-     * one-move keys together on a much weaker engine and measured -6.5 +/- 9.9; alone,
-     * on this one, these two screened +8 and +14. */
     int16_t nonPawnCorrHist[COLOR_NB][COLOR_NB][CORRHIST_SIZE];
     int16_t contCorrHist[PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
-
-    /* The same two-move key with the older move four plies up rather than two - this side's
-     * move before last, so a plan over two of its own moves (Stockfish keys both). */
     int16_t contCorrHist4[PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
 
-    /* Triangular PV table: pvTable[ply] is the principal variation from `ply` downwards,
-     * and a child's line is copied up behind the move that produced it. */
+    /* Triangular PV table: pvTable[ply] is the line from `ply` down. */
     Move pvTable[MAX_PLY][MAX_PLY];
     int pvLength[MAX_PLY];
 
-    /* Two spare entries: every node clears its grandchildren's cutoff counters, and the
-     * deepest node the ply guard admits would otherwise clear one past the end. */
+    /* +2: every node clears its grandchildren's cutoff counters. */
     SearchStack stack[MAX_PLY + 2];
 
-    /* The move lists, here rather than in the frames that use them. MAX_MOVES lists are 4 KB,
-     * and a frame past a page makes Windows probe the stack (___chkstk_ms) on every call - ~1%
-     * of the search. negamax's picker is per ply and per singular nesting ([ply][isExcluded]:
-     * a verification re-enters at the same ply while its parent's picker is live, and nothing
-     * nests deeper); quiescence never has two frames at one ply. Scratch, so search_clear()
-     * leaves them alone. */
-    MovePicker pickers[MAX_PLY][2];
+    /* Move lists live here rather than on the stack: a frame over a page makes Windows probe
+     * the stack on every call, ~1% of the search. Scratch, so search_clear() skips them. */
+    MovePicker pickers[MAX_PLY][2]; /* [ply][isExcluded] */
     ScoredMove qsMoves[MAX_PLY][MAX_MOVES];
 
-    /* This thread's own board. Every thread starts from the same position and then plays
-     * its own moves on it, so the copy is not an optimisation. */
     Position rootPos;
 
-    /* This thread's accumulator stack and refresh cache, claimed once in thread_entry().
-     * Held here rather than looked up per node - see EvalState in eval.h. NULL is legal
-     * and means the allocation failed: correct, and several times slower. */
+    /* NULL if the allocation failed: still correct, just much slower. */
     EvalState *es;
 
-    /* Nominal depth of the iteration currently running. Extensions are bounded relative
-     * to it, so a line that can be extended indefinitely cannot grow the tree without
-     * limit. */
+    /* Nominal depth of the current iteration; extensions are bounded relative to it. */
     Depth rootDepth;
-
-    /* Deepest ply any line reached this iteration, quiescence included. It is how a GUI
-     * tells a search genuinely looking deep along forcing lines from one reporting a big
-     * nominal depth after heavy reductions. */
     int selDepth;
 
-    /* Touched only by the owning thread, and published into the atomics below
-     * periodically rather than per node: an atomic increment in the innermost loop is a
-     * measurable cost for a counter nothing reads at that granularity. */
+    /* Owner-only counters, published to the atomics below every CHECK_INTERVAL nodes. */
     uint64_t nodeCount;
     uint64_t tbHits;
-
-#ifdef MOVE_PICKER_PROFILE
-    MoveProfile moveProfile;
-#endif
-
-    /* What any other thread is allowed to read, so `info nodes`, `info tbhits` and a node
-     * limit can see the whole search rather than one thread's share of it. */
     atomic_ullong publishedNodes;
     atomic_ullong publishedTbHits;
 
-    /* The last completed iteration's result. best_thread() compares these across the
-     * pool, and the winner's move is the one played. */
+    /* The last completed iteration, compared across the pool by best_thread(). */
     Move bestMove;
     Move ponderMove;
     Value rootScore;
     Depth completedDepth;
 
-    /* The line that produced it, copied out of pvTable when the iteration completed.
-     * The copy is what makes it reportable: pvTable is live storage, so an iteration
-     * that was interrupted has already half-overwritten the line the finished one
-     * left there - and the thread whose move gets played is very often a thread that
-     * was interrupted. */
+    /* Copied out when the iteration completes: an interrupted iteration overwrites pvTable,
+     * and the thread whose move is played is often one that was interrupted. */
     Move rootPv[MAX_PLY];
     int rootPvLength;
 
-    /* Nodes spent under each root move since this search began, keyed by from and to so
-     * the count survives the root list being re-sorted every iteration. Cumulative rather
-     * than per iteration: an aspiration re-search is real effort spent on the move, and
-     * the share is read only as a ratio. Only thread 0's is consulted, since only thread
-     * 0 owns the clock; the helpers keep one because search_root() is shared code. */
+    /* Nodes under each root move this search, [from * 64 + to] so it survives re-sorting.
+     * Only thread 0's is read, for time management. */
     uint64_t rootEffort[SQUARE_NB * SQUARE_NB];
 
-    /* Thread 0 owns the clock, the `info` lines and the `bestmove`; every other thread
-     * exists to disturb the shared table in a useful direction and nothing else. */
+    /* Thread 0 owns the clock, the `info` lines and `bestmove`. */
     int id;
 
     ThreadHandle handle;
     bool started;
 
-    /* Guarded by ThreadMutex, and the reason it exists: the pool is parked between
-     * searches rather than created per `go`, because starting 128 threads and faulting in
-     * a gigabyte of fresh history tables costs more than a whole move at blitz. */
+    /* Guarded by ThreadMutex. The pool is parked between searches rather than recreated. */
     bool go;
     bool exit;
     bool searching;
@@ -306,9 +188,7 @@ typedef struct {
 static SearchThread **Threads;
 static int ThreadCount;
 
-/* One mutex and one condition variable for the whole pool. The events are a search
- * starting and a thread finishing one - once per `go`, never per node - so waking every
- * thread with a broadcast is the cheap thing to do rather than the expensive one. */
+/* One mutex and condition variable for the whole pool; it is signalled once per `go`. */
 static Mutex ThreadMutex;
 static CondVar ThreadCv;
 static bool PoolReady;
@@ -317,9 +197,7 @@ static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int imax(int a, int b) { return a > b ? a : b; }
 static inline int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-/* Nodes between clock checks: fine enough that a search cannot overrun by more than a
- * millisecond or two, coarse enough that the clock read does not show up in a profile.
- * Must be a power of two. */
+/* Nodes between clock checks. Must be a power of two. */
 #define CHECK_INTERVAL 2048
 
 void search_limits_clear(SearchLimits *limits) {
@@ -327,10 +205,8 @@ void search_limits_clear(SearchLimits *limits) {
     limits->startTime = time_ms();
 }
 
-/* round(ln(i) * 1024) for i in 0..63, with ln(0) folded to 0. Hard-coded rather than
- * computed with libm: log() may differ by an ULP between platforms, and one ULP either
- * side of an integer boundary changes a reduction, which changes the tree and breaks the
- * cross-machine bench determinism OpenBench requires. */
+/* round(ln(i) * 1024), with ln(0) taken as 0. Hard-coded because libm's log() can differ by
+ * an ULP between platforms, which would change reductions and break bench determinism. */
 /* clang-format off */
 static const int LogFixed[64] = {
        0,    0,  710, 1125, 1420, 1648, 1835, 1993,
@@ -360,8 +236,7 @@ void search_init(void) {
     cond_init(&ThreadCv);
     PoolReady = true;
 
-    /* One block, and no thread yet - pool_start() makes them, at the first search that
-     * needs one. A single-threaded search then takes exactly the path it always did. */
+    /* No worker thread yet: pool_start() creates them when a search needs one. */
     thread_pool_set(1);
 }
 
@@ -381,15 +256,10 @@ void search_clear(void) {
         memset(td->contCorrHist, 0, sizeof(td->contCorrHist));
         memset(td->contCorrHist4, 0, sizeof(td->contCorrHist4));
         memset(td->stack, 0, sizeof(td->stack));
-#ifdef MOVE_PICKER_PROFILE
-        memset(&td->moveProfile, 0, sizeof(td->moveProfile));
-#endif
     }
 
-    /* Every thread's cached evaluations, wherever that thread is: eval_state_clear()
-     * keeps them ACROSS searches now, and this is the hook that says a new game is not
-     * another search. The workers act on it at the top of thread_search(); the calling
-     * thread, which is the one that has been evaluating outside a search, does so here. */
+    /* Cached evaluations survive between searches but not between games. Workers drop
+     * theirs at the top of thread_search(); the calling thread drops its own here. */
     eval_state_retire();
     eval_state_clear(eval_state());
 }
@@ -397,14 +267,8 @@ void search_clear(void) {
 bool search_running(void) { return atomic_load(&Searching); }
 bool search_stopped(void) { return atomic_load(&StopFlag); }
 
-/*
- * What the whole pool has searched. Every thread publishes its own count every
- * CHECK_INTERVAL nodes, so this trails the truth by at most that much per thread -
- * which is why it is a report and a limit and never a decision inside the tree.
- *
- * With one thread it is exactly that thread's counter at its last publication, which is
- * what the single-threaded engine always reported.
- */
+/* Trails the truth by up to CHECK_INTERVAL nodes per thread, so it is for reports and
+ * limits only, never a decision inside the tree. */
 uint64_t search_nodes(void) {
     uint64_t total = 0;
     for (int i = 0; i < ThreadCount; ++i)
@@ -412,8 +276,7 @@ uint64_t search_nodes(void) {
     return total;
 }
 
-/* The same sum with the caller's own live counters folded in, for the numbers it prints
- * about a search it is in the middle of. */
+/* The same, with the caller's own live counter in place of its published one. */
 static uint64_t nodes_including(const SearchThread *td) {
     uint64_t total = td->nodeCount;
     for (int i = 0; i < ThreadCount; ++i)
@@ -432,16 +295,8 @@ static uint64_t tbhits_including(const SearchThread *td) {
 
 static int64_t elapsed_ms(void) { return time_ms() - atomic_load(&ClockOrigin); }
 
-/*
- * Enforces the limits the search cannot express structurally. Depth is handled by the
- * iteration loop; node and time limits have to be noticed mid-tree, and an infinite or
- * pondering search ignores the clock entirely because UCI gives the GUI sole authority
- * over when those end.
- *
- * Thread 0 alone runs this. A helper reading the same clock would reach the same answer
- * a moment later and set the same flag, and the node total it would have to sum is
- * O(threads) - so the helpers poll StopFlag, which is the one thing they need to know.
- */
+/* Node and time limits, checked mid-tree by thread 0 only; helpers just poll StopFlag.
+ * Infinite and ponder searches ignore the clock because the GUI decides when they end. */
 static void check_limits(SearchThread *td) {
     if (td->id != 0 || atomic_load(&StopFlag))
         return;
@@ -471,46 +326,28 @@ static inline void update_seldepth(SearchThread *td, int ply) {
         td->selDepth = ply;
 }
 
-/*
- * Ordering bands, far enough apart that nothing scored within one can be promoted past
- * the band above it:
- *
- *   TT move > winning captures and promotions > killers > counter-move
- *           > quiets by history > losing captures
- *
- * The transposition table move was actually best last time this position was searched,
- * usually to a greater depth, so nothing generated locally should displace it.
- */
+/* Ordering bands, far enough apart that no score within one reaches the band above:
+ * TT move > good captures and promotions > killers > counter > quiets > bad captures. */
 #define SCORE_TT       (1 << 24)
 #define SCORE_CAPTURE  1000000
 #define SCORE_KILLER_1 900000
 #define SCORE_KILLER_2 800000
 #define SCORE_COUNTER  700000
 
-/* Below every quiet move, since history is bounded by HISTORY_MAX. */
 #define SCORE_BAD_CAPTURE (-1000000)
 
-/* Chosen so the whole quiet band stays well below SCORE_COUNTER and the value fits an
- * int16_t with room for the update arithmetic. */
+/* Keeps the quiet band below SCORE_COUNTER, and fits an int16_t. */
 #define HISTORY_MAX 16384
 
+/* A constant, or a UCI spin option under `make TUNE_SEARCH=on`. */
 #ifdef TUNE_SEARCH
 #define TUNABLE(name, def) int name = (def)
 #else
 #define TUNABLE(name, def) enum { name = (def) }
 #endif
 
-/*
- * Centipawns per ply of remaining depth that the search is willing to assume a position
- * cannot swing by. Every one of these trades safety for speed, is wrong sometimes, and
- * arrived behind its own SPRT rather than on the argument that it looks reasonable.
- *
- * They are also all wrong TOGETHER when the evaluation changes underneath them: each was
- * fitted against the classical model's scale and noise, and the network shares neither.
- * Hence TUNABLE rather than #define - in a normal build it folds to an enum constant and
- * the released engine is unchanged, while `make TUNE_SEARCH=on` makes each a spin option
- * so a sweep costs a `setoption` instead of a rebuild.
- */
+/* Pruning margins are centipawns per ply of remaining depth unless noted. Thresholds stay
+ * #defines: SPSA rounds both sides of a perturbation to the same integer. */
 TUNABLE(RFP_MARGIN, 67);
 #define RFP_DEPTH 7
 
@@ -518,122 +355,61 @@ TUNABLE(RFP_MARGIN, 67);
 
 #define FUTILITY_DEPTH 6
 
-/* Much smaller than the "value of a quiet move" intuition suggests: at a null-window node
- * alpha tracks the evaluation, so staticEval sits close to alpha far more often than
- * not, and 100/ply measured at 0.008% of the bench tree. The useful range is narrow. */
 TUNABLE(FUTILITY_MARGIN, 60);
 
-/* The depth below which the previous score is too unreliable to aim a window at. A
- * #define rather than a TUNABLE because SPSA perturbs continuously and then rounds, so
- * both sides of a gradient estimate land on the same integer and the measurement is
- * noise; thresholds want a sweep of their own, not a sweep seat. */
 #define ASPIRATION_MIN_DEPTH 5
 
-/*
- * When a proven mate is allowed to end the search early.
- */
+/* When a proven mate may end the search early. */
 #define MATE_CONFIRM_ITERS  5
 #define MATE_CONFIRM_MARGIN 8
 
-/* How far below alpha the static evaluation must sit before the node drops straight into
- * quiescence. Much larger than futility's because the claim is bigger - this discards
- * the whole node - and it is verified rather than assumed: the qsearch actually runs,
- * and only its result can prune. */
+/* Razoring: drop into quiescence when the eval is this far below alpha. */
 TUNABLE(RAZOR_MARGIN, 319);
 #define RAZOR_DEPTH 3
 
-/* A move that loses material outright is worth searching only if there is depth left to
- * show what it wins back. Captures scale linearly and quiets quadratically, because a
- * quiet move that hangs a piece has no compensation to demonstrate in the first place. */
+/* SEE pruning: linear in depth for captures, quadratic for quiets. */
 #define SEE_CAPTURE_DEPTH 6
 TUNABLE(SEE_CAPTURE_MARGIN, 87);
 #define SEE_QUIET_DEPTH 8
 TUNABLE(SEE_QUIET_MARGIN, 8);
 
-/*
- * ProbCut, the mirror of razoring at the other end of the window: a capture that still
- * beats a raised beta after a search several plies shallow is strong evidence the node
- * fails high. Only captures are tried, and that is the claim rather than a shortcut -
- * the bet is that material alone carries the node past the raised bound.
- *
- * The depth floor is a TUNABLE only so an ablation has a switch: set it above any depth
- * the search reaches and ProbCut is off with no rebuild. It is a threshold, not a sweep
- * seat - pass it to `make tune ARGS="--exclude ..."`.
- */
+/* ProbCut. The depth is a TUNABLE only as an off switch for ablations; exclude it from
+ * SPSA fits. */
 TUNABLE(PROBCUT_DEPTH, 5);
 #define PROBCUT_REDUCTION 4
 TUNABLE(PROBCUT_MARGIN, 112);
 
-/* Standing pat is always available, so a capture that cannot bring the evaluation within
- * a minor piece of alpha even after winning its victim outright will not raise it. The
- * margin covers what the rest of the sequence might swing, hence a piece rather than a
- * pawn. */
+/* Quiescence delta pruning, about a minor piece. */
 TUNABLE(DELTA_MARGIN, 421);
 
-/* The shallowest depth worth a singular test, and how far below the stored score the
- * verification window sits (in sixteenths of a centipawn per ply). The floor keeps it
- * affordable, and the margin has to be wide enough that a merely best move does not read
- * as singular and narrow enough that a forced line still does. */
+/* Singular extensions: minimum depth, and the margin in sixteenths of a cp per ply. */
 #define SINGULAR_DEPTH 7
 TUNABLE(SINGULAR_MARGIN, 33);
 
-/* How far below the singular window the other moves must ALL fail before the table move
- * is treated as forced rather than merely best, and how many such plies one line may
- * take. The cap is what makes this safe: without it a line that keeps qualifying grows
- * the tree without limit. */
+/* Double extensions: how far below the singular window, and the cap per line. */
 TUNABLE(DEXT_MARGIN, 20);
 TUNABLE(DEXT_MAX, 6);
 
-/* Further still below the window, a quiet table move gets a THIRD ply: the alternatives are
- * not merely worse but lost. Quiet only - a capture that is forced is usually forced because
- * it recaptures, and the recapture resolves itself without the depth. */
+/* Triple extensions, quiet table moves only: a forced capture is usually a recapture. */
 TUNABLE(TEXT_MARGIN, 80);
 
+/* Correction history weights, out of CORR_W_UNIT. Chosen, not fitted (E14); the non-pawn
+ * key is half weight per colour so the pair matches the pawn table. */
 #define CORR_W_UNIT 128
-/* How much the correction is believed, out of CORR_W_UNIT. A TUNABLE because how far to
- * trust a learned evaluation bias is the kind of question a sweep answers better than a
- * person; this was chosen rather than fitted. See E14. */
 TUNABLE(CORR_W_PAWN, 134);
-
-/* The same for the non-pawn keys, applied to each colour's entry, and for the two-move key.
- * Chosen, not fitted: half weight per colour so the pair together believe as much as the
- * pawn table does, and full weight for the continuation key. */
 TUNABLE(CORR_W_NONPAWN, 64);
 TUNABLE(CORR_W_CONT, 128);
 
-/* Uncertainty scaling of the margins above: floor percentage, percent per centipawn of
- * learned correction, and the cap. The cap is SPSA-fitted (E22, E22a); the floor and
- * slope are centred values, and cannot be swept against a net with an uncertainty head
- * because unc_scale() returns on the sigma branch before reading them. */
+/* Margin scaling by uncertainty, for a net without a sigma head: floor %, % per cp of
+ * learned correction, and cap. The cap is SPSA-fitted (E22). */
 TUNABLE(UNC_SCALE_BASE, 89);
 TUNABLE(UNC_SCALE_SLOPE, 2);
 TUNABLE(UNC_SCALE_MAX, 145);
 
-/* The same mapping for a net carrying the trained uncertainty head, whose signal is
- * predicted |eval error| rather than learned bias - a larger number with its own
- * distribution, hence its own floor and slope (sixteenths of a percent per cp). Centred
- * on sigma over the d12 bench tree and then fitted by E22; E22a's re-sweep moved both one
- * unit and stopped, which read as converged until a third sweep at LTC pulled the slope
- * another three units at drift z +3.5. STC reaches depth 12-13 and LTC does not stop
- * there, so what E22a measured as flat was a mapping flat over the tree it played on.
- *
- * Re-centred 75/16 -> 99/9 for gen-6-pw. Not a drift in the mean - that moved 126.8
- * to 121.2 - but in the SPREAD: the same constants on the new head give sd 21.8 where
- * gen-5 gave 14.4, and 33.8% of nodes at the cap where gen-5 had 26.2%. These are the
- * `unc-probe -ref` values, which reproduce gen-5's OUTPUT distribution rather than
- * centring on 100, and that is what carries E22's fit across the retrain.
- *
- * Re-centred 99/9 -> 100/7 for gen-6-noprior (E49), the same way: under 99/9 it gave mean
- * scale 131.6 and 39.7% at the cap against gen-6-pw's 128.7 and 33.1%, and `unc-probe -ref`
- * against gen-6-pw matches it at 100/7 (128.4, 30.1%). Its +25 Elo was measured at 100/7.
- *
- * Re-centred 100/7 -> 98/5 for gen-6-P1 (E52), the same way, against gen-6-noprior. The
- * lambda-0.75 finish moves the head's mean sigma from 82.6 to 108.7 cp; under 100/7 that gives
- * mean scale 132.4 and 42.1% at the cap against 126.1 and 28.1%, and `unc-probe -ref` matches
- * it at 98/5 (125.9, 26.0%). Its +10 over the lambda-0.75 gen-6 net and +23.8 against
- * berserk-8.5 were measured at 98/5. */
-/* Build-time overrides, so a candidate net can carry the centring `make unc-probe` solved for it
- * into a binary that plays without UCI options. */
+/* The same for a net with a sigma head: floor %, and slope in sixteenths of a % per cp.
+ * Re-centred for each net with `make unc-probe PROBE_ARGS=-ref` so it reproduces the
+ * previous net's scale distribution; these are gen-6-P1's (E52). Overridable at build time
+ * so a candidate net can be played without UCI options. */
 #ifndef UNC_SIGMA_BASE_DEFAULT
 #define UNC_SIGMA_BASE_DEFAULT 98
 #endif
@@ -643,17 +419,8 @@ TUNABLE(UNC_SCALE_MAX, 145);
 TUNABLE(UNC_SIGMA_BASE, UNC_SIGMA_BASE_DEFAULT);
 TUNABLE(UNC_SIGMA_SLOPE, UNC_SIGMA_SLOPE_DEFAULT);
 
-/*
- * How much of the mapping each margin actually wants. unc_scale() returns ONE number, and
- * every consumer multiplying by it asserts that RFP, razoring, ProbCut, delta and SEE all
- * want the same conditioning - which nothing ever measured, and which NNUE.md 5c found
- * two to three times too flat over half the tree.
- *
- * So each site weights the mapping DEVIATION: scale_c = 100 + (scale - 100) * W / UNIT.
- * Weighting the deviation rather than the scale keeps this orthogonal to the margin
- * beside it - a weight on the scale itself would just be a second spelling of the margin,
- * and a sweep holding both seats would converge on nothing.
- */
+/* Per-margin weight on the scale's deviation from 100%: 100 + (scale - 100) * W / UNIT.
+ * Weighting the deviation, not the scale, keeps it independent of the margin itself. */
 #define UNC_W_UNIT 16
 TUNABLE(UNC_W_RFP, 17);
 TUNABLE(UNC_W_FUTILITY, 16);
@@ -661,139 +428,68 @@ TUNABLE(UNC_W_RAZOR, 18);
 TUNABLE(UNC_W_PROBCUT, 17);
 TUNABLE(UNC_W_DELTA, 20);
 
-/*
- * The second tier: constants that shape a formula rather than sit in a comparison.
- * Wrapping them costs the shipped engine nothing, which the unchanged bench node count is
- * the proof of. Every DIVISOR has a minimum of 1 rather than 0, and that is load-bearing:
- * a sweep may walk a parameter to its bound, and zero here is a division by zero in the
- * hot path.
- *
- * Reductions[d][m] is built from LMR_BASE and LMR_DIVISOR once, so search_tunable_set()
- * rebuilds the table.
- */
+/* Formula constants. Divisors have a minimum of 1 so a sweep cannot divide by zero, and
+ * Reductions must be rebuilt when LMR_BASE or LMR_DIVISOR changes. */
 TUNABLE(LMR_BASE, 13);
 TUNABLE(LMR_DIVISOR, 23);
 
-/* How much history is allowed to pull a reduction back. Larger means less influence,
- * which is why these are divisors and not multipliers. */
+/* History's pull on a reduction; larger means less. */
 TUNABLE(LMR_HIST_DIVISOR, 8493);
 TUNABLE(LMR_CONT_DIVISOR, 7334);
-TUNABLE(CAPHIST_DIVISOR, 5);
+TUNABLE(CAPHIST_DIVISOR, 5); /* capture history's weight in capture ordering */
 
-/* How much capture history gives back of a capture's reduction: a full-scale entry is two
- * plies either way. */
+/* Capture history's give-back on a capture's reduction: a full entry is two plies. */
 TUNABLE(LMR_CAPHIST_DIVISOR, 8192);
 
-/* Null-move reduction: base, how fast it grows with depth, and how much of the margin
- * above beta may buy extra reduction before it is capped. */
+/* Null-move reduction: base, depth divisor, and the eval-over-beta divisor and cap. */
 TUNABLE(NMP_BASE, 5);
 TUNABLE(NMP_DEPTH_DIVISOR, 5);
 TUNABLE(NMP_EVAL_DIVISOR, 180);
 TUNABLE(NMP_EVAL_MAX, 3);
 
-/* How much less a node that was on a principal variation, but is not one in this tree,
- * gets reduced. Zero disables the exemption. */
+/* Reduction given back at a node that was once on a PV. */
 TUNABLE(TTPV_REDUCTION, 2);
 
-/* History bonus curve: the multiplier on depth-squared, and the depth past which extra
- * confidence stops being real. The cap cannot bind unless the search reaches past it, so
- * at STC - where this engine reaches depth 12-13 - a sweep random-walks it inside a flat
- * region; exclude it from the fit there rather than give it room to wander. */
+/* History bonus is min(depth, cap)^2 * mul. STC never reaches the cap, so leave it out of
+ * STC fits. */
 TUNABLE(HIST_BONUS_MUL, 10);
 TUNABLE(HIST_BONUS_DEPTH_MAX, 20);
 
-/* The same curve for the moves that FAILED, on its own multiplier. "This move caused a
- * cutoff" and "this move was tried and did not" are not claims of equal strength - the
- * second is levelled at up to sixty-three moves at once - so nothing says the answer to
- * one should size the other. The depth cap stays shared, because it is a statement about
- * the search and is equally true of evidence pointing either way. */
+/* The malus for moves that were tried and failed, on its own multiplier. */
 TUNABLE(HIST_MALUS_MUL, 9);
 
-/* How many cutoffs among this node's children make them "easy", and so the next move's
- * reduction one ply deeper. A threshold, so a sweep seat only for the ablation switch. */
+/* Child cutoffs above which the next move is reduced a ply more. */
 #define CUTOFF_CNT_THRESHOLD 3
 
-/* Late move pruning: the constant in `moveCount >= base + depth * depth`. */
+/* Late move pruning: `moveCount >= base + depth * depth`. */
 TUNABLE(LMP_BASE, 10);
 
-/* History pruning: a late quiet whose main and continuation history together sit this far
- * below zero per ply of depth is skipped outright at depth 4 and below. The scale is the sum
- * of four tables bounded by HISTORY_MAX each; half of this measured -4 where this measured +4
- * at VSTC, so the threshold is on the cautious side of where the gain is. */
+/* History pruning: at depth 4 and below, skip a late quiet whose main plus continuation
+ * history is below -HIST_PRUNE per ply. */
 TUNABLE(HIST_PRUNE, 4096);
 
 /* Half-width of the first aspiration window. */
 TUNABLE(ASPIRATION_DELTA, 16);
 
-/*
- * The child's own verdict on a late quiet move, read before searching it: its corrected static
- * evaluation against alpha in units of the uncertainty head's predicted error AT THE CHILD,
- * z = (-v_child - alpha) / max(sigma_child, floor). Both heads are needed - over the d13 bench
- * tree the same centipawn gap below alpha beat it a hundred times more often at high child
- * sigma than at low - and the number prices how likely the move is to matter.
- *
- * At STC only one direction of it pays (E45): a move z says is promising is reduced a ply
- * less, and if its reduced search then fails high it is re-searched a ply PAST normal depth.
- * Reducing hopeless moves harder on the same signal measured slightly negative at STC, and is
- * not here. Thresholds in sixteenths of a sigma.
- */
-/* Quiet checks into LMR, a ply less than a quiet: E46's run 35 measured +5.21 +/- 6.56 over 3000
- * STC games on top of today's HEAD (LOS 94%) and was never settled. Off by default until it is. */
-#ifndef QCHECK_LMR_DEFAULT
-#define QCHECK_LMR_DEFAULT 0
-#endif
-TUNABLE(QCHECK_LMR, QCHECK_LMR_DEFAULT);
+/* Quiet ordering by piece safety: history units for escaping a lesser attacker (and the
+ * same malus for walking into one), x2 for a rook, x3 for a queen. */
+TUNABLE(THREAT_ORDER, 8192);
 
-/* What a quiet move does to its own piece's safety, which history keys only as "attacked or
- * not" (E49). Over the d13 bench tree, inside every history quintile, a late quiet SEE calls
- * losing beat alpha 5-10x less often than the rest, and one escaping a LESSER attacker 2-5x more
- * often. THREAT_ORDER is on at 8192 (E50's stack, after ~+3 pooled over 6000 STC games in E49);
- * the other two are off.
- *   THREAT_ORDER  history units for escaping a lesser attacker (and the same malus for walking
- *                 into one), x2 for a rook, x3 for a queen - Stockfish's shape, at its scale over
- *                 this engine's quiet range
- *   LMR_SEE_BAD   plies more for a late quiet SEE calls losing
- *   LMR_ESCAPE    plies less for a late quiet escaping a lesser attacker to a square none hits */
-#ifndef THREAT_ORDER_DEFAULT
-#define THREAT_ORDER_DEFAULT 8192
-#endif
-#ifndef LMR_SEE_BAD_DEFAULT
-#define LMR_SEE_BAD_DEFAULT 0
-#endif
-#ifndef LMR_ESCAPE_DEFAULT
-#define LMR_ESCAPE_DEFAULT 0
-#endif
-TUNABLE(THREAT_ORDER, THREAT_ORDER_DEFAULT);
+/* Extra LMR plies for a late quiet at an expected cut node. */
+TUNABLE(LMR_CUTNODE, 1);
 
-/* History units for a quiet move that gives check. The prunes and LMR already exempt quiet
- * checks; ordering alone gives them no credit, so one waits behind every quiet history likes.
- * Off by default. */
-#ifndef CHECK_ORDER_DEFAULT
-#define CHECK_ORDER_DEFAULT 0
-#endif
-TUNABLE(CHECK_ORDER, CHECK_ORDER_DEFAULT);
-
-/* Plies more for a late quiet at an expected cut node. E6 removed a two-ply version in August
- * E49 pooled one ply at ~+5 over 6000 STC games, and it shipped with THREAT_ORDER 8192 in E50's
- * stack. */
-#ifndef LMR_CUTNODE_DEFAULT
-#define LMR_CUTNODE_DEFAULT 1
-#endif
-TUNABLE(LMR_CUTNODE, LMR_CUTNODE_DEFAULT);
-TUNABLE(LMR_SEE_BAD, LMR_SEE_BAD_DEFAULT);
-TUNABLE(LMR_ESCAPE, LMR_ESCAPE_DEFAULT);
-
+/* z-score LMR (E45). z is the child's corrected static eval against alpha in units of the
+ * sigma head's predicted error, in sixteenths: (-v_child - alpha) * 16 / max(sigma, floor).
+ * A late quiet with z >= ZLMR_LESS is reduced a ply less, and if it then fails high it is
+ * re-searched one ply past normal depth at z >= ZDEEPER_Z, two at twice that. */
 TUNABLE(ZLMR_LESS, 0);
 TUNABLE(ZDEEPER_Z, 16);
 TUNABLE(ZLMR_SIGMA_FLOOR, 16);
 
 #ifdef TUNE_SEARCH
 
-/* The sweep's view of the margins above: a name to set them by and the range a sweep may
- * explore. Written by hand rather than generated from a macro list because a list that
- * generated both could not carry the comments above, and the ranges are deliberately
- * wider than anything that looks plausible now - a sweep that cannot leave the
- * neighbourhood of the current value can only confirm it. */
+/* Name and sweep range for each TUNABLE. The ranges are deliberately wide: a sweep that
+ * cannot leave the current value's neighbourhood can only confirm it. */
 static const struct {
     const char *name;
     int *value;
@@ -842,12 +538,8 @@ static const struct {
     {"HistPrune", &HIST_PRUNE, 512, 16384},
     {"TtPvReduction", &TTPV_REDUCTION, 0, 3},
     {"AspirationDelta", &ASPIRATION_DELTA, 4, 60},
-    {"QcheckLmr", &QCHECK_LMR, 0, 1},
     {"ThreatOrder", &THREAT_ORDER, 0, 32768},
-    {"CheckOrder", &CHECK_ORDER, 0, 32768},
     {"LmrCutNode", &LMR_CUTNODE, 0, 3},
-    {"LmrSeeBad", &LMR_SEE_BAD, 0, 3},
-    {"LmrEscape", &LMR_ESCAPE, 0, 3},
     {"ZlmrLess", &ZLMR_LESS, -48, 48},
     {"ZdeeperZ", &ZDEEPER_Z, 0, 64},
     {"ZlmrSigmaFloor", &ZLMR_SIGMA_FLOOR, 1, 48},
@@ -865,14 +557,8 @@ void search_tunable_info(int i, const char **name, int *value, int *min, int *ma
 bool search_tunable_set(const char *name, int value) {
     for (int i = 0; i < search_tunable_count(); ++i)
         if (strcmp(name, Tunables[i].name) == 0) {
-            /* Clamped rather than rejected: a sweep that walks outside the range should
-             * stay at the edge and keep playing, not have one engine silently keep the
-             * previous value for the rest of a match while the other moved. */
+            /* Clamped, not rejected: a rejected value would silently keep the old one. */
             *Tunables[i].value = iclamp(value, Tunables[i].min, Tunables[i].max);
-
-            /* Reductions[][] is precomputed from LMR_BASE and LMR_DIVISOR, so setting
-             * either without rebuilding would leave the sweep measuring the previous curve
-             * and conclude the parameter does nothing. */
             init_reductions();
             return true;
         }
@@ -880,10 +566,7 @@ bool search_tunable_set(const char *name, int value) {
 }
 #endif
 
-/* Reduction ~ log(depth) * log(moveNumber) / 2.4 in exact integer arithmetic. Both
- * logarithms matter: scaling with move number is the whole idea, and scaling with depth
- * is what stops the reduction being reckless near the leaves, where there is no depth
- * left to absorb a mistake. */
+/* ln(depth) * ln(moveNumber) * LMR_BASE / LMR_DIVISOR, in exact integer arithmetic. */
 static void init_reductions(void) {
     for (int d = 0; d < 64; ++d)
         for (int m = 0; m < 64; ++m)
@@ -891,10 +574,8 @@ static void init_reductions(void) {
                                          (1024LL * 1024 * LMR_DIVISOR));
 }
 
-/* Captures and promotions - the moves that change material, and so must never be reduced
- * or written to the quiet history. Castling needs the explicit exclusion: it is encoded
- * king-captures-own-rook, so a naive look at the destination finds a friendly rook and
- * calls it a capture. */
+/* Captures and promotions. Castling is encoded king-takes-own-rook, so it must be excluded
+ * explicitly. */
 static inline bool is_tactical(const Position *pos, Move m) {
     switch (type_of_move(m)) {
     case MT_CASTLING: return false;
@@ -904,19 +585,11 @@ static inline bool is_tactical(const Position *pos, Move m) {
     }
 }
 
-/*
- * Is the material won by playing `m` at least `threshold`, once both sides have exchanged
- * optimally on the target square? MVV-LVA answers what a capture takes; this answers what
- * it WINS, which is the useful question - QxP looks excellent to MVV-LVA and is a
- * disaster if the pawn is defended.
- *
- * The standard swap-off: play the least valuable attacker each time, tracking the
- * balance, and stop as soon as the side to move would rather stand pat. Removing each
- * attacker from `occupied` is what reveals the sliders x-raying through it.
- */
+/* Static exchange evaluation: does `m` win at least `threshold` once both sides have
+ * exchanged optimally on its square? Removing each attacker from `occupied` reveals the
+ * sliders behind it. */
 static bool see_ge(const Position *pos, Move m, Value threshold) {
-    /* Castling captures nothing, and en passant and promotions change material in ways the
-     * swap loop does not model. Decline to judge them. */
+    /* Castling, en passant and promotions are not modelled: they count as winning nothing. */
     if (type_of_move(m) != MT_NORMAL)
         return VALUE_ZERO >= threshold;
 
@@ -947,9 +620,8 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
 
         result ^= 1;
 
-        /* Capture with the least valuable attacker available. Each branch reveals only the
-         * sliders that could have been behind the piece just removed, which is why the
-         * x-ray refresh differs per piece type. */
+        /* Least valuable attacker first. Each branch re-adds only the sliders that could have
+         * been behind the piece it removes. */
         Bitboard bb;
         if ((bb = mine & pos->byType[PAWN])) {
             if ((swap = PieceValues[PAWN] - swap) < result)
@@ -978,17 +650,14 @@ static bool see_ge(const Position *pos, Move m, Value threshold) {
                 (bishop_attacks(to, occupied) & (pos->byType[BISHOP] | pos->byType[QUEEN])) |
                 (rook_attacks(to, occupied) & (pos->byType[ROOK] | pos->byType[QUEEN]));
         } else {
-            /* Only the king is left, and capturing into a defended square is illegal - so if
-             * the other side still attacks it, the side to move cannot continue and loses
-             * the exchange by default. */
+            /* Only the king is left, and it cannot capture onto a defended square. */
             return (attackers & ~color_bb(pos, stm)) ? (result ^ 1) != 0 : result != 0;
         }
     }
     return result != 0;
 }
 
-/* Squares `c` attacks. The occupancy is the full board, so a slider stops at the first
- * piece either way - a threat is about what can be captured now, not x-rays. */
+/* Squares `c` attacks, with sliders stopped by every piece (no x-rays). */
 static Bitboard attacked_by(const Position *pos, Color c) {
     const Bitboard occ   = occupied_bb(pos);
     const Bitboard pawns = pieces_bb(pos, c, PAWN);
@@ -1005,8 +674,7 @@ static Bitboard attacked_by(const Position *pos, Color c) {
     return att | king_attacks(king_square(pos, c));
 }
 
-/* The squares `c` attacks with pieces worth at most a pawn, a minor, a rook - each set
- * includes the cheaper ones, so "attacked by something worth less than a rook" is one test. */
+/* Squares `c` attacks with a pawn, with a minor or cheaper, with a rook or cheaper. */
 typedef struct {
     Bitboard pawn, minor, rook;
 } LesserThreats;
@@ -1029,7 +697,7 @@ static LesserThreats lesser_threats(const Position *pos, Color c) {
     return t;
 }
 
-/* Where a `pt` stands attacked by something worth less than itself. Pawns and kings never are. */
+/* Squares where a `pt` is attacked by something cheaper. */
 static inline Bitboard lesser_for(const LesserThreats *t, PieceType pt) {
     return pt == QUEEN                    ? t->rook
            : pt == ROOK                   ? t->minor
@@ -1037,18 +705,13 @@ static inline Bitboard lesser_for(const LesserThreats *t, PieceType pt) {
                                           : BB_EMPTY;
 }
 
-/* The main-history entry for `m` by side `c`, keyed on the threats at the node it was
- * played from. Every access goes through here: a scoring site that buckets one way and an
- * update site that buckets another would leave a table that is incoherent rather than
- * wrong in any way a test could name. */
+/* Every main-history access goes through here, so readers and writers bucket alike. */
 static inline int16_t *main_hist(SearchThread *td, Color c, Bitboard threats, Move m) {
     const Square from = from_sq(m), to = to_sq(m);
     return &td->history[c][bb_test(threats, from)][bb_test(threats, to)][from][to];
 }
 
-/* The continuation-history slice for the move played `back` plies above `ply`, or NULL
- * when there is no such move - the top of the tree, or a null move, which is nobody's
- * plan and must not have continuations attributed to it. */
+/* The slice for the move `back` plies up, or NULL above the root or after a null move. */
 static inline int16_t *cont_slice(SearchThread *td, int slot, int ply, int back) {
     if (ply < back)
         return NULL;
@@ -1062,7 +725,6 @@ static inline int16_t *cont_slice(SearchThread *td, int slot, int ply, int back)
 
 static inline int cont_index(Piece pc, Square to) { return (int)pc * SQUARE_NB + (int)to; }
 
-/* What every continuation slot together thinks of playing `pc` to `to` here. */
 static inline int cont_score(int16_t *const *slices, Piece pc, Square to) {
     const int idx = cont_index(pc, to);
     int total     = 0;
@@ -1074,8 +736,7 @@ static inline int cont_score(int16_t *const *slices, Piece pc, Square to) {
     return total;
 }
 
-/* The victim a move takes, or NO_PIECE_TYPE. Castling is encoded king-captures-own-rook,
- * so it needs the explicit exclusion. */
+/* The captured piece type, or NO_PIECE_TYPE (castling included). */
 static inline PieceType victim_of(const Position *pos, Move m) {
     switch (type_of_move(m)) {
     case MT_EN_PASSANT: return PAWN;
@@ -1084,29 +745,17 @@ static inline PieceType victim_of(const Position *pos, Move m) {
     }
 }
 
-/* MVV-LVA for the tactical moves - most valuable victim, least valuable attacker - with
- * SEE deciding which band a capture lands in and capture history separating the ones SEE
- * calls equal. Quiet moves fall through to the heuristic tables. */
-/*
- * Returns the index of the highest-scoring move, taking the FIRST of equals - which is
- * exactly what pick_move() would have selected, generation order being the tie-break the
- * tree depends on. Handing it back costs one comparison per move on a loop that is
- * already touching every score, and saves the longest scan there is: the first selection
- * in the loop below, over the whole list.
- */
-static bool gives_check(const Position *pos, Move m);
-
+/* Captures by SEE band, MVV-LVA and capture history; quiets by killers, counter and history.
+ * Returns the index of the best, first of equals - the move pick_move() would select. */
 static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove *list, int count,
                                Move ttMove, int ply, Move counter, Move killer0, Move killer1) {
     const Color us = pos->sideToMove;
 
-    /* Context for continuation history: the moves that led to this node. */
     int16_t *slices[CONT_SLOTS];
     for (int i = 0; i < CONT_SLOTS; ++i)
         slices[i] = cont_slice(td, i, ply, ContPlies[i]);
 
-    /* Built at the first quiet that needs it: most lists scored here are quiescence's captures,
-     * which never read it. */
+    /* Built lazily: most lists scored here are quiescence captures. */
     LesserThreats lesser = {BB_EMPTY, BB_EMPTY, BB_EMPTY};
     bool lesserKnown     = false;
 
@@ -1124,13 +773,9 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
         int score              = 0;
 
         if (victim != NO_PIECE_TYPE) {
-            MP_ADD(td, orderingSee, 1);
             const int mvvLva = PieceValues[victim] * 16 - PieceValues[type_of(moved)];
 
-            /* Divided down so it refines the MVV-LVA order rather than overturning it:
-             * history is evidence about a capture, not a replacement for knowing what it
-             * takes. A capture that loses material once the recaptures are played out is
-             * worse than almost any quiet move, so it goes below them. */
+            /* Capture history only refines MVV-LVA. A losing capture goes below the quiets. */
             const int capHist = td->captureHist[moved][to_sq(m)][victim] / CAPHIST_DIVISOR;
 
             score =
@@ -1140,9 +785,7 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
         if (mt == MT_PROMOTION)
             score += SCORE_CAPTURE + PieceValues[promotion_type(m)];
 
-        /* Nothing tactical matched, so the move is quiet. Tested explicitly rather than by
-         * `score == 0`: capture history can push a capture's score anywhere inside its
-         * band, including onto zero. */
+        /* Not `score == 0`: capture history can put a capture's score on zero. */
         if (victim == NO_PIECE_TYPE && mt != MT_PROMOTION) {
             if (m == killer0)
                 score = SCORE_KILLER_1;
@@ -1153,8 +796,6 @@ static int score_moves_context(SearchThread *td, const Position *pos, ScoredMove
             else {
                 score = *main_hist(td, us, td->stack[ply].threats, m) +
                         cont_score(slices, moved, to_sq(m));
-                if (CHECK_ORDER && gives_check(pos, m))
-                    score += CHECK_ORDER;
                 if (THREAT_ORDER) {
                     if (!lesserKnown) {
                         lesser      = lesser_threats(pos, (Color)(us ^ 1));
@@ -1195,31 +836,23 @@ static Move counter_move(const SearchThread *td, int ply) {
                             : MOVE_NONE;
 }
 
-/* A cutoff found deep in the tree is much stronger evidence than one next to the leaves,
- * so the bonus grows with depth - but is capped, because beyond a point the extra
- * confidence is not real and one deep cutoff should not saturate an entry alone. */
 static int history_bonus(Depth depth) {
     const Depth d = imin(depth, HIST_BONUS_DEPTH_MAX);
     return d * d * HIST_BONUS_MUL;
 }
 
-/* What everything tried before the cutoff is charged: the same shape on its own
- * multiplier. */
 static int history_malus(Depth depth) {
     const Depth d = imin(depth, HIST_BONUS_DEPTH_MAX);
     return d * d * HIST_MALUS_MUL;
 }
 
-/* Applies `bonus`, decaying the entry toward zero in proportion to how large it already
- * is. That gravity term is the whole design: a plain running total saturates and ends up
- * describing the opening rather than the position on the board, where scaling the decay
- * by the current value makes the entry an exponential moving average of recent success. */
+/* The entry decays toward zero in proportion to its size, so it tracks recent success
+ * instead of saturating. */
 static void history_update(int16_t *entry, int bonus) {
     const int b = bonus > HISTORY_MAX ? HISTORY_MAX : bonus < -HISTORY_MAX ? -HISTORY_MAX : bonus;
     *entry += (int16_t)(b - (int)*entry * (b < 0 ? -b : b) / HISTORY_MAX);
 }
 
-/* Credit or blame `pc -> to` in every continuation slot that exists here. */
 static void cont_hist_update(SearchThread *td, int ply, Piece pc, Square to, int bonus) {
     const int idx = cont_index(pc, to);
 
@@ -1230,23 +863,13 @@ static void cont_hist_update(SearchThread *td, int ply, Piece pc, Square to, int
     }
 }
 
-/* Keyed on what the capture takes, so the victim has to be read off the board - which
- * means this must run AFTER the move was undone. */
+/* Reads the victim off the board, so call it after the move is undone. */
 static void capture_hist_update(SearchThread *td, const Position *pos, Move m, int bonus) {
     const Piece moved = piece_on(pos, from_sq(m));
     history_update(&td->captureHist[moved][to_sq(m)][victim_of(pos, m)], bonus);
 }
 
-/*
- * Records that `best` caused a cutoff and that everything tried before it did not.
- * Knowing what fails is worth as much as knowing what works: without the penalty, a move
- * tried early that always fails keeps its position forever, because nothing pushes it
- * down.
- *
- * Both lists are penalised whichever kind of move cut, because both were tried and both
- * failed; only the winner's own table is credited, since a capture teaches the quiet
- * heuristics nothing.
- */
+/* Credits `best` in its own table and penalises everything tried before it, quiet or not. */
 static void update_stats(SearchThread *td, const Position *pos, Move best, const Move *quiets,
                          int quietCount, const Move *captures, int captureCount, Depth depth,
                          int ply) {
@@ -1283,17 +906,9 @@ static void update_stats(SearchThread *td, const Position *pos, Move best, const
             capture_hist_update(td, pos, captures[i], -malus);
 }
 
-/*
- * Whether `m` checks the opponent's king, decided before it is played. The pruning below
- * runs before the move is made, and a quiet check pruned there is the most expensive kind
- * of mistake - the mate that a futile-looking node was hiding.
- *
- * Direct and discovered checks through one slider test each: the moved piece is placed on
- * its destination in the occupancy and the slider sets, so a slider that now sees the king
- * - the piece itself, or one it uncovered - answers both. Only normal moves are judged;
- * castling reports false, which just leaves it prunable exactly as before, and the other
- * special moves are tactical and never reach the quiet prunes.
- */
+/* Whether `m` gives check, judged before it is played so the quiet prunes can exempt it.
+ * The piece is moved in the occupancy and slider sets, so one test per slider type covers
+ * direct and discovered checks. Only normal moves are judged; the rest report false. */
 static bool gives_check(const Position *pos, Move m) {
     if (type_of_move(m) != MT_NORMAL)
         return false;
@@ -1321,15 +936,13 @@ static bool gives_check(const Position *pos, Move m) {
     return (bishop_attacks(ksq, occ) & diag) || (rook_attacks(ksq, occ) & orth);
 }
 
-/* Anything but kings and pawns - the test that decides whether null-move pruning is
- * safe. */
+/* Null move is only tried with this: king-and-pawn endings are full of zugzwang. */
 static inline bool has_non_pawn_material(const Position *pos, Color c) {
     return (pieces2_bb(pos, c, KNIGHT, BISHOP) | pieces2_bb(pos, c, ROOK, QUEEN)) != BB_EMPTY;
 }
 
-/* Selection sort, one move at a time: a beta cutoff usually lands within the first few
- * moves, so sorting the whole list up front is mostly wasted work. */
-/* The first selection, which score_moves() already worked out. */
+/* Moves are selected one at a time, since most cutoffs come early. The first pick was
+ * already found by score_moves(). */
 static inline void pick_first(ScoredMove *list, int best) {
     if (best != 0) {
         const ScoredMove tmp = list[0];
@@ -1339,10 +952,8 @@ static inline void pick_first(ScoredMove *list, int best) {
 }
 
 static void pick_move(ScoredMove *list, int count, int index) {
-    /* The running maximum in a register, not re-read through `best` each step. Strictly
-     * greater, so the first of equal scores still wins - the order is the tree, and unseen
-     * quiets tie at zero all the time. (A two-pass AVX2 scan measured 4% slower: most lists
-     * this sees are short.) */
+    /* Strictly greater, so the first of equal scores wins: generation order is part of the
+     * tree. (An AVX2 scan measured 4% slower; most lists are short.) */
     int best      = index;
     int bestScore = list[index].score;
     for (int i = index + 1; i < count; ++i) {
@@ -1362,7 +973,6 @@ static void pick_move(ScoredMove *list, int count, int index) {
 
 static void picker_init(MovePicker *mp, SearchThread *td, const Position *pos, Move tt,
                         Move excluded, int ply, Move counter) {
-    MP_ADD(td, mainNodes, 1);
     mp->tt             = tt;
     mp->excluded       = excluded;
     mp->refutations[0] = td->killers[ply][0];
@@ -1373,29 +983,13 @@ static void picker_init(MovePicker *mp, SearchThread *td, const Position *pos, M
     mp->tacticalCount = mp->quietCount = -1;
     mp->stage                          = PICK_TT;
 
-    /* Keep the old, eager evasion ordering. A pseudo-legal TT move alone does
-     * not prove membership of GEN_EVASIONS. */
+    /* In check, evasions are generated eagerly and the TT move is only scored among them:
+     * being pseudo-legal does not make it an evasion. */
     if (board_checkers(pos)) {
         mp->stage = PICK_EVASIONS;
         mp->end   = movegen_generate(pos, GEN_EVASIONS, mp->moves);
-        MP_ADD(td, genCalls[2], 1);
-        MP_ADD(td, generated[2], mp->end);
-        MP_ADD(td, scored[2], mp->end);
         pick_first(mp->moves, score_moves(td, pos, mp->moves, mp->end, tt, ply, counter));
     }
-#ifdef MOVE_PICKER_EAGER
-    else {
-        /* Matched-behaviour timing control: generation is eager, but scoring
-         * still happens at exactly the same stages as in the lazy build. */
-        mp->tacticalCount = movegen_generate(pos, GEN_TACTICALS, mp->moves);
-        mp->quietCount    = movegen_generate(pos, GEN_NON_TACTICALS, mp->moves + mp->tacticalCount);
-        MP_ADD(td, genCalls[0], 1);
-        MP_ADD(td, generated[0], mp->tacticalCount);
-        MP_ADD(td, genCalls[1], 1);
-        MP_ADD(td, generated[1], mp->quietCount);
-        assert(mp->tacticalCount + mp->quietCount <= MAX_MOVES);
-    }
-#endif
 }
 
 static bool picker_duplicate(const MovePicker *mp, Move m) {
@@ -1408,25 +1002,18 @@ static Move picker_next(MovePicker *mp, SearchThread *td, const Position *pos, i
         switch (mp->stage) {
         case PICK_TT:
             mp->stage = PICK_GENERATE_TACTICALS;
-            /* Search validated the TT encoding when probing. Legality stays in
-             * the common loop, before moveCount or board mutation. */
+            /* Validated at the probe; legality is checked in the move loop. */
             if (mp->tt != MOVE_NONE && mp->tt != mp->excluded)
                 return mp->tt;
             break;
 
         case PICK_GENERATE_TACTICALS:
-            if (mp->tacticalCount < 0) {
-                mp->tacticalCount = movegen_generate(pos, GEN_TACTICALS, mp->moves);
-                MP_ADD(td, genCalls[0], 1);
-                MP_ADD(td, generated[0], mp->tacticalCount);
-            }
-            MP_ADD(td, scored[0], mp->tacticalCount);
+            mp->tacticalCount = movegen_generate(pos, GEN_TACTICALS, mp->moves);
             mp->cur = mp->start = 0;
             mp->end             = mp->tacticalCount;
             pick_first(mp->moves, score_moves(td, pos, mp->moves, mp->end, mp->tt, ply, MOVE_NONE));
 #ifndef NDEBUG
-            /* A future SEE/promotion change must not silently put a tactical
-             * between quiets while this picker assumes two separated bands. */
+            /* The stages assume no tactical scores inside the quiet band. */
             for (int i = 0; i < mp->end; ++i)
                 assert(mp->moves[i].score > SCORE_KILLER_1 ||
                        mp->moves[i].score < -HISTORY_MAX * (1 + CONT_SLOTS + 2));
@@ -1444,8 +1031,7 @@ static Move picker_next(MovePicker *mp, SearchThread *td, const Position *pos, i
                 if (!picker_duplicate(mp, m))
                     return m;
             }
-            /* The best remaining tactical has already been selected. Preserve
-             * it, and its scores, across quiet subtrees. */
+            /* The rest are bad captures, left in place for PICK_BAD_TACTICALS. */
             mp->badBegin = mp->cur;
             mp->stage    = PICK_KILLER_0;
             break;
@@ -1465,19 +1051,13 @@ static Move picker_next(MovePicker *mp, SearchThread *td, const Position *pos, i
         }
 
         case PICK_GENERATE_QUIETS:
-            if (mp->quietCount < 0) {
-                mp->quietCount =
-                    movegen_generate(pos, GEN_NON_TACTICALS, mp->moves + mp->tacticalCount);
-                MP_ADD(td, genCalls[1], 1);
-                MP_ADD(td, generated[1], mp->quietCount);
-            }
-            MP_ADD(td, scored[1], mp->quietCount);
+            mp->quietCount =
+                movegen_generate(pos, GEN_NON_TACTICALS, mp->moves + mp->tacticalCount);
             assert(mp->tacticalCount + mp->quietCount <= MAX_MOVES);
             mp->cur = mp->start = mp->tacticalCount;
             mp->end             = mp->tacticalCount + mp->quietCount;
-            /* Refutations were snapshotted and tried already. Reading NEW
-             * killers here after singular verification would create a second
-             * refutation stage inside what is meant to be the history band. */
+            /* No refutations: they were snapshotted and tried, and killers written since by a
+             * singular search must not become a second refutation stage. */
             pick_first(mp->moves + mp->start,
                        score_moves_context(td, pos, mp->moves + mp->start, mp->quietCount,
                                            MOVE_NONE, ply, MOVE_NONE, MOVE_NONE, MOVE_NONE));
@@ -1508,8 +1088,7 @@ static Move picker_next(MovePicker *mp, SearchThread *td, const Position *pos, i
     }
 }
 
-/* Acceptance bridges use isolated state, so the UCI selftest cannot contaminate
- * the pool's histories. No playing-path branch or allocation is needed. */
+/* Bridges for `movepick selftest`, on a private SearchThread so the pool is untouched. */
 bool search_test_picker(const Position *pos, PickerTestMoves hints, int limit,
                         PickerTestResult *out) {
     memset(out, 0, sizeof(*out));
@@ -1589,8 +1168,7 @@ int search_test_picker_contracts(void) {
     picker_init(&parent, td, pos, tt, MOVE_NONE, 1, counter);
     failures += picker_next(&parent, td, pos, 1) != tt;
 
-    /* A nested same-ply picker and changed refutations cannot overwrite the
-     * parent's candidate snapshot. This is singular verification's lifetime. */
+    /* A nested same-ply picker (singular verification) must not disturb the parent's. */
     td->killers[1][0] = deferred;
     td->killers[1][1] = MOVE_NONE;
     picker_init(&child, td, pos, tt, tt, 1, deferred);
@@ -1606,11 +1184,8 @@ int search_test_picker_contracts(void) {
     failures += picker_next(&parent, td, pos, 1) != k0;
     failures += picker_next(&parent, td, pos, 1) != k1;
     failures += picker_next(&parent, td, pos, 1) != counter;
-#ifndef MOVE_PICKER_EAGER
     failures += parent.quietCount != -1;
-#endif
-    /* History is read when quiet scoring is reached, then frozen for that
-     * batch, not silently re-read on every next(). */
+    /* History is read once, when quiet scoring is reached. */
     td->history[WHITE][0][0][SQ_A2][SQ_A4] = HISTORY_MAX;
     failures += picker_next(&parent, td, pos, 1) != deferred;
     MovePicker frozen = parent;
@@ -1627,9 +1202,7 @@ int search_test_picker_contracts(void) {
             ++failures;
     }
 
-    /* All promotion scores are in the early band today: SEE declines to
-     * judge non-normal moves. Exercise the same formulas at history limits,
-     * rather than relying on a historical description of SEE. */
+    /* Promotions stay in the tactical band at both capture-history limits. */
     if (!board_set_fen(pos, "1r2k3/P7/8/8/8/8/8/4K3 w - - 0 1")) {
         ++failures;
     } else {
@@ -1646,8 +1219,7 @@ int search_test_picker_contracts(void) {
     const int maxQuiet = HISTORY_MAX * (1 + CONT_SLOTS + 2);
     failures += maxQuiet >= SCORE_COUNTER;
 
-    /* Read each kind of mutable ordering evidence at its documented stage,
-     * including contexts that share storage with a descendant's updates. */
+    /* Each kind of ordering evidence is read at its own stage, not at picker_init(). */
     if (!board_set_fen(pos, "4k3/8/8/8/8/1p3p2/8/2N1K1N1 w - - 0 1")) {
         ++failures;
     } else {
@@ -1660,8 +1232,7 @@ int search_test_picker_contracts(void) {
         failures += picker_next(&parent, td, pos, 1) != capture;
     }
     {
-        /* Continuation history is read at the stage that reads it, against the move that
-         * led here rather than against a ply-indexed slot. */
+        /* Continuation history is keyed on the move that led here. */
         board_set_startpos(pos);
         memset(td->history, 0, sizeof(td->history));
         td->stack[0].move       = make_move(SQ_E7, SQ_E5);
@@ -1687,9 +1258,7 @@ static void update_pv(SearchThread *td, int ply, Move m) {
     td->pvLength[ply] = childLength + 1;
 }
 
-/* Correction history remembers how far the static evaluation and the search have been
- * running apart for a given pawn structure. Pawn structure is the key because it survives
- * the moves a search makes, so the bias it carries is worth learning. */
+/* Correction history: how far search results have run from the static eval, by key. */
 static inline int16_t *corr_entry(SearchThread *td, const Position *pos) {
     return &td->pawnCorrHist[pos->sideToMove][pos->pawnKey & (CORRHIST_SIZE - 1)];
 }
@@ -1698,9 +1267,7 @@ static inline int16_t *non_pawn_corr_entry(SearchThread *td, const Position *pos
     return &td->nonPawnCorrHist[pos->sideToMove][c][pos->nonPawnKey[c] & (CORRHIST_SIZE - 1)];
 }
 
-/* The two-move entry for the node at `ply`, or NULL where either move above it is missing
- * or a null move - nobody's plan. Read off the search stack, which is why the correction
- * needs to know the ply. */
+/* The two-move entry, or NULL where either move is missing or null. */
 static inline int16_t *cont_corr_entry(SearchThread *td, int ply) {
     if (ply < 2)
         return NULL;
@@ -1714,7 +1281,6 @@ static inline int16_t *cont_corr_entry(SearchThread *td, int ply) {
                             [td->stack[ply - 1].movedPiece][to_sq(m1)];
 }
 
-/* The four-ply entry, on the same terms. */
 static inline int16_t *cont4_corr_entry(SearchThread *td, int ply) {
     if (ply < 4)
         return NULL;
@@ -1728,9 +1294,8 @@ static inline int16_t *cont4_corr_entry(SearchThread *td, int ply) {
                              [td->stack[ply - 1].movedPiece][to_sq(m1)];
 }
 
-/* Nothing the search reports is corrected. The corrected value feeds `improving`, the
- * margins and the reductions - decisions that are already bets - while the table keeps the
- * raw evaluation, so a later probe re-corrects with whatever has been learned since. */
+/* Feeds pruning, reductions and `improving` only. Reported scores are never corrected, and
+ * the TT stores the raw eval so a later probe re-corrects with newer data. */
 static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, int ply) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
@@ -1739,9 +1304,7 @@ static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, in
     const int16_t *const c4 = cont4_corr_entry(td, ply);
     const int nonPawn = *non_pawn_corr_entry(td, pos, WHITE) + *non_pawn_corr_entry(td, pos, BLACK);
 
-    /* Mate and tablebase scores are clamped away deliberately: a correction is evidence
-     * about an evaluation, and letting one push a score into a range reserved for proven
-     * results would have the search report a proof that nothing proved. */
+    /* Clamped below TB and mate scores: a correction must not fake a proven result. */
     const int v = raw + (CORR_W_PAWN * *corr_entry(td, pos) / CORR_W_UNIT) / CORRHIST_GRAIN +
                   (CORR_W_NONPAWN * nonPawn / CORR_W_UNIT) / CORRHIST_GRAIN +
                   (cc ? (CORR_W_CONT * *cc / CORR_W_UNIT) / CORRHIST_GRAIN : 0) +
@@ -1749,16 +1312,13 @@ static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, in
     return (Value)iclamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 
-/* Folds one observation in as an exponential moving average, weighted by depth because a
- * deeper search is better evidence about the same question. What counts as an observation
- * is the decision that matters, and it is made at the call site. */
+/* Exponential moving average, weighted by depth. */
 static void corrhist_fold(int16_t *e, int diff, int weight) {
     const int updated = (*e * (CORRHIST_WEIGHT_MAX - weight) + diff * weight) / CORRHIST_WEIGHT_MAX;
     *e                = (int16_t)iclamp(updated, -CORRHIST_LIMIT, CORRHIST_LIMIT);
 }
 
-/* Every key sees the same observation: each table is fitted to the one residual, conditioned
- * on a different part of the position. */
+/* Every key learns the same residual, conditioned on a different part of the position. */
 static void corrhist_update(SearchThread *td, const Position *pos, Value searched, Value staticEval,
                             Depth depth, int ply) {
     const int weight = imin(depth + 1, 16);
@@ -1777,25 +1337,14 @@ static void corrhist_update(SearchThread *td, const Position *pos, Value searche
         corrhist_fold(c4, diff, weight);
 }
 
-/* One consumer's share of the mapping; see the weights' declaration for why this scales
- * the deviation from 100 rather than the scale. Clamped at zero because a large enough
- * weight on a below-100 scale would otherwise produce a NEGATIVE margin, which is not a
- * tighter margin but a different rule. */
+/* Clamped at zero: a negative scale would invert the margin. */
 static inline int unc_apply(int scale, int weight) {
     const int scaled = 100 + (scale - 100) * weight / UNC_W_UNIT;
     return scaled < 0 ? 0 : scaled;
 }
 
-/*
- * How wide this node's margin-based prunes should be, as a percentage. Every margin above
- * is a global constant fitted by SPSA - a statement about the AVERAGE position - where the
- * residual it insures against is nowhere near homoscedastic.
- *
- * So they are scaled by whichever signal the loaded net offers: a trained uncertainty head
- * predicts the residual's scale directly, and otherwise |correction| stands in. The
- * corrhist defaults are centred rather than chosen, and a cold entry lands on the floor -
- * which is why the floor sits just under 100.
- */
+/* This node's margin scale in percent, from the net's sigma head, or else from |pawn
+ * correction|. A cold correction entry lands on the floor, just under 100. */
 static inline int unc_scale(SearchThread *td, const Position *pos) {
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
@@ -1810,21 +1359,12 @@ static inline int unc_scale(SearchThread *td, const Position *pos) {
     return unc_probe(ac, scale);
 }
 
-/*
- * The signal above is a second inference through the net, and most nodes never reach a
- * margin that wants it: quiescence that stands pat, a PV node - every consumer below is
- * non-PV only - or a node whose tests are all gated off by depth. Deferring it to first
- * use cannot change a decision, because it is a function of the position and not of when
- * it is read, and it removes the inference outright wherever nothing asks.
- *
- * UNC_PENDING is the "not yet asked" state; 100 is "neutral, never ask", which is what a
- * node in check wants, since every consumer is disabled there.
- */
+/* The scale costs a second inference and most nodes never reach a margin, so it is computed
+ * on first use. UNC_PENDING is "not yet computed"; 100 is neutral, for nodes in check. */
 #define UNC_PENDING (-1)
 
-/* Eager under UNC_PROBE on purpose: the probe's population is the set of nodes that READ
- * the signal, and deferring would silently resample it against the very mapping it exists
- * to re-centre. */
+/* Eager under UNC_PROBE: which nodes reach a margin depends on the mapping being measured,
+ * so a deferred sample would be biased by it. */
 static inline int unc_start(bool neutral, SearchThread *td, const Position *pos) {
     if (neutral)
         return 100;
@@ -1845,10 +1385,7 @@ static inline int unc_get(int *cache, SearchThread *td, const Position *pos) {
 
 #ifdef UNC_PROBE
 
-/* The other half of what `probe err` pairs: this node's signal, and what the search ended
- * up saying about the same node. Read again here rather than carried down from
- * unc_scale() to keep the probe out of the search stack; it is the same number, being a
- * function of the position. */
+/* Pairs this node's signal with the search's result for it, for the probe. */
 static void unc_probe_node(SearchThread *td, const Position *pos, Value searched, Value staticEval,
                            Bound bound, Depth depth) {
     if (staticEval == VALUE_NONE)
@@ -1869,9 +1406,7 @@ static void unc_probe_node(SearchThread *td, const Position *pos, Value searched
                        is_decisive_score(searched), depth);
 }
 
-/* Which constants the mapping is running on, and on which signal. The branch is the one
- * unc_scale() takes, written once here so a report of the mapping cannot describe a
- * branch the search is not taking. */
+/* The constants unc_scale() is using; keep the branch in step with it. */
 void search_unc_mapping(UncMapping *out) {
 #ifdef EVAL_NNUE
     if (nnue_has_uncertainty()) {
@@ -1901,13 +1436,8 @@ static inline void unc_probe_node(SearchThread *td, const Position *pos, Value s
 }
 #endif
 
-/*
- * Search only the forcing moves until the position is quiet. Without this the engine
- * hangs pieces at every depth: a search that stops counting material in the middle of an
- * exchange believes whatever the last capture left on the board. It is not an
- * optimisation, it is the difference between an engine that plays chess and one that does
- * not.
- */
+/* Captures only (every evasion in check) until the position is quiet, so material is never
+ * counted in the middle of an exchange. */
 static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, int ply) {
     count_node(td);
     update_seldepth(td, ply);
@@ -1921,23 +1451,17 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
     const bool pvNode = beta - alpha > 1;
     const Key key     = pos->key;
 
-    /* Quiescence probes the same table the main search writes to. Everything stored from
-     * here carries depth 0, so a quiescence entry can never satisfy a main-search probe -
-     * but a main-search entry, being deeper, answers a quiescence probe perfectly well. */
+    /* Stored at depth 0, so a quiescence entry never satisfies a main-search probe. */
     TTEntry tte;
     const bool ttHit    = tt_probe(key, &tte);
     const Value ttValue = ttHit ? tt_value_from_tt(tt_entry_value(&tte), ply) : VALUE_NONE;
     Move ttMove         = ttHit ? tt_entry_move(&tte) : MOVE_NONE;
 
-    /* Sixteen bits of key is not proof of identity, and the entry may predate several moves
-     * of the game. Never play a probed move unvalidated. */
+    /* A 16-bit key match is not proof of identity (invariant 6). */
     if (ttMove != MOVE_NONE && !movegen_is_pseudo_legal(pos, ttMove))
         ttMove = MOVE_NONE;
 
-    /* Quiescence PRESERVES the flag and never sets it. Seeding from `pvNode` looks
-     * equivalent and is not: a PV node hands quiescence a full window, and 18% of the
-     * classical bench tree would then reduce less for having once been a recapture on the
-     * principal variation. */
+    /* Preserved, never set here: seeding it from pvNode would mark ~18% of the tree as PV. */
     const bool ttPv = ttHit && tt_entry_is_pv(&tte);
 
     if (!pvNode && ttValue != VALUE_NONE &&
@@ -1951,18 +1475,15 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
     int uncScale       = 100;
 
     if (!inCheck) {
-        /* Stand pat: the side to move is never obliged to capture, so the static evaluation
-         * is a lower bound on what it can achieve. In check there is no such option and
-         * every reply must be searched. */
+        /* Stand pat: capturing is optional, so the static eval is a lower bound. */
         rawEval    = ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
                                                                 : eval_evaluate(td->es, pos);
         staticEval = corrected_eval(td, pos, rawEval, ply);
         uncScale   = unc_start(false, td, pos);
         best       = staticEval;
 
-        /* A stored bound that points past the static evaluation is a better stand-pat: it
-         * came from a search of this very position. Proven scores are left out, and the
-         * delta prunes below still reason from staticEval. */
+        /* A TT bound beyond the static eval is a better stand-pat. Not for proven scores, and
+         * delta pruning still uses staticEval. */
         if (ttValue != VALUE_NONE && !is_decisive_score(ttValue) &&
             (tt_entry_bound(&tte) & (ttValue > best ? BOUND_LOWER : BOUND_UPPER)))
             best = ttValue;
@@ -1975,19 +1496,13 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
             alpha = best;
     }
 
-    /* Quiescence reaches quiet moves only when evading a check, and scoring those reads the
-     * main history, so it needs the same key the main search would give them. */
+    /* Quiet evasions are scored by the main history, which is keyed on threats. */
     if (inCheck)
         td->stack[ply].threats = attacked_by(pos, (Color)(pos->sideToMove ^ 1));
 
     ScoredMove *const moves = td->qsMoves[ply];
     const int count         = movegen_generate(pos, inCheck ? GEN_EVASIONS : GEN_CAPTURES, moves);
-    MP_ADD(td, genCalls[3], 1);
-    MP_ADD(td, generated[3], count);
-    MP_ADD(td, scored[3], count);
 
-    /* No counter-move: quiescence only reaches quiet moves when answering a check, and an
-     * evasion is dictated by the check rather than by whatever the opponent played. */
     pick_first(moves, score_moves(td, pos, moves, count, ttMove, ply, MOVE_NONE));
 
     Move bestMove = MOVE_NONE;
@@ -1998,22 +1513,14 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
             pick_move(moves, count, i);
         const Move m = moves[i].m;
 
-        /* Drop the losing captures. score_moves already ran SEE and put them in the only
-         * negative band a capture list contains, and pick_move has just selected the highest
-         * remaining score, so once it is negative the whole tail can go. This is where
-         * quiescence earns most of its speed. */
+        /* Losing captures are the only negative scores and moves come out best first, so
+         * the rest of the list can go. */
         if (!inCheck && moves[i].score < 0)
             break;
 
-        /* Delta pruning: even winning this victim outright, plus a margin for what the rest
-         * of the sequence swings, leaves the score short of alpha, and standing pat already
-         * beats that. Skipped for promotions, whose gain is the new piece rather than the
-         * captured one, and in check, where there is no stand pat. */
+        /* Delta pruning: even winning the victim plus a margin does not reach alpha. Testing
+         * the bare material first keeps most captures from needing the uncertainty scale. */
         if (!inCheck && type_of_move(m) != MT_PROMOTION && !is_mate_score(alpha)) {
-            /* What the move wins outright, before any allowance for what the rest of the
-             * sequence might swing. The allowance is added, so a capture that clears alpha
-             * on material alone is never pruned whatever the head says - and most do, which
-             * is what keeps the second inference out of quiescence. */
             const Value bare = staticEval + PieceValues[victim_of(pos, m)];
 
             if (bare <= alpha &&
@@ -2026,9 +1533,7 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
             continue;
         ++legal;
 
-        /* Quiescence maintains the stack too, so a node below it reads the move that
-         * actually led there rather than whatever the main search left at this ply on an
-         * earlier visit. */
+        /* Kept current so nodes below read the move that led there, not a stale one. */
         td->stack[ply].move       = m;
         td->stack[ply].movedPiece = piece_on(pos, from_sq(m));
         td->stack[ply].staticEval = staticEval;
@@ -2054,30 +1559,19 @@ static Value qsearch(SearchThread *td, Position *pos, Value alpha, Value beta, i
         }
     }
 
-    /* Evasions are the complete move list, so no legal reply here really is checkmate -
-     * worth detecting, since missing it makes the engine walk into mate believing it has
-     * stand-pat equality. */
+    /* Evasions are the complete move list, so no legal reply is mate. */
     if (inCheck && legal == 0)
         return mated_in(ply);
 
-    /* Quiescence never searches the full move list, so it can never prove an exact score:
-     * the value is a lower bound if it failed high and an upper bound otherwise. */
+    /* Never exact: quiescence does not search every move. */
     tt_store(key, bestMove, best, rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER, ttPv, ply);
 
     return best;
 }
 
-/*
- * `cutNode` is the caller's expectation, not a fact: it is true at a node the parent
- * believes will fail high. It costs nothing to propagate and it is the best available
- * prior on how a node will turn out, which is exactly what the reductions want; being
- * wrong about it is safe, since everything it feeds either re-searches or is bounded by
- * depth.
- */
+/* `cutNode`: the parent expects this node to fail high. A hint for reductions only. */
 static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, Value beta, int ply,
                      bool cutNode) {
-    /* Cleared here rather than at each use, so a child that never extends the PV leaves a
-     * length of zero behind. */
     td->pvLength[ply] = 0;
 
     if (depth <= 0)
@@ -2089,21 +1583,18 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     if (search_stopped())
         return VALUE_ZERO;
 
-    /* Read and clear in one step. A singular search sets this immediately before re-entering
-     * at the same ply, and every other entry must see MOVE_NONE - including a later,
-     * unrelated visit that would otherwise inherit an exclusion. */
+    /* Read and cleared: a singular search sets it just before re-entering this ply, and no
+     * later visit may inherit it. */
     const Move excluded         = td->stack[ply].excludedMove;
     td->stack[ply].excludedMove = MOVE_NONE;
     const bool isExcluded       = excluded != MOVE_NONE;
 
     td->stack[ply + 2].cutoffCnt = 0;
 
-    /* Inherited on entry, so a null-move or ProbCut child - which never pass through the
-     * move loop that sets it - reads this line's count rather than a sibling's. */
+    /* Inherited on entry for children reached outside the move loop (null move, ProbCut). */
     td->stack[ply].doubleExtensions = td->stack[ply - 1].doubleExtensions;
 
-    /* The root is handled by search_root, so this is never ply 0 - which is what lets the
-     * draw and mate-distance tests below run unconditionally. */
+    /* search_root() handles ply 0, so the draw and mate-distance tests need no root guard. */
     assert(ply > 0);
 
     if (board_is_draw(pos, ply))
@@ -2112,14 +1603,10 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     if (ply >= MAX_PLY - 1)
         return corrected_eval(td, pos, eval_evaluate(td->es, pos), ply);
 
-    /* Determined before mate distance pruning narrows the window: a node is a PV node
-     * because of where it sits in the tree, and must keep being treated as one even if the
-     * narrowing leaves it with a null window. */
+    /* Decided before mate distance pruning, which can narrow a PV node's window to null. */
     const bool pvNode = beta - alpha > 1;
 
-    /* Mate distance pruning. Once a mate is known at this ply, no line can beat it by
-     * mating later and none can be worse than being mated now, so the window narrows to
-     * that range for two comparisons. */
+    /* Mate distance pruning. */
     if (alpha < mated_in(ply))
         alpha = mated_in(ply);
     if (beta > mate_in(ply + 1))
@@ -2127,11 +1614,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     if (alpha >= beta)
         return alpha;
 
-    /*
-     * A reversible move back into a position already on this line is a draw the side to move
-     * can always claim, so a node below the draw score is worth at least that. The scan stops
-     * at the nearest null move above, across which "the same position" means nothing.
-     */
+    /* Upcoming repetition: if a reversible move returns to a position on this line, the side
+     * to move can claim a draw. The scan stops at the nearest null move. */
     if (alpha < VALUE_DRAW && ply >= 4) {
         int limit = ply - 1;
         for (int j = 1; j <= ply - 1; ++j)
@@ -2156,57 +1640,25 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     if (ttMove != MOVE_NONE && !movegen_is_pseudo_legal(pos, ttMove))
         ttMove = MOVE_NONE;
 
-    /*
-     * Was this position ever on a principal variation? `pvNode` says where the node sits in
-     * THIS tree; the table says where the position sat in every tree before, which is the
-     * better-informed question - a position worth an exact score once is worth accuracy
-     * again now.
-     *
-     * It cannot run away: the flag is seeded only by genuine PV nodes and spreads only
-     * through the table, never down the stack, so the set it marks is bounded by the
-     * positions that have actually appeared on a principal variation.
-     */
+    /* Was this position ever on a PV? Seeded only by real PV nodes and spread only through
+     * the TT, so it cannot run away. */
     const bool ttPv = pvNode || (ttHit && tt_entry_is_pv(&tte));
 
-    /*
-     * Cut off on a stored result at least as deep whose bound points the right way. Not at
-     * PV nodes: a bound proves a cutoff but cannot name the move that caused it, so the
-     * reported principal variation would be truncated here.
-     *
-     * Not near the fifty-move boundary either - a stored score says nothing about how many
-     * reversible moves preceded the position. And never while verifying a singular move,
-     * whose stored result was proved with the excluded move available.
-     */
+    /* TT cutoff. Not at PV nodes (it would truncate the PV), near the fifty-move limit, or in
+     * a singular verification, whose entry was proved with the excluded move available. */
     if (!isExcluded && !pvNode && ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth &&
         pos->halfmoveClock < 90 &&
         (tt_entry_bound(&tte) & (ttValue >= beta ? BOUND_LOWER : BOUND_UPPER)))
         return ttValue;
 
-    /*
-     * What a tablebase hit at a PV node leaves behind: a floor under the score, or a ceiling
-     * over it. Both stay neutral at every node that does not probe.
-     */
+    /* Set by a TB hit at a PV node; neutral everywhere else. */
     Value tbFloor   = -VALUE_INFINITE;
     Value tbCeiling = VALUE_INFINITE;
 
-    /*
-     * Syzygy WDL probe. The halfmove-clock gate keeps this off the hot path and is also a
-     * correctness condition: WDL tables assume a fresh fifty-move counter, so only the
-     * capture or pawn move that entered the tablebase region probes and everything behind
-     * it transposes through the entry stored here.
-     *
-     * The value is game-theoretic truth rather than a heuristic, so it is returned outright
-     * WHERE IT SETTLES THE NODE - a draw, a win that already beats beta, a loss that is
-     * already under alpha. Stored a few plies deeper than asked so neighbouring nodes
-     * transpose into it rather than re-probing the disk.
-     *
-     * A win is only a lower bound, though, and a loss only an upper one: the tables prove
-     * the result and say nothing about its length, while a mate score says both and outranks
-     * the whole tablebase band. Returning the bound outright at a PV node is what stopped the
-     * engine ever looking for that mate - the one line where the search knows something the
-     * tables do not. So the PV node keeps the proof as a floor and searches on. Every other
-     * node still returns immediately, which is where the probe's cost savings were.
-     */
+    /* Syzygy WDL probe, only right after a capture or pawn move: WDL assumes a fresh
+     * fifty-move counter. Returned where it settles the node, and stored deeper so neighbours
+     * transpose into it. At a PV node an unsettled win or loss becomes a floor or ceiling and
+     * the search goes on, so it can still find the mate the tables cannot. */
     if (TbLimit != 0 && !isExcluded && pos->halfmoveClock == 0 && pos->castling == NO_CASTLING &&
         popcount(occupied_bb(pos)) <= TbLimit) {
         const Value tbValue = syzygy_probe_wdl(pos, ply);
@@ -2223,9 +1675,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 return tbValue;
             }
 
-            /* Not stored: this node is about to be searched properly, and the entry it writes
-             * on the way out describes that search. Writing the bound here at depth + 6 first
-             * would shadow it. */
+            /* Not stored: it would shadow the entry the search below writes. */
             if (tbBound == BOUND_LOWER) {
                 tbFloor = tbValue;
                 alpha   = (Value)imax(alpha, tbValue);
@@ -2238,18 +1688,12 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
     const Color us     = pos->sideToMove;
     const bool inCheck = board_checkers(pos) != BB_EMPTY;
 
-    /* Internal iterative reduction: no table move means nothing has searched this node
-     * deeply enough to leave an opinion, so the list will be ordered by heuristics alone -
-     * and a badly ordered node at full depth is the most expensive kind there is. One ply
-     * shallower is cheaper and leaves a table move behind for the revisit. */
+    /* Internal iterative reduction: without a TT move the ordering is poor, so search a ply
+     * shallower and leave a TT move for the revisit. */
     if (depth >= 4 && ttMove == MOVE_NONE && !inCheck)
         --depth;
 
-    /* Reusing the evaluation cached in the table when this position has been seen before.
-     * In check it is not computed at all: the score of a position whose king is attacked
-     * says nothing useful, and every heuristic that would consume it is disabled while in
-     * check anyway. The table keeps `rawEval`; everything below reasons with the corrected
-     * one. */
+    /* Not computed in check, where nothing reads it. The TT stores rawEval. */
     const Value rawEval =
         inCheck ? VALUE_NONE
                 : (ttHit && tt_entry_eval(&tte) != VALUE_NONE ? tt_entry_eval(&tte)
@@ -2260,36 +1704,21 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
     td->stack[ply].staticEval = staticEval;
 
-    /* Is this side's position getting better? Compared against the GRANDPARENT, because that
-     * is the last node where the same side was to move. A rising evaluation is more likely
-     * to produce the fail high pruning is betting on, and a falling one deserves the benefit
-     * of the doubt; in check and at the top of the tree it defaults to false, which prunes
-     * less. */
+    /* Against the grandparent, the last node with the same side to move. */
     const bool improving = !inCheck && ply >= 2 && td->stack[ply - 2].staticEval != VALUE_NONE &&
                            staticEval > td->stack[ply - 2].staticEval;
 
-    /* Reverse futility pruning: the static evaluation is so far above beta that conceding a
-     * pawn-and-a-bit per remaining ply would not bring it down, so the node is not going to
-     * fail low. The depth limit keeps it honest - deep enough searches find swings of any
-     * size - and it is restricted to non-PV nodes, where a bound was all anyone wanted. */
-    if (!pvNode && !inCheck && depth <= RFP_DEPTH && !is_mate_score(beta) &&
-        /* The margin is subtracted, so failing this cannot be rescued by any scale the
-         * head could report - and asking it is a whole inference. */
-        staticEval >= beta &&
+    /* Reverse futility pruning. The bare comparison comes first, before the margin's scale
+     * costs an inference. Returns halfway to beta: the margin shows a fail high, not its
+     * size. */
+    if (!pvNode && !inCheck && depth <= RFP_DEPTH && !is_mate_score(beta) && staticEval >= beta &&
         staticEval - RFP_MARGIN * (depth - improving) *
                          unc_apply(unc_get(&uncScale, td, pos), UNC_W_RFP) / 100 >=
             beta)
-        /* Halfway back to beta: the margin says the node fails high, not by how much, and a
-         * parent reading the full static evaluation as a bound believes more than was shown. */
         return (Value)((staticEval + beta) / 2);
 
-    /* Razoring, the mirror image at the other end of the window: a position this far below
-     * alpha is one the quiet moves will not save, and whether a tactic does is exactly what
-     * quiescence answers. The qsearch is what makes it safe - the margin only decides the
-     * node is worth a cheap second opinion, and the node is dropped only if that opinion
-     * agrees. */
+    /* Razoring: far below alpha, let quiescence decide whether a tactic saves the node. */
     if (!pvNode && !inCheck && depth <= RAZOR_DEPTH && !is_mate_score(alpha) &&
-        /* Added, so no scale can bring this under alpha if the bare evaluation is not. */
         staticEval < alpha &&
         staticEval +
                 RAZOR_MARGIN * depth * unc_apply(unc_get(&uncScale, td, pos), UNC_W_RAZOR) / 100 <
@@ -2299,11 +1728,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             return v;
     }
 
-    /* Null-move pruning: hand the opponent a free move, and if the position still fails high
-     * it was too good to be worth searching properly. The non-pawn-material test is what
-     * keeps this sound - in a king-and-pawn endgame zugzwang is often the whole content of
-     * the position, and a side that would love to pass will "prove" a cutoff it cannot
-     * achieve. Refusing two null moves in a row matters for the same reason. */
+    /* Null-move pruning, never twice in a row. */
     if (!pvNode && !inCheck && !isExcluded && depth >= 3 && staticEval >= beta &&
         td->stack[ply - 1].move != MOVE_NULL && has_non_pawn_material(pos, us)) {
         const Depth r = NMP_BASE + depth / NMP_DEPTH_DIVISOR +
@@ -2322,25 +1747,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         if (search_stopped())
             return VALUE_ZERO;
 
-        /* A mate score proved by letting the opponent move twice is not a mate at all. Return
-         * the bound the search is entitled to, not the claim. */
+        /* A mate found by passing is not a mate. */
         if (v >= beta)
             return v >= VALUE_MATE_IN_MAX_PLY ? beta : v;
     }
 
-    /*
-     * ProbCut. The margin's declaration has the idea; what matters here is that quiescence
-     * runs first, because it refutes most candidates for the price of one capture sequence
-     * and only what survives is worth a real search.
-     *
-     * Skipped while verifying a singular move - this ignores `excluded`, so it could prove a
-     * fail high with the very move being hidden - and skipped when the table already says
-     * from a comparable depth that the bound is not reached. Skipped, too, when staticEval
-     * is already past the raised bound: the SEE filter's threshold would go negative and
-     * admit every capture on the board.
-     */
-    /* The gates that do not depend on the margin are tested first, so a node that could
-     * not probcut whatever the margin came to never reads the uncertainty head for it. */
+    /* ProbCut: a capture that beats a raised beta in quiescence and then in a reduced search
+     * fails the node high. Skipped in a singular verification (it ignores `excluded`), when
+     * the TT shows the bound unreached, and when staticEval already beats it (the SEE
+     * threshold would admit every capture). The margin-free gates come first so the scale is
+     * only read when needed. */
     const bool probCutGate =
         !pvNode && !inCheck && !isExcluded && depth >= PROBCUT_DEPTH && !is_mate_score(beta);
     const Value probCutBeta =
@@ -2350,17 +1766,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
     if (probCutGate && !is_mate_score(probCutBeta) && staticEval < probCutBeta &&
         !(ttValue != VALUE_NONE && tt_entry_depth(&tte) >= depth - 3 && ttValue < probCutBeta)) {
-        /* This node's own picker list, free until the move loop below: ProbCut never runs under
-         * a singular exclusion, so the slot is [ply][0], and it is done before picker_init(). */
+        /* Borrows this node's picker list, unused until picker_init(). ProbCut never runs
+         * under an exclusion, so the slot is [ply][0]. */
         ScoredMove *const pcMoves = td->pickers[ply][0].moves;
         const int pcCount         = movegen_generate(pos, GEN_CAPTURES, pcMoves);
-        MP_ADD(td, genCalls[4], 1);
-        MP_ADD(td, generated[4], pcCount);
-        MP_ADD(td, scored[4], pcCount);
 
-        /* No counter-move: the list is captures, which the quiet heuristics have no opinion
-         * about. The capture has to reach the raised bound on material alone - one needing
-         * the search to find compensation is not what this is looking for. */
         pick_first(pcMoves, score_moves(td, pos, pcMoves, pcCount, ttMove, ply, MOVE_NONE));
 
         for (int i = 0; i < pcCount; ++i) {
@@ -2368,7 +1778,6 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 pick_move(pcMoves, pcCount, i);
             const Move m = pcMoves[i].m;
 
-            MP_ADD(td, pruningSee, 1);
             if (!see_ge(pos, m, probCutBeta - staticEval))
                 continue;
 
@@ -2394,8 +1803,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 return VALUE_ZERO;
 
             if (v >= probCutBeta) {
-                /* Stored at the depth the evidence actually covers, so a later probe cannot
-                 * read it as a full-depth result. */
+                /* Stored at the depth actually searched. */
                 tt_store(key, m, v, rawEval, depth - PROBCUT_REDUCTION + 1, BOUND_LOWER, ttPv, ply);
                 return v;
             }
@@ -2404,80 +1812,50 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
     td->stack[ply].threats = attacked_by(pos, (Color)(us ^ 1));
 
-    /* Computed at the first late quiet that asks (LMR_ESCAPE); a node that never gets that far
-     * never pays for it. */
-    LesserThreats lesser = {BB_EMPTY, BB_EMPTY, BB_EMPTY};
-    bool lesserKnown     = false;
-
     MovePicker *const picker = &td->pickers[ply][isExcluded];
     picker_init(picker, td, pos, ttMove, excluded, ply, counter_move(td, ply));
 
-    /* Moves already tried here, so the one that eventually cuts can penalise them. Bounded:
-     * a node with more than this many is one where the ordering statistics were not going to
-     * be decisive anyway. */
+    /* Moves tried so far, penalised if another move cuts. */
     Move quiets[64];
     int quietCount = 0;
     Move captures[32];
     int captureCount = 0;
 
-    /* The same continuation context score_moves used, kept for the pruning and reduction
-     * decisions below: a quiet move the plan-aware tables like deserves the benefit of the
-     * doubt that its position in the list denies it. */
     int16_t *slices[CONT_SLOTS];
     for (int i = 0; i < CONT_SLOTS; ++i)
         slices[i] = cont_slice(td, i, ply, ContPlies[i]);
 
-    /* Seeded from the tablebase floor, which is -VALUE_INFINITE at every node that did not
-     * probe one. A proven win the search cannot improve on is still this node's value, so it
-     * has to survive a move loop in which nothing beats it. */
+    /* From the TB floor, so a proven win survives a loop in which nothing beats it. */
     Value best    = tbFloor;
     Move bestMove = MOVE_NONE;
     int moveCount = 0;
 
-    /* Tracked separately from `bestMove`, and the distinction is the whole difference
-     * between an exact score and an upper bound. Every node ends up with a best-scoring
-     * move, including one that failed low, so using `bestMove != MOVE_NONE` would mark every
-     * fail-low entry BOUND_EXACT and a later probe would cut on it. */
+    /* Not `bestMove != MOVE_NONE`: a node that failed low still has a best move, and its
+     * entry must be an upper bound, not exact. */
     bool raisedAlpha = false;
 
     for (Move m; (m = picker_next(picker, td, pos, ply)) != MOVE_NONE;) {
-        MP_ADD(td, mainPicked, 1);
         if (!movegen_is_legal(pos, m))
             continue;
-        MP_ADD(td, mainLegal, 1);
         ++moveCount;
 
         const bool tactical = is_tactical(pos, m);
         const Piece moved   = piece_on(pos, from_sq(m));
 
-        /* How the plan-aware tables rate this move. Only meaningful for quiet moves - the
-         * tactical ones are scored by what they win. */
         const int contScore = tactical ? 0 : cont_score(slices, moved, to_sq(m));
 
-        /* Shallow-depth pruning of quiet moves, guarded on `best` beating a forced mate:
-         * until the node has found something that is not losing outright, every remaining
-         * move is a candidate escape. */
+        /* Quiet pruning, once the node has found something better than being mated. */
         if (!pvNode && !inCheck && best > VALUE_MATED_IN_MAX_PLY && !tactical) {
-            /* Late move pruning: the list is ordered, so once this many quiets have been
-             * tried without raising alpha the rest overwhelmingly will not. Unlike a
-             * reduction this does not re-search, which is why it is confined to low depths -
-             * and half as many get a look when the position is not improving.
-             *
-             * A quiet CHECK is exempt here and from futility below. Both prunes decide before
-             * the move is made, and a check is exactly the quiet move whose value the
-             * ordering cannot see: on WAC.001 the mate in two is a quiet check at a futile
-             * node, and with checks prunable the engine first found it at depth 13. */
+            /* Late move pruning, halved when not improving. Quiet checks are exempt here and
+             * from futility: the ordering cannot see their value (WAC.001's mate in two is a
+             * quiet check at a futile node). */
             if (depth <= LMP_DEPTH &&
                 moveCount >=
                     (improving ? LMP_BASE + depth * depth : (LMP_BASE + depth * depth) / 2) &&
                 !gives_check(pos, m))
                 continue;
 
-            /* Futility pruning: the position is so far below alpha that a quiet move, which
-             * wins no material by definition, cannot close the gap in the depth remaining.
-             * This prunes the whole quiet tail but its checks, since the test does not
-             * otherwise depend on which move it is; captures keep being searched, which is
-             * the point. */
+            /* Futility pruning. */
             if (depth <= FUTILITY_DEPTH && staticEval <= alpha &&
                 staticEval + FUTILITY_MARGIN * depth *
                                  unc_apply(unc_get(&uncScale, td, pos), UNC_W_FUTILITY) / 100 <=
@@ -2485,39 +1863,21 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 !gives_check(pos, m))
                 continue;
 
-            /* History pruning: a quiet move both history tables have kept refuting is not
-             * searched near the leaves at all. Checks are exempt, as above. */
+            /* History pruning. */
             if (depth <= 4 &&
                 *main_hist(td, us, td->stack[ply].threats, m) + contScore < -HIST_PRUNE * depth &&
                 !gives_check(pos, m))
                 continue;
         }
 
-        /*
-         * SEE pruning: the move loses material outright and there is not enough depth left
-         * for whatever it was playing for to appear. This is the one rule that applies to
-         * captures as well as quiets, and that is why it is worth having - nothing above
-         * touches a capture, so a piece thrown onto a defended square is otherwise searched
-         * at full width.
-         *
-         * The thresholds scale differently on purpose: a capture that loses a little is
-         * often a real sacrifice, so its allowance grows linearly with the depth left to
-         * justify it, while a quiet move that hangs material has won nothing to weigh
-         * against the loss.
-         */
+        /* SEE pruning, the one prune that also applies to captures. */
         if (!pvNode && !inCheck && best > VALUE_MATED_IN_MAX_PLY) {
             const Depth seeDepth = tactical ? SEE_CAPTURE_DEPTH : SEE_QUIET_DEPTH;
 
-            /* Still computed under the depth guard rather than beside it, though the reason
-             * has shrunk: it used to be a range check, because the quiet threshold is
-             * quadratic in depth and the uncertainty factor multiplied it by another 500 at
-             * the sweep bounds, which did not fit in the int a Value is. Without that factor
-             * it fits anywhere, and nothing reads the margin when the guard is false. */
             if (depth <= seeDepth) {
                 const Value seeMargin =
                     tactical ? -SEE_CAPTURE_MARGIN * depth : -SEE_QUIET_MARGIN * depth * depth;
 
-                MP_ADD(td, pruningSee, 1);
                 if (!see_ge(pos, m, seeMargin))
                     continue;
             }
@@ -2529,31 +1889,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
 
         Depth extension = 0;
 
-        /*
-         * Singular extension. The table says this move was best here, from a search nearly as
-         * deep as this one, and the question worth asking is not whether it is good but
-         * whether it is the ONLY move that is - a forced line is where an extra ply buys the
-         * most, because the branching that makes depth expensive is not there.
-         *
-         * One search of every OTHER move against a window just below the stored score gives
-         * three outcomes: all fail low, so extend; the reduced search beats the real beta, so
-         * several moves are good enough and this node fails high outright (multi-cut); or the
-         * others reach the window while the table move already beats beta, so the node is
-         * over-searched and plies come off.
-         *
-         * The verification runs at this same ply with `excludedMove` set, which is why the
-         * flag is read-and-cleared on entry and why the table is neither trusted nor written
-         * while it is set.
-         */
+        /* Singular extension: search every other move just below the TT score. All fail low:
+         * extend. One beats beta: multi-cut. Otherwise the TT move is one good move of several
+         * and loses depth. The verification re-enters this ply with `excludedMove` set. */
         if (!isExcluded && depth >= SINGULAR_DEPTH && m == ttMove && ttValue != VALUE_NONE &&
             !is_mate_score(ttValue) && (tt_entry_bound(&tte) & BOUND_LOWER) &&
             tt_entry_depth(&tte) >= depth - 3) {
             const Value singularBeta  = ttValue - SINGULAR_MARGIN * depth / 16;
             const Depth singularDepth = (depth - 1) / 2;
 
-            /* The verification searches this ply again and writes the PV table as it goes.
-             * Nothing has been recorded here yet - the table move always sorts first - but
-             * restoring it keeps that an observation rather than a dependency. */
+            /* The verification writes this ply's PV entry. */
             const int savedPvLength = td->pvLength[ply];
 
             td->stack[ply].excludedMove = m;
@@ -2566,9 +1911,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             if (search_stopped())
                 return VALUE_ZERO;
 
-            /* Every other move failing far below the window is a forced move, not merely
-             * the best one, and gets a second ply - off the principal variation only,
-             * where the tree is cheap, and never past the line's cap. */
+            /* Double and triple extensions are off the PV only, and capped per line. */
             if (v < singularBeta) {
                 extension = !pvNode && v < singularBeta - DEXT_MARGIN &&
                                     td->stack[ply - 1].doubleExtensions < DEXT_MAX
@@ -2580,91 +1923,56 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 return singularBeta;
             else if (ttValue >= beta)
                 extension = -2;
-            /* Not singular, at a node expected to fail high anyway: the table move is one good
-             * move among several, and the ply it would have been given goes elsewhere. */
             else if (cutNode)
                 extension = -1;
         }
 
-        /* Read before the move is made: afterwards the victim is gone from the board. */
+        /* Read before the move is made, while the victim is still on the board. */
         const int capHistScore = tactical ? td->captureHist[moved][to_sq(m)][victim_of(pos, m)] : 0;
-
-        /* The late-quiet facts LMR may read (E49), also from the board before the move. */
-        int factR = 0;
-        if ((LMR_SEE_BAD || LMR_ESCAPE) && depth >= 3 && moveCount > 2 && !tactical && !inCheck) {
-            if (LMR_SEE_BAD && !see_ge(pos, m, VALUE_ZERO))
-                factR += LMR_SEE_BAD;
-            if (LMR_ESCAPE) {
-                if (!lesserKnown) {
-                    lesser      = lesser_threats(pos, (Color)(us ^ 1));
-                    lesserKnown = true;
-                }
-                const Bitboard lt = lesser_for(&lesser, type_of(moved));
-                if (bb_test(lt, from_sq(m)) && !bb_test(lt, to_sq(m)))
-                    factR -= LMR_ESCAPE;
-            }
-        }
 
         td->stack[ply].move       = m;
         td->stack[ply].movedPiece = moved;
 
         board_do_move(pos, m);
-        /* The child's table line is asked for BEFORE the accumulator update, everywhere a move is
-         * made: the update is long enough to hide most of the miss, and issued after it the
-         * prefetch hid almost none - tt_probe's cluster load was 7.4% of the search (+5.9% nps). */
+        /* Prefetch before the accumulator update, everywhere a move is made: the update hides
+         * the miss (+5.9% nps). */
         tt_prefetch(pos->key);
         eval_state_push(td->es, pos, m);
 
         const bool givesCheck = board_checkers(pos) != BB_EMPTY;
 
-        /* No check extension. Every check used to get a ply, and with checks also exempt from
-         * LMR that bought a great deal of tree for lines that are seldom forced; singular
-         * extensions already find the checks that are, and the quiet-check exemptions from LMP
-         * and futility keep the mates visible (WAC.001 still mates at depth 3). Removing it
-         * measured +23.42 +/- 8.66 at STC on top of the rest of E46. */
+        /* No check extension: singular extensions find the forced checks (E46). */
         const Depth childDepth = depth - 1 + extension;
-        MP_ADD(td, mainSearched, 1);
 
         td->stack[ply].doubleExtensions = td->stack[ply - 1].doubleExtensions + (extension >= 2);
         Value v                         = VALUE_NONE;
 
-        /* LMR retries reduced fail-highs at normal depth, but a false fail-low can still
-         * hide a move. Forcing moves are exempt; failed-move learning below distinguishes
-         * a reduced-only rejection from one that received a normal-depth search. */
+        /* Late move reductions. Checks and tactical moves are exempt. */
         Depth r   = 0;
         int moveZ = INT32_MIN; /* this quiet's z, where one was computed */
-        if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && (QCHECK_LMR || !givesCheck)) {
-            r = Reductions[imin(depth, 63)][imin(moveCount, 63)] - (QCHECK_LMR && givesCheck);
+        if (depth >= 3 && moveCount > 2 && !tactical && !inCheck && !givesCheck) {
+            r = Reductions[imin(depth, 63)][imin(moveCount, 63)];
 
-            /* The principal variation is where accuracy is worth paying for, and a position
-             * that was on one before is still that position whatever window this visit uses.
-             * Two arms rather than `if (ttPv) --r` so an ablation can switch the second off. */
             if (pvNode)
                 --r;
             else if (ttPv)
                 r -= TTPV_REDUCTION;
 
-            /* A position that is not improving is one where the search has less to lose by
-             * looking at the tail more cheaply. */
             if (!improving)
                 ++r;
 
             if (td->stack[ply + 1].cutoffCnt > CUTOFF_CNT_THRESHOLD)
                 ++r;
 
-            r += factR;
             if (cutNode)
                 r += LMR_CUTNODE;
 
-            /* A move the history tables like gets some of its reduction back, on separate
-             * divisors because the two tables answer different questions and nothing says
-             * one ply of evidence in either is worth the same. */
             r -= *main_hist(td, us, td->stack[ply].threats, m) / LMR_HIST_DIVISOR;
             r -= contScore / LMR_CONT_DIVISOR;
 
 #ifdef EVAL_NNUE
-            /* The child evaluates itself on entry anyway, and the stack's recorded outputs
-             * hand it back this same pair, so asking here costs one lookup, not an inference. */
+            /* The child's eval is cached by the accumulator stack, so this costs a lookup, not
+             * an inference. */
             if (nnue_has_uncertainty() && !is_mate_score(alpha)) {
                 const Value cv = corrected_eval(td, pos, eval_evaluate(td->es, pos), ply + 1);
                 const int sig  = imax(nnue_uncertainty(td->es, pos), ZLMR_SIGMA_FLOOR);
@@ -2679,9 +1987,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             else if (r > childDepth - 1)
                 r = childDepth - 1;
         }
-        /* Late captures. The good ones are tried first, so a capture this far down the list is
-         * a losing one or one of many: half the quiet curve, given back by capture history.
-         * Promotions and checks stay exempt, as they are for quiets. */
+        /* Late captures: half the quiet reduction, given back by capture history. */
         else if (depth >= 3 && moveCount > 1 + pvNode && tactical &&
                  type_of_move(m) != MT_PROMOTION && !inCheck && !givesCheck) {
             r = Reductions[imin(depth, 63)][imin(moveCount, 63)] / 2;
@@ -2693,15 +1999,11 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 r = childDepth - 1;
         }
 
-        /* Principal variation search: the first move is searched with the full window, and for
-         * the rest the only question worth asking is whether anything BEATS it, which a null
-         * window answers far more cheaply. A reduced null-window search is a bet that the
-         * move fails low, so the child is by definition expected to fail high. */
+        /* PVS. A reduced child is expected to fail high, hence cutNode = true. */
         if (r > 0) {
             v = -negamax(td, pos, childDepth - r, -alpha - 1, -alpha, ply + 1, true);
-            /* A move z called promising, now confirmed by the reduced search: one ply past
-             * the normal depth, or two where z is at least twice the threshold. Bounded by
-             * ply < 2 * rootDepth, so a line that keeps qualifying cannot deepen without limit. */
+            /* Re-search; deeper for a move z called promising (see ZDEEPER_Z), bounded by
+             * ply < 2 * rootDepth. */
             if (v > alpha) {
                 const int deeper =
                     moveZ != INT32_MIN && moveZ >= ZDEEPER_Z && ply < 2 * td->rootDepth
@@ -2713,8 +2015,6 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             v = -negamax(td, pos, childDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
         }
 
-        /* A full-window search is never a cut node: the whole point is that its value is
-         * wanted exactly, not as a bound. */
         if (pvNode && (moveCount == 1 || (v > alpha && v < beta)))
             v = -negamax(td, pos, childDepth, -beta, -alpha, ply + 1, false);
 
@@ -2724,9 +2024,7 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         if (search_stopped())
             return VALUE_ZERO;
 
-        /* Only completed attempts enter the list: a move the loop pruned was never
-         * tried, and charging it for a failure it was not given the chance to have is
-         * evidence about the pruning rule rather than about the move. */
+        /* Only moves actually searched; pruned ones were never given the chance to fail. */
         if (!tactical && quietCount < (int)(sizeof(quiets) / sizeof(quiets[0])))
             quiets[quietCount++] = m;
 
@@ -2739,32 +2037,16 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
                 update_pv(td, ply, m);
                 if (v >= beta) {
                     ++td->stack[ply].cutoffCnt;
-
-                    /* Fail high: the opponent would avoid this line. The move that cut is
-                     * credited in whichever table describes it, and everything tried before it
-                     * is blamed in both. */
                     update_stats(td, pos, m, quiets, quietCount, captures, captureCount, depth,
                                  ply);
-#ifdef MOVE_PICKER_PROFILE
-                    const int stage = inCheck                                 ? 6
-                                      : m == ttMove                           ? 0
-                                      : picker->stage == PICK_GOOD_TACTICALS  ? 1
-                                      : picker->stage == PICK_GENERATE_QUIETS ? 3
-                                      : picker->stage == PICK_QUIETS          ? 4
-                                      : picker->stage == PICK_BAD_TACTICALS   ? 5
-                                                                              : 2;
-                    ++td->moveProfile.cutoffs[stage];
-#endif
                     break;
                 }
             }
         }
     }
 
-    /* No legal move at all: mate if the king is attacked, stalemate if not, scored by ply so
-     * the engine prefers the faster mate. Unless a move was excluded, in which case "no
-     * moves" means the position has exactly one - the most singular a move can be - so
-     * return alpha and let the caller read a fail low and extend. */
+    /* Mate or stalemate - unless a move was excluded, in which case it was the only one, and
+     * returning alpha lets the caller extend it. */
     if (moveCount == 0) {
         if (isExcluded)
             return alpha;
@@ -2774,42 +2056,21 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
         return best;
     }
 
-    /*
-     * A proven loss caps this node however well the tree below it scored: the tables are
-     * right and the search is guessing. Applied before the entry is written, so nothing
-     * above can read back a score the tables have already ruled out. Every pruning shortcut
-     * between the probe and here is !pvNode-gated and the ceiling is only ever set at a PV
-     * node, so there is no path out of this function that skips it.
-     */
+    /* A proven loss caps the score, before it is stored. The ceiling is only set at PV nodes,
+     * and every early return between the probe and here is !pvNode-gated. */
     if (tbCeiling != VALUE_INFINITE)
         best = (Value)imin(best, tbCeiling);
 
-    /*
-     * A move that raised alpha without failing high proves an exact score, because every
-     * alternative was searched and none beat it. At a null-window node that cannot happen,
-     * so only PV nodes ever store an exact entry. `bestMove` is still stored on a fail low -
-     * it is a hint about what to try first next time, which costs nothing to be wrong about.
-     *
-     * Never from a singular verification: its move list was missing a move, so its score is
-     * not a fact about this position and must not be cached as one.
-     */
+    /* Never from a singular verification: its move list was missing a move. */
     if (!isExcluded) {
         const Bound bound = best >= beta ? BOUND_LOWER : raisedAlpha ? BOUND_EXACT : BOUND_UPPER;
         tt_store(key, bestMove, best, rawEval, depth, bound, ttPv, ply);
 
-        /* Compiled out entirely unless UNC_PROBE; see test/uncprobe.h. */
         unc_probe_node(td, pos, best, staticEval, bound, depth);
 
-        /*
-         * Learn from this node only where the search genuinely contradicted the static
-         * evaluation, on the static evaluation's own terms. In check there is nothing to be
-         * wrong about, and a proven score is a different kind of fact - the test must be
-         * is_decisive_score(), because a tablebase score would otherwise be fed in as an
-         * ~8,000,000cp "error" that saturates the entry on one observation.
-         *
-         * A tactical best move means the gap was material quiescence found rather than a
-         * standing bias, and a bound is evidence only in the direction it bounds.
-         */
+        /* Learn the eval's error only where it means something: not in check, not from a
+         * decisive score (a TB score would saturate the entry at once), not when a capture
+         * explains the gap, and from a bound only in the direction it bounds. */
         if (!inCheck && !is_decisive_score(best) &&
             (bestMove == MOVE_NONE || !is_tactical(pos, bestMove)) &&
             !(bound == BOUND_LOWER && best <= staticEval) &&
@@ -2849,8 +2110,7 @@ static int collect_root_moves(const Position *pos, ScoredMove *out) {
 
 static inline int root_effort_key(Move m) { return (int)from_sq(m) * SQUARE_NB + (int)to_sq(m); }
 
-/* Insertion sort by descending score. Stable, so equal-scoring moves keep their generation
- * order and the node count stays reproducible. */
+/* Stable, so ties keep generation order and the node count stays reproducible. */
 static void sort_root_moves(ScoredMove *roots, int count) {
     for (int i = 1; i < count; ++i) {
         const ScoredMove key = roots[i];
@@ -2863,16 +2123,12 @@ static void sort_root_moves(ScoredMove *roots, int count) {
     }
 }
 
-/* One iteration of the root search. Written out rather than folded into negamax because
- * the root is the only place that has to honour `searchmoves`, keep its move list alive
- * between iterations so it can be reordered, and score every move rather than cutting off.
- * Returns VALUE_NONE if the iteration was interrupted, in which case its partial result
- * must be discarded. */
+/* One root iteration over a move list kept between iterations. Returns VALUE_NONE if
+ * interrupted. */
 static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int count, Depth depth,
                          Value alpha, Value beta, Move *bestMove) {
     Value best = -VALUE_INFINITE;
 
-    /* The root is not a negamax node, so it clears its grandchildren's counters itself. */
     td->pvLength[0]        = 0;
     td->stack[2].cutoffCnt = 0;
 
@@ -2893,10 +2149,6 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
         if (i == 0) {
             v = -negamax(td, pos, depth - 1, -beta, -alpha, 1, false);
         } else {
-            /* As in negamax: the first root move establishes alpha with the full window, and
-             * every later one only has to answer whether it beats that. The ones that do -
-             * rare, once the list is sorted by the previous iteration - pay for a re-search,
-             * and the null-window expectation is that the child fails high on its own terms. */
             v = -negamax(td, pos, depth - 1, -alpha - 1, -alpha, 1, true);
             if (v > alpha && v < beta && !search_stopped())
                 v = -negamax(td, pos, depth - 1, -beta, -alpha, 1, false);
@@ -2920,8 +2172,7 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
             if (v > alpha)
                 alpha = v;
 
-            /* Beat the aspiration window: the caller has to widen and retry, so there is
-             * nothing to gain from searching the rest against a bound already known wrong. */
+            /* Failed high on the aspiration window: the caller widens and retries. */
             if (v >= beta)
                 break;
         }
@@ -2930,41 +2181,23 @@ static Value search_root(SearchThread *td, Position *pos, ScoredMove *roots, int
     return best;
 }
 
-/* Plies-to-mate converted to the signed move count UCI wants. */
 static int mate_in_moves(Value v) {
     return v > 0 ? (VALUE_MATE - v + 1) / 2 : -((VALUE_MATE + v + 1) / 2);
 }
 
-/*
- * What a proven tablebase result is reported as, in centipawns.
- *
- * The internal band sits directly below the mate scores, so printing one raw gives
- * `score cp 31753` - a number that means nothing to whoever is reading it and looks like
- * the engine has lost its mind. Two hundred pawns is clear of anything the evaluation
- * produces and clear of the mate band, which is what "won, no mate in sight yet" should
- * look like; it is the convention Stockfish reports tablebase scores in, so GUIs already
- * display it the way people expect.
- */
+/* TB wins are reported as 200 pawns minus the ply distance, Stockfish's convention, rather
+ * than the raw internal value just below the mate band. */
 enum { TB_REPORT_CP = 20000 };
 
-/* Keeping the ply offset the probe put on the score, so a conversion that is nearer still
- * reads as better than one further away. */
 static int tb_in_cp(Value v) {
     const int ply = VALUE_TB_WIN - (v > 0 ? v : -v);
     return v > 0 ? TB_REPORT_CP - ply : ply - TB_REPORT_CP;
 }
 
-/*
- * The line is assembled in full and written once. main.c makes stdout unbuffered and the
- * UCI thread answers `isready` while this worker searches, so a sequence of printf calls
- * lets another thread's output land in the middle: the GUI sees
- * `info depth 12 seldepth 18 readyok`, which is neither a parsable info line nor a
- * readyok. One fputs of a complete line cannot be split that way.
- */
+/* Built in full and written with one fputs: stdout is unbuffered and the UCI thread may
+ * print `readyok` at any moment, which would otherwise land mid-line. */
 static void print_iteration(const SearchThread *td, Depth depth, Value value, int64_t elapsed,
                             bool chess960) {
-    /* Cannot be outgrown: the fixed prefix is under 200 characters and the PV is at most
-     * MAX_PLY moves of five characters plus a space. */
     char line[256 + MAX_PLY * 6];
     char buf[8];
     size_t n = 0;
@@ -2979,12 +2212,8 @@ static void print_iteration(const SearchThread *td, Depth depth, Value value, in
     else
         n += (size_t)snprintf(line + n, sizeof(line) - n, "score cp %d ", value);
 
-    /* The whole pool's nodes, not this thread's share: a GUI showing one thread's nps on a
-     * 64-thread search is reporting a number that describes nothing. */
     const uint64_t nodes = nodes_including(td);
-
-    /* Clamped so a sub-millisecond iteration cannot divide by zero. */
-    const int64_t ms = elapsed > 0 ? elapsed : 1;
+    const int64_t ms     = elapsed > 0 ? elapsed : 1;
     n += (size_t)snprintf(line + n, sizeof(line) - n, "nodes %llu nps %llu time %lld hashfull %d",
                           (unsigned long long)nodes,
                           (unsigned long long)((nodes * 1000ULL) / (uint64_t)ms),
@@ -3007,21 +2236,8 @@ static void print_iteration(const SearchThread *td, Depth depth, Value value, in
     fflush(stdout);
 }
 
-/*
- * Which iterations a helper thread skips.
- *
- * Lazy SMP only pays when the threads are looking at DIFFERENT things: N threads
- * running the same iteration in lockstep mostly re-derive each other's cutoffs and the
- * speedup collapses towards one. Each helper takes a phase and a period out of these
- * tables and sits out the iterations that fall the wrong side of it, so at any moment
- * the pool is spread over several depths and the table is being filled from several
- * distances at once. The pattern repeats every 20 helpers, which is why it needs no
- * relation to the thread count.
- *
- * The tables are Stockfish's, from the years its search used this scheme; they are
- * kept because they are known to work, not because these particular numbers were
- * derived here.
- */
+/* Which iterations each helper skips, so the pool spreads over several depths instead of
+ * searching in lockstep. Stockfish's old tables; the pattern repeats every 20 helpers. */
 /* clang-format off */
 static const int SkipSize[]  = {1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4};
 static const int SkipPhase[] = {0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7};
@@ -3029,38 +2245,19 @@ static const int SkipPhase[] = {0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 
 
 #define SKIP_PATTERNS ((int)(sizeof(SkipSize) / sizeof(SkipSize[0])))
 
-/* One thread's iterative deepening over its own copy of the root. Thread 0 owns the
- * clock, the `info` lines and the aspiration schedule the engine is judged on; a helper
- * runs the same loop with the time management taken out and its own skip pattern in. */
+/* One thread's iterative deepening. Helpers run the same loop without time management and
+ * with a skip pattern. */
 static void thread_search(SearchThread *td) {
     Position *const pos = &td->rootPos;
     const bool isMain   = td->id == 0;
 
-    /*
-     * A block whose accumulator stack was never claimed, which is not the pooled case:
-     * thread_entry() claims one as each thread starts. It is the SYNCHRONOUS one - a
-     * process that only ever calls search_run_sync() never starts the pool, so
-     * thread_entry() never runs and this block reaches the search with es == NULL.
-     * tools/datagen.c is that process, and the evaluation then accumulates all 32 rows
-     * per perspective at every node instead of applying a two-row delta, which measured
-     * 200 labels/s against 368 (E38).
-     *
-     * Claimed here rather than in search_run_sync() so the inline fallback in
-     * search_start() - the path taken when no pooled thread could be created - is
-     * covered by the same line. A no-op for a pooled thread, whose es is already set,
-     * and still NULL-safe if the allocation fails.
-     */
+    /* Pooled threads claim this in thread_entry(); a synchronous search (datagen) or the
+     * inline fallback in search_start() arrives here without one. */
     if (!td->es)
         td->es = eval_state();
 
-    /*
-     * This thread's accumulator stack starts empty. It has to: a level keeps the key of
-     * the position it describes and reuses its accumulator when the key matches, so a
-     * level left over from the previous search would be reused verbatim if this search
-     * starts from the same position - which is exactly what happens when `setoption name
-     * EvalFile` swapped the net in between. One accumulation per search per thread is
-     * nothing; a whole search scored by the net that was replaced is a silent loss.
-     */
+    /* An accumulator keyed on the same position would otherwise be reused, even after
+     * `setoption name EvalFile` swapped the net. */
     eval_state_clear(td->es);
 
     td->bestMove       = MOVE_NONE;
@@ -3076,35 +2273,22 @@ static void thread_search(SearchThread *td) {
     ScoredMove roots[MAX_MOVES];
     int rootCount = collect_root_moves(pos, roots);
 
-    /* Checkmate, stalemate, or a `searchmoves` list with nothing legal in it. MOVE_NONE
-     * prints as `bestmove 0000`, which is what GUIs expect. */
+    /* Mate, stalemate, or no legal `searchmoves`: `bestmove 0000`. */
     if (rootCount == 0)
         return;
 
     Value tbRootValue = VALUE_NONE;
 
-    /*
-     * Syzygy at the root, which settles the move and the score together. WDL alone cannot
-     * convert, because every winning move scores the same and a search free to choose among
-     * them can shuffle until the fifty-move rule takes the win away; DTZ names one that
-     * provably makes progress, and the root list is cut down to it so the PV, the info lines
-     * and time management all still work.
-     *
-     * The score matters too: interior nodes only probe at halfmoveClock == 0, so the children
-     * of a five-man root are searched heuristically and the tree would hand back an
-     * evaluation. That is the difference between a labelled KNP-vs-KP position scoring 0 and
-     * scoring +3.
-     */
+    /* Syzygy at the root. DTZ picks a move that makes progress (WDL alone can shuffle until
+     * the fifty-move rule takes the win), and the root list is cut to it so the PV and time
+     * management still work. The score is reported too, since interior nodes only probe
+     * right after a capture or pawn move. */
     if (TbLimit != 0 && Limits.searchmovesCount == 0) {
         const SyzygyRoot tb = syzygy_probe_root(pos);
         if (tb.value != VALUE_NONE) {
             ++td->tbHits;
             tbRootValue = tb.value;
 
-            /* The one thing a centipawn score cannot carry: how far the win is from a
-             * capture or a pawn move, and - when a won position scores as a draw anyway -
-             * why. Printed once, because the root probe cannot change under the search,
-             * and only by the thread that owns the output. */
             if (isMain && !Silent)
                 printf("info string syzygy: %s at the root (dtz %d)\n",
                        tb.value > VALUE_DRAW   ? "win"
@@ -3124,28 +2308,22 @@ static void thread_search(SearchThread *td) {
         }
     }
 
-    /* Something legal to play from the first moment, so a `stop` that arrives before any
-     * iteration completes still produces a move rather than `bestmove 0000`. */
+    /* A legal move from the start, in case `stop` arrives before the first iteration ends. */
     td->bestMove = roots[0].m;
 
     const Depth maxDepth = Limits.depth > 0 && Limits.depth < MAX_PLY ? Limits.depth : MAX_PLY - 1;
 
     Value prevScore = VALUE_NONE;
 
-    /* Consecutive completed iterations that agreed on the best move, feeding the time
-     * manager. Tracked against its own previous value rather than against the best move,
-     * which starts out holding an unsearched move. */
+    /* Completed iterations in a row that agreed on the best move, for time management. */
     int stability = 0;
     Move prevBest = MOVE_NONE;
 
-    /* Consecutive completed iterations returning the SAME mate score, which is a different
-     * question from agreeing on the move: two iterations can agree on the move while the
-     * distance behind it is still moving. */
+    /* Completed iterations in a row with the same mate score. */
     int mateStreak      = 0;
     Value prevMateScore = VALUE_NONE;
 
-    /* The helper's seat in the skip tables. Offset by the root's ply so two searches from
-     * different positions in the same game do not hand every thread the same schedule. */
+    /* Skips are offset by the game ply so successive searches vary each helper's schedule. */
     const int pattern = isMain ? -1 : (td->id - 1) % SKIP_PATTERNS;
 
     for (Depth depth = 1; depth <= maxDepth; ++depth) {
@@ -3161,9 +2339,7 @@ static void thread_search(SearchThread *td) {
         Value beta  = VALUE_INFINITE;
         Value delta = ASPIRATION_DELTA;
 
-        /* Aspiration windows: the score at depth N is nearly always close to the score at
-         * N-1, so a narrow window produces far more cutoffs, at the price of a re-search
-         * whenever the score moves outside it. Widening geometrically bounds that price. */
+        /* Aspiration windows, widened geometrically on each fail. */
         if (depth >= ASPIRATION_MIN_DEPTH && prevScore != VALUE_NONE && !is_mate_score(prevScore)) {
             alpha = prevScore - delta > -VALUE_INFINITE ? prevScore - delta : -VALUE_INFINITE;
             beta  = prevScore + delta < VALUE_INFINITE ? prevScore + delta : VALUE_INFINITE;
@@ -3188,8 +2364,7 @@ static void thread_search(SearchThread *td) {
             delta += delta / 3;
         }
 
-        /* An interrupted iteration searched some moves under a window the others never saw,
-         * so its ordering is meaningless: keep the last completed iteration's move. */
+        /* An interrupted iteration is discarded; the last completed one stands. */
         if (search_stopped())
             break;
 
@@ -3199,15 +2374,8 @@ static void thread_search(SearchThread *td) {
         mateStreak = (prevMateScore != VALUE_NONE && value == prevMateScore) ? mateStreak + 1 : 0;
         prevMateScore = value >= VALUE_MATE_IN_MAX_PLY ? value : VALUE_NONE;
 
-        /* A proven result outranks the tree's opinion of it. `prevScore` keeps the tree's own
-         * number so the next aspiration window is centred on something the tree can return,
-         * while everything outward-facing reports the proof.
-         *
-         * A mate the tree has actually found is the exception, because it is the stronger
-         * proof of the two: it names the distance, where the tablebase value only says
-         * "won". The search knows the fifty-move rule, so a mate it returns is one that
-         * really arrives before the counter does. Without this a mate in one under a
-         * five-man root reports as "won by tablebase". */
+        /* Report the root TB result unless the search found a mate, which also gives the
+         * distance. prevScore keeps the tree's value to centre the next window on. */
         const Value reported =
             tbRootValue != VALUE_NONE && !is_mate_score(value) ? tbRootValue : value;
 
@@ -3219,9 +2387,7 @@ static void thread_search(SearchThread *td) {
         td->rootPvLength = td->pvLength[0];
         memcpy(td->rootPv, td->pvTable[0], (size_t)td->rootPvLength * sizeof(Move));
 
-        /* Cleared, not left alone, when this iteration has no second PV move: the stale entry
-         * belongs to a line the search has abandoned, and pondering on a move that no longer
-         * follows `best` wastes the ponder search and desynchronises the GUI on ponderhit. */
+        /* Cleared when the PV is one move long: a stale ponder move may not follow `best`. */
         td->ponderMove = td->rootPvLength > 1 ? td->rootPv[1] : MOVE_NONE;
 
         if (isMain && !Silent)
@@ -3234,34 +2400,17 @@ static void thread_search(SearchThread *td) {
         if (Limits.mate && is_mate_score(value) && value > 0 && mate_in_moves(value) <= Limits.mate)
             break;
 
-        /*
-         * A proven mate the search can no longer improve on. Spending the rest of the clock
-         * re-proving it buys nothing - the move is already chosen, and the only better answer
-         * is a SHORTER mate, which is precisely what the two conditions above rule out.
-         *
-         * This is deliberately not "stop as soon as a mate appears": the first sighting is
-         * the least trustworthy number in the whole search, and the distance usually keeps
-         * falling for several iterations after it. Left unguarded the engine announces a mate
-         * in one and then drives the iteration counter to 245 re-proving it, which is where
-         * this came from.
-         *
-         * Only with a clock to save. `go depth`, `go nodes`, `go infinite` and bench were
-         * asked for an amount of work and get exactly it - bench's node counts are
-         * reproducible only because nothing abbreviates them.
-         */
+        /* Stop on a mate that has held for several iterations at a depth well past its
+         * distance; the first sighting is often not the shortest. Only with a clock: fixed
+         * depth, nodes and bench always do their full amount of work. */
         if (timeman_has_clock(&Timer) && !atomic_load(&Pondering) &&
             value >= VALUE_MATE_IN_MAX_PLY &&
             depth >= (Depth)(VALUE_MATE - value) + MATE_CONFIRM_MARGIN &&
             mateStreak >= MATE_CONFIRM_ITERS)
             break;
 
-        /* Do not begin an iteration there is no realistic chance of finishing: each costs
-         * several times the last, so starting one at 90% of the budget burns the remainder
-         * and throws the result away.
-         *
-         * How much of the tree went into the move about to be played says how settled the
-         * choice is in a way stability cannot: a move that has survived five iterations
-         * while its rivals soaked up half the nodes is being chased, not confirmed. */
+        /* Soft time limit, scaled by best-move stability and by the best move's share of
+         * the nodes. */
         if (!Limits.infinite && !atomic_load(&Pondering)) {
             const uint64_t effort = td->rootEffort[root_effort_key(iterationBest)];
             const int permille    = td->nodeCount ? (int)(effort * 1000 / td->nodeCount) : 1000;
@@ -3275,19 +2424,7 @@ static void thread_search(SearchThread *td) {
     atomic_store(&td->publishedTbHits, td->tbHits);
 }
 
-/*
- * Whose move gets played.
- *
- * Deeper first, and on a tie the better score. Depth first because a thread that
- * completed depth 20 examined everything the depth-18 thread did and more; score second
- * because at equal depth the threads searched the same tree with different move orders,
- * and the one that found more was looking in a better place. A thread that never
- * completed an iteration has nothing to offer and is skipped outright.
- *
- * Stockfish weighs votes across threads instead, which is a real and different rule -
- * it protects against one thread's single deep fluke - and swapping this for it is a
- * change with its own SPRT, not a refactor.
- */
+/* The thread whose move is played: deepest completed iteration, then best score. */
 static SearchThread *best_thread(void) {
     SearchThread *best = Threads[0];
 
@@ -3306,16 +2443,12 @@ static SearchThread *best_thread(void) {
     return best;
 }
 
-/* Everything a thread must forget between searches: a stale excluded move or grandparent
- * evaluation left here by the previous search would make this one depend on it. */
+/* Per-search state; anything left from the previous search would leak into this one. */
 static void thread_prepare(SearchThread *td) {
     td->rootPos   = RootPos;
     td->nodeCount = 0;
     td->tbHits    = 0;
     td->selDepth  = 0;
-#ifdef MOVE_PICKER_PROFILE
-    memset(&td->moveProfile, 0, sizeof(td->moveProfile));
-#endif
 
     atomic_store(&td->publishedNodes, 0);
     atomic_store(&td->publishedTbHits, 0);
@@ -3323,20 +2456,10 @@ static void thread_prepare(SearchThread *td) {
     memset(td->stack, 0, sizeof(td->stack));
 }
 
-/*
- * Thread 0's work once its own iterations are done: hold if UCI says it must, stop the
- * helpers, wait for them, and announce the result.
- *
- * The order is load-bearing. StopFlag is what ends a helper's search, and it is also
- * what the hold below is waiting for, so setting it early would end the hold as well and
- * send `bestmove` during a `go infinite` - which UCI forbids and which GUIs report as a
- * lost game rather than as a protocol error.
- */
+/* Thread 0, after its iterations: hold, stop the helpers, wait, and report. The order
+ * matters - setting StopFlag early would also end the hold. */
 static void finish_search(void) {
-    /* UCI forbids sending `bestmove` during a ponder or an infinite search: the GUI owns that
-     * decision and will send `stop` or `ponderhit` first. Replying early desynchronises the
-     * GUI and shows up as spurious losses. The helpers keep searching throughout, which is
-     * the only useful thing anyone can do with the time. */
+    /* UCI forbids `bestmove` during ponder or infinite until the GUI sends stop/ponderhit. */
     while (!atomic_load(&StopFlag) && (atomic_load(&Pondering) || Limits.infinite))
         thread_sleep_ms(1);
 
@@ -3357,34 +2480,7 @@ static void finish_search(void) {
 
     const SearchThread *const best = best_thread();
 
-#ifdef MOVE_PICKER_PROFILE
-    /* Helpers are parked before their counters are read. Per-position lines
-     * keep bench's final OpenBench line untouched and can be summed offline. */
-    static const char *const bands[] = {"tactical", "quiet", "evasion", "qsearch", "probcut"};
-    for (int t = 0; t < ThreadCount; ++t) {
-        const MoveProfile *p = &Threads[t]->moveProfile;
-        printf("info string movepick nodes=%llu picked=%llu legal=%llu searched=%llu "
-               "orderingSEE=%llu pruningSEE=%llu\n",
-               (unsigned long long)p->mainNodes, (unsigned long long)p->mainPicked,
-               (unsigned long long)p->mainLegal, (unsigned long long)p->mainSearched,
-               (unsigned long long)p->orderingSee, (unsigned long long)p->pruningSee);
-        for (int i = 0; i < 5; ++i)
-            printf("info string movepick %s calls=%llu generated=%llu scored=%llu\n", bands[i],
-                   (unsigned long long)p->genCalls[i], (unsigned long long)p->generated[i],
-                   (unsigned long long)p->scored[i]);
-        printf("info string movepick cuts tt=%llu good=%llu killer=%llu counter=%llu "
-               "quiet=%llu bad=%llu evasion=%llu\n",
-               (unsigned long long)p->cutoffs[0], (unsigned long long)p->cutoffs[1],
-               (unsigned long long)p->cutoffs[2], (unsigned long long)p->cutoffs[3],
-               (unsigned long long)p->cutoffs[4], (unsigned long long)p->cutoffs[5],
-               (unsigned long long)p->cutoffs[6]);
-    }
-#endif
-
-    /* A GUI's last `info` line is where its evaluation display comes from, and it has
-     * been thread 0's all search. When somebody else's iteration wins, saying so is the
-     * difference between a coherent report and a PV that does not start with the move
-     * the engine just played. */
+    /* Re-report when a helper's result wins, so the last PV starts with the move played. */
     if (best->id != 0 && best->completedDepth > 0 && !Silent)
         print_iteration(best, best->completedDepth, best->rootScore, elapsed_ms(),
                         RootPos.chess960);
@@ -3393,16 +2489,12 @@ static void finish_search(void) {
     uci_print_bestmove(best->bestMove, best->ponderMove);
 }
 
-/* A pooled thread's whole life: park, search, park again. Created once when `Threads`
- * is set and joined only when it changes or the engine exits. */
+/* A pooled thread: park, search, park again, until `Threads` changes or the engine exits. */
 static void thread_entry(void *arg) {
     SearchThread *const td = (SearchThread *)arg;
 
     thread_bind(td->id, ThreadCount);
 
-    /* Without one the evaluation is still correct and several times slower, so it is
-     * worth saying which thread is running that way rather than leaving an unexplained
-     * collapse in nps. */
     td->es = eval_state();
     if (!td->es)
         printf("info string thread %d: no accumulator stack; its evaluation will be slow\n",
@@ -3426,11 +2518,8 @@ static void thread_entry(void *arg) {
         if (td->id == 0)
             finish_search();
 
-        /* Cleared here and SET by whoever started the search, which is the whole
-         * handshake: a thread that marked itself busy on waking would leave a window
-         * in which the starter has already returned and a waiter sees an idle pool
-         * that has not begun. That window is not theoretical - it makes `bench` read
-         * a node count of zero and start the next position on top of this one. */
+        /* Cleared here but set by the starter: if a thread set it on waking, a waiter could
+         * see an idle pool that has not begun (bench would read zero nodes). */
         mutex_lock(&ThreadMutex);
         td->searching = false;
         cond_broadcast(&ThreadCv);
@@ -3440,8 +2529,7 @@ static void thread_entry(void *arg) {
     eval_state_free();
 }
 
-/* Blocks until no pooled thread is searching. `bestmove` is printed by thread 0 before
- * it clears its own flag, so a caller that returns from here has seen it. */
+/* Returns once no thread is searching, and so after `bestmove` has been printed. */
 static void pool_wait(void) {
     if (!PoolReady)
         return;
@@ -3481,15 +2569,8 @@ static void pool_destroy(void) {
     ThreadCount = 0;
 }
 
-/*
- * Allocates the pool's blocks. Every one is about 8 MB, so this is where a `Threads`
- * setting is paid for - once, rather than on every `go`, which is the whole reason the
- * threads are parked between searches instead of created per search.
- *
- * A block that cannot be allocated ends the pool where it is: the engine runs with fewer
- * threads than asked rather than failing to start a search. It never ends with none,
- * because thread 0's block is the one a synchronous search runs in too.
- */
+/* Allocates the per-thread blocks but starts no threads. A failed allocation leaves a
+ * smaller pool rather than none. */
 static void thread_pool_set(int count) {
     pool_destroy();
 
@@ -3519,15 +2600,9 @@ static void thread_pool_set(int count) {
     }
 }
 
-/*
- * Starts whatever is not running yet, and answers whether anything is.
- *
- * Separate from the allocation above, and that separation is the whole point: a process
- * that only ever runs SYNCHRONOUS searches then never gains a second thread at all.
- * tools/datagen.c is that process, and it forks - and fork() in a multithreaded program
- * is a far narrower contract than in a single-threaded one, for a thread it was never
- * going to use.
- */
+/* Starts any threads not yet running; returns whether thread 0 is. Kept separate from
+ * allocation so a process that only searches synchronously (datagen, which forks) never
+ * creates a thread. */
 static bool pool_start(void) {
     for (int i = 0; i < ThreadCount; ++i) {
         SearchThread *const td = Threads[i];
@@ -3538,10 +2613,8 @@ static bool pool_start(void) {
         if (td->started)
             continue;
 
-        /* Everything above this index is unstarted too, since they are started in order,
-         * so the pool becomes what did start. Thread 0's BLOCK is kept whether or not its
-         * thread was: it is where an inline search runs, and where a synchronous one
-         * always runs. */
+        /* Shrink to what started. Thread 0's block is kept regardless: inline and synchronous
+         * searches run in it. */
         const int kept = i > 0 ? i : 1;
         printf("info string could not start thread %d; using %d\n", i, kept);
 
@@ -3567,8 +2640,7 @@ void search_set_threads(int count) {
 
     thread_pool_set(count);
 
-    /* Started here rather than at the first `go`: a GUI that asks for 128 threads should
-     * pay for them where it asked, not in the middle of the first move's clock. */
+    /* Started now, not on the first move's clock. */
     pool_start();
     search_clear();
 }
@@ -3587,27 +2659,19 @@ void search_exit(void) {
     }
 }
 
-/* Common to both entry points: everything that must be true before the threads run. */
+/* Everything that must be set before any thread runs. */
 static void search_setup(const Position *pos, const SearchLimits *limits, bool silent) {
     RootPos = *pos;
     Limits  = *limits;
     Silent  = silent;
 
-    /* Read once here rather than per node, and once for the whole pool: a `SyzygyPath`
-     * that changed mid-search would otherwise mean two threads disagreeing about how many
-     * pieces a probe is legal at. */
     TbLimit = syzygy_max_pieces();
 
     atomic_store(&StopFlag, false);
     atomic_store(&ClockOrigin, limits->startTime);
     atomic_store(&Searching, true);
 
-    /* Here rather than inside thread 0's iterations, which is where it used to be: the
-     * helpers are woken at the same moment thread 0 is, so a bump made from inside the
-     * search is a bump made while the rest of the pool is already storing. Those entries
-     * get stamped with the previous generation and are born one search stale, which puts
-     * the helpers' contribution - the entire point of Lazy SMP - first in line for
-     * replacement. Nothing is running yet at this point in the setup. */
+    /* Before any thread runs, or the helpers' first entries are stamped one search stale. */
     tt_new_search();
 
     for (int i = 0; i < ThreadCount; ++i)
@@ -3615,17 +2679,11 @@ static void search_setup(const Position *pos, const SearchLimits *limits, bool s
 }
 
 void search_start(const Position *pos, const SearchLimits *limits) {
-    /* Only one search at a time, so the previous one has to be finished - but waiting is not
-     * enough on its own. A `go infinite` search parks until StopFlag is set, so a bare wait
-     * would block the UCI thread inside `go` while the `stop` that would release it can only
-     * arrive on that same thread. Asking it to stop first makes the wait bounded. */
+    /* Stop before waiting: a `go infinite` search would otherwise never finish. */
     search_stop();
     search_wait();
 
     if (ThreadCount == 0) {
-        /* Not one block could be allocated, so there is nowhere to search. Answering the
-         * protocol is all that is left - a GUI that gets no `bestmove` at all hangs until
-         * it times the engine out, which hides the reason. */
         printf("info string no search thread could be allocated; cannot search\n");
         atomic_store(&Searching, false);
         uci_print_bestmove(MOVE_NONE, MOVE_NONE);
@@ -3635,9 +2693,6 @@ void search_start(const Position *pos, const SearchLimits *limits) {
     search_setup(pos, limits, false);
     atomic_store(&Pondering, limits->ponder);
 
-    /* The first `go` of a session is where the default pool is actually created. One
-     * thread costs tens of microseconds; a pool the GUI asked for was started when it
-     * asked. */
     const bool released = pool_start();
 
     mutex_lock(&ThreadMutex);
@@ -3651,10 +2706,8 @@ void search_start(const Position *pos, const SearchLimits *limits) {
     mutex_unlock(&ThreadMutex);
 
     if (!released) {
-        /* No pooled thread to run it, so the UCI thread searches inline. It still produces a
-         * legal game - it just cannot be interrupted - which beats not moving at all. The
-         * ponder/infinite hold has to be dropped with it: that loop waits for a `stop` only
-         * the UCI thread can deliver, and the UCI thread is the one about to search. */
+        /* No thread could start: search inline on the UCI thread, uninterruptibly. The
+         * ponder/infinite hold is dropped, since only this thread could end it. */
         Limits.infinite = false;
         atomic_store(&Pondering, false);
 
@@ -3666,7 +2719,6 @@ void search_start(const Position *pos, const SearchLimits *limits) {
 }
 
 void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResult *out) {
-    /* Same bounded-wait reasoning as search_start(). */
     search_stop();
     search_wait();
 
@@ -3681,17 +2733,11 @@ void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResu
 
     search_setup(pos, limits, true);
 
-    /* A synchronous ponder search would wait for a `stop` that no one is around to send, so
-     * the flag is dropped rather than honoured. */
+    /* Nobody could send the `stop` a synchronous ponder search would wait for. */
     atomic_store(&Pondering, false);
 
-    /*
-     * One thread, on the caller's own stack, whatever `Threads` says. Everything that calls
-     * this - datagen above all - wants a search that is a function of its position, its seed
-     * and its node limit and of nothing else, and a parallel search is not: the pool reaches
-     * the shared table in an order the operating system chooses, so the same position would
-     * label differently on two runs of the same shard.
-     */
+    /* One thread on the caller's stack, whatever `Threads` says: a parallel search is not
+     * reproducible, and datagen labels must be. */
     SearchThread *const td = Threads[0];
     thread_search(td);
 
@@ -3707,15 +2753,9 @@ void search_run_sync(const Position *pos, const SearchLimits *limits, SearchResu
 void search_stop(void) { atomic_store(&StopFlag, true); }
 
 void search_ponderhit(void) {
-    /* Only a pondering search may have its clock restarted. Without this guard a stray
-     * `ponderhit` during an ordinary timed search resets the origin every elapsed-time test
-     * is measured against, handing the search a second full budget. */
+    /* A stray ponderhit during a timed search must not restart its clock. */
     if (!atomic_load(&Pondering))
         return;
-
-    /* The opponent played our predicted move, so the ponder search becomes a real one and the
-     * clock is now ours. Only the origin moves - the budget was derived from the clock the
-     * GUI reported, which has not changed. */
 
     atomic_store(&ClockOrigin, time_ms());
     atomic_store(&Pondering, false);

@@ -166,7 +166,10 @@ correct response is to implement movegen, not to relax the check.
 
 - C17, 4-space indent, 100-column limit, enforced by `.clang-format`.
   Run `make format` before committing.
-- Comments explain **why**, not what. Prefer one good comment on a non-obvious
+- Comments explain **why**, not what, and are short - usually one or two lines.
+  Keep the constraint a reader must not break; drop the story of how it was found.
+  Experiment history, Elo figures and measurements belong in docs/EXPERIMENTS.md;
+  code cites the E-number at most. Prefer one good comment on a non-obvious
   decision over narrating obvious code.
 - Mark unfinished work `TODO(engine):` with enough context to act on.
 - Keep `src/` flat — it matches how strong engines are organised. The one

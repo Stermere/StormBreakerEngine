@@ -1,12 +1,7 @@
 /* thread.c - Win32 / pthreads implementations of the thread.h shim. */
 
-/*
- * -std=c17 sets __STRICT_ANSI__, which glibc reads as "ISO C and nothing else" and
- * so hides every POSIX declaration below; the request has to come before the first
- * header, because feature test macros are consulted only once. Darwin is excluded
- * deliberately - there _POSIX_C_SOURCE subtracts from the default visibility, and
- * would take the BSD-only _SC_NPROCESSORS_ONLN with it.
- */
+/* -std=c17 hides POSIX declarations from glibc; this must precede every header. Not on
+ * Darwin, where it would hide _SC_NPROCESSORS_ONLN. */
 #if !defined(_WIN32) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -16,15 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * Each search frame carries a MAX_MOVES move list, and `-fstack-usage` puts negamax at
- * about 5 KB and qsearch at 4.3 KB. Singular verification re-enters negamax at the same
- * ply, so a line running to MAX_PLY reserves on the order of two to five megabytes -
- * more under a sanitizer. Reserved address space is committed only as it is touched, so
- * asking for eight costs nothing and the default (1 MB on Win32, 2 MB from MinGW's PE
- * header) does not cover it. The Makefile passes the same number to the linker for the
- * main thread, which runs the search in tools/datagen.c and in search_start()'s fallback.
- */
+/* A line to MAX_PLY, with singular re-entries, needs several MB of stack; the platform
+ * defaults are 1-2 MB. Reserved, not committed. The Makefile gives the main thread the
+ * same, since synchronous searches run on it. */
 #define THREAD_STACK_BYTES (8u * 1024u * 1024u)
 
 #if defined(_WIN32)
@@ -34,8 +23,7 @@ typedef struct {
     void *arg;
 } ThreadStart;
 
-/* Win32 entry points must return DWORD and use the stdcall ABI, so the caller's
- * void(void*) is smuggled through this trampoline. */
+/* Adapts void(void*) to Win32's DWORD WINAPI signature. */
 static DWORD WINAPI thread_trampoline(LPVOID param) {
     ThreadStart *start = (ThreadStart *)param;
     ThreadEntry fn     = start->fn;
@@ -66,22 +54,14 @@ void thread_join(ThreadHandle handle) {
     CloseHandle(handle);
 }
 
-/*
- * Every processor group, not the one this process happens to be in. GetSystemInfo
- * reports the CURRENT group only, so on a two-group 128-core machine it answers 64
- * and the engine would size itself to half the box.
- */
+/* All processor groups; GetSystemInfo counts only the current one. */
 int thread_hardware_concurrency(void) {
     const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n > 0 ? (int)n : 1;
 }
 
-/*
- * The processor groups and their real affinity masks. Read from the OS rather than
- * synthesised as the low `count` bits of a word: a group's active processors need
- * not be contiguous once any of them is parked or offline, and a mask naming a
- * processor that is not there is rejected outright, leaving the thread where it was.
- */
+/* Processor groups with their real masks, read from the OS: active processors need not
+ * be contiguous, and a mask naming an absent one is rejected. */
 #define MAX_GROUPS 64
 
 typedef struct {
@@ -94,17 +74,8 @@ static int GroupCount;
 static int GroupCpuTotal;
 static INIT_ONCE GroupsOnce = INIT_ONCE_STATIC_INIT;
 
-/*
- * The physical cores, in the order the OS reports them - which is group by group, so
- * indexing this fills a group before moving to the next one, the same policy the group
- * binding below follows.
- *
- * `mask` is the logical processors that share this core. On a machine with SMT there are
- * two, and they share everything that matters to a search: the level 1 and 2 caches, and
- * the execution units the evaluation's vector work is bound by.
- */
-/* 64 groups of 64 logical processors is the most Windows addresses, so this covers
- * every core on the largest machine that can exist even without SMT. */
+/* Physical cores in OS order (group by group); `mask` is the core's logical processors.
+ * 4096 = the 64 x 64 logical processors Windows can address. */
 #define MAX_CORES 4096
 
 typedef struct {
@@ -128,8 +99,7 @@ static void probe_cores(void) {
         return;
 
     if (GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
-        /* One variable-sized record per core, walked by its own Size field - unlike the
-         * RelationGroup query above, which answers with a single record. */
+        /* Variable-sized records, one per core. */
         const char *const end = (const char *)info + len;
 
         const char *at = (const char *)info;
@@ -146,9 +116,7 @@ static void probe_cores(void) {
             at += e->Size;
         }
 
-        /* If the list did not fit, CoreCount is a lie: it would read as a small machine
-         * and strand the pool on the cores that happened to fit. Disable core binding and
-         * let the group binding below place these threads. */
+        /* A truncated list would strand the pool on the cores that fit: no core binding. */
         if (at < end)
             CoreCount = 0;
     }
@@ -159,7 +127,6 @@ static void probe_cores(void) {
 static void probe_groups(void) {
     DWORD len = 0;
 
-    /* Asks for the size first: the record is variably sized, one entry per group. */
     if (GetLogicalProcessorInformationEx(RelationGroup, NULL, &len) ||
         GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return;
@@ -183,9 +150,7 @@ static void probe_groups(void) {
     free(info);
 }
 
-/* Threads are bound as they start, so several can reach this at once and the
- * accumulation in probe_groups() is not something two of them may do at the same
- * time. InitOnceExecuteOnce rather than a flag: a flag IS the race. */
+/* Threads bind as they start, concurrently, so the probe runs exactly once. */
 static BOOL CALLBACK probe_groups_once(PINIT_ONCE once, PVOID param, PVOID *context) {
     (void)once;
     (void)param;
@@ -196,23 +161,10 @@ static BOOL CALLBACK probe_groups_once(PINIT_ONCE once, PVOID param, PVOID *cont
     return TRUE;
 }
 
-/*
- * Give this thread a physical core of its own.
- *
- * Left to itself the scheduler will seat two search threads on the two halves of one
- * physical core while another core sits idle, and eight threads on eight cores measured
- * 9% slower when it does: the pair share a level 1 cache and the vector units the
- * network runs on, so the second thread is not getting a core, it is getting a share of
- * one.
- *
- * SetThreadIdealProcessorEx is asked first and is not enough on its own - it is accepted,
- * reports success, and changes the placement by 0.1%, which is to say not at all. The
- * affinity below is what actually moves the threads apart; the hint is kept because it
- * tells the scheduler which half of the core to prefer, which the mask does not say.
- *
- * `index / CoreCount` is which sibling: every core gets a thread before any core gets a
- * second one, which is the order that matters on a pool the size of the machine.
- */
+/* Gives this thread a physical core of its own: the scheduler otherwise pairs threads on
+ * SMT siblings while cores sit idle (9% slower at 8 threads on 8 cores). The ideal-
+ * processor hint alone changes nothing; the affinity mask does. Every core gets a thread
+ * before any gets a second. */
 static bool bind_to_core(int index) {
     if (CoreCount <= 0)
         return false;
@@ -239,16 +191,9 @@ static bool bind_to_core(int index) {
             pn.Group  = core->group;
             pn.Number = (BYTE)i;
 
-            /* Survivable either way: a refused hint leaves the thread exactly where the
-             * scheduler would have put it anyway. */
             SetThreadIdealProcessorEx(GetCurrentThread(), &pn, NULL);
 
-            /*
-             * The mask is the whole physical core rather than the one logical processor
-             * named above, which costs nothing - no two threads are given the same core
-             * until every core has one - and leaves the pair free for the thread to move
-             * between, so a processor busy with device interrupts does not stall it.
-             */
+            /* The whole core, so the thread can dodge a sibling busy with interrupts. */
             GROUP_AFFINITY ga;
             memset(&ga, 0, sizeof(ga));
             ga.Group = core->group;
@@ -264,31 +209,16 @@ static bool bind_to_core(int index) {
 void thread_bind(int index, int poolSize) {
     InitOnceExecuteOnce(&GroupsOnce, probe_groups_once, NULL, NULL);
 
-    /*
-     * Only once the pool is at least as large as the machine.
-     *
-     * Below that there are cores to spare, and the scheduler spreading threads over all
-     * of them, with the idle ones' thermal headroom - beats confining them to
-     * the first few: a pool of four on eight cores measured 6% SLOWER bound than free,
-     * and a pool of one is the whole engine on one thread (bench, datagen, one SPRT
-     * game) with nothing to be separated from in any case.
-     *
-     * At or above the core count binding leaves no core idle, which is also what makes
-     * it safe when the engine does not own the machine: index % CoreCount spreads every
-     * instance across all the cores evenly, so two engines running at once oversubscribe
-     * the way the scheduler would have anyway rather than piling onto the first core.
-     */
+    /* Core binding only once the pool fills the machine: a smaller pool runs faster left to
+     * the scheduler (4 threads on 8 cores, 6% slower bound). */
     if (CoreCount > 0 && poolSize >= CoreCount && bind_to_core(index))
-        return; /* That mask already names a group; the one below would only widen it. */
+        return;
 
-    /* One group is the ordinary case, and there the default affinity already covers
-     * the whole machine - a mask could only take choices away from the scheduler. */
+    /* With one group the default affinity already covers the machine. */
     if (GroupCount <= 1 || GroupCpuTotal <= 0)
         return;
 
-    /* Fill each group in turn rather than interleaving: threads that share a group
-     * share a NUMA node on every machine that has more than one group, and the
-     * transposition table traffic between them is the whole cost of Lazy SMP. */
+    /* Fill groups in turn: a group is a NUMA node, and TT traffic is Lazy SMP's cost. */
     int slot = index % GroupCpuTotal;
     for (int g = 0; g < GroupCount; ++g) {
         if (slot < Groups[g].cpus) {
@@ -297,8 +227,6 @@ void thread_bind(int index, int poolSize) {
             affinity.Group = (WORD)g;
             affinity.Mask  = Groups[g].mask;
 
-            /* Failure is survivable - the thread keeps the affinity it had, which is
-             * every processor in its own group - so nothing is reported here. */
             SetThreadGroupAffinity(GetCurrentThread(), &affinity, NULL);
             return;
         }
@@ -367,16 +295,13 @@ int thread_hardware_concurrency(void) {
     return n > 0 ? (int)n : 1;
 }
 
-/* Nothing to do: there is no equivalent of a processor group, so a thread can
- * already be scheduled anywhere, and pinning it would only stop the kernel moving
- * it off a core somebody else is using. */
+/* No processor groups here, and pinning would only constrain the kernel. */
 void thread_bind(int index, int poolSize) {
     (void)index;
     (void)poolSize;
 }
 
-/* nanosleep() rather than usleep(): POSIX.1-2008 removed the latter, so asking for
- * that level at the top of this file is precisely what makes it unavailable. */
+/* nanosleep: POSIX.1-2008, requested above, removed usleep. */
 void thread_sleep_ms(int ms) {
     struct timespec ts;
     ts.tv_sec  = ms / 1000;

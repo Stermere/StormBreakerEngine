@@ -1,3 +1,4 @@
+/* board.c - position setup, FEN I/O, hashing and move making. */
 #include "board.h"
 
 #include <assert.h>
@@ -8,8 +9,6 @@
 #include "bitboard.h"
 #include "movegen.h"
 #include "zobrist.h"
-
-/* board.c - position setup, FEN I/O, hashing and move making. */
 
 static const char PieceChars[PIECE_NB] = {
     [W_PAWN] = 'P',   [W_KNIGHT] = 'N', [W_BISHOP] = 'B', [W_ROOK] = 'R',
@@ -34,14 +33,11 @@ static Piece piece_from_char(char c) {
     }
 }
 
-/* A piece's contribution to the pawn key: its own Zobrist key if it is a pawn, zero
- * otherwise. Branch-free on purpose - the three mutators are the hottest code in
- * make/unmake, and ZobristPiece[pc][s] is a line do_move is about to read anyway. */
+/* A piece's share of the pawn and non-pawn keys, branch-free for the hot mutators. */
 static inline Key pawn_key_term(Piece pc, Square s) {
     return ZobristPiece[pc][s] & ZobristPawnSelect[pc];
 }
 
-/* The complement, for the moving piece's own colour: branch-free for the same reason. */
 static inline Key non_pawn_key_term(Piece pc, Square s) {
     return ZobristPiece[pc][s] & ~ZobristPawnSelect[pc];
 }
@@ -79,9 +75,8 @@ void board_move_piece(Position *pos, Square from, Square to) {
     pos->nonPawnKey[color_of(pc)] ^= non_pawn_key_term(pc, from) ^ non_pawn_key_term(pc, to);
 }
 
-/* The ep file belongs in the hash only when the right can be exercised, or the table splits
- * and the position after a double push cannot answer for the identical one reached without.
- * Pseudo-legal on purpose: the key's correctness is do_move agreeing with this. */
+/* The ep file is hashed only when a pawn could capture, so identical positions share a key.
+ * Pseudo-legal: what matters is that do_move uses the same test. */
 static bool ep_capturable(const Position *pos, Color capturer, Square ep) {
     return (pawn_attacks((Color)(capturer ^ 1), ep) & pieces_bb(pos, capturer, PAWN)) != BB_EMPTY;
 }
@@ -106,9 +101,7 @@ Key board_compute_key(const Position *pos) {
     return k;
 }
 
-/* Side to move is deliberately not hashed: this key names a pawn structure, and a
- * structure is the same structure whoever is on move. The one consumer that cares
- * indexes the side separately. */
+/* No side to move: correction history indexes that separately. */
 Key board_compute_pawn_key(const Position *pos) {
     Key k = 0;
 
@@ -133,8 +126,7 @@ Key board_compute_non_pawn_key(const Position *pos, Color c) {
     return k;
 }
 
-/* pawn_attacks(BLACK, s) is the set of squares a WHITE pawn would have to stand on to
- * attack s - the relation is symmetric, so the colours look inverted on purpose. */
+/* pawn_attacks(BLACK, s) is where a white pawn attacking s stands: the inversion is right. */
 Bitboard board_attackers_to(const Position *pos, Square s, Bitboard occupied) {
     return (pawn_attacks(BLACK, s) & pieces_bb(pos, WHITE, PAWN)) |
            (pawn_attacks(WHITE, s) & pieces_bb(pos, BLACK, PAWN)) |
@@ -143,8 +135,7 @@ Bitboard board_attackers_to(const Position *pos, Square s, Bitboard occupied) {
            (rook_attacks(s, occupied) & (pos->byType[ROOK] | pos->byType[QUEEN]));
 }
 
-/* Cheapest and likeliest first: the leaper lookups are single loads, and the two
- * slider lookups are the only real work in this function. */
+/* Cheap leaper lookups before the sliders. */
 bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occupied) {
     const Color them = (Color)(by ^ 1);
 
@@ -159,9 +150,7 @@ bool board_square_attacked(const Position *pos, Square s, Color by, Bitboard occ
     return (rook_attacks(s, occupied) & pieces2_bb(pos, by, ROOK, QUEEN)) != 0;
 }
 
-/* Pieces of `us` that are the sole blocker between their own king and an enemy slider.
- * Moving one off the pinning line exposes the king, which is precisely the test
- * movegen_is_legal has to make. */
+/* Pieces of `us` that are the only blocker between their king and an enemy slider. */
 static Bitboard compute_pinned(const Position *pos, Color us, Square ksq) {
     const Color them   = (Color)(us ^ 1);
     const Bitboard occ = occupied_bb(pos);
@@ -180,8 +169,7 @@ static Bitboard compute_pinned(const Position *pos, Color us, Square ksq) {
     return pinned;
 }
 
-/* Refreshes the cached derived state for whoever is to move. Must be called after
- * every change to the board. */
+/* Must be called after every change to the board. */
 static void set_check_info(Position *pos) {
     const Color us   = pos->sideToMove;
     const Square ksq = king_square(pos, us);
@@ -190,16 +178,9 @@ static void set_check_info(Position *pos) {
     pos->pinned   = compute_pinned(pos, us, ksq);
 }
 
-/*
- * Grants one right and derives what movegen needs. `kingPath` is every square the king
- * occupies or crosses INCLUDING its origin, which is what makes movegen_is_legal
- * reject castling out of check for free; `emptyPath` is both travel lanes minus the
- * king's and rook's own squares, which the two moving pieces are allowed to occupy.
- *
- * Chess960 overlaps those lanes in ways standard chess never shows - the king may not
- * move at all, the rook may already stand where the king is going - so both are built
- * as unions, and the subtraction is what stops a castle from blocking itself.
- */
+/* Grants one right and derives its geometry. `kingPath` includes the king's origin, so
+ * castling out of check is rejected for free. `emptyPath` is both lanes minus the king's
+ * and rook's own squares, which in Chess960 may overlap the lanes. */
 static void grant_castling(Position *p, Color c, Square rookSq) {
     const Square ksq    = king_square(p, c);
     const bool kingside = rookSq > ksq;
@@ -222,9 +203,7 @@ static void grant_castling(Position *p, Color c, Square rookSq) {
     p->castlingLoss[rookSq] |= (uint8_t)castling_right(c, kingside);
 }
 
-/* What X-FEN's KQkq mean on a Chess960 board: not the rook on h1, but the rook
- * furthest from the king on that side. Scanning inward from the edge and stopping at
- * the king's file returns exactly that, and h1 or a1 on a standard board. */
+/* X-FEN's K/Q: the rook furthest from the king on that side. */
 static Square outermost_rook(const Position *p, Color c, Square ksq, bool kingside) {
     const Rank home  = rank_of(ksq);
     const Piece rook = make_piece(c, ROOK);
@@ -237,16 +216,8 @@ static Square outermost_rook(const Position *p, Color c, Square ksq, bool kingsi
     return SQ_NONE;
 }
 
-/*
- * Two spellings arrive and mean the same thing: KQkq (X-FEN) names the outermost rook
- * on each side of the king, and AHah (Shredder) names the rook's file outright, which
- * is needed whenever a colour has two rooks on one side of its king.
- *
- * A claimed right the diagram cannot back is DROPPED rather than rejected. That is not
- * cosmetic: gen_castling() consults `castling` and the geometry beside it and nothing
- * else, so an unbacked right emits a move that makes do_move put a rook down where
- * none stood.
- */
+/* Accepts X-FEN (KQkq) and Shredder (AHah) rights. A right the diagram cannot back is
+ * dropped: movegen trusts the rights, and an unbacked one would conjure a rook. */
 static void resolve_castling(Position *p, const char *field) {
     for (const char *c = field; *c; ++c) {
         const Color col  = islower((unsigned char)*c) ? BLACK : WHITE;
@@ -270,11 +241,7 @@ static void resolve_castling(Position *p, const char *field) {
     }
 }
 
-/* A king off the e-file, or a castling rook off the a- or h-file, cannot be written as
- * KQkq without losing information, so latching `chess960` on hands a GUI that never set
- * the option moves it can read back. The converse is not detectable and is not
- * attempted: a Chess960 game where both sides have castled leaves a diagram
- * indistinguishable from a standard one. */
+/* Rights that standard notation cannot express, which switch on Chess960 notation. */
 static bool castling_is_nonstandard(const Position *p) {
     for (Color c = WHITE; c <= BLACK; ++c) {
         const Rank home = c == WHITE ? RANK_1 : RANK_8;
@@ -294,11 +261,7 @@ static bool castling_is_nonstandard(const Position *p) {
     return false;
 }
 
-/* gen_pawn_moves() emits an en passant capture whenever a pawn stands beside the
- * target, without checking that there is anything to capture - do_move would then
- * remove a pawn from an empty square and fold it into the key, which poisons every
- * entry written from there on. The target sits on the sixth rank from the mover's side
- * whichever colour is to move, so one expression covers both. */
+/* movegen trusts the ep square, so a FEN's must have a pawn to capture behind it. */
 static bool ep_target_is_real(const Position *p, Square ep) {
     const Color us      = p->sideToMove;
     const int up        = pawn_push(us);
@@ -312,9 +275,7 @@ static bool ep_target_is_real(const Position *p, Square ep) {
            is_empty(p, fromSq);
 }
 
-/* Every rejection names the field it rejected on in terms of the diagram rather than
- * of the parser: a user who typed nine pawns is helped by being told they typed nine
- * pawns, and not at all by "invalid fen". */
+/* Rejections describe the diagram ("nine white pawns"), not the parser. */
 static bool fen_reject(const char **why, const char *reason) {
     if (why)
         *why = reason;
@@ -373,8 +334,7 @@ bool board_set_fen_reason(Position *pos, const char *fen, const char **why) {
     for (int i = 0; i < CASTLING_NB; ++i)
         p.castlingRook[i] = SQ_NONE;
 
-    /* Only copied out and validated as a character set here. Resolving it needs the kings
-     * located, and that needs the piece-count check further down to have passed. */
+    /* Resolved later, once the kings are known to exist. */
     char castlingField[16] = {0};
     size_t castlingLen     = 0;
     bool shredderSpelling  = false;
@@ -391,8 +351,6 @@ bool board_set_fen_reason(Position *pos, const char *fen, const char **why) {
                 return fen_reject(why,
                                   "the castling field contains a character that is not a right");
 
-            /* A field longer than the four real rights is malformed, and silently
-             * truncating it would accept a FEN we cannot describe. */
             if (castlingLen + 1 >= sizeof(castlingField))
                 return fen_reject(why, "the castling field is longer than the rights it can spell");
             castlingField[castlingLen++] = *c;
@@ -418,51 +376,29 @@ bool board_set_fen_reason(Position *pos, const char *fen, const char **why) {
     if (p.halfmoveClock < 0 || p.fullmoveNumber < 1)
         return fen_reject(why, "the halfmove or fullmove clock is negative");
 
-    /* Exactly one king each, or nothing downstream is meaningful. */
     if (p.pieceCount[W_KING] != 1 || p.pieceCount[B_KING] != 1)
         return fen_reject(why, "the diagram does not have exactly one king a side");
 
-    /*
-     * A gate on what the ENGINE can represent, not on what chess allows. A position
-     * editor or a puzzle routinely produces a diagram no legal game could reach - nine
-     * pawns, five knights - and every one of those plays perfectly well, so the only
-     * question asked is whether it fits what the consumers are sized for.
-     *
-     * THIRTY-TWO IS THE NUMBER BECAUSE THE NETWORK IS SIZED BY IT. tools/export_net.py
-     * proves the int16 accumulator cannot wrap by bounding it with "bias plus the N
-     * largest weights in a column", and N is this. At 64 that proof reserved half the
-     * accumulator's range for boards no legal game can reach, which pushed the shipped
-     * net to 99.5% of int16 and forced the feature transformer's weight clip down to a
-     * bound belonging to the output layer - see Task 6 in docs/NNUE.md.
-     *
-     * What it costs is loading a diagram with more than the 32 men chess has. Nothing in
-     * the engine, the suites or the training pipeline produces one; a position editor
-     * theoretically could, and it now gets a named rejection rather than a net quietly
-     * evaluating it through a wrapped accumulator. ENGINE_MAX_PIECES in export_net.py is
-     * the same number and the two must move together.
-     */
+    /* Illegal material (nine pawns) is fine, but more than 32 men is not: the net's int16
+     * accumulator is proven not to wrap for at most 32 features. Must match
+     * ENGINE_MAX_PIECES in tools/export_net.py. */
     if (popcount(occupied_bb(&p)) > 32)
         return fen_reject(why, "the diagram has more men than chess has");
 
-    /* Discard rights and an en passant target the diagram does not back, rather than
-     * rejecting the whole FEN: a wrong piece layout means the sender and the engine
-     * disagree about the position, but a stale right is routine editor output and the
-     * position is playable once it is gone. Both must precede the key. */
+    /* Unbacked rights and ep targets are dropped, not rejected: stale ones are routine
+     * editor output. Before the key is computed. */
     resolve_castling(&p, castlingField);
     if (p.epSquare != SQ_NONE && !ep_target_is_real(&p, p.epSquare))
         p.epSquare = SQ_NONE;
 
-    /* Sticky, never cleared here: the UCI option carries across position changes, and a
-     * FEN that proves the board is Chess960 latches it on for a GUI that forgot. It
-     * controls notation only - the rules come from the geometry either way. */
+    /* Sticky: a FEN can switch Chess960 notation on but never off. Notation only - the
+     * rules come from the geometry either way. */
     p.chess960 = pos->chess960 || shredderSpelling || castling_is_nonstandard(&p);
     p.gamePly  = 0;
     p.key      = board_compute_key(&p);
     set_check_info(&p);
 
-    /* The side that just moved may not have left its own king en prise. Such a diagram is
-     * unreachable by legal play, and accepting it would let the search "win" by
-     * capturing a king. */
+    /* The side not to move may not be in check. */
     if (board_square_attacked(&p, king_square(&p, (Color)(p.sideToMove ^ 1)), p.sideToMove,
                               occupied_bb(&p)))
         return fen_reject(why, "the side that just moved has left its own king in check");
@@ -473,10 +409,8 @@ bool board_set_fen_reason(Position *pos, const char *fen, const char **why) {
 
 bool board_set_fen(Position *pos, const char *fen) { return board_set_fen_reason(pos, fen, NULL); }
 
-/* The ten ways to arrange K, R, N on five squares with the king between the rooks -
- * the whole of the Chess960 castling constraint, since the bishops and queen are
- * placed first. The order is Scharnagl's and it IS the numbering: permuting these rows
- * renumbers all 960 positions and silently disagrees with every published table. */
+/* K, R, N on the five remaining squares, king between the rooks. Scharnagl's order, which
+ * defines the standard 0-959 numbering: do not reorder. */
 static const char *const KrnPatterns[10] = {"NNRKR", "NRNKR", "NRKNR", "NRKRN", "RNNKR",
                                             "RNKNR", "RNKRN", "RKNNR", "RKNRN", "RKRNN"};
 
@@ -484,10 +418,7 @@ static void chess960_back_rank(int idx, char back[9]) {
     memset(back, ' ', 8);
     back[8] = '\0';
 
-    /* Scharnagl's derivation, in the order the numbering is defined: light-squared
-     * bishop, dark-squared bishop, queen into the n-th square still free, then the K/R/N
-     * pattern into the five that remain. The bishop files are 2n+1 and 2n, which is what
-     * puts one on each colour. */
+    /* Scharnagl: light bishop, dark bishop, queen into the n-th free square, then K/R/N. */
     int n                 = idx;
     back[2 * (n % 4) + 1] = 'B';
     n /= 4;
@@ -516,14 +447,12 @@ bool board_set_dfrc_start(Position *pos, int whiteIdx, int blackIdx) {
     for (int f = 0; f < 8; ++f)
         front[f] = (char)tolower((unsigned char)front[f]);
 
-    /* Each side's rooks are found on its own rank: with two arrays the files differ. */
     const char wA = (char)('A' + (strchr(back, 'R') - back));
     const char wH = (char)('A' + (strrchr(back, 'R') - back));
     const char bA = (char)('a' + (strchr(front, 'r') - front));
     const char bH = (char)('a' + (strrchr(front, 'r') - front));
 
-    /* Spelled the Shredder way even for SP 518, whose geometry is standard: a Chess960
-     * game is being set up, and its castling should read back as one. */
+    /* Shredder spelling even for SP 518, so the position reads back as Chess960. */
     char fen[FEN_MAX_LEN];
     snprintf(fen, sizeof(fen), "%s/pppppppp/8/8/8/8/PPPPPPPP/%s w %c%c%c%c - 0 1", front, back, wH,
              wA, bH, bA);
@@ -567,10 +496,7 @@ void board_to_fen(const Position *pos, char *buf) {
     if (pos->castling == NO_CASTLING) {
         *out++ = '-';
     } else {
-        /* Shredder spelling - the castling rook's file - for a Chess960 position, KQkq
-         * otherwise. KQkq can only name the OUTERMOST rook on each side, so on a board
-         * with two rooks on one side of the king it would write a FEN that does not read
-         * back as the position it came from. */
+        /* Shredder (rook files) for Chess960: KQkq can only name the outermost rook. */
         static const char Standard[CASTLING_NB] = {'K', 'Q', 'k', 'q'};
 
         for (int i = 0; i < CASTLING_NB; ++i) {
@@ -669,9 +595,7 @@ void board_do_move(Position *pos, Move m) {
 
     Key k = pos->key ^ ZobristSideToMove;
 
-    /* The en passant right expires after exactly one ply, whatever happens. Only unhash
-     * it if it was hashed: `us` is the side that could have taken, which is who
-     * ep_capturable() was asked about when it went in. */
+    /* The ep right expires; unhash it only if it was hashed. */
     if (pos->epSquare != SQ_NONE) {
         if (ep_capturable(pos, us, pos->epSquare))
             k ^= ZobristEnPassant[file_of(pos->epSquare)];
@@ -687,9 +611,7 @@ void board_do_move(Position *pos, Move m) {
 
         assert(piece_on(pos, to) == rook);
 
-        /* Both pieces come off before either goes down: in Chess960 a king's destination
-         * can be the rook's origin and vice versa, so any move-then-move ordering would
-         * clobber a square. */
+        /* Both off before either goes down: in Chess960 the squares can overlap. */
         board_remove_piece(pos, from);
         board_remove_piece(pos, to);
         board_put_piece(pos, pc, kingTo);
@@ -704,8 +626,6 @@ void board_do_move(Position *pos, Move m) {
         u->captured          = captured;
 
         if (captured != NO_PIECE) {
-            /* En passant takes the pawn that double-pushed, which stands beside the
-             * capturing pawn rather than on its destination square. */
             const Square capsq = mt == MT_EN_PASSANT ? (Square)(to - pawn_push(us)) : to;
 
             assert(piece_on(pos, capsq) == captured);
@@ -729,25 +649,18 @@ void board_do_move(Position *pos, Move m) {
         if (type_of(pc) == PAWN) {
             pos->halfmoveClock = 0;
 
-            /* A double push is the only move whose origin and destination differ by two
-             * ranks, and the only one that creates an ep target. */
+            /* Double push. The ep square is always recorded, but hashed only if capturable. */
             if ((from ^ to) == 16) {
                 pos->epSquare = (Square)((from + to) / 2);
 
-                /* Recorded either way - the FEN has to show it - but hashed only when
-                 * `them` can actually answer it, so a double push nobody stands next to
-                 * leaves the key saying what it should. */
                 if (ep_capturable(pos, them, pos->epSquare))
                     k ^= ZobristEnPassant[file_of(pos->epSquare)];
             }
         }
     }
 
-    /* castlingLoss is per-position because Chess960 moves the king's and rooks' origins
-     * off their standard squares. Only ORIGIN squares need consulting: the king moves in
-     * every castle and its square carries both of its colour's rights, so a Chess960
-     * castle landing a rook on the other rook's origin gave that right up through
-     * `from`. */
+    /* castlingLoss is per position because Chess960 origins vary. A castle always moves the
+     * king, whose square carries both its rights, so `from` covers it. */
     const uint8_t lost = (uint8_t)(pos->castlingLoss[from] | pos->castlingLoss[to]);
     if (pos->castling & lost) {
         k ^= ZobristCastling[pos->castling];
@@ -799,7 +712,6 @@ void board_undo_move(Position *pos, Move m) {
         }
     }
 
-    /* Restored verbatim rather than derived: that is the whole reason it was pushed. */
     pos->key           = u->key;
     pos->castling      = u->castling;
     pos->epSquare      = u->epSquare;
@@ -856,9 +768,7 @@ void board_undo_null_move(Position *pos) {
     pos->sideToMove    = (Color)(pos->sideToMove ^ 1);
 }
 
-/* Material from which no mate exists at all, so no amount of search can find one.
- * Deliberately conservative: king and two knights is NOT included, because mate is
- * possible there with cooperation, and that ending is drawn by the fifty-move count. */
+/* Material that cannot mate at all. KNN is excluded: mate is possible with cooperation. */
 static bool insufficient_material(const Position *pos) {
     if (pos->byType[PAWN] | pos->byType[ROOK] | pos->byType[QUEEN])
         return false;
@@ -868,8 +778,7 @@ static bool insufficient_material(const Position *pos) {
     if (bb_at_most_one(minors))
         return true;
 
-    /* One bishop each, both on the same colour complex: neither can ever attack the
-     * other's squares, so no mating net exists. */
+    /* One bishop each, on the same colour. */
     if (piece_count(pos, WHITE, BISHOP) == 1 && piece_count(pos, BLACK, BISHOP) == 1 &&
         minors == pos->byType[BISHOP])
         return (minors & BB_LIGHT_SQUARES) == minors || (minors & BB_DARK_SQUARES) == minors;
@@ -877,16 +786,9 @@ static bool insufficient_material(const Position *pos) {
     return false;
 }
 
-/*
- * A position repeated INSIDE the search is a draw on the FIRST repetition: the side to
- * move has demonstrably forced the cycle once and can force it again, so making it
- * prove the point twice only costs search. One repeated from the game history before
- * the root still needs the full threefold count, because the opponent had a chance to
- * deviate and did not.
- */
+/* A repetition inside the search is a draw at once; one reaching back before the root
+ * needs the full threefold count. */
 static bool is_repetition(const Position *pos, int ply) {
-    /* Nothing before the last irreversible move can repeat, and coming back round to the
-     * same position takes at least four plies. */
     const int back = pos->halfmoveClock < pos->gamePly ? pos->halfmoveClock : pos->gamePly;
     int seen       = 0;
 
@@ -899,12 +801,9 @@ static bool is_repetition(const Position *pos, int ply) {
     return false;
 }
 
-/*
- * Every reversible move a non-pawn piece can make on an empty board, keyed by the Zobrist
- * difference it makes to a position, side to move included: 3668 of them in 8192 slots, placed
- * by cuckoo hashing so a lookup is two probes at most (Marcel van Kervinck's method, as
- * Stockfish uses it).
- */
+/* Every reversible non-pawn move on an empty board, keyed by its Zobrist difference
+ * (side to move included): 3668 moves cuckoo-hashed into 8192 slots, so a lookup is at
+ * most two probes. Marcel van Kervinck's method, as Stockfish uses it. */
 static Key CuckooKey[8192];
 static Move CuckooMove[8192];
 
@@ -928,8 +827,6 @@ void board_cuckoo_init(void) {
                     Key key   = ZobristPiece[pc][s1] ^ ZobristPiece[pc][s2] ^ ZobristSideToMove;
                     int i     = cuckoo_h1(key);
 
-                    /* Insert, evicting whatever sits in the slot to its other home, until an
-                     * empty slot ends the chain. */
                     for (;;) {
                         const Key tk  = CuckooKey[i];
                         CuckooKey[i]  = key;
@@ -948,13 +845,9 @@ void board_cuckoo_init(void) {
     (void)count;
 }
 
-/*
- * is_repetition() sees a cycle once it has been played; this sees one the side to move can
- * still choose to close. Walking back two plies at a time, `other` accumulates what the
- * OPPONENT's moves changed - when that cancels, the difference between now and the position
- * `i` plies up is the work of the side to move alone, and if it is one reversible move with a
- * clear path, playing it repeats that position.
- */
+/* Whether the side to move can repeat a position with one move. `other` accumulates the
+ * opponent's changes; when it cancels, the difference to the position `i` plies up is one
+ * of our moves, and if that move is reversible with a clear path it repeats. */
 bool board_upcoming_repetition(const Position *pos, int ply, int limit) {
     int end = pos->halfmoveClock < pos->gamePly ? pos->halfmoveClock : pos->gamePly;
     if (limit < end)
@@ -979,8 +872,7 @@ bool board_upcoming_repetition(const Position *pos, int ply, int limit) {
                 continue;
         }
 
-        /* Only cycles inside the search: one reaching back past the root needs the threefold
-         * count is_repetition() keeps, which a single reachable position does not give. */
+        /* Inside the search only; before the root needs the threefold count. */
         const Move move = CuckooMove[j];
         if (!(SquaresBetween[from_sq(move)][to_sq(move)] & occupied_bb(pos)) && ply > i)
             return true;
@@ -990,8 +882,7 @@ bool board_upcoming_repetition(const Position *pos, int ply, int limit) {
 
 bool board_is_draw(const Position *pos, int ply) {
     if (pos->halfmoveClock > 99) {
-        /* Checkmate outranks the fifty-move rule, so the position is drawn only if the
-         * side to move actually has a legal reply. */
+        /* Checkmate outranks the fifty-move rule. */
         if (pos->checkers == BB_EMPTY)
             return true;
 

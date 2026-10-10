@@ -1,13 +1,6 @@
 /*
- * eval.c - static position evaluation.
- *
- * Every term is tapered between a midgame and an endgame weight, because the same fact
- * means opposite things at different points in a game: a king on g1 behind three pawns
- * belongs there on move 20 and is a liability on move 60.
- *
- * NOT ONE NUMBER IN THIS FILE IS A LITERAL. Every weight lives in evalparams.c and is
- * applied through TERM(), which is what makes the model fittable - the tuner never has
- * to model what this file does, it reads out what this file did.
+ * eval.c - the classical evaluation: a linear model, tapered between midgame and endgame.
+ * Every weight lives in evalparams.c and is applied through TERM() (invariants 9, 10).
  */
 #include "eval.h"
 
@@ -17,10 +10,7 @@
 #include "bitboard.h"
 #include "evalparams.h"
 
-/* Deliberately NOT the tuned Material[] table below. SEE walks an exchange sequence
- * and needs values that are stable and ordered, while the tuner is free to move value
- * between Material[] and the placement tables since only their sum shows in a score.
- * Keeping this fixed means tuning can never silently change how moves are ordered. */
+/* Fixed, not the tuned Material[]: tuning must never change move ordering or SEE. */
 const Value PieceValues[PIECE_TYPE_NB] = {
     [NO_PIECE_TYPE] = 0, [PAWN] = 100,  [KNIGHT] = 320, [BISHOP] = 330,
     [ROOK] = 500,        [QUEEN] = 900, [KING] = 0,
@@ -31,11 +21,8 @@ typedef struct {
     int mg, eg;
 } Score;
 
-/* Apply one weight. `table` must be a bare table name so PARAM_OFF_##table resolves,
- * and `coeff` is signed - positive for white - which keeps the evaluation
- * white-relative until the last line. The trace entry comes from the same index and
- * coefficient as the score, so the tuner's gradient cannot disagree with the
- * arithmetic; this macro is the only sanctioned way to add anything to a score. */
+/* The only way to add to a score: the tuner's trace comes from the same index and
+ * coefficient. `table` must be a bare table name; `coeff` is positive for white. */
 #define TERM(sc, table, index, coeff)          \
     do {                                       \
         const int i_ = (index);                \
@@ -45,28 +32,25 @@ typedef struct {
         TRACE_ADD(PARAM_OFF_##table + i_, c_); \
     } while (0)
 
-/* +1 for white, -1 for black: the sign every term is applied with. */
 #define SIGN(c) ((c) == WHITE ? 1 : -1)
 
 static inline int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static inline int abs_int(int v) { return v < 0 ? -v : v; }
 
-/* Chebyshev distance - the number of king moves between two squares. */
+/* Chebyshev distance: king moves between two squares. */
 static inline int square_distance(Square a, Square b) {
     const int df = abs_int((int)file_of(a) - (int)file_of(b));
     const int dr = abs_int((int)rank_of(a) - (int)rank_of(b));
     return df > dr ? df : dr;
 }
 
-/* The square as its owner sees it: black's board is flipped to share white's tables. */
 static inline Square relative_square(Color c, Square s) { return c == WHITE ? s : flip_rank(s); }
 
 /* The piece of `b` nearest to `c`'s own back rank. Undefined for empty `b`. */
 static inline Square frontmost(Color c, Bitboard b) { return c == WHITE ? lsb(b) : msb(b); }
 
-/* Filled by eval_init(). All are pure functions of the geometry, so they cost nothing
- * at runtime and keep the term code readable. */
+/* Filled by eval_init(). */
 static Bitboard AdjacentFiles[8];
 static Bitboard ForwardRanks[COLOR_NB][8];
 static Bitboard ForwardFile[COLOR_NB][SQUARE_NB];
@@ -75,9 +59,7 @@ static Bitboard PawnAttackSpan[COLOR_NB][SQUARE_NB];
 
 #define PHASE_MAX 24
 
-/* 24 with all the pieces on, 0 once only kings and pawns remain. Pawns deliberately
- * contribute nothing: phase measures how much material is left to attack WITH, and a
- * position with every pawn and no piece is an endgame. */
+/* 24 with all pieces on, 0 with only kings and pawns. */
 static const int PhaseWeight[PIECE_TYPE_NB] = {
     [KNIGHT] = 1,
     [BISHOP] = 1,
@@ -91,14 +73,11 @@ static int game_phase(const Position *pos) {
     for (PieceType pt = KNIGHT; pt <= QUEEN; ++pt)
         phase += PhaseWeight[pt] * (piece_count(pos, WHITE, pt) + piece_count(pos, BLACK, pt));
 
-    /* Promotions can put more material on the board than the game started with, and an
-     * unclamped phase would extrapolate past the midgame table. */
+    /* Promotions can exceed the starting material. */
     return phase > PHASE_MAX ? PHASE_MAX : phase;
 }
 
-/* Computed once and shared. The attack maps are the bulk of it: mobility, king safety
- * and threats all want to know which squares each side covers, and computing that
- * three times would triple the cost of the most expensive part of the evaluation. */
+/* Attack maps and king data, computed once and shared by the terms. */
 typedef struct {
     Square ksq[COLOR_NB];
     Bitboard kingRing[COLOR_NB];
@@ -113,19 +92,15 @@ typedef struct {
     int kingRingAttacks[COLOR_NB];
 } EvalInfo;
 
-/* Folds the 32 normalised king squares onto 8 buckets by pairing files and ranks. Eight is
- * a compromise: a bucket the tuner cannot fill is worse than no bucket at all. */
+/* 32 normalised king squares onto 8 buckets: more would be too sparse to fit. */
 static inline int king_bucket(Square normalisedKing) {
     return (int)(rank_of(normalisedKing) >> 1) * 2 + (int)(file_of(normalisedKing) >> 1);
 }
 
-/* Mirror across the d/e file boundary. */
 static inline Square mirror_file(Square s) { return (Square)(s ^ 7); }
 
-/* Score one piece's placement relative to a king; both squares arrive already
- * rank-normalised for the piece's owner. Mirroring is driven by the KING, not the
- * piece: the point is where the piece stands with respect to that king, so both must
- * be folded the same way or the table is indexed inconsistently. */
+/* A piece's placement relative to a king, both squares rank-normalised for the owner. The
+ * king decides the mirror, and both squares are folded with it. */
 #define TERM_PSQK(sc, table, kingSq, pieceSq, pt, coeff)             \
     do {                                                             \
         Square k_ = (kingSq), p_ = (pieceSq);                        \
@@ -161,7 +136,6 @@ void eval_init(void) {
     }
 }
 
-/* Set up the attack maps every later term reads. */
 static void eval_init_info(const Position *pos, EvalInfo *ei) {
     memset(ei, 0, sizeof(*ei));
 
@@ -181,9 +155,7 @@ static void eval_init_info(const Position *pos, EvalInfo *ei) {
     for (Color c = WHITE; c <= BLACK; ++c) {
         const Color them = (Color)(c ^ 1);
 
-        /* The king's eight neighbours, pulled back onto the board when it stands on an
-         * edge - otherwise a king on h1 would have a three-square ring and look far
-         * safer than it is. */
+        /* Widened inward on an edge, or a cornered king would look safer than it is. */
         Bitboard ring = king_attacks(ei->ksq[c]);
         if (file_of(ei->ksq[c]) == FILE_A)
             ring |= shift_east(ring);
@@ -195,16 +167,12 @@ static void eval_init_info(const Position *pos, EvalInfo *ei) {
             ring |= shift_south(ring);
         ei->kingRing[c] = ring | square_bb(ei->ksq[c]);
 
-        /* Where a piece could actually go: not onto our own men, and not onto a square an
-         * enemy pawn covers, because standing there loses material however many squares
-         * it nominally attacks. */
+        /* Not our own men, nor squares enemy pawns cover. */
         ei->mobilityArea[c] = ~(color_bb(pos, c) | ei->attackedBy[them][PAWN]);
     }
 }
 
-/* Material and the three placement tables, in one pass over the occupancy. The
- * king-relative lookups are where most of the parameter budget goes; evalparams.h says
- * why they are worth it. */
+/* Material and the three placement tables, in one pass. */
 static void eval_placement(const Position *pos, const EvalInfo *ei, Score *sc) {
     Bitboard occupied = occupied_bb(pos);
 
@@ -215,7 +183,6 @@ static void eval_placement(const Position *pos, const EvalInfo *ei, Score *sc) {
         const PieceType pt = type_of(pc);
         const int sign     = SIGN(c);
 
-        /* Everything below is read from the owner's point of view. */
         const Square rs = relative_square(c, s);
         const Square ok = relative_square(c, ei->ksq[c]);
         const Square ek = relative_square(c, ei->ksq[c ^ 1]);
@@ -257,8 +224,6 @@ static void eval_pawns(const Position *pos, const EvalInfo *ei, Score *sc) {
             const Bitboard opposed    = theirs & ForwardFile[c][s];
             const Bitboard lever      = theirs & pawn_attacks(c, s);
 
-            /* A pawn on the last rank cannot exist, so the stop square is always on the
-             * board. */
             const Square stop        = (Square)(s + push);
             const Bitboard leverPush = theirs & pawn_attacks(c, stop);
             const bool doubled       = (ours & square_bb((Square)(s - push))) != 0;
@@ -268,9 +233,8 @@ static void eval_pawns(const Position *pos, const EvalInfo *ei, Score *sc) {
             if (doubled)
                 TERM(sc, PawnDoubled, (int)f, sign);
 
-            /* Backward: every friendly pawn on an adjacent file is already further up the
-             * board, so none can ever support this one's advance, and the square in front
-             * is covered by an enemy pawn. */
+            /* Backward: no neighbour can support its advance, and the stop square is
+             * covered by an enemy pawn. */
             if (!(neighbours & ~ForwardRanks[c][rank_of(s)]) && leverPush)
                 TERM(sc, PawnBackward, (int)f, sign);
 
@@ -287,24 +251,22 @@ static void eval_pawns(const Position *pos, const EvalInfo *ei, Score *sc) {
                 if (support)
                     TERM(sc, PawnPassedDefended, r, sign);
 
-                /* Both kings' races against the pawn. Only the endgame half of these
-                 * weights can be non-zero and mean anything. */
+                /* King distances to the stop square; meaningful in the endgame. */
                 TERM(sc, PawnPassedOwnKing, clamp_int(square_distance(ei->ksq[c], stop), 0, 7),
                      sign);
                 TERM(sc, PawnPassedEnemyKing, clamp_int(square_distance(ei->ksq[them], stop), 0, 7),
                      sign);
             } else if (!opposed && popcount(support) >= popcount(lever) &&
                        popcount(phalanx) >= popcount(leverPush)) {
-                /* Not passed, but nothing blocks its own file and it wins every pawn
-                 * exchange on the way up - a passer in waiting. */
+                /* Candidate: unopposed and winning every pawn exchange ahead. */
                 TERM(sc, PawnCandidate, r, sign);
             }
         }
     }
 }
 
-/* Mobility, outposts, rook files and bishop quality - and, as a side effect, the
- * attack maps and king-ring pressure counts the king safety terms need. */
+/* Mobility, outposts, rook files and bishops; also fills the attack maps and king-ring
+ * counts that eval_king() and eval_threats() read. */
 static void eval_pieces(const Position *pos, EvalInfo *ei, Score *sc) {
     const Bitboard occ = occupied_bb(pos);
 
@@ -333,8 +295,7 @@ static void eval_pieces(const Position *pos, EvalInfo *ei, Score *sc) {
                 default: TERM(sc, MobilityQueen, clamp_int(mobility, 0, 27), sign); break;
                 }
 
-                /* Pressure on the enemy king, banked for eval_king(). The weight is a
-                 * penalty on the king's owner, hence SIGN(them). */
+                /* Scored against the king's owner, hence SIGN(them). */
                 if (atk & ei->kingRing[them]) {
                     ei->kingAttackerCount[them]++;
                     ei->kingRingAttacks[them] += popcount(atk & ei->kingRing[them]);
@@ -343,9 +304,7 @@ static void eval_pieces(const Position *pos, EvalInfo *ei, Score *sc) {
                 }
 
                 if (pt == KNIGHT || pt == BISHOP) {
-                    /* An outpost is a square in enemy territory that no enemy pawn can ever
-                     * attack - which is what makes it permanent, and therefore worth
-                     * something. */
+                    /* Outpost: ranks 4-6, never attackable by an enemy pawn. */
                     const int rr = (int)relative_rank(c, s);
                     if (rr >= RANK_4 && rr <= RANK_6 && !(PawnAttackSpan[c][s] & theirs)) {
                         const int supported = (ours & pawn_attacks(them, s)) != 0;
@@ -386,12 +345,9 @@ static void eval_king(const Position *pos, const EvalInfo *ei, Score *sc) {
         const Bitboard ours   = pieces_bb(pos, c, PAWN);
         const Bitboard theirs = pieces_bb(pos, them, PAWN);
 
-        /* Squares at or in front of the king from its own point of view: a pawn behind the
-         * king shelters nothing. */
         const Bitboard inFront = ForwardRanks[c][rank_of(ksq)] | rank_bb(rank_of(ksq));
 
-        /* Shelter and storm over the king's file and its two neighbours. The king file is
-         * clamped away from the edge so the three-file window always fits on the board. */
+        /* Shelter and storm over three files, the window clamped onto the board. */
         const File kf = (File)clamp_int((int)file_of(ksq), FILE_B, FILE_G);
         for (File f = (File)(kf - 1); f <= (File)(kf + 1); ++f) {
             const int edge      = f < FILE_E ? (int)f : 7 - (int)f;
@@ -412,8 +368,7 @@ static void eval_king(const Position *pos, const EvalInfo *ei, Score *sc) {
         TERM(sc, KingAttackers, clamp_int(ei->kingAttackerCount[c], 0, 7), sign);
         TERM(sc, KingRingAttacks, clamp_int(ei->kingRingAttacks[c], 0, 15), sign);
 
-        /* Checks the checking piece survives: one we can simply capture is not a threat, so
-         * the square has to be one the enemy can occupy and we do not cover. */
+        /* Safe checks: from squares we do not cover. */
         const Bitboard safe = ~color_bb(pos, them) & ~ei->attackedAll[c];
 
         if (knight_attacks(ksq) & ei->attackedBy[them][KNIGHT] & safe)
@@ -433,10 +388,9 @@ static void eval_threats(const Position *pos, const EvalInfo *ei, Score *sc) {
         const int sign     = SIGN(c);
         const Bitboard win = color_bb(pos, them);
 
-        /* Attacked by us and defended by nothing at all. */
+        /* Attacked and undefended. */
         const Bitboard weak = win & ei->attackedAll[c] & ~ei->attackedAll[them];
 
-        /* Non-pawns are what a pawn or minor threat is actually worth winning. */
         const Bitboard nonPawn = win & ~pieces_bb(pos, them, PAWN);
 
         Bitboard b = nonPawn & ei->attackedBy[c][PAWN];
@@ -458,8 +412,7 @@ static void eval_threats(const Position *pos, const EvalInfo *ei, Score *sc) {
         if (weak)
             TERM(sc, Hanging, 0, sign * popcount(weak));
 
-        /* Squares the enemy covers that we contest and they do not hold firmly - space
-         * they cannot actually use. */
+        /* Squares both sides cover that the enemy does not hold firmly. */
         const Bitboard strong     = ei->attackedBy[them][PAWN] | ei->attackedBy2[them];
         const Bitboard restricted = ei->attackedAll[them] & ei->attackedAll[c] & ~strong;
         if (restricted)
@@ -480,19 +433,14 @@ Value eval_classical(const Position *pos) {
 
     TERM(&sc, Tempo, 0, SIGN(pos->sideToMove));
 
-    /* Interpolate: with everything on the board this is purely the midgame score, with
-     * nothing but kings and pawns purely the endgame one. */
     const int phase   = game_phase(pos);
     const Value score = (Value)((sc.mg * phase + sc.eg * (PHASE_MAX - phase)) / PHASE_MAX);
 
-    /* Side-to-move-relative, so the search can stay plain negamax. */
     return pos->sideToMove == WHITE ? score : -score;
 }
 
-/* src/nnue.c defines this same symbol under EVAL_NNUE, so the engine carries exactly
- * one evaluation and never tests a flag to find out which. eval_classical() stays
- * reachable by name in every build: `eval` traces it, tools/tuner.c fits it, and it is
- * the reference a net has to beat. */
+/* src/nnue.c defines this symbol in an NNUE build. eval_classical() exists in every
+ * build, for `eval` and the tuner. */
 #ifndef EVAL_NNUE
 Value eval_evaluate(EvalState *es, const Position *pos) {
     (void)es;
@@ -509,8 +457,7 @@ void eval_trace(const Position *pos) {
     memset(parts, 0, sizeof(parts));
     eval_init_info(pos, &ei);
 
-    /* Same helpers, same order, separate accumulators - so the breakdown is guaranteed to
-     * sum to what eval_classical() would have returned. */
+    /* The same helpers in the same order, so the parts sum to eval_classical(). */
     eval_placement(pos, &ei, &parts[0]);
     eval_pawns(pos, &ei, &parts[1]);
     eval_pieces(pos, &ei, &parts[2]);

@@ -1,9 +1,4 @@
-/*
- * bitboard.h - bitboard constants, shifts and attack lookup.
- *
- * Bit i is Square i: A1 is bit 0, H8 is bit 63. Every table here is filled by
- * bb_init(), which main() calls once before anything else runs.
- */
+/* bitboard.h - bitboards (bit i is square i, A1 = 0) and attack lookup. bb_init() first. */
 #ifndef BITBOARD_H
 #define BITBOARD_H
 
@@ -38,8 +33,6 @@ static inline Bitboard file_bb(File f) { return BB_FILE_A << f; }
 static inline Bitboard rank_bb(Rank r) { return BB_RANK_1 << (8 * r); }
 
 static inline bool bb_test(Bitboard b, Square s) { return (b & square_bb(s)) != 0; }
-static inline Bitboard bb_set(Bitboard b, Square s) { return b | square_bb(s); }
-static inline Bitboard bb_clear(Bitboard b, Square s) { return b & ~square_bb(s); }
 
 /* Cheaper than popcount(b) <= 1. */
 static inline bool bb_at_most_one(Bitboard b) { return (b & (b - 1)) == 0; }
@@ -55,22 +48,15 @@ static inline Bitboard shift_north_west(Bitboard b) { return (b & ~BB_FILE_A) <<
 static inline Bitboard shift_south_east(Bitboard b) { return (b & ~BB_FILE_H) >> 7; }
 static inline Bitboard shift_south_west(Bitboard b) { return (b & ~BB_FILE_A) >> 9; }
 
-static inline Bitboard shift_forward(Bitboard b, Color c) {
-    return c == WHITE ? shift_north(b) : shift_south(b);
-}
-
-/* Read through the accessors below, never indexed directly elsewhere, so the
- * storage strategy can change without touching call sites. */
+/* Read through the accessors below. */
 extern Bitboard PawnAttacks[COLOR_NB][SQUARE_NB];
 extern Bitboard KnightAttacks[SQUARE_NB];
 extern Bitboard KingAttacks[SQUARE_NB];
 
-/* Squares strictly between a and b when they share a line, empty otherwise - the
- * check-blocking mask. */
+/* Squares strictly between a and b on a shared line, else empty. */
 extern Bitboard SquaresBetween[SQUARE_NB][SQUARE_NB];
 
-/* The whole rank, file or diagonal containing both squares, empty if they are not
- * aligned. Used for pin detection. */
+/* The whole line through both squares, else empty. */
 extern Bitboard LineThrough[SQUARE_NB][SQUARE_NB];
 
 void bb_init(void);
@@ -93,12 +79,7 @@ typedef struct {
 extern Magic BishopMagics[SQUARE_NB];
 extern Magic RookMagics[SQUARE_NB];
 
-/*
- * Sliding attacks are the hottest lookup in the engine, so they are table-driven
- * rather than a ray walk. PEXT and magic multiplication index the SAME table, so
- * the scheme changes only the speed of the answer - the Makefile picks PEXT only
- * for arch profiles where the instruction is not microcoded.
- */
+/* PEXT or magic multiplication; either way the same table and the same answer. */
 static inline unsigned magic_index(const Magic *m, Bitboard occupied) {
 #ifdef USE_PEXT
     return (unsigned)pext(occupied, m->mask);
@@ -132,8 +113,5 @@ static inline Bitboard attacks_bb(PieceType pt, Square s, Bitboard occupied) {
     default: return BB_EMPTY;
     }
 }
-
-/* Debug helper: dump an 8x8 grid to stdout, rank 8 at the top. */
-void bb_print(Bitboard b);
 
 #endif
