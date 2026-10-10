@@ -153,12 +153,7 @@ validation (all 65,536 encodings over fixed positions), stage laziness,
 same-ply lifetime and deferred history scoring. Picker-driven perft compares
 against ordinary perft over all four suites; deterministic standard/Chess960
 walks exercise positions outside those suites. The gate runs under CI sanitizers.
-
-`make staged-eager` builds an eager-GENERATION control, with the SAME scoring
-timestamps as the lazy picker. It must bench identically to the ordinary build;
-CI compares depth 10. Time alternating release builds, never instrumented ones.
-`make staged-profile` builds per-thread work counters, printed after the pool
-parks. See [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md) for scope and manual SPRT commands.
+See [STAGED_MOVEGEN.md](STAGED_MOVEGEN.md) for scope and manual SPRT commands.
 
 ---
 

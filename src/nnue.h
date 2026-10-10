@@ -1,12 +1,7 @@
 /*
- * nnue.h - the network evaluation, and the file format it loads.
- *
- * The architecture is DATA wherever it can be: a net file carries its own shape and
- * the loader believes the file rather than a constant compiled beside it, so
- * retraining wider or with more output buckets is a drop-in. The activation and
- * feature set are not free choices - the implemented ones are the enums below, the
- * loader rejects an unknown tag by name, and adding one means C code at the
- * `UPGRADE POINT` marks in nnue.c.
+ * nnue.h - the network evaluation and its file format. A net file carries its own shape
+ * (invariant 8), so a wider net is a drop-in; a new activation or feature set needs code
+ * in nnue.c and a case in the loader.
  */
 #ifndef NNUE_H
 #define NNUE_H
@@ -17,59 +12,38 @@
 #include "board.h"
 #include "types.h"
 
-/* Declared in eval.h, which this header does not need in full: the uncertainty head
- * reads the same per-thread state the value head does. */
 typedef struct EvalState EvalState;
 
 #ifdef EVAL_NNUE
 
-/* The accumulator is a stack array, so the width needs a compile-time bound; 2048
- * covers the roadmap at 8 KB of stack. A wider net is rejected at load with a
- * message naming this number. */
-#define NNUE_MAX_HIDDEN 2048
-
-/* The layer stack's widths are stack arrays too, and they are small by design - other
- * engines run 16 and 32. Generous, and a net past it is rejected by name. */
+/* Compile-time bounds for stack arrays; a larger net is rejected at load by name. */
+#define NNUE_MAX_HIDDEN      2048
 #define NNUE_MAX_STACK_WIDTH 128
 
-/* Bumped whenever the on-disk layout or the meaning of a tag changes, so a net from
- * an older exporter fails on the version before anything can read a tag as the
- * wrong thing. Version 3 grew the header by the four stack fields below. */
+/* Bumped whenever the layout or a tag's meaning changes. */
 #define NNUE_FORMAT_VERSION 3u
 
 #define NNUE_MAGIC     "CKNNUE\0\0"
 #define NNUE_MAGIC_LEN 8u
 #define NNUE_TAG_LEN   32u
 
-/* SCReLU squares the clamped activation, so a term carries QA^2 rather than QA and
- * the output sum is divided by QA before the bias is added.
- *
- * PAIRWISE is a stacked net's alternative: each perspective's accumulator is split in
- * half and the clamped halves multiplied, `(x * y) >> log2(QA)`, into the same [0, QA]
- * range - so L1 reads `hidden` numbers rather than `2 * hidden`, which halves the layer
- * that is most of a stacked evaluation. A flat net has no L1 and cannot use it. */
+/* SCReLU squares the clamped activation. PAIRWISE (layer stack only) multiplies the two
+ * clamped halves of each accumulator, `(x * y) >> log2(QA)`, halving L1's input. */
 typedef enum { NNUE_ACT_SCRELU = 1, NNUE_ACT_PAIRWISE = 2 } NnueActivation;
 
-/* A mirrored king stands on one of 32 squares, which the net indexes directly.
- * Deliberately not shared with eval.c's king_bucket(): the net's indexing can move
- * on while the classical evaluation's stays where the tuner fitted it. */
+/* HalfKA with the king mirrored onto 32 squares, each its own slot. */
 typedef enum { NNUE_FEATURES_HALFKA_32SQ = 1 } NnueFeatureSet;
 
-/* The accumulator and the output layer are both walked 16 int16 lanes at a time, and
- * every width worth training is a multiple of 64 already, so the loader requires
- * this rather than carrying a remainder loop that would never run. */
+/* Every width must be a multiple of the 16-lane vectors, so no tail loops. */
 #define NNUE_WIDTH_MULTIPLE 16
 
-/* Buckets are selected by piece count, so a count must divide 32. The bound belongs
- * here rather than in nnue.c because it is a property of the file format - a header
- * claiming more is malformed, not unsupported. */
+/* Output buckets by piece count; the count must divide 32. */
 #define NNUE_MAX_OUTPUT_BUCKETS 32
 
 /*
- * Little-endian, fixed 112 bytes, immediately followed by the payload:
+ * Little-endian, a fixed 112-byte header followed by the payload:
  *
- *     int16  ftWeight[features][hidden]   feature-major, so one feature's row is
- *                                         contiguous - the span the accumulator adds
+ *     int16  ftWeight[features][hidden]   feature-major: one row per feature
  *     int16  ftBias[hidden]
  *     int16  l1Weight[outputBuckets][l1Size][l1Inputs]     only when l1Size > 0;
  *                                         l1Inputs is 2 * hidden, or hidden if pairwise
@@ -81,19 +55,10 @@ typedef enum { NNUE_FEATURES_HALFKA_32SQ = 1 } NnueFeatureSet;
  *     int16  uncWeight[outputBuckets][trunk]        only when reserved[0] == 1
  *     int32  uncBias[outputBuckets]                 only when reserved[0] == 1
  *
- * where `trunk` is the width of whatever the output heads read: `2 * hidden` with no
- * stack, the stack's last hidden layer with one. BOTH HEADS READ THE SAME TRUNK, which
- * is what keeps them one pass over one vector.
- *
- * l1Size == 0 IS THE FLAT ARCHITECTURE, and its payload is byte-identical to the one
- * version 2 described - `trunk` is then `2 * hidden` and there is no stack to skip. That
- * is deliberate: it makes a version-2 net's re-export under version 3 a change that
- * cannot alter an evaluation, which is a thing a bench node count can prove.
- *
- * reserved[0] flags a second output head, trained to predict the value head's own
- * |error|. It is a flag rather than a version bump because a headless net is still
- * a complete net, and an engine too old for it rejects a flagged net on the payload
- * size rather than misreading it.
+ * where `trunk`, which both heads read, is `2 * hidden` with no stack and the stack's
+ * last layer with one. l1Size == 0 is the flat architecture, byte-identical to version 2.
+ * reserved[0] flags the uncertainty head, which predicts the value head's |error|; an
+ * older engine rejects a flagged net on its payload size.
  */
 typedef struct {
     char magic[NNUE_MAGIC_LEN];
@@ -108,10 +73,7 @@ typedef struct {
     int32_t scale;
     uint32_t payloadBytes;
 
-    /* The stack. Zero means absent, and absent for l1Size means the flat output layer
-     * above. The shifts are the requantisation each stage applies to its int32 sum,
-     * carried in the file rather than compiled in for the same reason the widths are:
-     * retraining at a different scale must not need a C change. */
+    /* The layer stack; zero means absent. Each shift requantises a layer's int32 sum. */
     uint32_t l1Size;
     uint32_t l2Size;
     uint32_t l1Shift;
@@ -121,45 +83,33 @@ typedef struct {
     uint8_t reserved[16];
 } NnueHeader;
 
-/* Loads the embedded net, or EvalFile if one was set. Fatal on failure: an engine
- * whose evaluation did not load has nothing useful to do. */
+/* Loads the embedded net. Fatal on failure. */
 void nnue_init(void);
 
-/* The `EvalFile` option. Keeps the current net when the file is missing or
- * malformed, so a typo in a GUI config cannot leave the engine without one. */
+/* The `EvalFile` option. Keeps the current net on failure. */
 bool nnue_load_file(const char *path);
 
-/* Side-to-move-relative centipawns, clamped to the range eval_evaluate() promises -
- * see NNUE_EVAL_LIMIT in nnue.c. */
+/* From scratch, side to move, clamped like eval_evaluate(). */
 Value nnue_evaluate(const Position *pos);
 
-/* Whether the loaded net carries the uncertainty head AND the `UncertaintyHead` option has
- * it on. Constant between loads and option changes, so callers may branch on it per node
- * without paying for the nets that lack the head. */
+/* Whether the net has the uncertainty head and the `UncertaintyHead` option is on. */
 bool nnue_has_uncertainty(void);
 
-/* The `UncertaintyHead` option: false runs the net as if exported without its uncertainty
- * head - the margins fall back to the corrhist signal, z-LMR is off, and the head is never
- * computed - so an A/B of the head needs one file. Never during a search. Returns whether the
- * net carries the head at all. */
+/* The `UncertaintyHead` option. Off, the head is never computed: margins fall back to
+ * correction history and z-LMR is off. Not during a search. Returns whether the net has
+ * the head at all. */
 bool nnue_set_uncertainty(bool on);
 
-/* The head's prediction of the evaluation's own |error| in centipawns, >= 0, for one
- * extra output pass over an accumulator the evaluation already keeps. Asserted
- * against on a net without the head - check nnue_has_uncertainty() first. */
+/* The head's predicted |error| of the evaluation, in centipawns. Only when
+ * nnue_has_uncertainty(). */
 Value nnue_uncertainty(EvalState *es, const Position *pos);
 
-/* Short hex prefix of the loaded net's SHA-256, for the bench header: a node count
- * that cannot be attributed to a specific net is not a measurement. */
+/* Hex SHA-256 of the loaded net, for the bench header. */
 const char *nnue_hash(void);
 
-/* One line naming the net: architecture, width, provenance tag, hash. */
 void nnue_print_info(void);
 
-/* Recomputes the `<raw> <cp> <fen>` vectors written by tools/export_net.py and
- * requires EXACT equality on every line; 0 on success. Integer arithmetic is
- * reproducible, so a tolerance would only hide a rounding difference that will be
- * worth 20 Elo in a position that matters. */
+/* Checks the vectors from tools/export_net.py for exact equality; 0 on success. */
 int nnue_verify_vectors(const char *path);
 
 #endif

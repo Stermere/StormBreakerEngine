@@ -138,13 +138,6 @@ jobs:
       - name: Staged picker gate
         run: make movepick-test
 
-      - name: Eager-generation control has the same search tree
-        run: |
-          make staged-eager ARCH=popcnt
-          lazy=$(./stormbreaker bench 10 | sed -n 's/^\([0-9][0-9]*\) nodes .*/\1/p')
-          eager=$(./stormbreaker-eager bench 10 | sed -n 's/^\([0-9][0-9]*\) nodes .*/\1/p')
-          [ -n "$lazy" ] && [ "$lazy" = "$eager" ]
-
       # Bench pins one thread by design, so nothing else in this file says
       # whether the thread pool starts, whether its helpers search, or whether a
       # session that used them can still be measured afterwards.

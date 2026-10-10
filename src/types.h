@@ -22,8 +22,8 @@
 
 enum {
     MAX_PLY = 246,
-    /* 256 is not enough. board_set_fen accepts any diagram, and a ring of queens
-     * generates 270 pseudo-legal moves; NDEBUG deletes the generator's bounds check. */
+    /* Not 256: board_set_fen accepts diagrams with 270 pseudo-legal moves, and the
+     * generator's bound is only asserted. */
     MAX_MOVES = 512,
     SQUARE_NB = 64,
     COLOR_NB  = 2,
@@ -90,7 +90,6 @@ typedef enum { RANK_1, RANK_2, RANK_3, RANK_4, RANK_5, RANK_6, RANK_7, RANK_8 } 
 static inline Square make_square(File f, Rank r) { return (Square)((r << 3) | f); }
 static inline File file_of(Square s) { return (File)(s & 7); }
 static inline Rank rank_of(Square s) { return (Rank)(s >> 3); }
-static inline bool is_ok_square(Square s) { return s >= SQ_A1 && s <= SQ_H8; }
 
 /* Mirror vertically, so black can read white's tables. */
 static inline Square flip_rank(Square s) { return (Square)(s ^ 56); }
@@ -130,9 +129,8 @@ enum {
     VALUE_MATE_IN_MAX_PLY  = VALUE_MATE - MAX_PLY,
     VALUE_MATED_IN_MAX_PLY = -VALUE_MATE_IN_MAX_PLY,
 
-    /* Tablebase scores get a band directly below the mate band: proven won, mate not
-     * yet in sight. A win probed at ply p scores VALUE_TB_WIN - p, so converting
-     * sooner is worth more. */
+    /* TB results, just below the mate band. A win probed at ply p scores
+     * VALUE_TB_WIN - p, so converting sooner is worth more. */
     VALUE_TB_WIN             = VALUE_MATE_IN_MAX_PLY - 1,
     VALUE_TB_WIN_IN_MAX_PLY  = VALUE_TB_WIN - MAX_PLY,
     VALUE_TB_LOSS_IN_MAX_PLY = -VALUE_TB_WIN_IN_MAX_PLY
@@ -144,8 +142,8 @@ static inline bool is_mate_score(Value v) {
     return v >= VALUE_MATE_IN_MAX_PLY || v <= VALUE_MATED_IN_MAX_PLY;
 }
 
-/* Proven result - a mate score or a tablebase score. Ask this, not is_mate_score(),
- * wherever the question is "fact or evaluation?": a TB score is not a mate score. */
+/* A proven result, mate or TB. Use this, not is_mate_score(), to ask "proven or
+ * evaluated?". */
 static inline bool is_decisive_score(Value v) {
     return v >= VALUE_TB_WIN_IN_MAX_PLY || v <= VALUE_TB_LOSS_IN_MAX_PLY;
 }

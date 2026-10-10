@@ -1,4 +1,4 @@
-/* zobrist.c - fixed-seed key generation. See the determinism note in zobrist.h. */
+/* zobrist.c - fixed-seed key generation. */
 #include "zobrist.h"
 
 Key ZobristPiece[PIECE_NB][SQUARE_NB];
@@ -9,8 +9,7 @@ Key ZobristSideToMove;
 
 static uint64_t rng_state;
 
-/* xorshift64*: two instructions per word, and reproducible across compilers because
- * every operation is defined on exact-width unsigned integers. */
+/* xorshift64*: exact-width unsigned arithmetic, so identical on every compiler. */
 static uint64_t rng_next(void) {
     rng_state ^= rng_state >> 12;
     rng_state ^= rng_state << 25;
@@ -25,17 +24,14 @@ void zobrist_init(void) {
         for (int s = 0; s < SQUARE_NB; ++s)
             ZobristPiece[p][s] = rng_next();
 
-    /* Derived rather than drawn: taking these from rng_next() would shift every key
-     * generated after them, moving the bench node count for a change that alters no
-     * search decision. */
+    /* Derived, not drawn, so the keys generated after are unchanged. */
     for (int p = 0; p < PIECE_NB; ++p)
         ZobristPawnSelect[p] = type_of((Piece)p) == PAWN ? ~(Key)0 : (Key)0;
 
     for (int f = 0; f < 8; ++f)
         ZobristEnPassant[f] = rng_next();
 
-    /* Four independent right-keys, XORed together per mask, so do_move can update the
-     * key with one XOR instead of toggling rights one at a time. */
+    /* One key per rights mask, so do_move updates castling with a single XOR. */
     Key rights[4];
     for (int i = 0; i < 4; ++i)
         rights[i] = rng_next();

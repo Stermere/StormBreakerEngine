@@ -1,9 +1,4 @@
-/*
- * eval.h - static position evaluation.
- *
- * Scores are from the point of view of the SIDE TO MOVE, which is what lets the
- * search run plain negamax with no sign juggling.
- */
+/* eval.h - static evaluation, from the side to move's point of view. */
 #ifndef EVAL_H
 #define EVAL_H
 
@@ -15,66 +10,38 @@
 
 void eval_init(void);
 
-/* Textbook exchange values for move ordering and SEE, deliberately not the tuned
- * Material[] weights. The king is zero: valuing it would corrupt every exchange
- * it appears in. */
+/* Fixed exchange values for move ordering and SEE; the king is zero. */
 extern const Value PieceValues[PIECE_TYPE_NB];
 
-/*
- * The network's per-thread evaluation state: the accumulator stack, the refresh cache,
- * and the layer stack a stacked net needs. Opaque here - nnue.c owns the layout.
- *
- * It is PASSED rather than reached for, and that is a speed decision as much as a
- * clarity one. Either way it is per-thread state under invariant 11, but the Windows
- * toolchain this engine is built with has no native thread-local storage: GCC is
- * configured `--enable-threads=posix`, so every reference to a `_Thread_local` compiles
- * into a call to __emutls_get_address(). At four of those per node - push, pop, and the
- * two output heads - that was about a tenth of the whole search. A pointer the caller
- * already has in hand costs nothing, here or on any other platform.
- */
+/* The network's per-thread state (accumulator stack and caches), owned by nnue.c. Passed
+ * down rather than read from a thread-local: on this toolchain every TLS access is a call
+ * to __emutls_get_address(), which cost a tenth of the search. */
 typedef struct EvalState EvalState;
 
 Value eval_evaluate(EvalState *es, const Position *pos);
 
-/* The classical model by name. eval_evaluate() is the network in a default build,
- * so the tuner and `eval` must ask for this or they measure whatever got linked. */
+/* The classical model by name: eval_evaluate() is the network in a default build. */
 Value eval_classical(const Position *pos);
 
-/* Term-by-term breakdown - the UCI `eval` command. */
+/* The UCI `eval` command. */
 void eval_trace(const Position *pos);
 
-/*
- * The accumulator stack inside that state: push after a move is played, pop before it
- * is retracted. Correctness does not depend on these being called - each level rebuilds
- * from the board when its stored key does not match - but speed does. A NULL state is
- * accepted everywhere and means exactly that: correct, and slow.
- */
+/* Every function taking an EvalState accepts NULL: correct, just slower. Push after a move
+ * is played and pop before it is undone; a missed push costs speed, never correctness. */
 #ifdef EVAL_NNUE
 
-/*
- * The calling thread's state, claimed on first use. Every searching thread should call
- * this once and keep what it returns.
- *
- * NULL means the allocation failed, and is not an error: every consumer below accepts it
- * and answers correctly from a full accumulation at each node, which is several times
- * slower. That is also what a caller that never asks gets, which is why a tool wanting
- * one score need not know any of this exists.
- */
+/* The calling thread's state, allocated on first use; NULL if that failed. */
 EvalState *eval_state(void);
 
 void eval_state_free(void);
 
-/* What one thread's stack costs, so a `Threads` setting can be reported before it is
- * multiplied by a hundred. */
+/* Per-thread memory, for reporting a `Threads` setting. */
 size_t eval_state_bytes(void);
 
-/* Resets one thread's stack, and retires its cached evaluations when the net they were
- * produced under is no longer the loaded one. Called at the top of every search. */
+/* Called at the start of every search. Drops cached evaluations if the net changed. */
 void eval_state_clear(EvalState *es);
 
-/* Declares every thread's cached evaluations stale, wherever those threads are. Loading
- * a net does this by itself; `search_clear()` calls it so that `ucinewgame` leaves
- * nothing at all behind (invariant 7). */
+/* Marks every thread's cached evaluations stale (`ucinewgame`, invariant 7). */
 void eval_state_retire(void);
 void eval_state_push(EvalState *es, const Position *pos, Move m);
 void eval_state_push_null(EvalState *es, const Position *pos);
@@ -82,7 +49,6 @@ void eval_state_pop(EvalState *es);
 
 #else
 
-/* No state to keep: the classical evaluation reads the board and nothing else. */
 static inline EvalState *eval_state(void) { return NULL; }
 static inline void eval_state_free(void) {}
 static inline size_t eval_state_bytes(void) { return 0; }

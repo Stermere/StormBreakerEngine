@@ -1,9 +1,4 @@
-/*
- * thread.h - minimal portable threading primitives.
- *
- * Win32 threads on Windows, pthreads elsewhere. Deliberately not C11 <threads.h>:
- * MinGW-w64 does not ship it, and winpthreads would mean an extra DLL.
- */
+/* thread.h - Win32 threads or pthreads. Not C11 <threads.h>: MinGW-w64 lacks it. */
 #ifndef THREAD_H
 #define THREAD_H
 
@@ -16,9 +11,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-/* Processor groups are a Windows 7 API, and a machine with more than 64 logical
- * processors cannot be used without them - so the declarations are not optional
- * here, however old a default the toolchain picks. */
+/* Processor groups (Windows 7+) are needed past 64 logical processors. */
 #if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0601
 #undef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
@@ -44,30 +37,15 @@ bool thread_create(ThreadHandle *handle, ThreadEntry fn, void *arg);
 
 void thread_join(ThreadHandle handle);
 
-/* Logical processors this process may use - every processor group on Windows, not
- * just the one it was launched into. */
+/* Logical processors in every processor group. */
 int thread_hardware_concurrency(void);
 
-/*
- * Places the CALLING thread, which must be worker number `index` of a pool of
- * `poolSize`, on the machine.
- *
- * Only Windows does anything, for two reasons. A process is confined to a single
- * processor group unless a thread asks for another by name, so on a 128-core machine
- * every thread would pile onto the first 64 cores and half the machine would sit idle.
- * And its scheduler will seat two search threads on the two halves of one physical core
- * while another core is idle, which costs about a tenth of the search. Every other
- * platform schedules across the whole machine already, and pinning there would only take
- * away the kernel's ability to migrate a thread off a core somebody else is using.
- *
- * `poolSize` is why this is not simply an affinity mask: see thread.c. A pool smaller
- * than the machine is left alone, and that includes the pool of one that bench, datagen
- * and a single SPRT game all run on.
- */
+/* Places the calling thread, worker `index` of `poolSize`. Windows only: otherwise a
+ * process stays in one processor group, and the scheduler pairs threads on SMT siblings
+ * while cores idle. A pool smaller than the machine is left alone. */
 void thread_bind(int index, int poolSize);
 
-/* Only for parking a thread on an external event, such as a `stop` that has not
- * arrived - never inside the search. */
+/* For waiting on an external event, never inside the search. */
 void thread_sleep_ms(int ms);
 
 void mutex_init(Mutex *m);

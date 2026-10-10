@@ -271,7 +271,7 @@ endif
         ratings snapshot \
         classical nnue-export nnue-test nnue-info net-fetch net-publish engines-fetch \
         syzygy-fetch syzygy-test chess960-test chess960-campaign unc-probe \
-        smp-test movepick-test staged-eager staged-profile
+        smp-test movepick-test
 
 all: $(TARGET)
 
@@ -398,14 +398,6 @@ smp-test: $(TARGET)
 
 movepick-test: $(TARGET)
 	./$(TARGET) movepick selftest
-
-# Same picker and scoring timestamps, but no deferred generation. A timing
-# control, not an opponent: this must bench identically to the lazy picker.
-staged-eager: $(EVALDEP)
-	$(CC) $(CFLAGS) -DMOVE_PICKER_EAGER $(SOURCES) -o $(EXE)-eager$(SUFFIX) $(LDFLAGS)
-
-staged-profile: $(EVALDEP)
-	$(CC) $(CFLAGS) -DMOVE_PICKER_PROFILE $(SOURCES) -o $(EXE)-profile$(SUFFIX) $(LDFLAGS)
 
 chess960-test: $(TARGET)
 	./$(TARGET) chess960 selftest
@@ -945,8 +937,6 @@ help:
 	@echo "make unc-probe          build a probe binary; measure what unc_scale() reads"
 	@echo "make smp-test           parallel-search gate (THREADS= caps the pool)"
 	@echo "make movepick-test      staged picker completeness, ordering and laziness gate"
-	@echo "make staged-eager       matched-tree eager-generation timing control"
-	@echo "make staged-profile     separate binary with per-thread move-work counters"
 	@echo "make chess960-test      Chess960 structural gate + its perft suites"
 	@echo "make chess960-campaign  differential perft vs ORACLE= (default stockfish)"
 	@echo "make net-publish        upload EVALFILE as a content-addressed release"

@@ -1,13 +1,7 @@
-/*
- * bitboard.c - attack table generation.
- *
- * Everything here is built once by bb_init(). The tables are pure functions of board
- * geometry, so they hold no position state and are safe to share across threads.
- */
+/* bitboard.c - attack tables, built once by bb_init() and read-only after. */
 #include "bitboard.h"
 
 #include <assert.h>
-#include <stdio.h>
 
 Bitboard PawnAttacks[COLOR_NB][SQUARE_NB];
 Bitboard KnightAttacks[SQUARE_NB];
@@ -18,14 +12,11 @@ Bitboard LineThrough[SQUARE_NB][SQUARE_NB];
 Magic BishopMagics[SQUARE_NB];
 Magic RookMagics[SQUARE_NB];
 
-/* The well-known totals of 2^popcount(mask) summed over all squares. init_magics
- * asserts that the fill lands exactly on the end, so a wrong constant cannot go
- * unnoticed. */
+/* Sum of 2^popcount(mask) over all squares; init_magics asserts the fill matches. */
 static Bitboard BishopTable[5248];
 static Bitboard RookTable[102400];
 
-/* (file, rank) deltas, so edge wrapping is impossible by construction: a candidate is
- * rejected unless both components stay on the board. */
+/* (file, rank) deltas, so nothing can wrap round an edge. */
 static const int KnightDeltas[8][2] = {{1, 2},   {2, 1},   {2, -1}, {1, -2},
                                        {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
 
@@ -44,9 +35,8 @@ static Square offset_square(Square s, int df, int dr) {
     return make_square((File)f, (Rank)r);
 }
 
-/* Walks each ray outward, stopping on and including the first occupied square. Far
- * too slow for the search, but obviously correct, so it is the source of truth the
- * fast tables are built and verified against. */
+/* Ray walk up to and including the first blocker: slow, obviously correct, and the
+ * reference the fast tables are built and checked against. */
 static Bitboard slide(Square s, Bitboard occupied, const int deltas[4][2]) {
     Bitboard attacks = BB_EMPTY;
 
@@ -65,9 +55,7 @@ static Bitboard slide(Square s, Bitboard occupied, const int deltas[4][2]) {
 }
 
 #if !defined(USE_PEXT) || !defined(NDEBUG)
-/* xorshift64* from a constant seed: magic numbers are part of the engine's behaviour,
- * so they must come out identical on every run and machine. Deliberately not sharing
- * state with the Zobrist generator, so changing one cannot perturb the other. */
+/* Constant seed, separate from Zobrist's, so magics are identical everywhere. */
 static uint64_t magic_rng_state = 0x246C0B1AF3E17D9BULL;
 
 static uint64_t magic_rng(void) {
@@ -83,17 +71,12 @@ static uint64_t magic_rng(void) {
 /* A useful magic has very few set bits, so ANDing three draws finds one far faster. */
 static uint64_t magic_rng_sparse(void) { return magic_rng() & magic_rng() & magic_rng(); }
 
-/* Per-rank starting points for the magic search: it is a random walk, and where it
- * starts changes how long it walks - these measure ~55ms for all 128 multipliers
- * against ~90ms from a single seed, paid once per process. They affect only how fast
- * a magic is found, never which attacks it produces. */
+/* Per-rank seeds that make the magic search faster (~55ms rather than ~90ms). */
 static const uint64_t MagicSeeds[8] = {8977, 44560, 54343, 38998, 5731, 95205, 104912, 17020};
 #endif
 
-/* Under USE_PEXT no search happens - the CPU extracts the masked bits, so the table is
- * indexed by the occupancy subset number directly. Otherwise a multiplier is searched
- * for that maps every subset onto a distinct index, tolerating a collision only when
- * both subsets yield the same attacks. */
+/* With PEXT the table is indexed by pext() directly. Otherwise search for a multiplier
+ * with no destructive collisions. */
 static void init_magics(Bitboard *table, Magic magics[SQUARE_NB], const int deltas[4][2]) {
     Bitboard reference[4096];
     size_t used = 0;
@@ -106,9 +89,7 @@ static void init_magics(Bitboard *table, Magic magics[SQUARE_NB], const int delt
     for (Square s = SQ_A1; s <= SQ_H8; ++s) {
         Magic *const m = &magics[s];
 
-        /* Blockers on the board edge cannot hide anything behind them, so excluding them
-         * roughly halves the table without losing a case. The square's own rank and file
-         * are exempt: a rook on A1 genuinely is blocked by a piece on A8. */
+        /* Edge blockers hide nothing, except along the square's own rank and file. */
         const Bitboard edges = ((BB_RANK_1 | BB_RANK_8) & ~rank_bb(rank_of(s))) |
                                ((BB_FILE_A | BB_FILE_H) & ~file_bb(file_of(s)));
 
@@ -132,9 +113,7 @@ static void init_magics(Bitboard *table, Magic magics[SQUARE_NB], const int delt
 
         used += (size_t)size;
 
-        /* Search for a multiplier that hashes all `size` subsets without a destructive
-         * collision. `epoch` marks which entries belong to the attempt in progress, which
-         * avoids clearing the slice each time. */
+        /* `epoch` marks the current attempt's entries, so the slice is never cleared. */
 #ifndef USE_PEXT
         magic_rng_state = MagicSeeds[rank_of(s)];
 
@@ -181,13 +160,10 @@ void bb_init(void) {
         }
     }
 
-    /* Must precede everything below: these are what attacks_bb() reads for sliders. */
+    /* Before anything below calls attacks_bb(). */
     init_magics(BishopTable, BishopMagics, BishopDeltas);
     init_magics(RookTable, RookMagics, RookDeltas);
 
-    /* Cross-check the fast path against the reference walk on pseudo-random occupancies.
-     * A wrong magic would otherwise surface as a bizarre illegal move deep in a search
-     * rather than here. */
 #ifndef NDEBUG
     for (Square s = SQ_A1; s <= SQ_H8; ++s)
         for (int i = 0; i < 256; ++i) {
@@ -197,9 +173,8 @@ void bb_init(void) {
         }
 #endif
 
-    /* Derived from empty-board slider attacks: two squares are aligned iff one attacks
-     * the other with nothing in the way, and the squares strictly between them are the
-     * intersection of the two attack sets computed with the far square as a blocker. */
+    /* From empty-board slider attacks: aligned squares see each other, and the squares
+     * between are the overlap of their attacks with each other as blocker. */
     for (Square a = SQ_A1; a <= SQ_H8; ++a) {
         for (Square b = SQ_A1; b <= SQ_H8; ++b) {
             SquaresBetween[a][b] = BB_EMPTY;
@@ -222,15 +197,4 @@ void bb_init(void) {
             }
         }
     }
-}
-
-void bb_print(Bitboard b) {
-    for (int r = RANK_8; r >= RANK_1; --r) {
-        printf("  +---+---+---+---+---+---+---+---+\n%d ", r + 1);
-        for (int f = FILE_A; f <= FILE_H; ++f)
-            printf("| %c ", bb_test(b, make_square((File)f, (Rank)r)) ? 'X' : ' ');
-        printf("|\n");
-    }
-    printf("  +---+---+---+---+---+---+---+---+\n    a   b   c   d   e   f   g   h\n");
-    printf("  0x%016llXULL\n", (unsigned long long)b);
 }
