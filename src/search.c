@@ -276,6 +276,12 @@ uint64_t search_nodes(void) {
     return total;
 }
 
+uint64_t search_thread_nodes(int thread) {
+    if (thread < 0 || thread >= ThreadCount)
+        return 0;
+    return atomic_load(&Threads[thread]->publishedNodes);
+}
+
 /* The same, with the caller's own live counter in place of its published one. */
 static uint64_t nodes_including(const SearchThread *td) {
     uint64_t total = td->nodeCount;

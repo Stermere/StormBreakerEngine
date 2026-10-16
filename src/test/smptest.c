@@ -6,6 +6,7 @@
 #include "smptest.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -59,13 +60,34 @@ static uint64_t search_position(const char *fen) {
     return search_nodes();
 }
 
-static uint64_t search_all(uint64_t *out) {
-    uint64_t total = 0;
+/* The fewest nodes any helper searched in the last search; UINT64_MAX if there were none. */
+static uint64_t idlest_helper_nodes(void) {
+    uint64_t fewest = UINT64_MAX;
+
+    for (int i = 1; i < search_threads(); ++i) {
+        const uint64_t nodes = search_thread_nodes(i);
+        if (nodes < fewest)
+            fewest = nodes;
+    }
+    return fewest;
+}
+
+/* `idlest`, if given, receives the idlest helper's count over all the positions. */
+static uint64_t search_all(uint64_t *out, uint64_t *idlest) {
+    uint64_t total  = 0;
+    uint64_t fewest = UINT64_MAX;
 
     for (int i = 0; i < POSITION_COUNT; ++i) {
         out[i] = search_position(Positions[i]);
         total += out[i];
+
+        const uint64_t helper = idlest_helper_nodes();
+        if (helper < fewest)
+            fewest = helper;
     }
+
+    if (idlest)
+        *idlest = fewest;
     return total;
 }
 
@@ -96,7 +118,7 @@ int smp_selftest(int maxThreads) {
     uint64_t after[POSITION_COUNT];
 
     search_set_threads(1);
-    const uint64_t singleTotal = search_all(before);
+    const uint64_t singleTotal = search_all(before, NULL);
 
     snprintf(detail, sizeof(detail), "%llu nodes over %d positions at depth %d",
              (unsigned long long)singleTotal, POSITION_COUNT, GATE_DEPTH);
@@ -114,18 +136,23 @@ int smp_selftest(int maxThreads) {
         report("the pool resizes to what was asked", got == want, detail);
 
         uint64_t nodes[POSITION_COUNT];
-        const uint64_t total = search_all(nodes);
+        uint64_t idlest;
+        const uint64_t total = search_all(nodes, &idlest);
 
-        /* Idle helpers would reproduce the single-threaded total exactly; more means they
-         * searched. */
-        snprintf(detail, sizeof(detail), "%d threads: %llu nodes against %llu at one", got,
-                 (unsigned long long)total, (unsigned long long)singleTotal);
-        report("the helpers actually search", total > singleTotal, detail);
+        /* Per helper, not the pool total against one thread's: the helpers' entries can
+         * shrink thread 0's tree by more than they search themselves. */
+        const bool searched = idlest > 0 && idlest != UINT64_MAX;
+        if (idlest == UINT64_MAX)
+            snprintf(detail, sizeof(detail), "%d threads: no helpers", got);
+        else
+            snprintf(detail, sizeof(detail), "%d threads: %llu nodes, the idlest helper %llu", got,
+                     (unsigned long long)total, (unsigned long long)idlest);
+        report("the helpers actually search", searched, detail);
     }
 
     /* The main check: back at one thread, the counts must match the baseline exactly. */
     search_set_threads(1);
-    search_all(after);
+    search_all(after, NULL);
 
     for (int i = 0; i < POSITION_COUNT; ++i) {
         snprintf(detail, sizeof(detail), "position %d: %llu before, %llu after", i + 1,

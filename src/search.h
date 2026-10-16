@@ -87,6 +87,9 @@ bool search_running(void);
 /* Summed over threads; trails by up to CHECK_INTERVAL nodes each. */
 uint64_t search_nodes(void);
 
+/* One thread's share of search_nodes(); 0 for a thread not in the pool. */
+uint64_t search_thread_nodes(int thread);
+
 bool search_stopped(void);
 
 /* The live constants of unc_scale(), for the probe. */
