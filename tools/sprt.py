@@ -184,18 +184,20 @@ def main() -> int:
     ap.add_argument("--tc", default="STC", help="VSTC, STC, LTC, or a literal like 10+0.1")
     ap.add_argument("--bounds", help='"elo0,elo1"; defaults per time control')
     ap.add_argument("--concurrency", type=int, default=0)
-    ap.add_argument("--hash", type=int, default=16, dest="hash_mb")
+    ap.add_argument("--hash", type=int, dest="hash_mb",
+                    help="MB per engine; default per preset (VSTC 4, STC 16, LTC 64)")
     ap.add_argument("--threads", type=int, default=1,
                     help="search threads per engine; base's alone when --dev-threads is given")
     ap.add_argument("--dev-threads", type=int,
                     help="search threads for dev only, e.g. 4 against base's --threads 1. "
                          "Without --concurrency, concurrency is divided by the larger count")
     ap.add_argument("--rounds", type=int, default=40000, help="game-pair cap; default runs to a verdict")
-    ap.add_argument("--book")
+    ap.add_argument("--book", help="EPD book; default UHO, or the balanced CCRL book at LTC")
     ap.add_argument("--syzygy",
-                    help="tablebase directory, given to BOTH engines. Without it a change "
-                         "to tablebase code is not exercised at all: the engine loads none "
-                         "unless SyzygyPath is set.")
+                    help="tablebase directory, given to BOTH engines; LTC defaults to "
+                         "external/syzygy/3-4-5, and 'off' disables it. Without tables a "
+                         "change to tablebase code is not exercised at all: the engine "
+                         "loads none unless SyzygyPath is set.")
     ap.add_argument("--dev-options", default="",
                     help='UCI options for dev only: "RfpMargin=72 DeltaMargin=222". '
                          'An "option." prefix is tolerated so tune.py output pastes straight in.')
@@ -212,6 +214,7 @@ def main() -> int:
     tc, tc_label = c.resolve_tc(args.tc)
     elo0, elo1 = c.resolve_bounds(tc_label, args.bounds)
     rounds = args.rounds
+    hash_mb, book, syzygy = c.resolve_conditions(tc_label, args.hash_mb, args.book, args.syzygy)
 
     dev_options = {}
     if args.dev_from:
@@ -287,8 +290,6 @@ def main() -> int:
         base_options["Threads"] = args.threads
         each_threads = None
 
-    book = args.book or c.get_book()
-
     c.ensure_dir(c.GAMES_DIR)
     pgn = c.GAMES_DIR / f"{c.stamp()}-{tc_label}.pgn"
 
@@ -308,11 +309,11 @@ def main() -> int:
         rounds=rounds,
         concurrency=concurrency,
         pgn=pgn,
-        hash_mb=args.hash_mb,
+        hash_mb=hash_mb,
         threads=each_threads,
         book=book,
         extra=extra,
-        syzygy=args.syzygy,
+        syzygy=syzygy,
     )
 
     c.section("SPRT configuration")
@@ -323,13 +324,13 @@ def main() -> int:
         print(f"  bounds       [{elo0}, {elo1}]  alpha=0.05 beta=0.05")
     print(f"  concurrency  {concurrency}")
     if dev_threads is None:
-        print(f"  hash/threads {args.hash_mb} MB / {args.threads}")
+        print(f"  hash/threads {hash_mb} MB / {args.threads}")
     else:
-        print(f"  hash/threads {args.hash_mb} MB / dev {dev_threads}, base {args.threads}")
+        print(f"  hash/threads {hash_mb} MB / dev {dev_threads}, base {args.threads}")
     if book:
         print(f"  book         {book}")
-    if args.syzygy:
-        print(f"  syzygy       {args.syzygy}  (both engines)")
+    if syzygy:
+        print(f"  syzygy       {syzygy}  (both engines)")
     print(f"  pgn          {pgn}")
     if dev_options:
         print(f"  dev options  {len(dev_options)}: " +

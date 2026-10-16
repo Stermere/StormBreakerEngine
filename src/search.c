@@ -349,7 +349,7 @@ static inline void update_seldepth(SearchThread *td, int ply) {
 /* Pruning margins are centipawns per ply of remaining depth unless noted. Thresholds stay
  * #defines: SPSA rounds both sides of a perturbation to the same integer. */
 TUNABLE(RFP_MARGIN, 67);
-#define RFP_DEPTH 7
+#define RFP_DEPTH 9
 
 #define LMP_DEPTH 8
 
@@ -486,6 +486,11 @@ TUNABLE(ZLMR_LESS, 0);
 TUNABLE(ZDEEPER_Z, 16);
 TUNABLE(ZLMR_SIGMA_FLOOR, 16);
 
+/* The search's eval is scaled by (K + material) / (K + 6200), pieces counted 3/3/5/9 and
+ * pawns not at all: 1.0 with every piece on, K / (K + 6200) with none (E54). Datagen labels
+ * are scaled too, so a net trained on them has absorbed some of it: re-fit K for each net. */
+TUNABLE(MAT_SCALE_K, 9000);
+
 #ifdef TUNE_SEARCH
 
 /* Name and sweep range for each TUNABLE. The ranges are deliberately wide: a sweep that
@@ -543,6 +548,7 @@ static const struct {
     {"ZlmrLess", &ZLMR_LESS, -48, 48},
     {"ZdeeperZ", &ZDEEPER_Z, 0, 64},
     {"ZlmrSigmaFloor", &ZLMR_SIGMA_FLOOR, 1, 48},
+    {"MatScaleK", &MAT_SCALE_K, 2000, 64000},
 };
 
 int search_tunable_count(void) { return (int)(sizeof(Tunables) / sizeof(Tunables[0])); }
@@ -1296,9 +1302,17 @@ static inline int16_t *cont4_corr_entry(SearchThread *td, int ply) {
 
 /* Feeds pruning, reductions and `improving` only. Reported scores are never corrected, and
  * the TT stores the raw eval so a later probe re-corrects with newer data. */
+/* Non-pawn material at 3/3/5/9, both sides: what MAT_SCALE_K's scaling counts. */
+static inline int scale_material(const Position *pos) {
+    return 300 * popcount(pos->byType[KNIGHT] | pos->byType[BISHOP]) +
+           500 * popcount(pos->byType[ROOK]) + 900 * popcount(pos->byType[QUEEN]);
+}
+
 static Value corrected_eval(SearchThread *td, const Position *pos, Value raw, int ply) {
     if (raw == VALUE_NONE)
         return VALUE_NONE;
+
+    raw = (Value)((int64_t)raw * (MAT_SCALE_K + scale_material(pos)) / (MAT_SCALE_K + 6200));
 
     const int16_t *const cc = cont_corr_entry(td, ply);
     const int16_t *const c4 = cont4_corr_entry(td, ply);
@@ -1805,7 +1819,8 @@ static Value negamax(SearchThread *td, Position *pos, Depth depth, Value alpha, 
             if (v >= probCutBeta) {
                 /* Stored at the depth actually searched. */
                 tt_store(key, m, v, rawEval, depth - PROBCUT_REDUCTION + 1, BOUND_LOWER, ttPv, ply);
-                return v;
+                /* Less the margin: v was proven against the raised beta, not this node's. */
+                return is_decisive_score(v) ? v : (Value)(v - (probCutBeta - beta));
             }
         }
     }

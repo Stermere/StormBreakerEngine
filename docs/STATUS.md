@@ -138,6 +138,14 @@ test results are recorded in [EXPERIMENTS.md](EXPERIMENTS.md).
 | Against berserk-8.5 at LTC (40+0.4): the P2 net | +4.93 +/- 10.40 over 1340 games, stopped by hand; STC was +19.71: the edge narrows at LTC (E52) |
 | NNUE recipe: one label scale across gen-006 / gen-006-u (S1); lambda 0.6 in the main stage too (L6) | S1 -6.14 +/- 6.95 vs P1u over 3000 STC games; L6 **-26.39 +/- 10.31** vs P2u, H0. The recipe is settled for this data: pretrain at lambda 0.95, finish at 0.6-0.75, raw scales ([E53](EXPERIMENTS.md#e53-the-last-recipe-follow-ups-and-berserk-85-under-ccrl-like-conditions)) |
 | **Against berserk-8.5 under CCRL-like conditions: P1u on a balanced book (STC), P2u at LTC (UHO, 2000 games pooled)** | **+3.24 +/- 7.56** and **+3.82 +/- 8.48**, against +23.78 / +19.71 at STC on UHO. The edge lives in UHO's lopsided openings and at short clocks: **about 3575-3580, 3625 is ~45-60 away**. Confirm externally on a balanced book from here (E53) |
+| **Test conditions: hash scales with the clock (VSTC 4 / STC 16 / LTC 64 MB); LTC plays the balanced CCRL book with 3-4-5 tables** | built 2026-10-14: CCRL Blitz's table load at every preset ([E54](EXPERIMENTS.md#e54-material-scaling-of-the-searchs-evaluation-a-10-byte-table-and-ccrl-like-test-conditions)). LTC results before it do not compare |
+| **Search: material scaling of the evaluation, x (K + material) / (K + 6200), K 9000; off in datagen's search** | with the next two rows: STC **+30.96 +/- 10.02** (H1), balanced book **+24.36 +/- 10.48**, and **+27.05 +/- 10.06 against viridithas-12.0.0 + koivisto-8.0** over 6000 games (E54) |
+| TT: 10-byte entries, six to a cache line (1.5x the entries per MB) | shipped in the E54 stack; screen +4.05 at VSTC / 4 MB |
+| Search: ProbCut returns v less its margin; RFP to depth 9 | shipped in the E54 stack; screens +6.37 and +7.82 |
+| Search: low-ply history, opponent-worsening RFP, improving from four plies, IIR at PV/cut only, a second IIR ply | not kept: +3.76 to -5.21 at VSTC (E54); code in `external/patches/e54-night-candidates.patch` |
+| SPSA of 26 seats on the E54 stack | stopped at iteration 369 of 550: only `MatScaleK` moved (to ~8070, within noise of 9000); nothing shipped (E54) |
+| **E54 build vs HEAD under the CCRL-like LTC (40+0.4, 64 MB, balanced book, tables)** | **+20.87 +/- 6.65** over 1500 games: the edge holds with the clock; against viridithas-12.0.0 under the same conditions **-4.63 +/- 12.84** over 600 (E54) |
+| **Against viridithas-12.0.0 / koivisto-8.0, STC, balanced book, tables, 1500 games each** | E54 build **+3.01 / -6.25**, HEAD -25.29 / -32.05: about **3595** CCRL from HEAD's ~3568 |
 
 `make perft` and `make perft-all` pass exactly — standard chess and Chess960
 alike, since the 960 suites are part of the same gate. `make chess960-test`

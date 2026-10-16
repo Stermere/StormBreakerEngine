@@ -4962,3 +4962,203 @@ UHO SPRTs rank changes the way balanced play would is unmeasured.
 
 - `tools/gauntlet.py --book <epd>`. The default is still the UHO book.
 - In the run directory's copy of `sprt_queue.py`, fixed-length entries now pass `extra` through.
+
+---
+
+### E54: Material scaling of the search's evaluation, a 10-byte table, and CCRL-like test conditions
+
+**Date** 2026-10-14/15 (overnight) · **Net** `93b2eecc8dbc` (P1u) · **Baseline** HEAD `5ecb428`,
+bench 208681 (d7) / 4341193 (d13) · **Final bench** 218533 / 4408909 · **Status** the stack
+measured **+30.96 +/- 10.02** at STC (SPRT [0, 5] H1 at 1294 games) and **+24.36 +/- 10.48** over
+1000 fixed STC games on the balanced CCRL book, both against HEAD. **Against viridithas-12.0.0
+and koivisto-8.0 it gained +27.05 +/- 10.06 over HEAD** (3000 games each, balanced book, tables):
+the self-play gain transferred whole, and the build is level with viridithas (+3.01 +/- 10.08).
+**Under the CCRL-like LTC it holds: +20.87 +/- 6.65 over HEAD**, 1500 games, and -4.63 +/- 12.84
+against viridithas over 600: about **3595** CCRL.
+Run directory: `external/games/sprt-20261014-night/` (`NOTES.md`, `queue.json`, every log).
+Every candidate is in `external/patches/e54-night-candidates.patch` as `#ifdef CAND_*` blocks.
+
+The brief: the Elo left before the gen-7 datagen run, with no NNUE retraining, confirmed against
+~3600 engines (viridithas-12.0.0, koivisto-8.0).
+
+#### Test conditions now follow CCRL's
+
+CCRL Blitz is 2'+1" on an i7-4770K, 128 or 256 MB hash, ponder off, a general book of up to 12
+moves, tablebases up to six men. One engine of a 14-game match on this Ryzen 7 5800X runs at about
+one 4770K core. A CCRL game therefore puts ~2.3M nodes a move into 8-17M entries, a table 14-28%
+full. The old LTC put ~0.85M into 16 MB's 1M entries, ~80% full: 3-6x more crowded than any
+CCRL game. The presets now scale the hash with the clock (`HASH_PRESETS` in `tools/common.py`,
+read by `sprt.py`, `gauntlet.py` and `tune.py`), and LTC also takes CCRL's book and tables:
+
+| preset | TC | hash | book | tables |
+|---|---|---|---|---|
+| VSTC | 2+0.02 | 4 MB (was 16) | UHO | none |
+| STC | 8+0.08 | 16 MB | UHO | none |
+| LTC | 40+0.4 | 64 MB (was 16) | `ccrl4040_ply20.epd` (was UHO) | 3-4-5, both sides (was none) |
+
+`--hash`, `--book` and `--syzygy` (`off` included) override a preset; `gauntlet.py` gained
+`--syzygy`. LTC results from before this entry do not difference against later ones.
+
+#### The screens (VSTC 2+0.02 at 4 MB, 1200 games each, against HEAD)
+
+| candidate | Elo | LLR |
+|---|---|---|
+| **material scaling, K 9000**: the search's eval x (K + material) / (K + 6200) | **+37.49 +/- 12.06** | 2.77 |
+| material scaling, K 4500 | +27.27 +/- 11.72 | 2.10 |
+| material scaling, K 18000 | +20.00 +/- 11.55 | 1.56 |
+| material scaling, K 48000 | +9.56 +/- 11.12 | 0.71 |
+| **RFP depth 7 -> 9** (E50, held) | **+7.82 +/- 11.72** | 0.53 |
+| **ProbCut returns v less its margin** (E50, held) | **+6.37 +/- 11.35** | 0.43 |
+| **10-byte TT entries, six to a cache line** (E46, E50, held) | **+4.05 +/- 11.46** | 0.22 |
+| low-ply history, plies 1-4, ordering weight 4 / (1 + ply) | +3.76 +/- 12.00 | 0.18 |
+| RFP margin less a third when the opponent's last move worsened their eval (E50) | +2.32 +/- 10.98 | 0.08 |
+| IIR only at PV and cut nodes (E50) | -1.45 +/- 12.08 | -0.24 |
+| improving from four plies back when the grandparent was in check (E50) | -2.03 +/- 12.40 | -0.28 |
+| a second IIR ply at cut nodes, depth >= 8 (E50) | -5.21 +/- 11.74 | -0.56 |
+
+The survivor rule was written before the first screen finished: Elo >= +4 with LLR > 0; the TT
+at >= 0, a capacity change worth ~+1-3 that a +/-12 screen cannot resolve; one material-scaling
+strength. K 9000 and 4500 were added after 48000 and 18000 read rising; a quadratic in log K
+through 4500 / 9000 / 18000 tops out near 8000. One time loss in 14,400 screen games.
+
+#### STC (8+0.08, 16 MB, against HEAD)
+
+| # | build | games | W-L-D | Elo | nElo | ptnml |
+|---|---|---|---|---|---|---|
+| 13 | **stack**: TT10 + material scaling K 9000 + ProbCut return + RFP depth 9, SPRT [0, 5], UHO | 1294 | 360-245-689 | **+30.96 +/- 10.02**, H1 | +58.82 | [3, 107, 324, 198, 15] |
+| 14 | the same pair, 1000 fixed games, `ccrl4040_ply20.epd` | 1000 | 190-120-690 | **+24.36 +/- 10.48** | +50.25 | [4, 65, 298, 123, 10] |
+
+No time losses. Run 13 stopped on H1 and carries the early-stopping bias. **The balanced book
+keeps nearly all of it** (nElo +50 against +59): unlike the berserk edge in E53, this does not
+live in UHO's lopsided openings.
+
+#### Why material scaling pays: the net's calibration by material
+
+On val-006 (1.97M records), the shipped P1 checkpoint's eval scale a, minimising
+MSE(sigmoid(a * eval / 400), target), per bucket of non-pawn material counted 3/3/5/9 (both
+sides, in the scaling's units). Against the game result, and against the search-score label
+(`calib_by_material.py` in the run directory):
+
+| material | records | a (result) | / full | a (score) | K 9000 | K 18000 |
+|---|---|---|---|---|---|---|
+| 0 | 7,344 | 0.785 | 0.390 | 0.940 | 0.592 | 0.744 |
+| 1-999 | 228,200 | 1.015 | 0.504 | 1.085 | 0.625 | 0.764 |
+| 1000-1999 | 538,704 | 1.285 | 0.638 | 1.000 | 0.691 | 0.806 |
+| 2000-2999 | 235,784 | 1.520 | 0.754 | 0.950 | 0.757 | 0.847 |
+| 3000-3999 | 168,717 | 1.715 | 0.851 | 0.915 | 0.822 | 0.888 |
+| 4000-4999 | 143,195 | 1.730 | 0.859 | 0.900 | 0.888 | 0.930 |
+| 5000-5999 | 257,911 | 1.850 | 0.918 | 0.855 | 0.954 | 0.971 |
+| 6000+ | 241,745 | 2.015 | 1.000 | 0.805 | 1.000 | 1.000 |
+
+**A centipawn with every piece on is worth 2.5x what it is worth with only pawns left**, in win
+probability. Every margin in `search.c` is a fixed number of centipawns, and so is the search's
+view of a trade, so a margin fitted where most nodes are (the middlegame) is too tight in the
+endgame. The scaling gives a centipawn one meaning in every phase. Solving
+(K + m) / (K + 6200) = a / a_full bucket by bucket gives K 4000-12000: where the screens put the
+optimum, found independently. The labels carry the same distortion: a (score) is ~1 in endgames
+and ~0.8 at full material, so the net is about as confident as its labels late and 1.2x more
+confident early.
+
+#### What shipped
+
+- **Material scaling.** `corrected_eval()` multiplies the raw evaluation by
+  (`MAT_SCALE_K` + material) / (`MAT_SCALE_K` + 6200), pieces counted 3/3/5/9, pawns not at
+  all: 1.0 with every piece on, 0.59 with none at K 9000. The TT keeps the raw evaluation, so a
+  probe re-scales it. `MatScaleK` has a sweep seat.
+- **Datagen searches and labels scaled too** (2026-10-15, after the measurements, bench
+  unchanged). Turning the scaling off in `search_run_sync()` would label with a weaker search,
+  and unscaling only the stored score is approximate. Instead gen-7 is labelled by the search
+  that plays, and the training is staged so the two label scales never meet in one stage:
+  pretrain on gen-5 / gen-6 (unscaled), then gen-7, then a final fine-tune on gen-7 alone, which
+  sets the net's calibration (E52: a net's scale follows its last ~16M positions, per output
+  bucket). Such a net has absorbed some or all of the correction, so **K must be re-fitted
+  for it**: left at 9000 it would scale twice, roughly K 2000-3300, and K 4500 already screened
+  ~10 below 9000. The optimum may be close to no scaling at all. Datagen's score thresholds
+  (`-openingscore`, `-maxscore`, the random-move margin) now see scaled scores, slightly looser
+  late in a game.
+- **10-byte TT entries.** Three entries and two bytes of padding make a 32-byte cluster, so a
+  probe is still one miss and a megabyte holds 1.5x the entries. The PV flag moved into bit 2 of
+  `genBound` under a five-bit generation (32 searches to wrap).
+- **ProbCut returns v - (probCutBeta - beta)**, not v: v was proven against the raised beta.
+- **RFP to depth 9** (was 7).
+
+The shipped tree was written from scratch on HEAD in a separate worktree and reproduces the
+tested `stack.exe` to the node, 218533 / 4408909. Gates on it: perft (all four suites) 0
+failures; `movepick selftest` 14/0; `chess960 selftest`; `smp selftest` 11/0; asserted debug
+bench 10 = release (1201107); `openbench-check` PASS; `make format-check`; `make datagen-test`
+PASS; `make classical` (bench 245070: the classical search changes at untested values, E22's
+precedent) and the tuner build.
+
+#### The SPSA, stopped
+
+26 seats at STC on top of the stack, 550 iterations x 28 games planned. Stopped by hand at
+iteration 369 (10,332 games): most seats were not moving. The one strong mover was `MatScaleK`,
+9000 -> ~8070 (drift z -3.0), within noise of the tested 9000. The rest: `UncSigmaSlope` 5 ->
+6.1 (+2.3), `RfpMargin` 67 -> 68.9 (+1.7), `HistMalusMul` 9 -> 9.8 (+1.6), `CorrWPawn` 134 -> 136
+(+1.5), everything else |z| < 1.2. **Nothing from it ships.** The state is intact in the run
+directory (`spsa.json`).
+
+#### Against ~3600 engines (STC 8+0.08, 16 MB, `ccrl4040_ply20.epd`, 3-4-5 tables for every seat)
+
+HEAD and the final build each played viridithas-12.0.0 (3600) and koivisto-8.0 (3593), 1500 games
+per pairing in two 750-game blocks, the two seats' blocks interleaved so both saw the same
+machine. Nothing else ran. Pooled from the pentanomials (`pool.py` in the run directory):
+
+| seat | vs viridithas-12.0.0 | vs koivisto-8.0 | both, 3000 games | ptnml |
+|---|---|---|---|---|
+| HEAD | -25.29 +/- 10.28 | -32.05 +/- 10.33 | **-28.67 +/- 7.29** | [62, 434, 725, 247, 32] |
+| final | +3.01 +/- 10.08 | -6.25 +/- 9.53 | **-1.62 +/- 6.94** | [29, 347, 773, 311, 40] |
+| **final - HEAD** | +28.30 +/- 14.39 | +25.80 +/- 14.05 | **+27.05 +/- 10.06** | |
+
+The only time losses were koivisto's: 4, all against the final build, three of them within 11
+seconds of each other at 10:29. Without those games the final build reads -2.09 +/- 7.69.
+
+**The self-play gain transferred whole**: +24.36 in self-play on the same book, +27.05 against
+two outside engines, where E50's search batch moved +16 in self-play and ~+1 against berserk.
+Anchored on the two (3600, 3593), HEAD sits at ~3568 and the final build at **~3595** under
+these conditions, each +/- 7 before the anchors' own +/- 10-13.
+
+#### CCRL-like LTC (40+0.4, 64 MB, `ccrl4040_ply20.epd`, 3-4-5 tables for both)
+
+| # | build | vs | games | W-L-D | Elo | nElo | ptnml |
+|---|---|---|---|---|---|---|---|
+| 25 | final | HEAD | 1500 | 225-135-1140 | **+20.87 +/- 6.65** | +55.29 | [0, 62, 541, 142, 5] |
+| 26 | final | viridithas-12.0.0 | 600 | 91-99-410 | **-4.63 +/- 12.84** | -10.04 | [1, 63, 181, 53, 2] |
+
+No time losses in either. The edge did not narrow with the clock, as E53's berserk edge did (+19.7 at STC,
++4.9 at LTC): +24.36 at STC on the same book, +20.87 here, within one interval of each other.
+76% of the games were drawn, which is what makes 1500 LTC games resolve to +/- 7.
+Against viridithas the build is level at LTC as at STC (+3.01 +/- 10.08): 3600 - 5 +/- 13.
+
+#### What it says
+
+**The evaluation had a calibration error the search was paying for, and fixing it in the search
+transferred whole.** Every margin, and the search's view of every trade, is a fixed number of
+centipawns, and a centipawn of this net is worth 2.5x more with every piece on than with only
+pawns left. Material scaling is not a style: K was found three ways and they agree - the screens'
+curve tops out near 8000, the SPSA walked to ~8070, and the per-bucket fit of the net against
+game results spans 4000-12000 around it. That is why it
+transferred where E50's search batch did not: it corrects something true of every position, not
+a habit of this engine's own tree.
+
+**The search was otherwise well fitted.** 369 SPSA iterations moved no seat but K beyond
+|z| 2.3. E22a's fit, carried across three nets, still holds; the re-fit can wait for gen-7.
+
+**Pruning tweaks still transplant badly.** Of seven held E50 candidates, the two that survived
+are the two smallest changes: a deeper RFP limit and ProbCut's return value. Low-ply history,
+the only new ordering idea, screened +3.76: inside noise either way.
+
+**About 3595 now**, from HEAD's ~3568 measured beside it: level with viridithas-12.0.0 at STC and
+LTC, 6 below koivisto-8.0 at STC. The 3625 target (clover-6.0) is ~30 away.
+
+#### Pending
+
+| item | why |
+|---|---|
+| **re-fit `MatScaleK` against each new net** | the scaling corrects this net's calibration; gen-7's will differ (`calib_by_material.py`, or a screen) |
+| **gen-7 training staged**: gen-5 / gen-6 first, then gen-7, then a gen-7-only fine-tune | gen-7's labels are material-scaled and the older generations' are not; never mix the two in one stage |
+| a per-phase sigmoid K in the training target | the eval-to-result scale varies 2.5x by phase; the target uses one K (a gen-7 recipe lead) |
+| clover-6.0 at the CCRL-like LTC | the 3625 gate |
+| the classical build's search | it takes the stack too, at untested values (bench 245070) |
+| low-ply history at STC | +3.76 at VSTC, not tested further |
+

@@ -184,11 +184,18 @@ which is why fastchess reports results this way and why `-repeat` is always on.
 
 ### Time controls and bounds
 
-| Preset | Time control | Bounds | Use |
-|---|---|---|---|
-| `VSTC` | 2+0.02 | [0, 5] | quick sanity check |
-| `STC` | 8+0.08 | [0, 5] | the default working test |
-| `LTC` | 40+0.4 | [0.5, 4.5] | confirmation before committing |
+| Preset | Time control | Hash | Book | Tablebases | Bounds | Use |
+|---|---|---|---|---|---|---|
+| `VSTC` | 2+0.02 | 4 MB | UHO | none | [0, 5] | quick sanity check |
+| `STC` | 8+0.08 | 16 MB | UHO | none | [0, 5] | the default working test |
+| `LTC` | 40+0.4 | 64 MB | `ccrl4040_ply20.epd` | 3-4-5 | [0.5, 4.5] | confirmation before committing |
+
+The hash scales with the clock so the table is about as full as in a CCRL Blitz game
+(2'+1" on an i7-4770K into 128-256 MB, 15-30% full; one engine of a 14-game match here runs
+at about that core's speed). LTC also takes CCRL's other conditions: a balanced book and
+tablebases for both sides. `--hash`, `--book` and `--syzygy` (`off` included) override any of
+it. LTC results from before 2026-10-14 ran at 16 MB on UHO without tables, and do not
+difference against later ones.
 
 Some patches only help at depth. A patch that passes STC should be confirmed at
 LTC before it is committed; a patch that fails STC but you believe helps at long

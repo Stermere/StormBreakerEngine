@@ -213,8 +213,12 @@ def main() -> int:
     ap.add_argument("--games", type=int, default=100, help="games per pairing")
     ap.add_argument("--tc", default="STC")
     ap.add_argument("--concurrency", type=int, default=0)
-    ap.add_argument("--hash", type=int, default=16, dest="hash_mb")
-    ap.add_argument("--book", help="EPD opening book; default is the UHO book sprt.py uses")
+    ap.add_argument("--hash", type=int, dest="hash_mb",
+                    help="MB per engine; default per preset (VSTC 4, STC 16, LTC 64)")
+    ap.add_argument("--book", help="EPD opening book; default UHO, or the balanced CCRL "
+                                   "book at LTC")
+    ap.add_argument("--syzygy", help="tablebase directory for every seat; LTC defaults to "
+                                     "external/syzygy/3-4-5, and 'off' disables it")
     ap.add_argument("--include-stockfish", action="store_true",
                     help="add Stockfish to the field, alongside the rest of it")
     ap.add_argument("--skill-level", type=int, default=None,
@@ -239,6 +243,7 @@ def main() -> int:
     engine = str(Path(engine).resolve())
 
     tc, tc_label = c.resolve_tc(args.tc)
+    hash_mb, book, syzygy = c.resolve_conditions(tc_label, args.hash_mb, args.book, args.syzygy)
     concurrency = args.concurrency if args.concurrency > 0 else c.default_concurrency()
 
     if args.opponents:
@@ -307,8 +312,9 @@ def main() -> int:
         rounds=max(1, args.games // 2),
         concurrency=concurrency,
         pgn=pgn,
-        hash_mb=args.hash_mb,
-        book=args.book or c.get_book(),
+        hash_mb=hash_mb,
+        book=book,
+        syzygy=syzygy,
         # Round-robin so the opponents also play each other, which anchors the
         # Elo table instead of leaving every rating relative to a single engine.
         extra=["-tournament", "roundrobin"],
@@ -322,7 +328,10 @@ def main() -> int:
     print(f"  time control {tc}  ({tc_label})")
     print(f"  games        ~{args.games} per pairing")
     print(f"  concurrency  {concurrency}")
-    print(f"  book         {args.book or c.get_book()}")
+    print(f"  hash         {hash_mb} MB")
+    print(f"  book         {book}")
+    if syzygy:
+        print(f"  syzygy       {syzygy}  (every seat)")
     print(f"  pgn          {pgn}")
     print()
 

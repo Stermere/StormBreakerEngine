@@ -222,7 +222,7 @@ repository:
   Sharing a history table is not merely a race: it is two different searches
   averaging their opinions into a table neither can then trust, and the ordering
   that results is worse than either thread's alone.
-- **The table is shared and read racily, by design.** Entries are 16 bytes and
+- **The table is shared and read racily, by design.** Entries are 10 bytes and
   are not written atomically, so a probe can in principle return one write's
   depth beside another's score. That is survivable only because of invariant 6 —
   every move that comes out of the table is validated before it is played — and

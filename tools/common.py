@@ -38,6 +38,7 @@ ENGINES_DIR = EXTERNAL_DIR / "engines"
 BASELINE_DIR = EXTERNAL_DIR / "baselines"
 GAMES_DIR = EXTERNAL_DIR / "games"
 TUNE_DIR = EXTERNAL_DIR / "tune"
+SYZYGY_DIR = EXTERNAL_DIR / "syzygy" / "3-4-5"
 
 
 def ensure_dir(path: Path) -> Path:
@@ -123,6 +124,36 @@ TC_PRESETS = {"VSTC": "2+0.02", "STC": "8+0.08", "LTC": "40+0.4"}
 # elo0 is the null hypothesis (no gain), elo1 the alternative (a gain worth
 # keeping). Wider bounds resolve faster but wave through smaller regressions.
 BOUND_PRESETS = {"VSTC": (0.0, 5.0), "STC": (0.0, 5.0), "LTC": (0.5, 4.5)}
+
+
+# Hash per preset, sized to fill the table about as much as a CCRL Blitz game does: 2'+1" on a
+# 4770K-class core into 128-256 MB is 15-30% full, and a 14-game match here runs each engine
+# at about that speed. Nodes per move scale with the clock, so the hash does too. A literal
+# time control gets DEFAULT_HASH_MB.
+HASH_PRESETS = {"VSTC": 4, "STC": 16, "LTC": 64}
+DEFAULT_HASH_MB = 16
+
+# LTC is the confirmation tier, so it also plays CCRL's openings (a balanced book; CCRL uses
+# one of up to 12 moves) and gives both sides tablebases (CCRL allows up to 6 pieces).
+LTC_BOOK = BOOKS_DIR / "ccrl4040_ply20.epd"
+
+
+def resolve_conditions(label: str, hash_mb: int | None, book: str | None,
+                       syzygy: str | None) -> tuple[int, str | None, str | None]:
+    """(hash MB, book, tablebase directory) for a preset, explicit values winning.
+    `syzygy` "off" turns LTC's default tables off."""
+    if hash_mb is None:
+        hash_mb = HASH_PRESETS.get(label, DEFAULT_HASH_MB)
+    if syzygy is not None and syzygy.lower() in ("off", "none"):
+        syzygy = None
+    elif syzygy is None and label == "LTC":
+        if any(SYZYGY_DIR.glob("*.rtbw")):
+            syzygy = str(SYZYGY_DIR)
+        else:
+            warn(f"LTC plays with tablebases, but {SYZYGY_DIR} has none: make syzygy-fetch")
+    if book is None:
+        book = str(LTC_BOOK) if label == "LTC" and LTC_BOOK.exists() else get_book()
+    return hash_mb, book, syzygy
 
 
 def resolve_tc(tc: str) -> tuple[str, str]:

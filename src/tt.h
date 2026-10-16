@@ -16,7 +16,8 @@ typedef enum {
     BOUND_EXACT = BOUND_UPPER | BOUND_LOWER
 } Bound;
 
-/* 16 bytes, so a four-entry cluster is one cache line (asserted in tt.c). */
+/* 10 bytes, so a cache line holds six entries where 16 bytes held four (asserted in tt.c).
+ * `genBound` is the generation (top 5 bits), the PV flag and the bound (low 2 bits). */
 typedef struct {
     uint16_t key16;
     uint16_t move;
@@ -24,9 +25,9 @@ typedef struct {
     int16_t eval;
     uint8_t depth;
     uint8_t genBound;
-    uint8_t pv;
-    uint8_t padding[5];
 } TTEntry;
+
+#define TT_PV_FLAG 4u
 
 static inline Move tt_entry_move(const TTEntry *e) { return (Move)e->move; }
 static inline Value tt_entry_value(const TTEntry *e) { return (Value)e->value; }
@@ -35,7 +36,7 @@ static inline Depth tt_entry_depth(const TTEntry *e) { return (Depth)e->depth; }
 static inline Bound tt_entry_bound(const TTEntry *e) { return (Bound)(e->genBound & 3); }
 
 /* The position was once searched as a PV node. */
-static inline bool tt_entry_is_pv(const TTEntry *e) { return e->pv != 0; }
+static inline bool tt_entry_is_pv(const TTEntry *e) { return (e->genBound & TT_PV_FLAG) != 0; }
 
 /* The Hash option. False if allocation failed. */
 bool tt_resize(size_t mb);

@@ -6,14 +6,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Four 16-byte entries per 64-byte cache line: one cluster, one cache miss. */
-#define TT_CLUSTER_SIZE 4
+/* Three 10-byte entries and two bytes of padding: a cluster is half a cache line, so a probe
+ * is still one miss and the table holds 1.5x the entries a 16-byte layout did (E54). */
+#define TT_CLUSTER_SIZE 3
 
-_Static_assert(sizeof(TTEntry) == 16, "TTEntry must stay 16 bytes for cache-line packing");
+_Static_assert(sizeof(TTEntry) == 10, "TTEntry must stay 10 bytes for cluster packing");
 
 typedef struct {
     TTEntry entry[TT_CLUSTER_SIZE];
+    uint8_t padding[2];
 } TTCluster;
+
+_Static_assert(sizeof(TTCluster) == 32, "a cluster must stay half a cache line");
 
 static TTCluster *Table;
 
@@ -30,9 +34,9 @@ static inline uint8_t generation(void) {
     return atomic_load_explicit(&Generation, memory_order_relaxed);
 }
 
-/* The generation is the top 6 bits of genBound: steps of 4, wrapping after 64 searches. */
-#define GENERATION_DELTA 4
-#define GENERATION_MASK  0xFCu
+/* The generation is the top 5 bits of genBound: steps of 8, wrapping after 32 searches. */
+#define GENERATION_DELTA 8
+#define GENERATION_MASK  0xF8u
 
 static inline uint64_t mul_hi64(uint64_t a, uint64_t b) {
 #if defined(__SIZEOF_INT128__)
@@ -147,7 +151,7 @@ bool tt_probe(Key key, TTEntry *out) {
 
         if (e->key16 == key16 && (e->genBound & 3) != BOUND_NONE) {
             /* Refresh the generation of an entry still in use. */
-            e->genBound = (uint8_t)(generation() | (e->genBound & 3));
+            e->genBound = (uint8_t)(generation() | (e->genBound & (TT_PV_FLAG | 3u)));
             *out        = *e;
             return true;
         }
@@ -195,7 +199,8 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
     if (!sameSlot || m != MOVE_NONE)
         replace->move = (uint16_t)m;
 
-    replace->pv = (uint8_t)(pv || (sameSlot && replace->pv));
+    const unsigned pvFlag = pv || (sameSlot && (replace->genBound & TT_PV_FLAG)) ? TT_PV_FLAG : 0u;
+    replace->genBound     = (uint8_t)((replace->genBound & ~TT_PV_FLAG) | pvFlag);
 
     /* The four-ply slack lets reduced re-searches refresh an entry still in use. */
     if (!sameSlot || bound == BOUND_EXACT || (Depth)replace->depth < depth + 4) {
@@ -206,7 +211,7 @@ void tt_store(Key key, Move m, Value value, Value eval, Depth depth, Bound bound
         replace->value    = (int16_t)stored;
         replace->eval     = (int16_t)eval;
         replace->depth    = (uint8_t)(depth > 255 ? 255 : depth);
-        replace->genBound = (uint8_t)(gen | (unsigned)bound);
+        replace->genBound = (uint8_t)(gen | pvFlag | (unsigned)bound);
     }
 }
 

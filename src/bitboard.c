@@ -2,6 +2,7 @@
 #include "bitboard.h"
 
 #include <assert.h>
+#include <stddef.h>
 
 Bitboard PawnAttacks[COLOR_NB][SQUARE_NB];
 Bitboard KnightAttacks[SQUARE_NB];

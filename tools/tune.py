@@ -471,7 +471,8 @@ def main() -> int:
     ap.add_argument("--depth", type=int, default=0,
                     help="fixed-depth games instead of a clock. DIAGNOSTIC ONLY - see below")
     ap.add_argument("--concurrency", type=int, default=0)
-    ap.add_argument("--hash", type=int, default=16, dest="hash_mb")
+    ap.add_argument("--hash", type=int, dest="hash_mb",
+                    help="MB per engine; default per preset (VSTC 4, STC 16, LTC 64)")
     ap.add_argument("--book")
     ap.add_argument("--seed", type=int, default=0, help="0 picks one and records it")
     ap.add_argument("--c-end", type=float, help="override the perturbation for every parameter")
@@ -538,8 +539,7 @@ def main() -> int:
         t.games_per_iter = args.games_per_iter or max(2, 2 * t.concurrency)
         if t.games_per_iter % 2:
             t.games_per_iter += 1  # fastchess plays colour-reversed pairs
-        t.hash_mb = args.hash_mb
-        t.book = args.book or c.get_book()
+        t.hash_mb, t.book, _ = c.resolve_conditions(t.tc_label, args.hash_mb, args.book, "off")
         t.seed = args.seed or random.randrange(1, 2**31)
         t.rng = random.Random(t.seed)
 
